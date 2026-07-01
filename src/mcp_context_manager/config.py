@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -16,6 +16,10 @@ class ContextConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     bearer_token: str = ""
+    project_id: str = ""
+    root_uri: str = ""
+    allowed_roots: tuple[str, ...] = field(default_factory=tuple)
+    root_mappings: tuple[tuple[str, str], ...] = field(default_factory=tuple)
 
     @classmethod
     def from_env(cls) -> "ContextConfig":
@@ -28,6 +32,10 @@ class ContextConfig:
         return cls(
             repo_path=repo_path,
             state_dir=state_dir.resolve(),
+            allowed_roots=_split_env_list(os.getenv("MCP_CONTEXT_ALLOWED_ROOTS", "")),
+            root_mappings=_parse_root_mappings(
+                os.getenv("MCP_CONTEXT_ROOT_MAPPINGS", "")
+            ),
             max_read_bytes=max(1024, int(os.getenv("MAX_READ_BYTES", "262144"))),
             max_output_chars=max(1024, int(os.getenv("MAX_OUTPUT_CHARS", "12000"))),
             default_output_profile=os.getenv("MCP_CONTEXT_OUTPUT_PROFILE", "compact"),
@@ -35,6 +43,29 @@ class ContextConfig:
             host=os.getenv("HOST", "127.0.0.1"),
             port=int(os.getenv("PORT", "8000")),
             bearer_token=os.getenv("MCP_HTTP_BEARER_TOKEN", "").strip(),
+        )
+
+    def with_project(
+        self,
+        repo_path: Path,
+        state_dir: Path,
+        project_id: str = "",
+        root_uri: str = "",
+    ) -> "ContextConfig":
+        return ContextConfig(
+            repo_path=repo_path.resolve(),
+            state_dir=state_dir.resolve(),
+            project_id=project_id,
+            root_uri=root_uri,
+            allowed_roots=self.allowed_roots,
+            root_mappings=self.root_mappings,
+            max_read_bytes=self.max_read_bytes,
+            max_output_chars=self.max_output_chars,
+            default_output_profile=self.default_output_profile,
+            transport=self.transport,
+            host=self.host,
+            port=self.port,
+            bearer_token=self.bearer_token,
         )
 
     @property
@@ -90,3 +121,25 @@ class ContextConfig:
             return str(resolved.relative_to(self.repo_path)).replace("\\", "/") or "."
         except ValueError:
             return str(resolved)
+
+
+def _split_env_list(value: str) -> tuple[str, ...]:
+    if not value.strip():
+        return ()
+    raw_parts: list[str] = []
+    for chunk in value.split(os.pathsep):
+        raw_parts.extend(chunk.split(","))
+    return tuple(part.strip() for part in raw_parts if part.strip())
+
+
+def _parse_root_mappings(value: str) -> tuple[tuple[str, str], ...]:
+    mappings: list[tuple[str, str]] = []
+    for item in _split_env_list(value):
+        if "=" not in item:
+            continue
+        host_prefix, local_prefix = item.split("=", 1)
+        host_prefix = host_prefix.strip().rstrip("/")
+        local_prefix = local_prefix.strip().rstrip("/")
+        if host_prefix and local_prefix:
+            mappings.append((host_prefix or "/", local_prefix or "/"))
+    return tuple(mappings)

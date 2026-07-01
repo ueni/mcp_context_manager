@@ -129,18 +129,34 @@ class ContextIndex:
         files = self._iter_candidate_files(root, max_files=max_files)
         with self.connect() as conn:
             fts_enabled = self.initialize(conn)
-            conn.execute("DELETE FROM files")
-            conn.execute("DELETE FROM symbols")
-            conn.execute("DELETE FROM imports")
-            if fts_enabled:
-                conn.execute("DELETE FROM fts_files")
-            symbol_count = 0
-            import_count = 0
+            existing_rows = {
+                row["path"]: row
+                for row in conn.execute(
+                    "SELECT path, size, mtime_ns, sha256 FROM files"
+                ).fetchall()
+                if self._rel_in_refresh_scope(row["path"], root)
+            }
+            current_rels = {
+                str(file_path.relative_to(self.config.repo_path)).replace("\\", "/")
+                for file_path in files
+            }
+            removed_count = 0
+            updated_count = 0
+            unchanged_count = 0
+            for rel in sorted(set(existing_rows) - current_rels):
+                self._delete_file_rows(conn, rel, fts_enabled)
+                removed_count += 1
             for file_path in files:
                 rel = str(file_path.relative_to(self.config.repo_path)).replace("\\", "/")
                 raw = file_path.read_bytes()
                 text = raw.decode("utf-8", errors="replace")
                 stat = file_path.stat()
+                digest = sha256_bytes(raw)
+                existing = existing_rows.get(rel)
+                if existing and existing["sha256"] == digest:
+                    unchanged_count += 1
+                    continue
+                self._delete_file_rows(conn, rel, fts_enabled)
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO files
@@ -151,7 +167,7 @@ class ContextIndex:
                         rel,
                         int(stat.st_size),
                         int(stat.st_mtime_ns),
-                        sha256_bytes(raw),
+                        digest,
                         file_path.suffix.lower(),
                         language_for_path(rel),
                         len(text.splitlines()),
@@ -164,8 +180,7 @@ class ContextIndex:
                         (rel, text),
                     )
                 symbols, imports = self.extract_file_intel(rel, text)
-                symbol_count += len(symbols)
-                import_count += len(imports)
+                updated_count += 1
                 conn.executemany(
                     """
                     INSERT OR REPLACE INTO symbols
@@ -181,19 +196,54 @@ class ContextIndex:
                     """,
                     imports,
                 )
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("generated_at", indexed_at))
+            previous_generated = conn.execute(
+                "SELECT value FROM meta WHERE key='generated_at'"
+            ).fetchone()
+            generated_at = (
+                indexed_at
+                if updated_count or removed_count or previous_generated is None
+                else previous_generated["value"]
+            )
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("generated_at", generated_at))
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("git_head", git_value(self.config.repo_path, "rev-parse", "HEAD")))
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("git_branch", git_value(self.config.repo_path, "branch", "--show-current")))
             conn.commit()
+            total_files = conn.execute("SELECT COUNT(*) AS count FROM files").fetchone()["count"]
+            total_symbols = conn.execute("SELECT COUNT(*) AS count FROM symbols").fetchone()["count"]
+            total_imports = conn.execute("SELECT COUNT(*) AS count FROM imports").fetchone()["count"]
         return {
             "schema": "context_index.refresh.v1",
-            "generated_at": indexed_at,
+            "generated_at": generated_at,
             "index_path": self.config.display_path(self.config.index_db_path),
-            "file_count": len(files),
-            "symbol_count": symbol_count,
-            "import_count": import_count,
+            "file_count": int(total_files),
+            "symbol_count": int(total_symbols),
+            "import_count": int(total_imports),
+            "files_considered": len(files),
+            "updated_count": updated_count,
+            "unchanged_count": unchanged_count,
+            "removed_count": removed_count,
             "fts_enabled": fts_enabled,
         }
+
+    def _delete_file_rows(
+        self, conn: sqlite3.Connection, rel: str, fts_enabled: bool
+    ) -> None:
+        conn.execute("DELETE FROM files WHERE path = ?", (rel,))
+        conn.execute("DELETE FROM symbols WHERE path = ?", (rel,))
+        conn.execute("DELETE FROM imports WHERE path = ?", (rel,))
+        if fts_enabled:
+            try:
+                conn.execute("DELETE FROM fts_files WHERE path = ?", (rel,))
+            except sqlite3.OperationalError:
+                pass
+
+    def _rel_in_refresh_scope(self, rel: str, root: Path) -> bool:
+        if root == self.config.repo_path:
+            return True
+        root_rel = str(root.relative_to(self.config.repo_path)).replace("\\", "/")
+        if root.is_file():
+            return rel == root_rel
+        return rel == root_rel or rel.startswith(root_rel.rstrip("/") + "/")
 
     def status(self) -> dict[str, Any]:
         with self.connect() as conn:

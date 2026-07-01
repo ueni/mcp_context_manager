@@ -49,6 +49,7 @@ class ContextService:
         if mode not in allowed:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
         if mode == "search":
+            self._ensure_index_fresh(path=path)
             cache_key = self._cache_key(
                 "search",
                 {
@@ -71,10 +72,13 @@ class ContextService:
             self._cache_set(cache_key, result)
             return {**result, "cache": {"hit": False, "key": cache_key}}
         if mode == "snippet":
+            self._ensure_index_fresh(path=path)
             return self.index.snippet(path=path, start_line=start_line, end_line=end_line)
         if mode == "tree":
+            self._ensure_index_fresh(path=path)
             return self.index.tree(path=path, max_entries=max_entries, max_depth=max_depth)
         if mode == "symbols":
+            self._ensure_index_fresh()
             return self.index.symbols(query=query, limit=max_results)
         return {
             "schema": "context_references.list.v1",
@@ -159,6 +163,7 @@ class ContextService:
                 "schema": "context_admin.health.v1",
                 "ok": True,
                 "repo_path": str(self.config.repo_path),
+                "project_id": self.config.project_id,
                 "state_dir": self.config.display_path(self.config.state_dir),
                 "index": self.index.status(),
             }
@@ -189,8 +194,7 @@ class ContextService:
             raise ValueError("prompt is required")
         started = time.perf_counter()
         self.config.ensure_state_dirs()
-        if refresh_index or self.index.status()["file_count"] == 0:
-            self.index.refresh(max_files=5000)
+        self._ensure_index_fresh(max_files=5000)
         profile = output_profile or self._budget()["default_output_profile"]
         budget = max_output_chars or int(self._budget()["max_output_chars"])
         route = classify_route(prompt)
@@ -295,6 +299,10 @@ class ContextService:
             "repo": {
                 "path": str(self.config.repo_path),
                 "state_dir": self.config.display_path(self.config.state_dir),
+                "project_id": self.config.project_id,
+                "root_uri_hash": sha256_text(self.config.root_uri)
+                if self.config.root_uri
+                else "",
             },
             "request": {
                 "prompt": prompt,
@@ -356,6 +364,11 @@ class ContextService:
 
     def repo_context_resource(self, reference_id: str) -> str:
         return json.dumps(self.references.resolve(reference_id=reference_id), indent=2, sort_keys=True)
+
+    def _ensure_index_fresh(
+        self, path: str = ".", max_files: int = 5000
+    ) -> dict[str, Any]:
+        return self.index.refresh(path=path, max_files=max_files)
 
     def _collect_paths(self, prompt: str, changed: list[str], focus: list[str]) -> list[str]:
         found: list[str] = []

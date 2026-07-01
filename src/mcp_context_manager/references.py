@@ -25,6 +25,7 @@ class ResultReferences:
             "schema": "mcp_result_reference.v1",
             "reference_id": reference_id,
             "producer_tool": producer,
+            "project_id": self.config.project_id,
             "created_at": now_iso(),
             "expires_at": expires_at,
             "summary": summary,
@@ -38,7 +39,11 @@ class ResultReferences:
             "sensitivity": {"redacted": True, "payload_embedded": False},
             "resolver": {
                 "tool": "result_reference_resolve",
-                "uri": f"repo://context/{reference_id}",
+                "uri": (
+                    f"repo://project/{self.config.project_id}/context/{reference_id}"
+                    if self.config.project_id
+                    else f"repo://context/{reference_id}"
+                ),
                 "path": self.config.display_path(path),
                 "repo_boundary_enforced": True,
             },
