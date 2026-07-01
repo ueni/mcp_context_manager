@@ -25,6 +25,19 @@ except ModuleNotFoundError:  # pragma: no cover
 
 SERVICE = ProjectContextService.from_env()
 
+CONTEXT_PACK_HTTP_FIELDS = {
+    "prompt",
+    "changed_files",
+    "focus_paths",
+    "memory_session",
+    "max_output_chars",
+    "output_profile",
+    "max_items",
+    "refresh_index",
+    "project_id",
+    "root_uri",
+}
+
 
 async def _mcp_roots(ctx: Any) -> list[Any]:
     if ctx is None:
@@ -281,8 +294,18 @@ def create_http_app(service: ProjectContextService | ContextService | None = Non
         return JSONResponse(svc.context_admin(mode="health"))
 
     async def context_pack_http(request: Any) -> JSONResponse:
-        payload = await request.json()
-        return JSONResponse(svc.context_pack(**payload))
+        try:
+            payload = _normalize_context_pack_http_payload(await request.json())
+            return JSONResponse(svc.context_pack(**payload))
+        except (TypeError, ValueError) as exc:
+            return JSONResponse(
+                {
+                    "schema": "context_http.error.v1",
+                    "error": "bad_request",
+                    "message": str(exc),
+                },
+                status_code=400,
+            )
 
     async def reference_http(_request: Any) -> JSONResponse:
         reference_id = _request.path_params["reference_id"]
@@ -319,6 +342,30 @@ def _project_service(
     if isinstance(service, ProjectContextService):
         return service
     return ProjectContextService(service.config)
+
+
+def _normalize_context_pack_http_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object")
+
+    normalized: dict[str, Any] = {}
+    unknown_fields: list[str] = []
+    for key, value in payload.items():
+        target = "prompt" if key == "task" else key
+        if target not in CONTEXT_PACK_HTTP_FIELDS:
+            unknown_fields.append(str(key))
+            continue
+        if target == "prompt" and target in normalized:
+            continue
+        normalized[target] = value
+
+    if unknown_fields:
+        raise ValueError(f"unsupported fields: {', '.join(sorted(unknown_fields))}")
+
+    prompt = normalized.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt is required")
+    return normalized
 
 
 def main() -> None:
