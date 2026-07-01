@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "mcp-context-manager"
 version = "0.1.0"
 description = "Focused MCP server for compact repository context packs."
-readme = "AGENTS.md"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "mcp>=1.26,<3",
