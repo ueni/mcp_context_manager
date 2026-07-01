@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Nico Ueberfeldt - ueni
+# SPDX-License-Identifier: MIT
+
+version = 1
+SPDX-PackageName = "mcp-context-manager"
+SPDX-PackageSupplier = "Nico Ueberfeldt - ueni"
+
+[[annotations]]
+path = [
+  ".dockerignore",
+  ".gitignore",
+  "AGENTS.md",
+  "Dockerfile",
+  "README.md",
+  "compose.yaml",
+  "pyproject.toml",
+  "src/**",
+  "tests/**",
+]
+SPDX-FileCopyrightText = "2026 Nico Ueberfeldt - ueni"
+SPDX-License-Identifier = "MIT"

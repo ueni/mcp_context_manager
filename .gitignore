@@ -1,4 +1,5 @@
 .mcp-context-manager/
+.continue/
 .pytest_cache/
 __pycache__/
 *.py[cod]
