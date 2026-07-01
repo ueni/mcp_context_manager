@@ -18,6 +18,20 @@ SECRET_PATTERNS = [
     re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
 ]
 
+FILE_URI_WINDOWS_HOST_PATH_RE = re.compile(
+    r"\bfile://(?:localhost)?/[A-Za-z]:[/\\][^\s:'\",)>\]}]+"
+)
+FILE_URI_HOST_PATH_RE = re.compile(r"\bfile://(?:localhost)?/[^\s:'\",)>\]}]+")
+POSIX_HOST_PATH_RE = re.compile(
+    r"(?<![\w:/.-])/(home|Users|var|tmp|etc|opt|root|data|mnt|workspace-roots|workspace|private)"
+    r"(?:/[^\s:'\",)>\]}]+)?(?=$|[\s:'\",)>\]}])"
+)
+WINDOWS_HOST_PATH_RE = re.compile(
+    r"(?<![\w:/.-])[A-Za-z]:[/\\]"
+    r"(?:Users|Windows|ProgramData|Temp|tmp|workspace-roots|workspace|data|mnt|repo)"
+    r"(?:[/\\][^\s:'\",)>\]}]+)?(?=$|[\s:'\",)>\]}])"
+)
+
 PROMPT_INJECTION_PATTERNS = {
     "instruction_override": re.compile(
         r"(?i)\b(ignore|override|forget|bypass)\b.{0,40}\b(previous|system|developer|instruction|rules)\b"
@@ -211,12 +225,17 @@ def redact_text(text: str) -> tuple[str, list[str]]:
         out = pattern.sub(f"[REDACTED_SECRET_{idx}]", out)
         if out != before:
             redactions.append(f"secret_pattern_{idx}")
-    out = re.sub(
-        r"(?<![\w:/.-])/(home|Users|var|tmp|etc|opt|root|data|mnt|workspace|workspace-roots|private)/[^\s:'\",)>\]}]+",
-        "[REDACTED_HOST_PATH]",
-        out,
-    )
-    if "[REDACTED_HOST_PATH]" in out:
+
+    before = out
+    out = FILE_URI_WINDOWS_HOST_PATH_RE.sub("file://[REDACTED_HOST_PATH]", out)
+    out = FILE_URI_HOST_PATH_RE.sub("file://[REDACTED_HOST_PATH]", out)
+    if out != before:
+        redactions.append("host_path_uri")
+
+    before = out
+    out = POSIX_HOST_PATH_RE.sub("[REDACTED_HOST_PATH]", out)
+    out = WINDOWS_HOST_PATH_RE.sub("[REDACTED_HOST_PATH]", out)
+    if out != before:
         redactions.append("host_path")
     return out, sorted(set(redactions))
 

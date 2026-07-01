@@ -6,6 +6,39 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from mcp_context_manager.context import ContextService
+from mcp_context_manager.util import redact_text, sanitize_json
+
+
+def test_sanitizer_redacts_file_uri_posix_and_windows_host_paths() -> None:
+    text = (
+        "file:///home/user/source/repo "
+        "file://localhost/home/user/source/repo "
+        "file:///workspace-roots/demo "
+        "/home/user/source/repo "
+        r"C:\Users\alice\repo "
+        "C:/Users/alice/repo"
+    )
+
+    redacted, categories = redact_text(text)
+    sanitized, sensitivity = sanitize_json(
+        {
+            "uri": "file:///workspace-roots/demo",
+            "windows": r"C:\Users\alice\repo",
+        }
+    )
+
+    assert "file:///home/user/source/repo" not in redacted
+    assert "file://localhost/home/user/source/repo" not in redacted
+    assert "file:///workspace-roots/demo" not in redacted
+    assert "/home/user/source/repo" not in redacted
+    assert r"C:\Users\alice\repo" not in redacted
+    assert "C:/Users/alice/repo" not in redacted
+    assert "host_path_uri" in categories
+    assert "host_path" in categories
+    assert sanitized["uri"] == "file://[REDACTED_HOST_PATH]"
+    assert sanitized["windows"] == "[REDACTED_HOST_PATH]"
+    assert sensitivity["redacted"] is True
+    assert set(sensitivity["categories"]) == {"host_path", "host_path_uri"}
 
 
 def test_memory_ttl_decision_priority_and_compaction(service: ContextService) -> None:
@@ -117,6 +150,32 @@ def test_memory_upsert_redacts_secret_values_before_persisting(
     assert payload["entries"][0]["value"]["path"] == "[REDACTED_HOST_PATH]"
 
 
+def test_memory_redacts_file_uri_payloads_before_persisting(
+    service: ContextService,
+) -> None:
+    result = service.context_memory(
+        mode="upsert",
+        namespace="workspace",
+        key="file-uri",
+        value={
+            "root_uri": "file:///home/user/source/private-repo",
+            "mapped_uri": "file:///workspace-roots/private-repo",
+        },
+        source="see file://localhost/home/user/source/private-repo/log.txt",
+    )
+
+    stored = service.config.memory_path.read_text(encoding="utf-8")
+    payload = json.loads(stored)
+
+    assert result["sensitivity"]["redacted"] is True
+    assert "host_path_uri" in result["sensitivity"]["categories"]
+    assert "file:///home/user/source/private-repo" not in stored
+    assert "file:///workspace-roots/private-repo" not in stored
+    assert "file://localhost/home/user/source/private-repo/log.txt" not in stored
+    assert payload["entries"][0]["value"]["root_uri"] == "file://[REDACTED_HOST_PATH]"
+    assert payload["entries"][0]["value"]["mapped_uri"] == "file://[REDACTED_HOST_PATH]"
+
+
 def test_memory_rejects_sensitive_identifiers(service: ContextService) -> None:
     with pytest.raises(ValueError, match="unsafe memory identifier"):
         service.context_memory(
@@ -174,6 +233,27 @@ def test_result_reference_create_sanitizes_payload_and_summary(
     assert "/home/user/source/private-repo" not in stored
     assert resolved["content"]["secret"].startswith("[REDACTED_SECRET_")
     assert resolved["content"]["host_path"] == "[REDACTED_HOST_PATH]"
+
+
+def test_result_reference_redacts_file_uri_payload_and_summary(
+    service: ContextService,
+) -> None:
+    ref = service.references.create(
+        producer="test",
+        payload={"uri": "file:///workspace-roots/private-repo"},
+        summary={"note": "see file://localhost/home/user/source/private-repo"},
+    )
+
+    stored = (service.config.references_dir / f"{ref['reference_id']}.json").read_text(
+        encoding="utf-8"
+    )
+    resolved = service.result_reference_resolve(reference_id=ref["reference_id"])
+
+    assert ref["sensitivity"]["redacted"] is True
+    assert "host_path_uri" in ref["sensitivity"]["categories"]
+    assert "file:///workspace-roots/private-repo" not in stored
+    assert "file://localhost/home/user/source/private-repo" not in stored
+    assert resolved["content"]["uri"] == "file://[REDACTED_HOST_PATH]"
 
 
 def test_expired_reference_envelope_is_enforced_by_id_only(

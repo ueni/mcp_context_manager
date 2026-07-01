@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from .config import ContextConfig
-from .util import load_json_file, now_iso, save_json_file, sha256_text
+from .util import load_json_file, now_iso, redact_text, save_json_file, sha256_text
 
 
 @dataclass(frozen=True)
@@ -160,16 +160,21 @@ class ProjectRegistry:
         if not self.config.allowed_roots:
             return {"safe": True, "reason": "single_project_config"}
         repo_path = _norm_abs_posix(str(self.config.repo_path))
-        configured_parents = {
+        allowed_parents = {
             _allowed_root_to_path(allowed) for allowed in self.config.allowed_roots
         }
-        configured_parents.update(
+        mapped_parents = {
             _norm_abs_posix(local_prefix)
             for _host_prefix, local_prefix in self.config.root_mappings
-        )
+        }
+        configured_parents = allowed_parents | mapped_parents
         if repo_path in configured_parents:
             return {"safe": False, "reason": "repo_path_is_project_parent"}
-        return {"safe": True, "reason": "repo_path_is_project_root"}
+        if any(_path_is_below(repo_path, parent) for parent in allowed_parents):
+            return {"safe": True, "reason": "repo_path_under_allowed_root"}
+        if any(_path_is_below(repo_path, parent) for parent in mapped_parents):
+            return {"safe": True, "reason": "repo_path_under_mapped_root"}
+        return {"safe": False, "reason": "repo_path_outside_configured_roots"}
 
     def project_from_uri(
         self, root_uri: str, name: str = "", source: str = "root_uri"
@@ -204,39 +209,115 @@ class ProjectRegistry:
         projects: list[ProjectRoot] = []
         for metadata_path in sorted(projects_dir.glob("*/project.json")):
             metadata = load_json_file(metadata_path, {})
-            root_uri = str(metadata.get("root_uri") or "")
-            if not root_uri:
+            project, rewrite = self._project_from_metadata(metadata)
+            if project is None:
                 continue
-            try:
-                project = self.project_from_uri(
-                    root_uri,
-                    name=str(metadata.get("name") or ""),
-                    source="state",
-                )
-            except ValueError:
-                continue
+            if rewrite:
+                self.remember_project(project)
             projects.append(project)
         return projects
 
     def remember_project(self, project: ProjectRoot) -> None:
         if project.legacy:
             return
+        root_locator = self._root_locator_for_project(project)
+        if root_locator is None:
+            raise ValueError("project root cannot be represented by a safe locator")
         metadata_path = project.state_dir / "project.json"
         current = load_json_file(metadata_path, {})
         created_at = current.get("created_at") or now_iso()
+        root_uri_redacted, _redactions = redact_text(project.root_uri)
         save_json_file(
             metadata_path,
             {
                 "schema": "context_project.metadata.v1",
                 "project_id": project.project_id,
-                "root_uri": project.root_uri,
-                "root_hash": project.root_hash,
+                "root_uri_hash": project.root_hash,
+                "root_uri_redacted": root_uri_redacted,
+                "root_locator": root_locator,
                 "name": project.name,
                 "source": project.source,
                 "created_at": created_at,
                 "updated_at": now_iso(),
             },
         )
+
+    def _project_from_metadata(
+        self, metadata: Any
+    ) -> tuple[ProjectRoot | None, bool]:
+        if not isinstance(metadata, dict):
+            return None, False
+        name = str(metadata.get("name") or "")
+        locator = metadata.get("root_locator")
+        rewrite = False
+        if isinstance(locator, dict):
+            root_uri = self._root_uri_from_locator(locator)
+            if not root_uri:
+                return None, False
+        else:
+            root_uri = str(metadata.get("root_uri") or "")
+            if not root_uri:
+                return None, False
+            rewrite = True
+        try:
+            project = self.project_from_uri(root_uri, name=name, source="state")
+        except ValueError:
+            return None, False
+        stored_project_id = str(metadata.get("project_id") or "")
+        if stored_project_id and stored_project_id != project.project_id:
+            return None, False
+        stored_root_hash = str(
+            metadata.get("root_uri_hash") or metadata.get("root_hash") or ""
+        )
+        if stored_root_hash and stored_root_hash != project.root_hash:
+            return None, False
+        return project, rewrite
+
+    def _root_locator_for_project(self, project: ProjectRoot) -> dict[str, str] | None:
+        host_path = _file_uri_path(project.root_uri)
+        for allowed_path in sorted(
+            (_allowed_root_to_path(allowed) for allowed in self.config.allowed_roots),
+            key=len,
+            reverse=True,
+        ):
+            if not _path_is_at_or_under(host_path, allowed_path):
+                continue
+            relative_path = posixpath.relpath(host_path, allowed_path)
+            return {
+                "kind": "allowed_root",
+                "allowed_root_hash": _allowed_root_hash(allowed_path),
+                "relative_path": "." if relative_path == "." else relative_path,
+            }
+        legacy_path = _norm_abs_posix(str(self.config.repo_path))
+        if host_path == legacy_path:
+            return {"kind": "legacy_repo_path", "relative_path": "."}
+        return None
+
+    def _root_uri_from_locator(self, locator: dict[str, Any]) -> str:
+        relative_path = _safe_relative_path(locator.get("relative_path", "."))
+        if relative_path is None:
+            return ""
+        kind = str(locator.get("kind") or "")
+        if kind == "legacy_repo_path":
+            if self.config.allowed_roots or relative_path != ".":
+                return ""
+            return canonical_file_uri(self.config.repo_path)
+        if kind != "allowed_root":
+            return ""
+        allowed_root_hash = str(locator.get("allowed_root_hash") or "")
+        if not allowed_root_hash:
+            return ""
+        for allowed in self.config.allowed_roots:
+            allowed_path = _allowed_root_to_path(allowed)
+            if _allowed_root_hash(allowed_path) != allowed_root_hash:
+                continue
+            host_path = allowed_path
+            if relative_path != ".":
+                host_path = _norm_abs_posix(posixpath.join(allowed_path, relative_path))
+            if not _path_is_at_or_under(host_path, allowed_path):
+                return ""
+            return _file_uri_from_path(host_path)
+        return ""
 
     def _project_by_id(
         self, project_id: str, visible_roots: list[ProjectRoot]
@@ -299,7 +380,7 @@ class ProjectRegistry:
         )
         for host_prefix, local_prefix in mappings:
             host_prefix = _norm_abs_posix(host_prefix)
-            if normalized == host_prefix or normalized.startswith(host_prefix + "/"):
+            if _path_is_at_or_under(normalized, host_prefix):
                 rel = posixpath.relpath(normalized, host_prefix)
                 local = Path(local_prefix)
                 if rel != ".":
@@ -320,7 +401,7 @@ class ProjectRegistry:
         normalized = _norm_abs_posix(host_path)
         for allowed in self.config.allowed_roots:
             allowed_path = _allowed_root_to_path(allowed)
-            if normalized == allowed_path or normalized.startswith(allowed_path + "/"):
+            if _path_is_at_or_under(normalized, allowed_path):
                 return
         raise ValueError("MCP root is outside MCP_CONTEXT_ALLOWED_ROOTS")
 
@@ -337,7 +418,7 @@ def canonicalize_root_uri(root_uri: str) -> str:
     if parsed.netloc not in {"", "localhost"}:
         raise ValueError("only local file:// MCP roots are supported")
     path = _norm_abs_posix(unquote(parsed.path))
-    return urlunparse(("file", "", quote(path), "", "", ""))
+    return _file_uri_from_path(path)
 
 
 def canonical_file_uri(path: Path) -> str:
@@ -352,11 +433,48 @@ def _allowed_root_to_path(value: str) -> str:
     return _norm_abs_posix(value)
 
 
+def _allowed_root_hash(path: str) -> str:
+    return sha256_text(_file_uri_from_path(path))
+
+
+def _file_uri_path(root_uri: str) -> str:
+    parsed = urlparse(canonicalize_root_uri(root_uri))
+    return _norm_abs_posix(unquote(parsed.path))
+
+
+def _file_uri_from_path(path: str) -> str:
+    return urlunparse(("file", "", quote(_norm_abs_posix(path)), "", "", ""))
+
+
 def _norm_abs_posix(path: str) -> str:
     normalized = posixpath.normpath(path.replace("\\", "/"))
     if not normalized.startswith("/"):
         normalized = "/" + normalized
     return normalized.rstrip("/") or "/"
+
+
+def _path_is_at_or_under(path: str, parent: str) -> bool:
+    path = _norm_abs_posix(path)
+    parent = _norm_abs_posix(parent)
+    return path == parent or _path_is_below(path, parent)
+
+
+def _path_is_below(path: str, parent: str) -> bool:
+    path = _norm_abs_posix(path)
+    parent = _norm_abs_posix(parent)
+    if parent == "/":
+        return path != "/"
+    return path.startswith(parent + "/")
+
+
+def _safe_relative_path(value: Any) -> str | None:
+    raw = str(value or ".").strip().replace("\\", "/")
+    if not raw or raw.startswith("/"):
+        return None
+    normalized = posixpath.normpath(raw)
+    if normalized in {"", ".."} or normalized.startswith("../"):
+        return None
+    return "." if normalized == "." else normalized
 
 
 def _slug(value: str) -> str:
