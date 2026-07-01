@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from mcp_context_manager import server as server_module
 from mcp_context_manager.server import (
+    MCP_SERVER_INSTRUCTIONS,
     _mcp_roots,
     _mcp_tools_http_payload,
     _normalize_context_pack_http_payload,
@@ -56,6 +58,32 @@ def test_mcp_tools_http_payload_lists_transport_endpoints() -> None:
             "result_reference_resolve",
         ],
     }
+
+
+def test_create_mcp_advertises_server_instructions(monkeypatch, service) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeFastMCP:
+        def __init__(self, name: str, **kwargs: object):
+            captured["name"] = name
+            captured.update(kwargs)
+
+        def tool(self):
+            return lambda fn: fn
+
+        def resource(self, *_args: object, **_kwargs: object):
+            return lambda fn: fn
+
+        def prompt(self, *_args: object, **_kwargs: object):
+            return lambda fn: fn
+
+    monkeypatch.setattr(server_module, "FastMCP", FakeFastMCP)
+
+    server_module.create_mcp(service)
+
+    assert captured["name"] == "mcp-context-manager"
+    assert captured["instructions"] == MCP_SERVER_INSTRUCTIONS
+    assert "call context_pack first" in MCP_SERVER_INSTRUCTIONS
 
 
 def test_mcp_roots_returns_empty_when_session_has_no_roots_support() -> None:
