@@ -68,6 +68,28 @@ def test_mcp_roots_returns_empty_when_session_has_no_roots_support() -> None:
     assert roots == []
 
 
+def test_mcp_roots_returns_empty_when_roots_list_is_not_supported() -> None:
+    class RootsNotSupportedSession:
+        def list_roots(self) -> object:
+            raise RuntimeError("List roots not supported")
+
+    roots = asyncio.run(_mcp_roots(SimpleNamespace(session=RootsNotSupportedSession())))
+
+    assert roots == []
+
+
+def test_mcp_roots_returns_empty_when_roots_list_times_out() -> None:
+    class HangingSession:
+        async def list_roots(self) -> object:
+            await asyncio.sleep(60)
+
+    roots = asyncio.run(
+        _mcp_roots(SimpleNamespace(session=HangingSession()), timeout_seconds=0.01)
+    )
+
+    assert roots == []
+
+
 def test_mcp_roots_still_raises_unexpected_errors() -> None:
     class BrokenSession:
         def list_roots(self) -> object:

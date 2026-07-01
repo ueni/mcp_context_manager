@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import inspect
 from typing import Any
@@ -38,8 +39,12 @@ CONTEXT_PACK_HTTP_FIELDS = {
     "root_uri",
 }
 
+MCP_ROOTS_TIMEOUT_SECONDS = 1.0
 
-async def _mcp_roots(ctx: Any) -> list[Any]:
+
+async def _mcp_roots(
+    ctx: Any, timeout_seconds: float = MCP_ROOTS_TIMEOUT_SECONDS
+) -> list[Any]:
     if ctx is None:
         return []
     session = getattr(ctx, "session", None)
@@ -51,9 +56,11 @@ async def _mcp_roots(ctx: Any) -> list[Any]:
     try:
         result = session.list_roots()
         if inspect.isawaitable(result):
-            result = await result
+            result = await asyncio.wait_for(result, timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        return []
     except Exception as exc:
-        if _is_mcp_method_not_found(exc):
+        if _is_mcp_roots_unavailable(exc):
             return []
         raise
     roots = getattr(result, "roots", result)
@@ -62,7 +69,7 @@ async def _mcp_roots(ctx: Any) -> list[Any]:
     return list(roots)
 
 
-def _is_mcp_method_not_found(exc: Exception) -> bool:
+def _is_mcp_roots_unavailable(exc: Exception) -> bool:
     candidates = [exc, getattr(exc, "error", None)]
     for candidate in candidates:
         if candidate is None:
@@ -71,7 +78,12 @@ def _is_mcp_method_not_found(exc: Exception) -> bool:
         if code in {-32601, "method_not_found", "METHOD_NOT_FOUND"}:
             return True
         text = str(getattr(candidate, "message", candidate)).lower()
-        if "method not found" in text or "-32601" in text:
+        if (
+            "method not found" in text
+            or "-32601" in text
+            or "list roots not supported" in text
+            or "roots/list not supported" in text
+        ):
             return True
     return False
 
