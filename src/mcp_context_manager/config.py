@@ -124,7 +124,25 @@ class ContextConfig:
         try:
             return str(resolved.relative_to(self.repo_path)).replace("\\", "/") or "."
         except ValueError:
-            return str(resolved)
+            pass
+        try:
+            state_relative = resolved.relative_to(self.state_dir)
+        except ValueError:
+            return "[REDACTED_HOST_PATH]"
+        prefix = self._state_display_prefix()
+        relative = str(state_relative).replace("\\", "/")
+        if relative == ".":
+            return prefix
+        return f"{prefix}/{relative}"
+
+    def _state_display_prefix(self) -> str:
+        if (
+            self.project_id
+            and self.state_dir.name == self.project_id
+            and self.state_dir.parent.name == "projects"
+        ):
+            return f"state/projects/{self.project_id}"
+        return "state"
 
 
 def _split_env_list(value: str) -> tuple[str, ...]:

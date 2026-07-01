@@ -296,6 +296,9 @@ def test_workspace_roots_without_mapping_requires_explicit_project_selection(
     assert health["project_selection_required"] is True
     assert health["legacy_fallback"]["safe"] is False
     assert health["legacy_fallback"]["reason"] == "repo_path_outside_configured_roots"
+    assert health["state_dir"] == "state"
+    assert str(tmp_path) not in json.dumps(health, sort_keys=True)
+    assert "/workspace-roots" not in json.dumps(health, sort_keys=True)
 
 
 def test_legacy_single_project_fallback_still_works(tmp_path: Path) -> None:

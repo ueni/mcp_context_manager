@@ -97,14 +97,25 @@ def test_external_state_dir_supports_container_layout(
     )
 
     health = service.context_admin(mode="health")
+    index = service.context_admin(mode="index_refresh")
     pack = service.context_pack("review auth token behavior", max_items=2)
     memory = service.context_memory(mode="get")
     references = service.context_lookup(mode="references")
+    metrics = service.context_admin(mode="metrics")
 
-    assert health["state_dir"] == str(state_dir.resolve())
-    assert health["index"]["index_path"] == str(
-        state_dir.resolve() / "index" / "context.sqlite3"
+    assert health["repo_path"] == "."
+    assert health["state_dir"] == "state"
+    assert health["index"]["index_path"] == "state/index/context.sqlite3"
+    assert index["index_path"] == "state/index/context.sqlite3"
+    assert pack["repo"]["path"] == "."
+    assert pack["repo"]["state_dir"] == "state"
+    assert memory["path"] == "state/memory/context_memory.json"
+    assert references["references"][0]["path"].startswith("state/references/")
+    assert metrics["path"] == "state/reports/context_metrics.json"
+
+    public_payload = json.dumps(
+        [health, index, pack["repo"], memory, references, metrics],
+        sort_keys=True,
     )
-    assert pack["repo"]["state_dir"] == str(state_dir.resolve())
-    assert memory["path"] == str(state_dir.resolve() / "memory" / "context_memory.json")
-    assert references["references"][0]["path"].startswith(str(state_dir.resolve()))
+    assert str(sample_repo.resolve()) not in public_payload
+    assert str(state_dir.resolve()) not in public_payload

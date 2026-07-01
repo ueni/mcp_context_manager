@@ -197,7 +197,7 @@ class ContextService:
             return {
                 "schema": "context_admin.health.v1",
                 "ok": True,
-                "repo_path": str(self.config.repo_path),
+                "repo_path": self.config.display_path(self.config.repo_path),
                 "project_id": self.config.project_id,
                 "state_dir": self.config.display_path(self.config.state_dir),
                 "index": self.index.status(),
@@ -336,7 +336,7 @@ class ContextService:
             "schema": "context_pack.v1",
             "generated_at": now_iso(),
             "repo": {
-                "path": str(self.config.repo_path),
+                "path": self.config.display_path(self.config.repo_path),
                 "state_dir": self.config.display_path(self.config.state_dir),
                 "project_id": self.config.project_id,
                 "root_uri_hash": sha256_text(self.config.root_uri)

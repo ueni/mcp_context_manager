@@ -174,7 +174,7 @@ class ProjectContextService:
                     "project_selection_required": bool(visible)
                     or not legacy_fallback["safe"],
                     "legacy_fallback": legacy_fallback,
-                    "state_dir": str(self.config.state_dir),
+                    "state_dir": self.config.display_path(self.config.state_dir),
                     "projects": self._project_list(mcp_roots=mcp_roots),
                 }
         service, project = self._service_for_request(
