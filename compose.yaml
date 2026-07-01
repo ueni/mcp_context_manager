@@ -4,17 +4,19 @@ services:
     image: mcp-context-manager:local
     environment:
       HOST: 0.0.0.0
+      MCP_CONTEXT_ALLOWED_ROOTS: ${MCP_CONTEXT_ALLOWED_ROOTS:-${MCP_CONTEXT_HOST_ROOT:-${PWD}}}
+      MCP_CONTEXT_ROOT_MAPPINGS: ${MCP_CONTEXT_ROOT_MAPPINGS:-${MCP_CONTEXT_HOST_ROOT:-${PWD}}=/workspace-roots}
       MCP_CONTEXT_STATE_DIR: /state
       MCP_TRANSPORT: streamable-http
       PORT: 8000
-      REPO_PATH: /workspace
+      REPO_PATH: /workspace-roots
     ports:
       - "127.0.0.1:8000:8000"
     read_only: true
     tmpfs:
       - /tmp
     volumes:
-      - .:/workspace:ro
+      - ${MCP_CONTEXT_HOST_ROOT:-${PWD}}:/workspace-roots:ro
       - mcp-context-state:/state
 
 volumes:

@@ -12,7 +12,7 @@ ENV HOME=/tmp \
     PORT=8000 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    REPO_PATH=/workspace
+    REPO_PATH=/workspace-roots
 
 WORKDIR /app
 
@@ -24,13 +24,13 @@ COPY src ./src
 RUN pip install --no-compile . \
     && groupadd --gid 10001 mcp \
     && useradd --uid 10001 --gid mcp --home-dir /tmp --shell /usr/sbin/nologin --no-create-home mcp \
-    && mkdir -p /workspace /state \
-    && chown -R mcp:mcp /workspace /state
+    && mkdir -p /workspace-roots /state \
+    && chown -R mcp:mcp /workspace-roots /state
 
 USER mcp
 
 EXPOSE 8000
-VOLUME ["/workspace", "/state"]
+VOLUME ["/workspace-roots", "/state"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.getenv('PORT', '8000'), timeout=3).read()" || exit 1
