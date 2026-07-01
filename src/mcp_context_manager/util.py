@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+SECRET_PATTERNS = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    re.compile(
+        r"(?i)\b[A-Za-z0-9_-]*(api[_-]?key|token|secret|password)[A-Za-z0-9_-]*\s*[:=]\s*['\"]?[^'\"\s]+"
+    ),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
+    re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+]
+
+PROMPT_INJECTION_PATTERNS = {
+    "instruction_override": re.compile(
+        r"(?i)\b(ignore|override|forget|bypass)\b.{0,40}\b(previous|system|developer|instruction|rules)\b"
+    ),
+    "tool_manipulation": re.compile(
+        r"(?i)\b(call|invoke|run|execute|use)\b.{0,40}\b(tool|shell|command|curl|wget)\b"
+    ),
+    "credential_exfiltration": re.compile(
+        r"(?i)\b(send|exfiltrate|upload|print|reveal|show)\b.{0,40}\b(secret|token|password|key|credential)\b"
+    ),
+    "role_switch": re.compile(r"(?i)\b(system|assistant|developer)\s*:\s*"),
+}
+
+CODE_EXTENSIONS = {
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".java",
+    ".go",
+    ".rs",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".cs",
+    ".php",
+    ".rb",
+    ".swift",
+    ".kt",
+    ".kts",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".sql",
+    ".html",
+    ".css",
+    ".scss",
+}
+
+TEXT_EXTENSIONS = CODE_EXTENSIONS | {
+    ".md",
+    ".rst",
+    ".txt",
+    ".toml",
+    ".yaml",
+    ".yml",
+    ".json",
+    ".ini",
+    ".cfg",
+    ".xml",
+    ".csv",
+    ".dockerfile",
+}
+
+ROUTE_TERMS = {
+    "debug": {"bug", "debug", "error", "failure", "traceback", "crash", "fix"},
+    "review": {"review", "diff", "change", "pr", "merge", "regression"},
+    "test": {"test", "pytest", "coverage", "unit", "integration", "verify"},
+    "docs": {"doc", "docs", "readme", "documentation", "guide"},
+    "security": {"security", "secret", "token", "auth", "permission", "vulnerability"},
+    "coding": {"implement", "code", "feature", "refactor", "api", "function"},
+}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def expiry_iso(ttl_days: int | None) -> str:
+    if ttl_days is None:
+        return ""
+    return (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
+
+
+def is_expired(value: str | None) -> bool:
+    parsed = parse_iso(value)
+    return parsed is not None and parsed < datetime.now(timezone.utc)
+
+
+def estimate_tokens(text_or_value: Any) -> int:
+    if not isinstance(text_or_value, str):
+        text_or_value = json.dumps(text_or_value, ensure_ascii=False, sort_keys=True)
+    return max(1, (len(text_or_value) + 3) // 4)
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def trim_text(text: str, max_chars: int) -> tuple[str, bool]:
+    if max_chars < 1:
+        return "", bool(text)
+    if len(text) <= max_chars:
+        return text, False
+    return text[: max_chars - 15].rstrip() + "\n...[truncated]", True
+
+
+def normalize_query_terms(text: str, max_terms: int = 12) -> list[str]:
+    seen: set[str] = set()
+    terms: list[str] = []
+    for token in re.findall(r"[A-Za-z0-9_]{3,}", text.lower()):
+        if token in seen or token.isdigit():
+            continue
+        seen.add(token)
+        terms.append(token)
+        if len(terms) >= max_terms:
+            break
+    return terms
+
+
+def classify_route(prompt: str) -> str:
+    terms = set(normalize_query_terms(prompt, max_terms=80))
+    if terms.intersection({"debug", "traceback", "crash", "failure"}):
+        return "debug"
+    if terms.intersection({"review", "pr", "merge"}):
+        return "review"
+    if terms.intersection({"implement", "code", "feature", "refactor"}):
+        return "coding"
+    if terms.intersection({"security", "secret", "token", "auth", "vulnerability"}):
+        return "security"
+    if terms.intersection({"test", "pytest", "coverage", "verify"}):
+        return "test"
+    if terms.intersection({"doc", "docs", "readme", "documentation"}):
+        return "docs"
+    best_route = "general"
+    best_score = 0
+    for route, route_terms in ROUTE_TERMS.items():
+        score = len(terms.intersection(route_terms))
+        if score > best_score:
+            best_route = route
+            best_score = score
+    return best_route
+
+
+def redact_text(text: str) -> tuple[str, list[str]]:
+    redactions: list[str] = []
+    out = text
+    for idx, pattern in enumerate(SECRET_PATTERNS):
+        before = out
+        out = pattern.sub(f"[REDACTED_SECRET_{idx}]", out)
+        if out != before:
+            redactions.append(f"secret_pattern_{idx}")
+    out = re.sub(r"(?<![\w/])/(home|Users|var|tmp|etc)/[^\s:'\"]+", "[REDACTED_HOST_PATH]", out)
+    if "[REDACTED_HOST_PATH]" in out:
+        redactions.append("host_path")
+    return out, sorted(set(redactions))
+
+
+def prompt_injection_signals(text: str) -> dict[str, Any]:
+    categories: list[str] = []
+    for name, pattern in PROMPT_INJECTION_PATTERNS.items():
+        if pattern.search(text):
+            categories.append(name)
+    return {
+        "schema": "prompt_injection_signals.v1",
+        "detected": bool(categories),
+        "categories": categories,
+    }
+
+
+def is_likely_binary(path: Path) -> bool:
+    try:
+        chunk = path.read_bytes()[:4096]
+    except OSError:
+        return True
+    return b"\0" in chunk
+
+
+def should_skip_path(path: Path, repo_path: Path, state_dir: Path) -> bool:
+    try:
+        rel = path.relative_to(repo_path)
+    except ValueError:
+        return True
+    parts = set(rel.parts)
+    if ".git" in parts or "__pycache__" in parts or ".pytest_cache" in parts:
+        return True
+    try:
+        path.relative_to(state_dir)
+        return True
+    except ValueError:
+        return False
+
+
+def language_for_path(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    return {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".go": "go",
+        ".rs": "rust",
+        ".java": "java",
+        ".c": "c",
+        ".h": "c",
+        ".cc": "cpp",
+        ".cpp": "cpp",
+        ".hpp": "cpp",
+        ".cs": "csharp",
+        ".md": "markdown",
+        ".rst": "rst",
+        ".json": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".toml": "toml",
+    }.get(suffix, suffix.lstrip(".") or "text")
+
+
+def git_value(repo_path: Path, *args: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=repo_path,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def load_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json_file(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
