@@ -150,6 +150,58 @@ def test_docker_host_to_container_root_mapping(tmp_path: Path) -> None:
     assert project.project_id.endswith(project.root_hash[:12])
 
 
+def test_unsafe_global_parent_requires_explicit_project_selection(
+    tmp_path: Path,
+) -> None:
+    host_parent = tmp_path / "host-source"
+    container_parent = tmp_path / "workspace-roots"
+    host_repo = host_parent / "demo"
+    make_repo(container_parent / "demo", "mapped")
+    container_parent.mkdir(exist_ok=True)
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=container_parent.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(host_parent),),
+            root_mappings=((str(host_parent), str(container_parent)),),
+        )
+    )
+
+    with pytest.raises(ValueError, match="project selection required"):
+        manager.context_pack("review mapped marker")
+
+    pack = manager.context_pack(
+        "review mapped marker",
+        root_uri=host_repo.as_uri(),
+        max_items=2,
+    )
+    assert pack["items"]
+    assert pack["project"]["root"]["mapped"] is True
+    assert pack["project"]["name"] == "demo"
+
+    health = manager.context_admin(mode="health")
+    assert health["ok"] is True
+    assert health["project_selection_required"] is True
+    assert health["visible_project_count"] == 0
+    assert health["projects"]["count"] == 1
+
+
+def test_legacy_single_project_fallback_still_works(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path / "repo", "legacy")
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    pack = manager.context_pack("review legacy marker", max_items=2)
+
+    assert pack["items"]
+    assert pack["project"]["source"] == "repo_path"
+    assert pack["project"]["project_id"].startswith("legacy-")
+
+
 def test_hash_refresh_updates_changed_files_and_removes_deleted(
     tmp_path: Path,
 ) -> None:

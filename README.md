@@ -133,7 +133,7 @@ Selection order for a request:
 2. explicit `project_id`
 3. the only visible MCP root
 4. path hints such as `focus_paths`, `changed_files`, or `path`
-5. legacy `REPO_PATH` fallback when no MCP roots are available
+5. legacy `REPO_PATH` fallback only in safe single-project configurations
 
 Example explicit request payload:
 
@@ -147,7 +147,10 @@ Example explicit request payload:
 
 If the MCP client exposes `/home/user/source` as one root, the server treats that
 whole directory as one project. For per-repo isolation, expose or pass roots like
-`file:///home/user/source/my-repo`.
+`file:///home/user/source/my-repo`. When `REPO_PATH` is a configured parent such
+as `/workspace-roots`, unqualified project-scoped calls require `root_uri` or
+`project_id`; health remains available and reports that project selection is
+required.
 
 ## Non-Docker Run
 

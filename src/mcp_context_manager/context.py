@@ -18,6 +18,7 @@ from .util import (
     normalize_query_terms,
     now_iso,
     prompt_injection_signals,
+    sanitize_json,
     save_json_file,
     sha256_text,
 )
@@ -318,8 +319,9 @@ class ContextService:
         full_reference = self.references.create(
             producer="context_pack",
             payload={
-                "prompt": prompt,
+                "prompt_sha256": sha256_text(prompt),
                 "route": route,
+                "terms": terms,
                 "candidate_count": len(candidates),
                 "selected_count": len(selected),
                 "candidates": candidates,
@@ -587,7 +589,12 @@ class ContextService:
     def _cache_set(self, key: str, value: dict[str, Any]) -> None:
         payload = self._cache_load()
         entries = payload.setdefault("entries", {})
-        entries[key] = {"updated_at": now_iso(), "value": value}
+        sanitized_value, sensitivity = sanitize_json(value)
+        entries[key] = {
+            "updated_at": now_iso(),
+            "value": sanitized_value,
+            "sensitivity": sensitivity,
+        }
         if len(entries) > 200:
             ordered = sorted(entries.items(), key=lambda item: item[1].get("updated_at", ""), reverse=True)
             payload["entries"] = dict(ordered[:200])

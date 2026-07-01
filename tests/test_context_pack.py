@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from mcp_context_manager.context import ContextService
 
 
@@ -49,6 +51,22 @@ def test_context_pack_redacts_secret_like_content(service: ContextService, sampl
 
     assert "[REDACTED_SECRET_" in pack["items"][0]["content"]
     assert pack["items"][0]["redactions"]
+
+
+def test_context_pack_reference_does_not_persist_raw_prompt(
+    service: ContextService,
+) -> None:
+    raw_prompt = "review auth token behavior never-persist-this-private-task-text"
+
+    pack = service.context_pack(raw_prompt, max_items=2)
+    reference_id = pack["references"][0]["reference_id"]
+    reference_path = service.config.references_dir / f"{reference_id}.json"
+    stored = reference_path.read_text(encoding="utf-8")
+    envelope = json.loads(stored)
+
+    assert raw_prompt not in stored
+    assert envelope["payload"]["prompt_sha256"]
+    assert "prompt" not in envelope["payload"]
 
 
 def test_context_pack_budget_omits_extra_candidates(service: ContextService) -> None:

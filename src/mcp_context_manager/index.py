@@ -353,7 +353,8 @@ class ContextIndex:
         terms = normalize_query_terms(query, max_terms=8)
         if not terms:
             raise ValueError("query must contain at least one searchable term")
-        root_rel = self.config.repo_relative(path)
+        root_path = self.config.resolve_repo_path(path)
+        root_rel = self.config.repo_relative(root_path)
         if root_rel == ".":
             root_rel = ""
         with self.connect() as conn:
@@ -362,14 +363,27 @@ class ContextIndex:
             if fts_enabled:
                 fts_query = " OR ".join(f'"{term}"' for term in terms)
                 try:
+                    path_clause = ""
+                    params: list[Any] = [fts_query]
+                    if root_rel:
+                        if root_path.is_file():
+                            path_clause = "AND path = ?"
+                            params.append(root_rel)
+                        else:
+                            path_clause = (
+                                "AND (path = ? OR path LIKE ? ESCAPE '\\')"
+                            )
+                            prefix = _sqlite_like_escape(root_rel.rstrip("/"))
+                            params.extend([root_rel, f"{prefix}/%"])
+                    params.append(max_results * 4)
                     sql_rows = conn.execute(
-                        """
+                        f"""
                         SELECT path, snippet(fts_files, 1, '', '', ' ... ', 12) AS excerpt
                         FROM fts_files
-                        WHERE fts_files MATCH ?
+                        WHERE fts_files MATCH ? {path_clause}
                         LIMIT ?
                         """,
-                        (fts_query, max_results * 4),
+                        tuple(params),
                     ).fetchall()
                     rows = [{"path": row["path"], "excerpt": row["excerpt"], "source": "fts"} for row in sql_rows]
                 except sqlite3.OperationalError:
@@ -552,3 +566,7 @@ class ContextIndex:
         return path.exists() and not should_skip_path(
             path, self.config.repo_path, self.config.state_dir
         )
+
+
+def _sqlite_like_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

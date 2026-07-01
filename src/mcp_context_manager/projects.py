@@ -94,6 +94,13 @@ class ProjectRegistry:
                 "ambiguous project: multiple MCP roots are visible; pass "
                 f"project_id or root_uri. visible_project_ids={ids}"
             )
+        if not self.legacy_fallback_safe():
+            status = self.legacy_fallback_status()
+            raise ValueError(
+                "project selection required: MCP roots are unavailable and "
+                "REPO_PATH is configured as a project parent; pass project_id "
+                f"or root_uri. reason={status['reason']}"
+            )
         return self.legacy_project()
 
     def list_projects(self, mcp_roots: list[Any] | None = None) -> dict[str, Any]:
@@ -108,8 +115,12 @@ class ProjectRegistry:
             "projects": projects,
             "selection": {
                 "default": "mcp_roots",
-                "legacy_repo_path_fallback": not bool(visible),
+                "legacy_repo_path_fallback": not bool(visible)
+                and self.legacy_fallback_safe(),
+                "project_selection_required": (not bool(visible))
+                and not self.legacy_fallback_safe(),
                 "ambiguous_without_project": len(visible) > 1,
+                "legacy_fallback": self.legacy_fallback_status(),
             },
         }
 
@@ -141,6 +152,24 @@ class ProjectRegistry:
             source="repo_path",
             legacy=True,
         )
+
+    def legacy_fallback_safe(self) -> bool:
+        return bool(self.legacy_fallback_status()["safe"])
+
+    def legacy_fallback_status(self) -> dict[str, Any]:
+        if not self.config.allowed_roots:
+            return {"safe": True, "reason": "single_project_config"}
+        repo_path = _norm_abs_posix(str(self.config.repo_path))
+        configured_parents = {
+            _allowed_root_to_path(allowed) for allowed in self.config.allowed_roots
+        }
+        configured_parents.update(
+            _norm_abs_posix(local_prefix)
+            for _host_prefix, local_prefix in self.config.root_mappings
+        )
+        if repo_path in configured_parents:
+            return {"safe": False, "reason": "repo_path_is_project_parent"}
+        return {"safe": True, "reason": "repo_path_is_project_root"}
 
     def project_from_uri(
         self, root_uri: str, name: str = "", source: str = "root_uri"
@@ -212,7 +241,10 @@ class ProjectRegistry:
     def _project_by_id(
         self, project_id: str, visible_roots: list[ProjectRoot]
     ) -> ProjectRoot:
-        for project in [*visible_roots, *self.known_projects(), self.legacy_project()]:
+        candidates = [*visible_roots, *self.known_projects()]
+        if self.legacy_fallback_safe():
+            candidates.append(self.legacy_project())
+        for project in candidates:
             if project.project_id == project_id:
                 return project
         raise ValueError(f"unknown project_id: {project_id}")

@@ -45,6 +45,32 @@ def test_index_refresh_search_symbols_and_snippet(service: ContextService) -> No
     assert "class AuthService" in snippet["content"]
 
 
+def test_path_scoped_fts_search_applies_path_before_limit(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for idx in range(20):
+        (repo / f"root_match_{idx:02d}.py").write_text(
+            "needle = 'root'\n", encoding="utf-8"
+        )
+    target = repo / "target"
+    target.mkdir()
+    (target / "hit.py").write_text("needle = 'target'\n", encoding="utf-8")
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    service.context_admin(mode="index_refresh")
+    search = service.context_lookup(
+        mode="search", query="needle", path="target", max_results=1
+    )
+
+    assert search["count"] == 1
+    assert search["results"][0]["path"] == "target/hit.py"
+
+
 def test_tree_omits_generated_state(service: ContextService) -> None:
     service.context_admin(mode="index_refresh")
     tree = service.context_lookup(mode="tree", path=".", max_depth=3)

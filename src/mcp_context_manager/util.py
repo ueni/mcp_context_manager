@@ -211,10 +211,76 @@ def redact_text(text: str) -> tuple[str, list[str]]:
         out = pattern.sub(f"[REDACTED_SECRET_{idx}]", out)
         if out != before:
             redactions.append(f"secret_pattern_{idx}")
-    out = re.sub(r"(?<![\w/])/(home|Users|var|tmp|etc)/[^\s:'\"]+", "[REDACTED_HOST_PATH]", out)
+    out = re.sub(
+        r"(?<![\w:/.-])/(home|Users|var|tmp|etc|opt|root|data|mnt|workspace|workspace-roots|private)/[^\s:'\",)>\]}]+",
+        "[REDACTED_HOST_PATH]",
+        out,
+    )
     if "[REDACTED_HOST_PATH]" in out:
         redactions.append("host_path")
     return out, sorted(set(redactions))
+
+
+def redaction_metadata(
+    categories: list[str] | None = None, redaction_count: int = 0
+) -> dict[str, Any]:
+    category_list = sorted(set(categories or []))
+    return {
+        "redacted": bool(category_list or redaction_count),
+        "redaction_count": int(redaction_count),
+        "categories": category_list,
+    }
+
+
+def merge_redaction_metadata(*items: dict[str, Any] | None) -> dict[str, Any]:
+    categories: list[str] = []
+    redaction_count = 0
+    redacted = False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        redacted = redacted or bool(item.get("redacted"))
+        redaction_count += int(item.get("redaction_count", 0) or 0)
+        raw_categories = item.get("categories", [])
+        if isinstance(raw_categories, list):
+            categories.extend(str(category) for category in raw_categories)
+    merged = redaction_metadata(categories, redaction_count)
+    if redacted and not merged["redacted"]:
+        merged["redacted"] = True
+    return merged
+
+
+def sanitize_json(value: Any) -> tuple[Any, dict[str, Any]]:
+    categories: list[str] = []
+    redaction_count = 0
+
+    def walk(item: Any) -> Any:
+        nonlocal redaction_count
+        if isinstance(item, str):
+            sanitized, redactions = redact_text(item)
+            if sanitized != item:
+                redaction_count += 1
+                categories.extend(redactions)
+            return sanitized
+        if isinstance(item, dict):
+            sanitized_dict: dict[Any, Any] = {}
+            for key, child in item.items():
+                sanitized_key = walk(key) if isinstance(key, str) else key
+                sanitized_dict[sanitized_key] = walk(child)
+            return sanitized_dict
+        if isinstance(item, (list, tuple)):
+            return [walk(child) for child in item]
+        if isinstance(item, (bool, int, float)) or item is None:
+            return item
+        return walk(str(item))
+
+    sanitized_value = walk(value)
+    return sanitized_value, redaction_metadata(categories, redaction_count)
+
+
+def contains_sensitive_text(value: str) -> bool:
+    redacted, redactions = redact_text(value)
+    return redacted != value or bool(redactions)
 
 
 def prompt_injection_signals(text: str) -> dict[str, Any]:

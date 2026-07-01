@@ -162,12 +162,18 @@ class ProjectContextService:
             )
         if mode == "health" and not project_id and not root_uri:
             visible = self.registry.roots_from_mcp(mcp_roots or [])
+            legacy_fallback = self.registry.legacy_fallback_status()
             if len(visible) != 1:
                 return {
                     "schema": "context_admin.health.v1",
                     "ok": True,
-                    "mode": "global" if visible else "legacy",
+                    "mode": "global"
+                    if visible or not legacy_fallback["safe"]
+                    else "legacy",
                     "visible_project_count": len(visible),
+                    "project_selection_required": bool(visible)
+                    or not legacy_fallback["safe"],
+                    "legacy_fallback": legacy_fallback,
                     "state_dir": str(self.config.state_dir),
                     "projects": self._project_list(mcp_roots=mcp_roots),
                 }
@@ -303,7 +309,7 @@ class ProjectContextService:
 
     def _project_list(self, mcp_roots: list[Any] | None = None) -> dict[str, Any]:
         listing = self.registry.list_projects(mcp_roots=mcp_roots)
-        if listing["count"] == 0:
+        if listing["count"] == 0 and self.registry.legacy_fallback_safe():
             legacy = self.registry.legacy_project()
             listing["projects"] = [legacy.public_metadata()]
             listing["count"] = 1

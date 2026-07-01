@@ -5,11 +5,14 @@ from typing import Any
 
 from .config import ContextConfig
 from .util import (
+    contains_sensitive_text,
     expiry_iso,
     is_expired,
     load_json_file,
+    merge_redaction_metadata,
     now_iso,
     parse_iso,
+    sanitize_json,
     save_json_file,
 )
 
@@ -34,7 +37,62 @@ class ContextMemory:
 
     def _save(self, payload: dict[str, Any]) -> None:
         self.config.ensure_state_dirs()
+        self._sanitize_store_payload(payload)
         save_json_file(self.config.memory_path, payload)
+
+    def _sanitize_store_payload(self, payload: dict[str, Any]) -> None:
+        for row in payload.get("entries", []):
+            if not isinstance(row, dict):
+                continue
+            row["value"], value_sensitivity = sanitize_json(row.get("value"))
+            row["source"], source_sensitivity = sanitize_json(row.get("source", ""))
+            row["tags"], tags_sensitivity = sanitize_json(row.get("tags", []))
+            row["sensitivity"] = merge_redaction_metadata(
+                row.get("sensitivity"),
+                value_sensitivity,
+                source_sensitivity,
+                tags_sensitivity,
+            )
+        for row in payload.get("summaries", []):
+            if not isinstance(row, dict):
+                continue
+            row["summary"], summary_sensitivity = sanitize_json(row.get("summary", ""))
+            row["source"], source_sensitivity = sanitize_json(row.get("source", ""))
+            row["tags"], tags_sensitivity = sanitize_json(row.get("tags", []))
+            row["sensitivity"] = merge_redaction_metadata(
+                row.get("sensitivity"),
+                summary_sensitivity,
+                source_sensitivity,
+                tags_sensitivity,
+            )
+        for row in payload.get("decisions", []):
+            if not isinstance(row, dict):
+                continue
+            row["decision"], decision_sensitivity = sanitize_json(row.get("decision"))
+            row["rationale"], rationale_sensitivity = sanitize_json(
+                row.get("rationale", "")
+            )
+            row["source"], source_sensitivity = sanitize_json(row.get("source", ""))
+            row["tags"], tags_sensitivity = sanitize_json(row.get("tags", []))
+            row["sensitivity"] = merge_redaction_metadata(
+                row.get("sensitivity"),
+                decision_sensitivity,
+                rationale_sensitivity,
+                source_sensitivity,
+                tags_sensitivity,
+            )
+
+    def _assert_safe_identifier(
+        self, field: str, value: str | None, required: bool = True
+    ) -> str:
+        normalized = str(value or "").strip()
+        if required and not normalized:
+            raise ValueError(f"{field} is required")
+        if normalized and contains_sensitive_text(normalized):
+            raise ValueError(
+                f"unsafe memory identifier: {field} contains sensitive content"
+            )
+        return normalized
 
     def upsert(
         self,
@@ -46,10 +104,16 @@ class ContextMemory:
         source: str = "agent",
         tags: list[str] | None = None,
     ) -> dict[str, Any]:
-        if not namespace.strip() or not key.strip():
-            raise ValueError("namespace and key are required")
+        namespace = self._assert_safe_identifier("namespace", namespace)
+        key = self._assert_safe_identifier("key", key)
         if confidence < 0 or confidence > 1:
             raise ValueError("confidence must be in range [0, 1]")
+        value, value_sensitivity = sanitize_json(value)
+        source, source_sensitivity = sanitize_json(source)
+        tags, tags_sensitivity = sanitize_json(tags or [])
+        sensitivity = merge_redaction_metadata(
+            value_sensitivity, source_sensitivity, tags_sensitivity
+        )
         payload = self._load()
         now = now_iso()
         expires_at = expiry_iso(ttl_days)
@@ -61,9 +125,10 @@ class ContextMemory:
                         "value": value,
                         "confidence": confidence,
                         "source": source,
-                        "tags": tags or [],
+                        "tags": tags,
                         "updated_at": now,
                         "expires_at": expires_at,
+                        "sensitivity": sensitivity,
                     }
                 )
                 updated = True
@@ -76,10 +141,11 @@ class ContextMemory:
                     "value": value,
                     "confidence": confidence,
                     "source": source,
-                    "tags": tags or [],
+                    "tags": tags,
                     "created_at": now,
                     "updated_at": now,
                     "expires_at": expires_at,
+                    "sensitivity": sensitivity,
                 }
             )
         self._save(payload)
@@ -90,6 +156,7 @@ class ContextMemory:
             "key": key,
             "updated": True,
             "expires_at": expires_at,
+            "sensitivity": sensitivity,
         }
 
     def summary_upsert(
@@ -102,8 +169,14 @@ class ContextMemory:
         source: str = "agent",
         tags: list[str] | None = None,
     ) -> dict[str, Any]:
-        if not namespace.strip() or not focus.strip():
-            raise ValueError("namespace and focus are required")
+        namespace = self._assert_safe_identifier("namespace", namespace)
+        focus = self._assert_safe_identifier("focus", focus)
+        summary, summary_sensitivity = sanitize_json(summary)
+        source, source_sensitivity = sanitize_json(source)
+        tags, tags_sensitivity = sanitize_json(tags or [])
+        sensitivity = merge_redaction_metadata(
+            summary_sensitivity, source_sensitivity, tags_sensitivity
+        )
         payload = self._load()
         now = now_iso()
         expires_at = expiry_iso(ttl_days)
@@ -114,13 +187,20 @@ class ContextMemory:
                         "summary": summary,
                         "confidence": confidence,
                         "source": source,
-                        "tags": tags or [],
+                        "tags": tags,
                         "updated_at": now,
                         "expires_at": expires_at,
+                        "sensitivity": sensitivity,
                     }
                 )
                 self._save(payload)
-                return {"schema": "context_memory.summary_upsert.v1", "namespace": namespace, "focus": focus, "updated": True}
+                return {
+                    "schema": "context_memory.summary_upsert.v1",
+                    "namespace": namespace,
+                    "focus": focus,
+                    "updated": True,
+                    "sensitivity": sensitivity,
+                }
         payload["summaries"].append(
             {
                 "namespace": namespace,
@@ -128,14 +208,21 @@ class ContextMemory:
                 "summary": summary,
                 "confidence": confidence,
                 "source": source,
-                "tags": tags or [],
+                "tags": tags,
                 "created_at": now,
                 "updated_at": now,
                 "expires_at": expires_at,
+                "sensitivity": sensitivity,
             }
         )
         self._save(payload)
-        return {"schema": "context_memory.summary_upsert.v1", "namespace": namespace, "focus": focus, "updated": True}
+        return {
+            "schema": "context_memory.summary_upsert.v1",
+            "namespace": namespace,
+            "focus": focus,
+            "updated": True,
+            "sensitivity": sensitivity,
+        }
 
     def decision_record(
         self,
@@ -149,8 +236,20 @@ class ContextMemory:
         source: str = "agent",
         tags: list[str] | None = None,
     ) -> dict[str, Any]:
+        namespace = self._assert_safe_identifier("namespace", namespace)
+        topic = self._assert_safe_identifier("topic", topic, required=False)
         if decided_by not in {"human", "llm"}:
             raise ValueError("decided_by must be human or llm")
+        decision, decision_sensitivity = sanitize_json(decision)
+        rationale, rationale_sensitivity = sanitize_json(rationale)
+        source, source_sensitivity = sanitize_json(source)
+        tags, tags_sensitivity = sanitize_json(tags or [])
+        sensitivity = merge_redaction_metadata(
+            decision_sensitivity,
+            rationale_sensitivity,
+            source_sensitivity,
+            tags_sensitivity,
+        )
         payload = self._load()
         row = {
             "id": f"decision-{len(payload['decisions']) + 1}",
@@ -161,10 +260,11 @@ class ContextMemory:
             "rationale": rationale,
             "confidence": confidence,
             "source": source,
-            "tags": tags or [],
+            "tags": tags,
             "created_at": now_iso(),
             "updated_at": now_iso(),
             "expires_at": expiry_iso(ttl_days),
+            "sensitivity": sensitivity,
         }
         payload["decisions"].append(row)
         self._save(payload)
