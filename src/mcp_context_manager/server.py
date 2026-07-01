@@ -234,28 +234,28 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         return svc.repo_context_resource(reference_id, project_id=project_id)
 
     @mcp.prompt()
-    def build_context_pack(task: str) -> str:
-        return (
+    def build_context_pack(task: str = "") -> str:
+        prompt = (
             "Call context_pack with the user's task, then answer using only the "
             "returned cited snippets unless you resolve a returned reference."
-            f"\n\nTask: {task}"
         )
+        return f"{prompt}\n\nTask: {task}" if task else prompt
 
     @mcp.prompt()
-    def review_with_context_pack(task: str) -> str:
-        return (
+    def review_with_context_pack(task: str = "") -> str:
+        prompt = (
             "Build a review-focused context pack. Prioritize changed files, tests, "
             "security-sensitive paths, and omitted evidence references."
-            f"\n\nReview task: {task}"
         )
+        return f"{prompt}\n\nReview task: {task}" if task else prompt
 
     @mcp.prompt()
-    def debug_with_context_pack(task: str) -> str:
-        return (
+    def debug_with_context_pack(task: str = "") -> str:
+        prompt = (
             "Build a debug-focused context pack. Prioritize error terms, stack frames, "
             "nearby symbols, tests, and recent memory."
-            f"\n\nDebug task: {task}"
         )
+        return f"{prompt}\n\nDebug task: {task}" if task else prompt
 
     return mcp
 
