@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from mcp_context_manager.config import ContextConfig
 from mcp_context_manager.context import ContextService
 
 
@@ -69,3 +72,25 @@ def test_cold_then_warm_context_pack_flow(service: ContextService) -> None:
     assert warm["items"]
     assert warm["metrics"]["elapsed_ms"] >= 0
     assert warm["references"][0]["reference_id"].startswith("ctxref-")
+
+
+def test_external_state_dir_supports_container_layout(
+    sample_repo: Path, tmp_path: Path
+) -> None:
+    state_dir = tmp_path / "state"
+    service = ContextService(
+        ContextConfig(repo_path=sample_repo.resolve(), state_dir=state_dir.resolve())
+    )
+
+    health = service.context_admin(mode="health")
+    pack = service.context_pack("review auth token behavior", max_items=2)
+    memory = service.context_memory(mode="get")
+    references = service.context_lookup(mode="references")
+
+    assert health["state_dir"] == str(state_dir.resolve())
+    assert health["index"]["index_path"] == str(
+        state_dir.resolve() / "index" / "context.sqlite3"
+    )
+    assert pack["repo"]["state_dir"] == str(state_dir.resolve())
+    assert memory["path"] == str(state_dir.resolve() / "memory" / "context_memory.json")
+    assert references["references"][0]["path"].startswith(str(state_dir.resolve()))

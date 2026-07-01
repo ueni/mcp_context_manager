@@ -85,7 +85,7 @@ class ContextMemory:
         self._save(payload)
         return {
             "schema": "context_memory.upsert.v1",
-            "path": str(self.config.memory_path.relative_to(self.config.repo_path)),
+            "path": self.config.display_path(self.config.memory_path),
             "namespace": namespace,
             "key": key,
             "updated": True,
@@ -196,7 +196,7 @@ class ContextMemory:
         decisions = self.effective_decisions(namespace=namespace, include_expired=include_expired)[:max_entries]
         return {
             "schema": "context_memory.get.v1",
-            "path": str(self.config.memory_path.relative_to(self.config.repo_path)),
+            "path": self.config.display_path(self.config.memory_path),
             "count": len(entries),
             "entries": entries,
             "summary_count": len(summaries),

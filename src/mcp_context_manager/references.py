@@ -21,7 +21,6 @@ class ResultReferences:
         path = self.config.references_dir / f"{reference_id}.json"
         path.write_text(body, encoding="utf-8")
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
-        rel_path = str(path.relative_to(self.config.repo_path)).replace("\\", "/")
         return {
             "schema": "mcp_result_reference.v1",
             "reference_id": reference_id,
@@ -40,7 +39,7 @@ class ResultReferences:
             "resolver": {
                 "tool": "result_reference_resolve",
                 "uri": f"repo://context/{reference_id}",
-                "path": rel_path,
+                "path": self.config.display_path(path),
                 "repo_boundary_enforced": True,
             },
         }

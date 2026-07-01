@@ -1,0 +1,21 @@
+services:
+  mcp-context-manager:
+    build: .
+    image: mcp-context-manager:local
+    environment:
+      HOST: 0.0.0.0
+      MCP_CONTEXT_STATE_DIR: /state
+      MCP_TRANSPORT: streamable-http
+      PORT: 8000
+      REPO_PATH: /workspace
+    ports:
+      - "127.0.0.1:8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - .:/workspace:ro
+      - mcp-context-state:/state
+
+volumes:
+  mcp-context-state:

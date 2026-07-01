@@ -52,3 +52,80 @@ def test_tree_omits_generated_state(service: ContextService) -> None:
 
     assert "src/auth.py" in paths
     assert not any(path.startswith(".mcp-context-manager") for path in paths)
+
+
+def test_runtime_skip_rules_hide_bind_mount_secrets(
+    sample_repo: Path, tmp_path: Path
+) -> None:
+    (sample_repo / ".env").write_text(
+        "WORKSPACESECRET=do-not-index\n", encoding="utf-8"
+    )
+    (sample_repo / "credentials").write_text(
+        "credentialleak should not be indexed\n", encoding="utf-8"
+    )
+    stale_state = sample_repo / ".mcp-context-manager" / "references"
+    stale_state.mkdir(parents=True)
+    (stale_state / "ctxref-secret.json").write_text(
+        '{"stateleak": true}\n', encoding="utf-8"
+    )
+    (sample_repo / "Dockerfile").write_text(
+        "FROM scratch\n# dockerallowed\n", encoding="utf-8"
+    )
+    (sample_repo / "Jenkinsfile").write_text(
+        "pipeline { stages { stage('jenkinsallowed') { steps { sh 'true' } } } }\n",
+        encoding="utf-8",
+    )
+    (sample_repo / "BUILD").write_text(
+        "# buildallowed target\n", encoding="utf-8"
+    )
+    (sample_repo / "Gemfile").write_text(
+        "source 'https://rubygems.org'\n# gemfileallowed\n", encoding="utf-8"
+    )
+    script = sample_repo / "deploy"
+    script.write_text("#!/bin/sh\n# scriptallowed\n", encoding="utf-8")
+    script.chmod(0o755)
+    service = ContextService(
+        ContextConfig(
+            repo_path=sample_repo.resolve(),
+            state_dir=(tmp_path / "external-state").resolve(),
+        )
+    )
+
+    service.context_admin(mode="index_refresh")
+    paths = {
+        row["path"]
+        for row in service.context_lookup(mode="tree", path=".", max_depth=4)["entries"]
+    }
+
+    assert "Dockerfile" in paths
+    assert "Jenkinsfile" in paths
+    assert "BUILD" in paths
+    assert "Gemfile" in paths
+    assert "deploy" in paths
+    assert ".env" not in paths
+    assert "credentials" not in paths
+    assert not any(path.startswith(".mcp-context-manager") for path in paths)
+    assert service.context_lookup(mode="search", query="dockerallowed")["results"]
+    assert service.context_lookup(mode="search", query="jenkinsallowed")["results"]
+    assert service.context_lookup(mode="search", query="buildallowed")["results"]
+    assert service.context_lookup(mode="search", query="gemfileallowed")["results"]
+    assert service.context_lookup(mode="search", query="scriptallowed")["results"]
+    assert not service.context_lookup(mode="search", query="workspacesecret")["results"]
+    assert not service.context_lookup(mode="search", query="credentialleak")["results"]
+    assert not service.context_lookup(mode="search", query="stateleak")["results"]
+    assert "pipeline" in service.context_lookup(
+        mode="snippet", path="Jenkinsfile"
+    )["content"]
+    assert "scriptallowed" in service.context_lookup(
+        mode="snippet", path="deploy", start_line=1, end_line=2
+    )["content"]
+
+    with pytest.raises(ValueError):
+        service.context_lookup(mode="snippet", path=".env")
+    with pytest.raises(ValueError):
+        service.context_lookup(mode="snippet", path="credentials")
+    with pytest.raises(ValueError):
+        service.context_lookup(
+            mode="snippet",
+            path=".mcp-context-manager/references/ctxref-secret.json",
+        )

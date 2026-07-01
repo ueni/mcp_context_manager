@@ -159,7 +159,7 @@ class ContextService:
                 "schema": "context_admin.health.v1",
                 "ok": True,
                 "repo_path": str(self.config.repo_path),
-                "state_dir": str(self.config.state_dir.relative_to(self.config.repo_path)),
+                "state_dir": self.config.display_path(self.config.state_dir),
                 "index": self.index.status(),
             }
         if mode == "index_refresh":
@@ -294,7 +294,7 @@ class ContextService:
             "generated_at": now_iso(),
             "repo": {
                 "path": str(self.config.repo_path),
-                "state_dir": str(self.config.state_dir.relative_to(self.config.repo_path)),
+                "state_dir": self.config.display_path(self.config.state_dir),
             },
             "request": {
                 "prompt": prompt,
@@ -549,7 +549,7 @@ class ContextService:
             refs.append(
                 {
                     "reference_id": path.stem,
-                    "path": str(path.relative_to(self.config.repo_path)).replace("\\", "/"),
+                    "path": self.config.display_path(path),
                     "size_bytes": path.stat().st_size,
                 }
             )

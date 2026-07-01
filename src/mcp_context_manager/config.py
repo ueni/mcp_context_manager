@@ -83,3 +83,10 @@ class ContextConfig:
     def repo_relative(self, path: str | Path) -> str:
         resolved = self.resolve_repo_path(path)
         return str(resolved.relative_to(self.repo_path)).replace("\\", "/") or "."
+
+    def display_path(self, path: str | Path) -> str:
+        resolved = Path(path).resolve()
+        try:
+            return str(resolved.relative_to(self.repo_path)).replace("\\", "/") or "."
+        except ValueError:
+            return str(resolved)

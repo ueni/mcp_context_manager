@@ -76,6 +76,37 @@ TEXT_EXTENSIONS = CODE_EXTENSIONS | {
     ".dockerfile",
 }
 
+RUNTIME_SKIP_DIRS = {
+    ".cache",
+    ".git",
+    ".mcp-context-manager",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+}
+
+RUNTIME_SECRET_FILENAMES = {
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "credentials.json",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+}
+
+RUNTIME_SECRET_SUFFIXES = {".key", ".pem", ".p12", ".pfx"}
+
 ROUTE_TERMS = {
     "debug": {"bug", "debug", "error", "failure", "traceback", "crash", "fix"},
     "review": {"review", "diff", "change", "pr", "merge", "regression"},
@@ -211,14 +242,25 @@ def should_skip_path(path: Path, repo_path: Path, state_dir: Path) -> bool:
         rel = path.relative_to(repo_path)
     except ValueError:
         return True
-    parts = set(rel.parts)
-    if ".git" in parts or "__pycache__" in parts or ".pytest_cache" in parts:
-        return True
     try:
         path.relative_to(state_dir)
         return True
     except ValueError:
-        return False
+        pass
+    parts = rel.parts
+    if any(part in RUNTIME_SKIP_DIRS for part in parts):
+        return True
+    if any(part.endswith(".egg-info") for part in parts):
+        return True
+    name = path.name
+    lower_name = name.lower()
+    if lower_name == ".env" or lower_name.startswith(".env."):
+        return True
+    if lower_name in RUNTIME_SECRET_FILENAMES:
+        return True
+    if path.suffix.lower() in RUNTIME_SECRET_SUFFIXES:
+        return True
+    return False
 
 
 def language_for_path(path: str) -> str:

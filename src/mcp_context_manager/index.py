@@ -188,7 +188,7 @@ class ContextIndex:
         return {
             "schema": "context_index.refresh.v1",
             "generated_at": indexed_at,
-            "index_path": str(self.config.index_db_path.relative_to(self.config.repo_path)),
+            "index_path": self.config.display_path(self.config.index_db_path),
             "file_count": len(files),
             "symbol_count": symbol_count,
             "import_count": import_count,
@@ -203,7 +203,7 @@ class ContextIndex:
             meta = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM meta")}
         return {
             "schema": "context_index.status.v1",
-            "index_path": str(self.config.index_db_path.relative_to(self.config.repo_path)),
+            "index_path": self.config.display_path(self.config.index_db_path),
             "exists": self.config.index_db_path.exists(),
             "file_count": int(file_count),
             "symbol_count": int(symbol_count),
@@ -220,7 +220,7 @@ class ContextIndex:
                 "SELECT path, size, extension, language, line_count FROM files ORDER BY path LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [dict(row) for row in rows if self._runtime_visible_rel(row["path"])]
 
     def extract_file_intel(
         self, rel_path: str, text: str
@@ -330,6 +330,8 @@ class ContextIndex:
         filtered: list[dict[str, Any]] = []
         for row in rows:
             rel = row["path"]
+            if not self._runtime_visible_rel(rel):
+                continue
             if root_rel and not rel.startswith(root_rel.rstrip("/") + "/") and rel != root_rel:
                 continue
             if include_globs and not any(fnmatch.fnmatch(rel, glob) for glob in include_globs):
@@ -396,7 +398,8 @@ class ContextIndex:
                     """,
                     (limit,),
                 ).fetchall()
-        return {"schema": "context_symbols.v1", "count": len(rows), "symbols": [dict(row) for row in rows]}
+        symbols = [dict(row) for row in rows if self._runtime_visible_rel(row["path"])]
+        return {"schema": "context_symbols.v1", "count": len(symbols), "symbols": symbols}
 
     def snippet(
         self,
@@ -412,6 +415,8 @@ class ContextIndex:
         file_path = self.config.resolve_repo_path(path)
         if not file_path.is_file():
             raise FileNotFoundError(path)
+        if should_skip_path(file_path, self.config.repo_path, self.config.state_dir):
+            raise ValueError("path is excluded by runtime skip rules")
         if file_path.stat().st_size > self.config.max_read_bytes:
             raise ValueError("file exceeds max_read_bytes")
         if is_likely_binary(file_path):
@@ -488,3 +493,12 @@ class ContextIndex:
             "git_head": git_value(self.config.repo_path, "rev-parse", "--short", "HEAD"),
             "index": self.status(),
         }
+
+    def _runtime_visible_rel(self, rel_path: str) -> bool:
+        try:
+            path = self.config.resolve_repo_path(rel_path)
+        except ValueError:
+            return False
+        return path.exists() and not should_skip_path(
+            path, self.config.repo_path, self.config.state_dir
+        )
