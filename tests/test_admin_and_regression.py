@@ -7,6 +7,32 @@ from mcp_context_manager.config import ContextConfig
 from mcp_context_manager.context import ContextService
 
 
+def _write_many_python_files(repo: Path, count: int = 12) -> None:
+    for idx in range(count):
+        (repo / f"file_{idx:03d}.py").write_text(
+            "def marker():\n    return 'needle'\n" * 20,
+            encoding="utf-8",
+        )
+
+
+def _count_python_read_bytes(repo: Path, monkeypatch) -> list[str]:
+    original_read_bytes = Path.read_bytes
+    read_paths: list[str] = []
+
+    def counted_read_bytes(path: Path) -> bytes:
+        try:
+            rel = path.resolve().relative_to(repo.resolve())
+        except ValueError:
+            pass
+        else:
+            if rel.suffix == ".py":
+                read_paths.append(str(rel))
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    return read_paths
+
+
 def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     budget = service.context_admin(
         mode="budget", max_output_chars=4096, default_output_profile="normal"
@@ -119,3 +145,94 @@ def test_external_state_dir_supports_container_layout(
     )
     assert str(sample_repo.resolve()) not in public_payload
     assert str(state_dir.resolve()) not in public_payload
+
+
+def test_warm_index_refresh_skips_full_reads_for_unchanged_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_many_python_files(repo)
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+    service.context_admin(mode="index_refresh")
+
+    read_paths = _count_python_read_bytes(repo, monkeypatch)
+
+    warm = service.context_admin(mode="index_refresh")
+
+    assert warm["updated_count"] == 0
+    assert warm["unchanged_count"] >= 12
+    assert read_paths == []
+
+
+def test_cached_search_does_not_reread_unchanged_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_many_python_files(repo)
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+    first = service.context_lookup(mode="search", query="needle")
+    assert first["cache"]["hit"] is False
+
+    read_paths = _count_python_read_bytes(repo, monkeypatch)
+
+    second = service.context_lookup(mode="search", query="needle")
+
+    assert second["cache"]["hit"] is True
+    assert read_paths == []
+
+
+def test_warm_context_pack_does_not_probe_every_unchanged_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_many_python_files(repo, count=30)
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+    service.context_pack("review needle", max_items=1)
+
+    read_paths = _count_python_read_bytes(repo, monkeypatch)
+
+    pack = service.context_pack("review needle", max_items=1)
+
+    assert pack["items"]
+    assert len(set(read_paths)) < 30
+
+
+def test_index_refresh_streams_traversal_without_rglob(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_many_python_files(repo, count=3)
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    def fail_rglob(_path: Path, _pattern: str):
+        raise AssertionError("index refresh should not materialize root.rglob")
+
+    monkeypatch.setattr(Path, "rglob", fail_rglob)
+
+    refresh = service.context_admin(mode="index_refresh")
+
+    assert refresh["updated_count"] == 3

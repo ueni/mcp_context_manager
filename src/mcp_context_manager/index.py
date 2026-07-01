@@ -4,8 +4,9 @@ import ast
 import fnmatch
 import re
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import ContextConfig
 from .util import (
@@ -21,6 +22,13 @@ from .util import (
     should_skip_path,
     trim_text,
 )
+
+
+@dataclass(frozen=True)
+class CandidateFile:
+    path: Path
+    size: int
+    mtime_ns: int
 
 
 class ContextIndex:
@@ -98,28 +106,50 @@ class ContextIndex:
         row = conn.execute("SELECT value FROM meta WHERE key='fts_enabled'").fetchone()
         return bool(row and row["value"] == "true")
 
-    def _iter_candidate_files(self, root: Path, max_files: int) -> list[Path]:
-        files: list[Path] = []
+    def _iter_candidate_files(self, root: Path, max_files: int) -> list[CandidateFile]:
+        files: list[CandidateFile] = []
         if root.is_file():
             candidates = [root]
         else:
-            candidates = sorted(root.rglob("*"))
+            candidates = self._walk_candidates(root)
         for path in candidates:
             if len(files) >= max_files:
                 break
+            if path.is_symlink():
+                continue
             if not path.is_file():
                 continue
             if should_skip_path(path, self.config.repo_path, self.config.state_dir):
                 continue
-            if path.stat().st_size > self.config.max_read_bytes:
+            stat = path.stat()
+            if stat.st_size > self.config.max_read_bytes:
                 continue
             suffix = path.suffix.lower()
             if suffix and suffix not in TEXT_EXTENSIONS:
                 continue
-            if is_likely_binary(path):
-                continue
-            files.append(path)
+            files.append(
+                CandidateFile(
+                    path=path,
+                    size=int(stat.st_size),
+                    mtime_ns=int(stat.st_mtime_ns),
+                )
+            )
         return files
+
+    def _walk_candidates(self, root: Path) -> Iterator[Path]:
+        try:
+            children = sorted(root.iterdir(), key=lambda path: path.name)
+        except OSError:
+            return
+        for child in children:
+            if should_skip_path(child, self.config.repo_path, self.config.state_dir):
+                continue
+            if child.is_symlink():
+                continue
+            if child.is_dir():
+                yield from self._walk_candidates(child)
+                continue
+            yield child
 
     def refresh(self, path: str = ".", max_files: int = 5000) -> dict[str, Any]:
         root = self.config.resolve_repo_path(path)
@@ -137,8 +167,8 @@ class ContextIndex:
                 if self._rel_in_refresh_scope(row["path"], root)
             }
             current_rels = {
-                str(file_path.relative_to(self.config.repo_path)).replace("\\", "/")
-                for file_path in files
+                str(candidate.path.relative_to(self.config.repo_path)).replace("\\", "/")
+                for candidate in files
             }
             removed_count = 0
             updated_count = 0
@@ -146,16 +176,25 @@ class ContextIndex:
             for rel in sorted(set(existing_rows) - current_rels):
                 self._delete_file_rows(conn, rel, fts_enabled)
                 removed_count += 1
-            for file_path in files:
+            for candidate in files:
+                file_path = candidate.path
                 rel = str(file_path.relative_to(self.config.repo_path)).replace("\\", "/")
-                raw = file_path.read_bytes()
-                text = raw.decode("utf-8", errors="replace")
-                stat = file_path.stat()
-                digest = sha256_bytes(raw)
                 existing = existing_rows.get(rel)
-                if existing and existing["sha256"] == digest:
+                if (
+                    existing
+                    and int(existing["size"]) == candidate.size
+                    and int(existing["mtime_ns"]) == candidate.mtime_ns
+                ):
                     unchanged_count += 1
                     continue
+                if is_likely_binary(file_path):
+                    if existing:
+                        self._delete_file_rows(conn, rel, fts_enabled)
+                        removed_count += 1
+                    continue
+                raw = file_path.read_bytes()
+                text = raw.decode("utf-8", errors="replace")
+                digest = sha256_bytes(raw)
                 self._delete_file_rows(conn, rel, fts_enabled)
                 conn.execute(
                     """
@@ -165,8 +204,8 @@ class ContextIndex:
                     """,
                     (
                         rel,
-                        int(stat.st_size),
-                        int(stat.st_mtime_ns),
+                        candidate.size,
+                        candidate.mtime_ns,
                         digest,
                         file_path.suffix.lower(),
                         language_for_path(rel),
@@ -417,8 +456,11 @@ class ContextIndex:
     def _fallback_search(self, terms: list[str], root_rel: str, limit: int) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         root = self.config.repo_path / root_rel if root_rel else self.config.repo_path
-        for path in self._iter_candidate_files(root, max_files=5000):
+        for candidate in self._iter_candidate_files(root, max_files=5000):
+            path = candidate.path
             rel = str(path.relative_to(self.config.repo_path)).replace("\\", "/")
+            if is_likely_binary(path):
+                continue
             try:
                 lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
