@@ -217,6 +217,10 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
     def repo_context_resource(reference_id: str) -> str:
         return svc.repo_context_resource(reference_id)
 
+    @mcp.resource("repo://metrics")
+    def repo_metrics_resource() -> str:
+        return svc.repo_metrics_resource()
+
     @mcp.resource("repo://project/{project_id}/summary")
     def repo_project_summary_resource(project_id: str) -> str:
         return svc.repo_summary_resource(project_id=project_id)
@@ -232,6 +236,10 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
     @mcp.resource("repo://project/{project_id}/context/{reference_id}")
     def repo_project_context_resource(project_id: str, reference_id: str) -> str:
         return svc.repo_context_resource(reference_id, project_id=project_id)
+
+    @mcp.resource("repo://project/{project_id}/metrics")
+    def repo_project_metrics_resource(project_id: str) -> str:
+        return svc.repo_metrics_resource(project_id=project_id)
 
     @mcp.prompt()
     def build_context_pack(task: str = "") -> str:

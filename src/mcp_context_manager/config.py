@@ -88,6 +88,10 @@ class ContextConfig:
     def budget_path(self) -> Path:
         return self.state_dir / "memory" / "token_budget.json"
 
+    @property
+    def metrics_path(self) -> Path:
+        return self.state_dir / "reports" / "context_metrics.json"
+
     def ensure_state_dirs(self) -> None:
         for path in [
             self.index_db_path.parent,

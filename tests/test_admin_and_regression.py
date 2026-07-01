@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from mcp_context_manager.config import ContextConfig
@@ -25,6 +26,19 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
 
     stats = service.context_admin(mode="cache_stats")
     assert stats["entry_count"] >= 1
+
+    pack = service.context_pack("review auth token behavior", max_items=2)
+    metrics = service.context_admin(mode="metrics")
+    resource = json.loads(service.repo_metrics_resource())
+
+    assert metrics["schema"] == "context_metrics.v1"
+    assert metrics["cache"]["hits"] >= 1
+    assert metrics["cache"]["misses"] >= 1
+    assert metrics["tokens"]["estimated_input_tokens_saved"] >= pack["metrics"]["estimated_input_tokens_saved"]
+    assert metrics["benchmarks"]["latency_ms_by_operation"]["context_pack"]["count"] >= 1
+    assert metrics["requests"]["by_operation"]["context_lookup.search"]["result_count"] >= first["count"]
+    assert resource["schema"] == "context_metrics.v1"
+    assert resource["requests"]["total"] == metrics["requests"]["total"]
 
 
 def test_context_retrieval_regression_smoke(service: ContextService) -> None:

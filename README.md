@@ -33,6 +33,25 @@ server uses MCP Roots from the client. If multiple roots are visible and the
 project cannot be inferred from request paths, the request is rejected as
 ambiguous.
 
+## MCP Resources
+
+- `repo://summary`: workspace facts for an unambiguous project.
+- `repo://file/{path}`: bounded file content for an unambiguous project.
+- `repo://tree/{path}`: bounded tree listing for an unambiguous project.
+- `repo://context/{reference_id}`: resolved result reference for an unambiguous
+  project.
+- `repo://metrics`: compact metrics for an unambiguous project.
+- `repo://project/{project_id}/summary`
+- `repo://project/{project_id}/file/{path}`
+- `repo://project/{project_id}/tree/{path}`
+- `repo://project/{project_id}/context/{reference_id}`
+- `repo://project/{project_id}/metrics`
+
+Metrics include request counts, cache hits and misses, estimated saved input
+tokens, retrieval counts, route totals, and recent latency benchmarks. They are
+stored under project-local generated state and do not include prompts, query
+text, file contents, or secrets.
+
 ## Run With Docker Compose
 
 Single-repo default from this checkout:
@@ -142,6 +161,7 @@ In global mode, each selected project gets isolated state:
 <state_dir>/projects/<slug>-<root_hash>/memory/context_memory.json
 <state_dir>/projects/<slug>-<root_hash>/cache/tool_cache.json
 <state_dir>/projects/<slug>-<root_hash>/references/
+<state_dir>/projects/<slug>-<root_hash>/reports/context_metrics.json
 ```
 
 The root hash is derived from the canonical MCP root URI. Generated state should

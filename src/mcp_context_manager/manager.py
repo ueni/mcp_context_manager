@@ -268,6 +268,19 @@ class ProjectContextService:
         )
         return json.dumps(resolved, indent=2, sort_keys=True)
 
+    def repo_metrics_resource(
+        self,
+        project_id: str | None = None,
+        root_uri: str | None = None,
+        mcp_roots: list[Any] | None = None,
+    ) -> str:
+        service, _project = self._service_for_request(
+            project_id=project_id,
+            root_uri=root_uri,
+            mcp_roots=mcp_roots,
+        )
+        return service.repo_metrics_resource()
+
     def _service_for_request(
         self,
         project_id: str | None = None,

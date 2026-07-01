@@ -8,6 +8,7 @@ from typing import Any
 from .config import ContextConfig
 from .index import ContextIndex
 from .memory import ContextMemory
+from .metrics import ContextMetrics
 from .references import ResultReferences
 from .schemas import output_contracts
 from .util import (
@@ -27,6 +28,7 @@ class ContextService:
         self.config = config
         self.index = ContextIndex(config)
         self.memory = ContextMemory(config)
+        self.metrics = ContextMetrics(config)
         self.references = ResultReferences(config)
 
     @classmethod
@@ -45,6 +47,7 @@ class ContextService:
         max_depth: int = 2,
         include_globs: list[str] | None = None,
     ) -> dict[str, Any]:
+        started = time.perf_counter()
         allowed = {"search", "snippet", "tree", "symbols", "references"}
         if mode not in allowed:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
@@ -62,6 +65,12 @@ class ContextService:
             )
             cached = self._cache_get(cache_key)
             if cached:
+                self._record_metric(
+                    "context_lookup.search",
+                    started,
+                    cache_hit=True,
+                    result_count=int(cached.get("count", 0)),
+                )
                 return {**cached, "cache": {"hit": True, "key": cache_key}}
             result = self.index.search(
                 query=query,
@@ -70,19 +79,43 @@ class ContextService:
                 include_globs=include_globs,
             )
             self._cache_set(cache_key, result)
+            self._record_metric(
+                "context_lookup.search",
+                started,
+                cache_hit=False,
+                result_count=int(result.get("count", 0)),
+            )
             return {**result, "cache": {"hit": False, "key": cache_key}}
         if mode == "snippet":
             self._ensure_index_fresh(path=path)
-            return self.index.snippet(path=path, start_line=start_line, end_line=end_line)
+            result = self.index.snippet(path=path, start_line=start_line, end_line=end_line)
+            self._record_metric("context_lookup.snippet", started, result_count=1)
+            return result
         if mode == "tree":
             self._ensure_index_fresh(path=path)
-            return self.index.tree(path=path, max_entries=max_entries, max_depth=max_depth)
+            result = self.index.tree(path=path, max_entries=max_entries, max_depth=max_depth)
+            self._record_metric(
+                "context_lookup.tree",
+                started,
+                result_count=int(result.get("count", 0)),
+            )
+            return result
         if mode == "symbols":
             self._ensure_index_fresh()
-            return self.index.symbols(query=query, limit=max_results)
+            result = self.index.symbols(query=query, limit=max_results)
+            self._record_metric(
+                "context_lookup.symbols",
+                started,
+                result_count=int(result.get("count", 0)),
+            )
+            return result
+        references = self._reference_list(limit=max_results)
+        self._record_metric(
+            "context_lookup.references", started, result_count=len(references)
+        )
         return {
             "schema": "context_references.list.v1",
-            "references": self._reference_list(limit=max_results),
+            "references": references,
         }
 
     def context_memory(
@@ -155,6 +188,7 @@ class ContextService:
             "cache_prune",
             "budget",
             "contracts",
+            "metrics",
         }
         if mode not in allowed:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
@@ -177,6 +211,8 @@ class ContextService:
             return {"schema": "context_cache.prune.v1", **self._cache_prune(max_age_minutes)}
         if mode == "contracts":
             return output_contracts(tool_name=tool_name)
+        if mode == "metrics":
+            return self.metrics.snapshot()
         return self._budget(max_output_chars, default_output_profile)
 
     def context_pack(
@@ -293,6 +329,7 @@ class ContextService:
             ttl_hours=24,
         )
         elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        estimated_tokens_saved = max(0, sum(int(item.get("raw_chars", 0)) for item in selected) // 4 - estimate_tokens(json.dumps(selected, ensure_ascii=False)))
         result = {
             "schema": "context_pack.v1",
             "generated_at": now_iso(),
@@ -336,12 +373,21 @@ class ContextService:
                 "elapsed_ms": elapsed_ms,
                 "candidate_count": len(candidates),
                 "selected_count": len(selected),
-                "estimated_input_tokens_saved": max(0, sum(int(item.get("raw_chars", 0)) for item in selected) // 4 - estimate_tokens(json.dumps(selected, ensure_ascii=False))),
+                "estimated_input_tokens_saved": estimated_tokens_saved,
             },
             "next_actions": [
                 {"action": "resolve_reference", "when": "Need full omitted candidate evidence", "reference_id": full_reference["reference_id"]}
             ],
         }
+        self.metrics.record_event(
+            "context_pack",
+            elapsed_ms=elapsed_ms,
+            estimated_input_tokens_saved=estimated_tokens_saved,
+            result_count=len(selected),
+            candidate_count=len(candidates),
+            omitted_count=len(omitted),
+            route=route,
+        )
         return result
 
     def result_reference_resolve(
@@ -365,10 +411,28 @@ class ContextService:
     def repo_context_resource(self, reference_id: str) -> str:
         return json.dumps(self.references.resolve(reference_id=reference_id), indent=2, sort_keys=True)
 
+    def repo_metrics_resource(self) -> str:
+        return json.dumps(self.metrics.snapshot(), indent=2, sort_keys=True)
+
     def _ensure_index_fresh(
         self, path: str = ".", max_files: int = 5000
     ) -> dict[str, Any]:
         return self.index.refresh(path=path, max_files=max_files)
+
+    def _record_metric(
+        self,
+        operation: str,
+        started: float,
+        cache_hit: bool | None = None,
+        result_count: int = 0,
+    ) -> None:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        self.metrics.record_event(
+            operation,
+            elapsed_ms=elapsed_ms,
+            cache_hit=cache_hit,
+            result_count=result_count,
+        )
 
     def _collect_paths(self, prompt: str, changed: list[str], focus: list[str]) -> list[str]:
         found: list[str] = []

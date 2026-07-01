@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -85,6 +86,17 @@ def test_project_context_service_auto_indexes_and_isolates_memory(tmp_path: Path
 
     assert memory_a["entries"][0]["value"] == {"project": "alpha"}
     assert memory_b["entries"][0]["value"] == {"project": "beta"}
+
+    metrics_a = manager.context_admin(mode="metrics", mcp_roots=roots_a)
+    metrics_b = manager.context_admin(mode="metrics", mcp_roots=roots_b)
+    metrics_resource_a = json.loads(
+        manager.repo_metrics_resource(project_id=metrics_a["project_id"])
+    )
+
+    assert metrics_a["path"] != metrics_b["path"]
+    assert metrics_a["requests"]["by_operation"]["context_pack"]["count"] == 1
+    assert metrics_b["requests"]["by_operation"].get("context_pack", {}).get("count", 0) == 0
+    assert metrics_resource_a["project_id"] == metrics_a["project_id"]
 
 
 def test_multi_root_requests_are_ambiguous_unless_paths_disambiguate(
