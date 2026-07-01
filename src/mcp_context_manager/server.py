@@ -48,13 +48,32 @@ async def _mcp_roots(ctx: Any) -> list[Any]:
         session = getattr(request_context, "session", None)
     if session is None or not hasattr(session, "list_roots"):
         return []
-    result = session.list_roots()
-    if inspect.isawaitable(result):
-        result = await result
+    try:
+        result = session.list_roots()
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception as exc:
+        if _is_mcp_method_not_found(exc):
+            return []
+        raise
     roots = getattr(result, "roots", result)
     if roots is None:
         return []
     return list(roots)
+
+
+def _is_mcp_method_not_found(exc: Exception) -> bool:
+    candidates = [exc, getattr(exc, "error", None)]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        code = getattr(candidate, "code", None)
+        if code in {-32601, "method_not_found", "METHOD_NOT_FOUND"}:
+            return True
+        text = str(getattr(candidate, "message", candidate)).lower()
+        if "method not found" in text or "-32601" in text:
+            return True
+    return False
 
 
 def create_mcp(service: ProjectContextService | ContextService | None = None) -> Any:
@@ -293,6 +312,10 @@ def create_http_app(service: ProjectContextService | ContextService | None = Non
     async def healthz(_request: Any) -> JSONResponse:
         return JSONResponse(svc.context_admin(mode="health"))
 
+    async def mcp_tools_http(_request: Any) -> JSONResponse:
+        tools = await mcp.list_tools()
+        return JSONResponse(_mcp_tools_http_payload([tool.name for tool in tools]))
+
     async def context_pack_http(request: Any) -> JSONResponse:
         try:
             payload = _normalize_context_pack_http_payload(await request.json())
@@ -326,8 +349,10 @@ def create_http_app(service: ProjectContextService | ContextService | None = Non
         routes=[
             Route("/", root, methods=["GET"]),
             Route("/healthz", healthz, methods=["GET"]),
+            Route("/v1/mcp/tools", mcp_tools_http, methods=["GET"]),
             Route("/v1/context/pack", context_pack_http, methods=["POST"]),
             Route("/v1/context/references/{reference_id}", reference_http, methods=["GET"]),
+            Mount("/legacy", app=mcp.sse_app()),
             Mount("/", app=mcp.streamable_http_app()),
         ],
         lifespan=lifespan,
@@ -366,6 +391,16 @@ def _normalize_context_pack_http_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt is required")
     return normalized
+
+
+def _mcp_tools_http_payload(tool_names: list[str]) -> dict[str, Any]:
+    return {
+        "schema": "context_http.mcp_tools.v1",
+        "mcp_endpoint": "/mcp",
+        "legacy_sse_endpoint": "/legacy/sse",
+        "tool_count": len(tool_names),
+        "tools": tool_names,
+    }
 
 
 def main() -> None:

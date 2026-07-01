@@ -31,7 +31,40 @@ state directory.
 Project-aware tools accept optional `project_id` or `root_uri`. If omitted, the
 server uses MCP Roots from the client. If multiple roots are visible and the
 project cannot be inferred from request paths, the request is rejected as
-ambiguous.
+ambiguous. Clients that do not implement MCP `roots/list` fall back to explicit
+`project_id` / `root_uri` selection or legacy `REPO_PATH`.
+
+## MCP Client Configuration
+
+Streamable HTTP clients should point at the MCP endpoint:
+
+```yaml
+mcpServers:
+  - name: context-manager
+    type: streamable-http
+    url: http://localhost:8000/mcp
+```
+
+Some clients still have better compatibility with the older SSE transport. The
+server exposes a compatibility endpoint for those clients:
+
+```yaml
+mcpServers:
+  - name: context-manager
+    type: sse
+    url: http://localhost:8000/legacy/sse
+```
+
+If a client reports `Method not found` for a tool such as `context_pack`, verify
+the server-visible tool names:
+
+```bash
+curl http://localhost:8000/v1/mcp/tools
+```
+
+The response lists MCP tool names and transport endpoints. MCP tools are called
+through the protocol method `tools/call` with the tool name in `params.name`;
+they are not JSON-RPC methods named `context_pack`, `context_admin`, and so on.
 
 ## MCP Resources
 
@@ -136,6 +169,17 @@ MCP_CONTEXT_ALLOWED_ROOTS=/home/user/source \
 MCP_CONTEXT_STATE_DIR=/home/user/.local/state/mcp-context-manager \
 mcp-context-manager
 ```
+
+Useful HTTP endpoints:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /healthz` | Health and index status. |
+| `GET /v1/mcp/tools` | Diagnostic list of advertised MCP tool names and transport endpoints. |
+| `POST /v1/context/pack` | Direct HTTP fallback for context packs. Accepts `prompt` or `task`. |
+| `GET /v1/context/references/{reference_id}` | Direct HTTP fallback for resolving result references. |
+| `POST /mcp` | MCP Streamable HTTP endpoint. |
+| `GET /legacy/sse` | MCP legacy SSE compatibility endpoint. |
 
 ## Configuration
 
