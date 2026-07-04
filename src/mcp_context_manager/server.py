@@ -273,10 +273,12 @@ AdminModeParam = Annotated[
         "budget",
         "contracts",
         "metrics",
+        "measurement_matrix",
+        "benchmark",
     ],
     _tool_param(
         "Administrative operation: health, projects, index refresh/status, cache "
-        "stats/prune, budget, output contracts, or retrieval metrics."
+        "stats/prune, budget, output contracts, metrics, targets, or benchmarks."
     ),
 ]
 MaxFilesParam = Annotated[
@@ -297,6 +299,10 @@ ToolNameParam = Annotated[
         "Optional public tool name to filter mode=contracts, for example "
         "context_pack."
     ),
+]
+ContractProfileParam = Annotated[
+    Literal["", "verbose", "compact"],
+    _tool_param("Optional contract profile for mode=contracts."),
 ]
 ReferenceIdParam = Annotated[
     str,
@@ -499,10 +505,11 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         max_output_chars: MaxOutputCharsParam = None,
         default_output_profile: DefaultOutputProfileParam = None,
         tool_name: ToolNameParam = "",
+        contract_profile: ContractProfileParam = "",
         project_id: ProjectIdParam = None,
         root_uri: RootUriParam = None,
     ) -> dict[str, Any]:
-        """Read health, index, cache, budget, and output contract metadata."""
+        """Read health, index, cache, budget, contracts, metrics, and benchmarks."""
         return svc.context_admin(
             mode=mode,
             path=path,
@@ -511,6 +518,7 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
             max_output_chars=max_output_chars,
             default_output_profile=default_output_profile,
             tool_name=tool_name,
+            contract_profile=contract_profile,
             project_id=project_id,
             root_uri=root_uri,
             mcp_roots=await _mcp_roots(ctx),

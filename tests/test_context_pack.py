@@ -33,6 +33,20 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert pack["references"][0]["schema"] == "mcp_result_reference.v1"
     assert pack["budget"]["estimated_output_tokens"] > 0
     assert pack["safety"]["repository_boundary_enforced"] is True
+    assert pack["items"][0]["confidence"] > 0
+    assert pack["metrics"]["stage_timings_ms"]["index_refresh_ms"] >= 0
+    assert pack["metrics"]["stage_timings_ms"]["snippet_batch_ms"] >= 0
+    assert pack["metrics"]["baseline_input_tokens_est"] >= pack["metrics"]["output_tokens_est"]
+    assert pack["metrics"]["token_savings_formula"] == "max(0, baseline_input_tokens_est - output_tokens_est)"
+    assert pack["metrics"]["external_tool_calls_saved_est"] >= 1
+    assert pack["metrics"]["references_bytes_deferred_est"] > 0
+    assert pack["cache"]["namespace"] == "context_pack.retrieval"
+    assert pack["cache"]["reason"] in {
+        "miss",
+        "arg_changed",
+        "stale_index",
+        "disabled_refresh_index",
+    }
 
     resolved = service.result_reference_resolve(reference=pack["references"][0])
     assert resolved["status"] == "resolved"
@@ -51,6 +65,30 @@ def test_context_pack_redacts_secret_like_content(service: ContextService, sampl
 
     assert "[REDACTED_SECRET_" in pack["items"][0]["content"]
     assert pack["items"][0]["redactions"]
+
+
+def test_context_pack_reads_explicit_text_file_that_is_not_indexed(
+    service: ContextService, sample_repo
+) -> None:
+    lock_file = sample_repo / "poetry.lock"
+    lock_file.write_text(
+        "[[package]]\nname = \"critical-dependency\"\nversion = \"1.2.3\"\n",
+        encoding="utf-8",
+    )
+
+    pack = service.context_pack(
+        prompt="review dependency lock",
+        focus_paths=["poetry.lock"],
+        max_items=1,
+    )
+
+    assert pack["items"][0]["path"] == "poetry.lock"
+    assert "critical-dependency" in pack["items"][0]["content"]
+    assert not any(
+        row.get("path") == "poetry.lock"
+        and row.get("reason_code") == "unreadable_explicit_path"
+        for row in pack["omitted"]
+    )
 
 
 def test_context_pack_reference_does_not_persist_raw_prompt(

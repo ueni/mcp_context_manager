@@ -586,9 +586,114 @@ class ContextIndex:
             raise ValueError("binary file is not readable as a snippet")
         if text is None:
             text = file_path.read_text(encoding="utf-8", errors="replace")
+        return self._snippet_payload(
+            rel=rel,
+            text=text,
+            source=source,
+            start_line=start_line,
+            end_line=end_line,
+            context_before=context_before,
+            context_after=context_after,
+            max_chars=max_chars,
+        )
+
+    def snippet_batch(
+        self, requests: list[dict[str, Any]], indexed_only: bool = True
+    ) -> list[dict[str, Any]]:
+        text_cache: dict[str, tuple[str, str]] = {}
+        results: list[dict[str, Any]] = []
+        for request in requests:
+            path = str(request.get("path", ""))
+            try:
+                start_line = int(request.get("start_line", 1) or 1)
+                if start_line < 1:
+                    raise ValueError("start_line must be >= 1")
+                file_path = self.config.resolve_repo_path(path)
+                if not file_path.is_file():
+                    raise FileNotFoundError(path)
+                if should_skip_path(file_path, self.config.repo_path, self.config.state_dir):
+                    raise ValueError("path is excluded by runtime skip rules")
+                stat = file_path.stat()
+                rel = self.config.repo_relative(file_path)
+                cache_key = f"{rel}:{int(stat.st_size)}:{int(stat.st_mtime_ns)}"
+                if cache_key not in text_cache:
+                    request_indexed_only = bool(request.get("indexed_only", indexed_only))
+                    text = self._indexed_text(
+                        rel, size=int(stat.st_size), mtime_ns=int(stat.st_mtime_ns)
+                    )
+                    source = "index"
+                    if text is None:
+                        if request_indexed_only:
+                            raise ValueError("indexed content unavailable")
+                        if stat.st_size > self.config.max_read_bytes:
+                            raise ValueError("file exceeds max_read_bytes")
+                        if is_likely_binary(file_path):
+                            raise ValueError("binary file is not readable as a snippet")
+                        text = file_path.read_text(encoding="utf-8", errors="replace")
+                        source = "file"
+                    text_cache[cache_key] = (text, source)
+                text, source = text_cache[cache_key]
+                results.append(
+                    self._snippet_payload(
+                        rel=rel,
+                        text=text,
+                        source=source,
+                        start_line=start_line,
+                        end_line=request.get("end_line"),
+                        context_before=int(request.get("context_before", 0) or 0),
+                        context_after=int(request.get("context_after", 0) or 0),
+                        max_chars=int(request.get("max_chars", 4000) or 4000),
+                    )
+                )
+            except Exception as exc:
+                results.append(
+                    {
+                        "schema": "context_snippet.error.v1",
+                        "path": path,
+                        "error": type(exc).__name__,
+                    }
+                )
+        return results
+
+    def indexed_path_current(self, path: str) -> bool:
+        root = self.config.resolve_repo_path(path)
+        if not root.exists():
+            return False
+        if root.is_dir():
+            root_rel = self.config.repo_relative(root)
+            prefix = "" if root_rel == "." else root_rel.rstrip("/") + "/"
+            for _key, row in self.store.iter_json("index:file:"):
+                if not isinstance(row, dict):
+                    continue
+                rel = str(row.get("path", ""))
+                if not prefix or rel.startswith(prefix):
+                    return True
+            return False
+        if not root.is_file():
+            return False
+        if should_skip_path(root, self.config.repo_path, self.config.state_dir):
+            return False
+        stat = root.stat()
+        rel = self.config.repo_relative(root)
+        return (
+            self._indexed_text(rel, size=int(stat.st_size), mtime_ns=int(stat.st_mtime_ns))
+            is not None
+        )
+
+    def _snippet_payload(
+        self,
+        rel: str,
+        text: str,
+        source: str,
+        start_line: int,
+        end_line: Any,
+        context_before: int,
+        context_after: int,
+        max_chars: int,
+    ) -> dict[str, Any]:
         lines = text.splitlines()
         total = len(lines)
-        requested_end = end_line if end_line is not None else start_line
+        requested_end = int(end_line) if end_line is not None else start_line
         start = max(1, start_line - max(0, context_before))
         end = min(total, requested_end + max(0, context_after))
         if end < start:
@@ -598,7 +703,7 @@ class ContextIndex:
         content, redactions = redact_text(content)
         return {
             "schema": "context_snippet.v1",
-            "path": self.config.repo_relative(file_path),
+            "path": rel,
             "start_line": start,
             "end_line": end,
             "requested": {"start_line": start_line, "end_line": requested_end},

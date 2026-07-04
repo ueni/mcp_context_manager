@@ -27,6 +27,7 @@ COPY src ./src
 
 FROM base AS test
 
+COPY benchmarks ./benchmarks
 COPY tests ./tests
 
 RUN pip install --no-compile ".[dev]"

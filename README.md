@@ -84,9 +84,10 @@ they are not JSON-RPC methods named `context_pack`, `context_admin`, and so on.
 - `repo://project/{project_id}/instructions/codex-context-pack-first`
 
 Metrics include request counts, cache hits and misses, estimated saved input
-tokens, retrieval counts, route totals, and recent latency benchmarks. They are
-stored under project-local generated state and do not include prompts, query
-text, file contents, or secrets.
+tokens, baseline/output token estimates, retrieval counts, route totals, stage
+timings, tooling-call savings, and recent latency benchmarks. They are stored
+under project-local generated state and do not include prompts, query text, file
+contents, or secrets.
 
 ## Codex Speed Guidance
 
@@ -99,6 +100,49 @@ Agents can read `repo://instructions/codex-context-pack-first` or use the
 `use_context_pack_first` prompt. For global multi-root sessions, use
 `repo://project/{project_id}/instructions/codex-context-pack-first` after
 selecting a project.
+
+## Measurement Matrix And Benchmarks
+
+Use `context_admin(mode="measurement_matrix")` to get the exact pass/fail target
+matrix for context-pack speed and token economy. Current targets:
+
+| Key | Pass Target |
+| --- | --- |
+| `latency.context_pack.avg_elapsed_ms` | `<= 750 ms` |
+| `latency.context_pack.p95_recent_ms` | `<= 1500 ms` after at least 3 samples |
+| `latency.context_pack.index_refresh_avg_ms` | `<= 250 ms` |
+| `tokens.context_pack.avg_saved_per_pack` | `>= 500 estimated input tokens` |
+| `tokens.context_pack.compression_ratio` | `<= 0.70` |
+| `retrieval.context_pack.candidates_per_selected` | `<= 8.0` |
+| `cache.hit_ratio` | `>= 0.20` after at least 2 cacheable requests |
+| `cache.context_pack_retrieval_hit_ratio` | `>= 0.20` after at least 2 pack retrievals |
+| `tooling.external_calls_saved_per_pack` | `>= 2.0 estimated calls` |
+| `tooling.contract_tokens_saved_est` | `>= 1 estimated token` |
+| `references.bytes_deferred_est` | `>= 1 byte` |
+
+Token savings are measured as:
+
+```text
+estimated_input_tokens_saved =
+  max(0, baseline_input_tokens_est - output_tokens_est)
+```
+
+`baseline_input_tokens_est` estimates the candidate evidence an agent would
+likely inspect without ranking. `output_tokens_est` estimates the selected pack
+items returned to the model. The formula is intentionally conservative: if the
+compact JSON is larger than the candidate evidence estimate, savings are `0`.
+
+Run the built-in offline benchmark through MCP/admin:
+
+```bash
+python3 benchmarks/context_pack_benchmark.py --repo .
+```
+
+The benchmark executes four deterministic pack runs: forced cold refresh, warm
+cache reuse, repeated prompt reuse, and compact focused retrieval. It returns
+per-run stage timings, token estimates, external tool-call savings, reference
+bytes deferred, a compact contract sample, and the same measurement matrix used
+by live metrics.
 
 ## Run With Docker Compose
 

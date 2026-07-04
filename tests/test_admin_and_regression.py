@@ -61,28 +61,113 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
 
     contracts = service.context_admin(mode="contracts")
     assert "context_pack" in contracts["contracts"]
+    compact_contracts = service.context_admin(
+        mode="contracts", contract_profile="compact"
+    )
+    assert compact_contracts["metrics"]["compact_contract_tokens_est"] < contracts[
+        "metrics"
+    ]["contract_tokens_est"]
+    assert "context_pack.v1" in compact_contracts["contracts"]["context_pack"][
+        "output_schema_names"
+    ]
+    compact_pack_contract = service.context_admin(
+        mode="contracts", tool_name="context_pack", contract_profile="compact"
+    )
+    assert compact_pack_contract["schema"] == "tool_output_contract.compact.v1"
+    assert compact_pack_contract["output_schema_names"] == ["context_pack.v1"]
 
     service.context_admin(mode="index_refresh")
     first = service.context_lookup(mode="search", query="auth token")
     second = service.context_lookup(mode="search", query="auth token")
     assert first["cache"]["hit"] is False
     assert second["cache"]["hit"] is True
+    assert second["cache"]["namespace"] == "context_lookup.search"
+    assert second["cache"]["reason"] == "hit"
 
     stats = service.context_admin(mode="cache_stats")
     assert stats["entry_count"] >= 1
+    assert "context_lookup.search" in stats["namespaces"]
 
     pack = service.context_pack("review auth token behavior", max_items=2)
+    warm_pack = service.context_pack("review auth token behavior", max_items=2)
     metrics = service.context_admin(mode="metrics")
     resource = json.loads(service.repo_metrics_resource())
 
     assert metrics["schema"] == "context_metrics.v1"
     assert metrics["cache"]["hits"] >= 1
     assert metrics["cache"]["misses"] >= 1
+    assert metrics["cache"]["reasons"]["hit"] >= 1
+    assert metrics["cache"]["by_namespace"]["context_pack.retrieval"]["hits"] >= 1
+    assert metrics["cache"]["by_namespace"]["context_lookup.search"]["hits"] >= 1
     assert metrics["tokens"]["estimated_input_tokens_saved"] >= pack["metrics"]["estimated_input_tokens_saved"]
+    assert metrics["tokens"]["baseline_input_tokens_est"] >= pack["metrics"]["baseline_input_tokens_est"]
+    assert metrics["tokens"]["output_tokens_est"] >= pack["metrics"]["output_tokens_est"]
+    assert metrics["tooling"]["external_tool_calls_saved_est"] >= pack["metrics"]["external_tool_calls_saved_est"]
+    assert metrics["tooling"]["contract_chars"] >= compact_contracts["metrics"][
+        "compact_contract_chars"
+    ]
+    assert metrics["tooling"]["compact_contract_tokens_saved_est"] > 0
+    assert metrics["references"]["bytes_deferred_est"] >= pack["metrics"][
+        "references_bytes_deferred_est"
+    ]
+    assert warm_pack["cache"]["reason"] == "hit"
     assert metrics["benchmarks"]["latency_ms_by_operation"]["context_pack"]["count"] >= 1
+    assert "stage_latency_ms_by_operation" in metrics["benchmarks"]
+    assert "snippet_batch_ms" in metrics["benchmarks"]["stage_latency_ms_by_operation"]["context_pack"]
     assert metrics["requests"]["by_operation"]["context_lookup.search"]["result_count"] >= first["count"]
     assert resource["schema"] == "context_metrics.v1"
     assert resource["requests"]["total"] == metrics["requests"]["total"]
+
+    matrix = service.context_admin(mode="measurement_matrix")
+    assert matrix["schema"] == "context_measurement_matrix.v1"
+    assert {
+        "latency.context_pack.avg_elapsed_ms",
+        "latency.context_pack.snippet_batch_avg_ms",
+        "cache.context_pack_retrieval_hit_ratio",
+        "tokens.context_pack.avg_saved_per_pack",
+        "tooling.contract_tokens_saved_est",
+        "tooling.external_calls_saved_per_pack",
+        "references.bytes_deferred_est",
+    }.issubset({check["key"] for check in matrix["checks"]})
+    assert {
+        check["status"] for check in matrix["checks"]
+    }.issubset({"pass", "fail", "insufficient"})
+
+
+def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
+    benchmark = service.context_admin(mode="benchmark")
+
+    assert benchmark["schema"] == "context_benchmark.v1"
+    assert benchmark["run_count"] == 4
+    assert [run["name"] for run in benchmark["runs"]] == [
+        "cold_refresh",
+        "warm_cache",
+        "repeated_prompt",
+        "compact_focus",
+    ]
+    assert benchmark["runs"][1]["cache_hit"] is True
+    assert benchmark["runs"][2]["cache_hit"] is True
+    assert benchmark["compact_contract_sample"]["schema"] == "tool_output_contracts.compact.v1"
+    assert benchmark["compact_contract_sample"]["contract_tokens_saved_est"] > 0
+    assert benchmark["measurement_matrix"]["schema"] == "context_measurement_matrix.v1"
+
+
+def test_context_pack_benchmark_honors_max_files(
+    service: ContextService, monkeypatch
+) -> None:
+    original_refresh = service.index.refresh
+    seen_max_files: list[int] = []
+
+    def counted_refresh(path: str = ".", max_files: int = 5000):
+        seen_max_files.append(max_files)
+        return original_refresh(path=path, max_files=max_files)
+
+    monkeypatch.setattr(service.index, "refresh", counted_refresh)
+
+    service.context_admin(mode="benchmark", max_files=2)
+
+    assert 2 in seen_max_files
+    assert 5000 not in seen_max_files
 
 
 def test_context_retrieval_regression_smoke(service: ContextService) -> None:
@@ -132,6 +217,33 @@ def test_cold_then_warm_context_pack_flow(service: ContextService) -> None:
     assert warm["cache"]["hit"] is True
     assert warm["metrics"]["elapsed_ms"] >= 0
     assert warm["references"][0]["reference_id"].startswith("ctxref-")
+
+
+def test_warm_context_pack_reuses_retrieval_for_response_assembly(
+    service: ContextService, monkeypatch
+) -> None:
+    first = service.context_pack(
+        "review auth login token behavior", max_items=2, max_output_chars=5000
+    )
+
+    def fail_retrieval(*_args, **_kwargs):
+        raise AssertionError("warm pack should reuse cached retrieval")
+
+    monkeypatch.setattr(service.index, "search", fail_retrieval)
+    monkeypatch.setattr(service.index, "symbols", fail_retrieval)
+    monkeypatch.setattr(service.index, "snippet_batch", fail_retrieval)
+
+    warm = service.context_pack(
+        "review auth login token behavior", max_items=2, max_output_chars=3200
+    )
+
+    assert first["items"]
+    assert warm["items"]
+    assert warm["cache"]["hit"] is True
+    assert warm["cache"]["reason"] == "hit"
+    assert warm["metrics"]["stage_timings_ms"]["candidate_retrieval_ms"] == 0.0
+    assert warm["metrics"]["stage_timings_ms"]["snippet_batch_ms"] == 0.0
+    assert warm["references"][0]["reference_id"] != first["references"][0]["reference_id"]
 
 
 def test_external_state_dir_supports_container_layout(
@@ -257,6 +369,30 @@ def test_warm_context_pack_does_not_probe_every_unchanged_file(
     assert pack["cache"]["hit"] is True
     assert len(set(read_paths)) < 30
     assert text_paths == []
+
+
+def test_compact_context_pack_skips_symbols_after_enough_queued_search_hits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_many_python_files(repo, count=20)
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    def fail_symbols(*_args, **_kwargs):
+        raise AssertionError("compact retrieval should skip symbols")
+
+    monkeypatch.setattr(service.index, "symbols", fail_symbols)
+
+    pack = service.context_pack("review needle", max_items=1, output_profile="compact")
+
+    assert pack["items"]
+    assert pack["metrics"]["retrieval_plan"]["symbol_lookup_skipped"] is True
 
 
 def test_codex_guidance_resource_states_pack_first_boundary(

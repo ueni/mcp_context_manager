@@ -149,6 +149,7 @@ class ProjectContextService:
         max_output_chars: int | None = None,
         default_output_profile: str | None = None,
         tool_name: str = "",
+        contract_profile: str = "",
         project_id: str | None = None,
         root_uri: str | None = None,
         mcp_roots: list[Any] | None = None,
@@ -159,6 +160,7 @@ class ProjectContextService:
             return ContextService(self.config).context_admin(
                 mode="contracts",
                 tool_name=tool_name,
+                contract_profile=contract_profile,
             )
         if mode == "health" and not project_id and not root_uri:
             visible = self.registry.roots_from_mcp(mcp_roots or [])
@@ -191,6 +193,7 @@ class ProjectContextService:
             max_output_chars=max_output_chars,
             default_output_profile=default_output_profile,
             tool_name=tool_name,
+            contract_profile=contract_profile,
         )
         result.setdefault("project_id", project.project_id)
         return result
