@@ -3,12 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 from .config import ContextConfig
-from .util import load_json_file, now_iso, save_json_file
+from .store import ContextStore
+from .util import now_iso
 
 
 class ContextMetrics:
     def __init__(self, config: ContextConfig):
         self.config = config
+        self.store = ContextStore(config)
 
     def record_event(
         self,
@@ -129,7 +131,8 @@ class ContextMetrics:
             "schema": "context_metrics.v1",
             "generated_at": now_iso(),
             "project_id": self.config.project_id,
-            "path": self.config.display_path(self.config.metrics_path),
+            "path": self.config.display_path(self.config.store_path),
+            "storage_backend": self.store.backend,
             "since": payload.get("created_at", ""),
             "updated_at": payload.get("updated_at", ""),
             "requests": {
@@ -172,8 +175,8 @@ class ContextMetrics:
         }
 
     def _load(self) -> dict[str, Any]:
-        payload = load_json_file(
-            self.config.metrics_path,
+        payload = self.store.get_json(
+            "metrics:store",
             {
                 "schema": "context_metrics.store.v1",
                 "created_at": now_iso(),
@@ -196,8 +199,7 @@ class ContextMetrics:
         return payload
 
     def _save(self, payload: dict[str, Any]) -> None:
-        self.config.ensure_state_dirs()
-        save_json_file(self.config.metrics_path, payload)
+        self.store.put_json("metrics:store", payload)
 
     def _update_stats(
         self,

@@ -64,7 +64,7 @@ def test_project_context_service_auto_indexes_and_isolates_memory(tmp_path: Path
     pack = manager.context_pack("review marker alpha", mcp_roots=roots_a, max_items=2)
     project_a = pack["project"]["project_id"]
     assert pack["items"]
-    assert (tmp_path / "state" / "projects" / project_a / "index" / "context.sqlite3").exists()
+    assert (tmp_path / "state" / "projects" / project_a / "store" / "context.lmdb").exists()
 
     manager.context_memory(
         mode="upsert",

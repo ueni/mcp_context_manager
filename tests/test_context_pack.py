@@ -60,13 +60,21 @@ def test_context_pack_reference_does_not_persist_raw_prompt(
 
     pack = service.context_pack(raw_prompt, max_items=2)
     reference_id = pack["references"][0]["reference_id"]
-    reference_path = service.config.references_dir / f"{reference_id}.json"
-    stored = reference_path.read_text(encoding="utf-8")
+    stored = _stored_reference_body(service, reference_id)
     envelope = json.loads(stored)
 
     assert raw_prompt not in stored
     assert envelope["payload"]["prompt_sha256"]
     assert "prompt" not in envelope["payload"]
+
+
+def _stored_reference_body(service: ContextService, reference_id: str) -> str:
+    record = service.references.store.get_json(f"reference:{reference_id}", {})
+    if record.get("storage") == "file":
+        return (
+            service.config.references_dir / str(record.get("path", ""))
+        ).read_text(encoding="utf-8")
+    return str(record.get("body", ""))
 
 
 def test_context_pack_budget_omits_extra_candidates(service: ContextService) -> None:

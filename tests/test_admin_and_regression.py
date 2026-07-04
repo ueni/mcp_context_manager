@@ -151,13 +151,15 @@ def test_external_state_dir_supports_container_layout(
 
     assert health["repo_path"] == "."
     assert health["state_dir"] == "state"
-    assert health["index"]["index_path"] == "state/index/context.sqlite3"
-    assert index["index_path"] == "state/index/context.sqlite3"
+    assert health["index"]["index_path"] == "state/store/context.lmdb"
+    assert health["index"]["storage_backend"] == "lmdb"
+    assert index["index_path"] == "state/store/context.lmdb"
+    assert index["storage_backend"] == "lmdb"
     assert pack["repo"]["path"] == "."
     assert pack["repo"]["state_dir"] == "state"
-    assert memory["path"] == "state/memory/context_memory.json"
-    assert references["references"][0]["path"].startswith("state/references/")
-    assert metrics["path"] == "state/reports/context_metrics.json"
+    assert memory["path"] == "state/store/context.lmdb"
+    assert references["references"][0]["path"].startswith("state/store/context.lmdb")
+    assert metrics["path"] == "state/store/context.lmdb"
 
     public_payload = json.dumps(
         [health, index, pack["repo"], memory, references, metrics],

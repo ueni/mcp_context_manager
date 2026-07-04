@@ -11,15 +11,14 @@ from .memory import ContextMemory
 from .metrics import ContextMetrics
 from .references import ResultReferences
 from .schemas import output_contracts
+from .store import ContextStore
 from .util import (
     classify_route,
     estimate_tokens,
-    load_json_file,
     normalize_query_terms,
     now_iso,
     prompt_injection_signals,
     sanitize_json,
-    save_json_file,
     sha256_text,
 )
 
@@ -27,6 +26,7 @@ from .util import (
 class ContextService:
     def __init__(self, config: ContextConfig):
         self.config = config
+        self.store = ContextStore(config)
         self.index = ContextIndex(config)
         self.memory = ContextMemory(config)
         self.metrics = ContextMetrics(config)
@@ -672,8 +672,8 @@ class ContextService:
         max_output_chars: int | None = None,
         default_output_profile: str | None = None,
     ) -> dict[str, Any]:
-        payload = load_json_file(
-            self.config.budget_path,
+        payload = self.store.get_json(
+            "budget:default",
             {
                 "schema": "context_budget.v1",
                 "max_output_chars": self.config.max_output_chars,
@@ -689,74 +689,74 @@ class ContextService:
         payload["schema"] = "context_budget.v1"
         if max_output_chars is not None or default_output_profile is not None:
             payload["updated_at"] = now_iso()
-            save_json_file(self.config.budget_path, payload)
+            self.store.put_json("budget:default", payload)
         return payload
 
     def _cache_key(self, tool: str, args: dict[str, Any]) -> str:
         return f"{tool}:{sha256_text(json.dumps(args, sort_keys=True, default=str))[:24]}"
 
-    def _cache_load(self) -> dict[str, Any]:
-        return load_json_file(self.config.cache_path, {"schema": "context_cache.v1", "entries": {}})
-
-    def _cache_save(self, payload: dict[str, Any]) -> None:
-        save_json_file(self.config.cache_path, payload)
-
     def _cache_get(self, key: str) -> dict[str, Any] | None:
-        payload = self._cache_load()
-        row = payload.get("entries", {}).get(key)
+        row = self.store.get_json(f"cache:{key}")
         if isinstance(row, dict):
             return row.get("value")
         return None
 
     def _cache_set(self, key: str, value: dict[str, Any]) -> None:
-        payload = self._cache_load()
-        entries = payload.setdefault("entries", {})
         sanitized_value, sensitivity = sanitize_json(value)
-        entries[key] = {
-            "updated_at": now_iso(),
-            "value": sanitized_value,
-            "sensitivity": sensitivity,
-        }
+        self.store.put_json(
+            f"cache:{key}",
+            {
+                "updated_at": now_iso(),
+                "value": sanitized_value,
+                "sensitivity": sensitivity,
+            },
+        )
+        entries = self.store.iter_json("cache:")
         if len(entries) > 200:
-            ordered = sorted(entries.items(), key=lambda item: item[1].get("updated_at", ""), reverse=True)
-            payload["entries"] = dict(ordered[:200])
-        self._cache_save(payload)
+            ordered = sorted(
+                entries,
+                key=lambda item: item[1].get("updated_at", "")
+                if isinstance(item[1], dict)
+                else "",
+                reverse=True,
+            )
+            keep = {key for key, _row in ordered[:200]}
+            with self.store.write_txn() as txn:
+                for cache_key, _row in ordered[200:]:
+                    if cache_key not in keep:
+                        self.store.delete(cache_key, txn=txn)
 
     def _cache_stats(self) -> dict[str, Any]:
-        payload = self._cache_load()
-        entries = payload.get("entries", {})
-        return {"entry_count": len(entries), "keys": sorted(entries.keys())[:20]}
+        entries = self.store.iter_json("cache:")
+        keys = [key.removeprefix("cache:") for key, _row in entries]
+        return {
+            "entry_count": len(entries),
+            "keys": sorted(keys)[:20],
+            "storage_backend": self.store.backend,
+        }
 
     def _cache_prune(self, max_age_minutes: int) -> dict[str, Any]:
-        payload = self._cache_load()
-        entries = payload.get("entries", {})
-        kept = {}
         removed = 0
         cutoff_seconds = max_age_minutes * 60
         now = time.time()
-        for key, row in entries.items():
-            updated = row.get("updated_at", "")
-            try:
-                age = now - time.mktime(time.strptime(updated[:19], "%Y-%m-%dT%H:%M:%S"))
-            except Exception:
-                age = cutoff_seconds + 1
-            if age > cutoff_seconds:
-                removed += 1
-            else:
-                kept[key] = row
-        payload["entries"] = kept
-        self._cache_save(payload)
-        return {"removed_entries": removed, "entry_count": len(kept)}
+        with self.store.write_txn() as txn:
+            entries = self.store.iter_json("cache:", txn=txn)
+            for key, row in entries:
+                if not isinstance(row, dict):
+                    self.store.delete(key, txn=txn)
+                    removed += 1
+                    continue
+                updated = row.get("updated_at", "")
+                try:
+                    age = now - time.mktime(
+                        time.strptime(str(updated)[:19], "%Y-%m-%dT%H:%M:%S")
+                    )
+                except Exception:
+                    age = cutoff_seconds + 1
+                if age > cutoff_seconds:
+                    removed += 1
+                    self.store.delete(key, txn=txn)
+        return {"removed_entries": removed, "entry_count": self.store.count("cache:")}
 
     def _reference_list(self, limit: int = 20) -> list[dict[str, Any]]:
-        refs = []
-        self.config.ensure_state_dirs()
-        for path in sorted(self.config.references_dir.glob("ctxref-*.json"), reverse=True)[:limit]:
-            refs.append(
-                {
-                    "reference_id": path.stem,
-                    "path": self.config.display_path(path),
-                    "size_bytes": path.stat().st_size,
-                }
-            )
-        return refs
+        return self.references.list(limit=limit)

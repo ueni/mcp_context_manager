@@ -16,6 +16,7 @@ class ContextConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     bearer_token: str = ""
+    lmdb_map_size: int = 1_073_741_824
     project_id: str = ""
     root_uri: str = ""
     allowed_roots: tuple[str, ...] = field(default_factory=tuple)
@@ -43,6 +44,10 @@ class ContextConfig:
             host=os.getenv("HOST", "127.0.0.1"),
             port=int(os.getenv("PORT", "8000")),
             bearer_token=os.getenv("MCP_HTTP_BEARER_TOKEN", "").strip(),
+            lmdb_map_size=max(
+                16_777_216,
+                int(os.getenv("MCP_CONTEXT_LMDB_MAP_SIZE", "1073741824")),
+            ),
         )
 
     def with_project(
@@ -66,39 +71,21 @@ class ContextConfig:
             host=self.host,
             port=self.port,
             bearer_token=self.bearer_token,
+            lmdb_map_size=self.lmdb_map_size,
         )
 
     @property
-    def index_db_path(self) -> Path:
-        return self.state_dir / "index" / "context.sqlite3"
+    def store_path(self) -> Path:
+        return self.state_dir / "store" / "context.lmdb"
 
     @property
     def references_dir(self) -> Path:
         return self.state_dir / "references"
 
-    @property
-    def memory_path(self) -> Path:
-        return self.state_dir / "memory" / "context_memory.json"
-
-    @property
-    def cache_path(self) -> Path:
-        return self.state_dir / "cache" / "tool_cache.json"
-
-    @property
-    def budget_path(self) -> Path:
-        return self.state_dir / "memory" / "token_budget.json"
-
-    @property
-    def metrics_path(self) -> Path:
-        return self.state_dir / "reports" / "context_metrics.json"
-
     def ensure_state_dirs(self) -> None:
         for path in [
-            self.index_db_path.parent,
+            self.store_path.parent,
             self.references_dir,
-            self.memory_path.parent,
-            self.cache_path.parent,
-            self.state_dir / "reports",
             self.state_dir / "traces",
         ]:
             path.mkdir(parents=True, exist_ok=True)

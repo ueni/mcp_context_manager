@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .config import ContextConfig
+from .store import ContextStore
 from .util import (
     merge_redaction_metadata,
     now_iso,
@@ -16,11 +17,13 @@ from .util import (
 )
 
 REFERENCE_ID_RE = re.compile(r"^ctxref-[A-Za-z0-9_-]{1,64}$")
+INLINE_REFERENCE_MAX_BYTES = 131_072
 
 
 class ResultReferences:
     def __init__(self, config: ContextConfig):
         self.config = config
+        self.store = ContextStore(config)
 
     def create(self, producer: str, payload: Any, summary: dict[str, Any], ttl_hours: int = 24) -> dict[str, Any]:
         self.config.ensure_state_dirs()
@@ -45,8 +48,34 @@ class ResultReferences:
         }
         body = json.dumps(envelope, indent=2, sort_keys=True, ensure_ascii=False)
         digest = sha256_text(body)
-        path = self.config.references_dir / f"{reference_id}.json"
-        path.write_text(body, encoding="utf-8")
+        body_size = len(body.encode("utf-8"))
+        storage = "lmdb"
+        path = self.config.store_path
+        record: dict[str, Any] = {
+            "schema": "mcp_result_reference.store.v1",
+            "reference_id": reference_id,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "storage": storage,
+            "size_bytes": body_size,
+            "sha256": digest,
+            "body": body,
+        }
+        if body_size > INLINE_REFERENCE_MAX_BYTES:
+            storage = "file"
+            path = self.config.references_dir / f"{reference_id}.json"
+            path.write_text(body, encoding="utf-8")
+            record = {
+                "schema": "mcp_result_reference.store.v1",
+                "reference_id": reference_id,
+                "created_at": created_at,
+                "expires_at": expires_at,
+                "storage": storage,
+                "size_bytes": body_size,
+                "sha256": digest,
+                "path": path.name,
+            }
+        self.store.put_json(f"reference:{reference_id}", record)
         return {
             "schema": "mcp_result_reference.v1",
             "reference_id": reference_id,
@@ -58,11 +87,12 @@ class ResultReferences:
             "content": {
                 "mime_type": "application/json",
                 "encoding": "utf-8",
-                "size_bytes": len(body.encode("utf-8")),
+                "size_bytes": body_size,
                 "sha256": digest,
             },
             "retention": {"ttl_hours": ttl_hours, "policy": "local_generated_state"},
             "sensitivity": {**sensitivity, "payload_embedded": False},
+            "storage": {"backend": self.store.backend, "mode": storage},
             "resolver": {
                 "tool": "result_reference_resolve",
                 "uri": (
@@ -75,6 +105,15 @@ class ResultReferences:
             },
         }
 
+    def list(self, limit: int = 20) -> list[dict[str, Any]]:
+        refs = []
+        for _key, row in self.store.iter_json("reference:"):
+            if not isinstance(row, dict):
+                continue
+            refs.append(self._public_list_row(row))
+        refs.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
+        return refs[:limit]
+
     def resolve(
         self,
         reference_id: str = "",
@@ -86,19 +125,17 @@ class ResultReferences:
             expected_hash = str(reference.get("content", {}).get("sha256", expected_hash))
         if not reference_id or not REFERENCE_ID_RE.match(reference_id):
             return {"schema": "mcp_result_reference.resolve.v1", "status": "invalid_reference"}
-        path = self.config.references_dir / f"{reference_id}.json"
-        try:
-            path.relative_to(self.config.state_dir)
-        except ValueError:
-            return {"schema": "mcp_result_reference.resolve.v1", "status": "boundary_rejected"}
         reference_expires_at = (
             parse_iso(str(reference.get("expires_at", ""))) if reference else None
         )
         if reference_expires_at and reference_expires_at < datetime.now(timezone.utc):
             return {"schema": "mcp_result_reference.resolve.v1", "status": "expired", "reference_id": reference_id}
-        if not path.is_file():
+        record = self.store.get_json(f"reference:{reference_id}")
+        if not isinstance(record, dict):
             return {"schema": "mcp_result_reference.resolve.v1", "status": "missing", "reference_id": reference_id}
-        text = path.read_text(encoding="utf-8")
+        text = self._body_from_record(record)
+        if not text:
+            return {"schema": "mcp_result_reference.resolve.v1", "status": "missing", "reference_id": reference_id}
         digest = sha256_text(text)
         content = json.loads(text)
         metadata: dict[str, Any] = {}
@@ -144,3 +181,33 @@ class ResultReferences:
             "summary": summary,
             "sensitivity": sensitivity,
         }
+
+    def _public_list_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        storage = str(row.get("storage") or "lmdb")
+        if storage == "file":
+            path = self.config.references_dir / str(row.get("path", ""))
+        else:
+            path = self.config.store_path
+        return {
+            "reference_id": str(row.get("reference_id", "")),
+            "created_at": str(row.get("created_at", "")),
+            "expires_at": str(row.get("expires_at", "")),
+            "path": self.config.display_path(path),
+            "size_bytes": int(row.get("size_bytes", 0) or 0),
+            "storage": storage,
+        }
+
+    def _body_from_record(self, row: dict[str, Any]) -> str:
+        storage = str(row.get("storage") or "lmdb")
+        if storage == "lmdb":
+            body = row.get("body")
+            return body if isinstance(body, str) else ""
+        file_name = str(row.get("path") or "")
+        path = self.config.references_dir / file_name
+        try:
+            path.relative_to(self.config.state_dir)
+        except ValueError:
+            return ""
+        if not path.is_file():
+            return ""
+        return path.read_text(encoding="utf-8")

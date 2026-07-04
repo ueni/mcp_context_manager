@@ -140,8 +140,8 @@ def test_memory_upsert_redacts_secret_values_before_persisting(
         source="test",
     )
 
-    stored = service.config.memory_path.read_text(encoding="utf-8")
-    payload = json.loads(stored)
+    payload = service.memory._load()
+    stored = json.dumps(payload, sort_keys=True)
 
     assert result["sensitivity"]["redacted"] is True
     assert "super-secret-value-123456" not in stored
@@ -164,8 +164,8 @@ def test_memory_redacts_file_uri_payloads_before_persisting(
         source="see file://localhost/home/user/source/private-repo/log.txt",
     )
 
-    stored = service.config.memory_path.read_text(encoding="utf-8")
-    payload = json.loads(stored)
+    payload = service.memory._load()
+    stored = json.dumps(payload, sort_keys=True)
 
     assert result["sensitivity"]["redacted"] is True
     assert "host_path_uri" in result["sensitivity"]["categories"]
@@ -203,7 +203,7 @@ def test_summary_and_decision_payloads_are_redacted_before_persisting(
         rationale="validated from /home/user/project/log.txt",
     )
 
-    stored = service.config.memory_path.read_text(encoding="utf-8")
+    stored = json.dumps(service.memory._load(), sort_keys=True)
 
     assert "super-secret-value-123456" not in stored
     assert "/home/user/project/log.txt" not in stored
@@ -222,9 +222,7 @@ def test_result_reference_create_sanitizes_payload_and_summary(
         summary={"note": "token=another-secret-value-123456"},
     )
 
-    stored = (service.config.references_dir / f"{ref['reference_id']}.json").read_text(
-        encoding="utf-8"
-    )
+    stored = _stored_reference_body(service, ref["reference_id"])
     resolved = service.result_reference_resolve(reference_id=ref["reference_id"])
 
     assert ref["sensitivity"]["redacted"] is True
@@ -244,9 +242,7 @@ def test_result_reference_redacts_file_uri_payload_and_summary(
         summary={"note": "see file://localhost/home/user/source/private-repo"},
     )
 
-    stored = (service.config.references_dir / f"{ref['reference_id']}.json").read_text(
-        encoding="utf-8"
-    )
+    stored = _stored_reference_body(service, ref["reference_id"])
     resolved = service.result_reference_resolve(reference_id=ref["reference_id"])
 
     assert ref["sensitivity"]["redacted"] is True
@@ -269,3 +265,12 @@ def test_expired_reference_envelope_is_enforced_by_id_only(
     expired = service.result_reference_resolve(reference_id=ref["reference_id"])
 
     assert expired["status"] == "expired"
+
+
+def _stored_reference_body(service: ContextService, reference_id: str) -> str:
+    record = service.references.store.get_json(f"reference:{reference_id}", {})
+    if record.get("storage") == "file":
+        return (
+            service.config.references_dir / str(record.get("path", ""))
+        ).read_text(encoding="utf-8")
+    return str(record.get("body", ""))

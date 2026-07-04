@@ -4,26 +4,26 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import ContextConfig
+from .store import ContextStore
 from .util import (
     contains_sensitive_text,
     expiry_iso,
     is_expired,
-    load_json_file,
     merge_redaction_metadata,
     now_iso,
     parse_iso,
     sanitize_json,
-    save_json_file,
 )
 
 
 class ContextMemory:
     def __init__(self, config: ContextConfig):
         self.config = config
+        self.store = ContextStore(config)
 
     def _load(self) -> dict[str, Any]:
-        payload = load_json_file(
-            self.config.memory_path,
+        payload = self.store.get_json(
+            "memory:store",
             {"schema": "context_memory_store.v1", "entries": [], "summaries": [], "decisions": []},
         )
         if not isinstance(payload, dict):
@@ -36,9 +36,8 @@ class ContextMemory:
         }
 
     def _save(self, payload: dict[str, Any]) -> None:
-        self.config.ensure_state_dirs()
         self._sanitize_store_payload(payload)
-        save_json_file(self.config.memory_path, payload)
+        self.store.put_json("memory:store", payload)
 
     def _sanitize_store_payload(self, payload: dict[str, Any]) -> None:
         for row in payload.get("entries", []):
@@ -151,7 +150,8 @@ class ContextMemory:
         self._save(payload)
         return {
             "schema": "context_memory.upsert.v1",
-            "path": self.config.display_path(self.config.memory_path),
+            "path": self.config.display_path(self.config.store_path),
+            "storage_backend": self.store.backend,
             "namespace": namespace,
             "key": key,
             "updated": True,
@@ -296,7 +296,8 @@ class ContextMemory:
         decisions = self.effective_decisions(namespace=namespace, include_expired=include_expired)[:max_entries]
         return {
             "schema": "context_memory.get.v1",
-            "path": self.config.display_path(self.config.memory_path),
+            "path": self.config.display_path(self.config.store_path),
+            "storage_backend": self.store.backend,
             "count": len(entries),
             "entries": entries,
             "summary_count": len(summaries),

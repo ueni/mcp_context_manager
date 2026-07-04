@@ -52,11 +52,11 @@ class ProjectRoot:
             "state": {
                 "state_key": f"projects/{self.project_id}",
                 "exists": self.state_dir.exists(),
-                "index_exists": (self.state_dir / "index" / "context.sqlite3").exists(),
-                "memory_exists": (
-                    self.state_dir / "memory" / "context_memory.json"
-                ).exists(),
-                "cache_exists": (self.state_dir / "cache" / "tool_cache.json").exists(),
+                "storage_backend": "lmdb",
+                "store_exists": (self.state_dir / "store" / "context.lmdb").exists(),
+                "index_exists": (self.state_dir / "store" / "context.lmdb").exists(),
+                "memory_exists": (self.state_dir / "store" / "context.lmdb").exists(),
+                "cache_exists": (self.state_dir / "store" / "context.lmdb").exists(),
             },
         }
 

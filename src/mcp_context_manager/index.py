@@ -3,12 +3,12 @@ from __future__ import annotations
 import ast
 import fnmatch
 import re
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
 from .config import ContextConfig
+from .store import ContextStore
 from .util import (
     TEXT_EXTENSIONS,
     git_value,
@@ -24,6 +24,9 @@ from .util import (
     trim_text,
 )
 
+TOKEN_RE = re.compile(r"[A-Za-z0-9_]{3,}")
+MAX_INDEX_TERMS_PER_FILE = 4000
+
 
 @dataclass(frozen=True)
 class CandidateFile:
@@ -35,77 +38,7 @@ class CandidateFile:
 class ContextIndex:
     def __init__(self, config: ContextConfig):
         self.config = config
-
-    def connect(self) -> sqlite3.Connection:
-        self.config.ensure_state_dirs()
-        conn = sqlite3.connect(self.config.index_db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def initialize(self, conn: sqlite3.Connection) -> bool:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS files (
-              path TEXT PRIMARY KEY,
-              size INTEGER NOT NULL,
-              mtime_ns INTEGER NOT NULL,
-              sha256 TEXT NOT NULL,
-              extension TEXT NOT NULL,
-              language TEXT NOT NULL,
-              line_count INTEGER NOT NULL,
-              indexed_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS symbols (
-              path TEXT NOT NULL,
-              name TEXT NOT NULL,
-              kind TEXT NOT NULL,
-              line_start INTEGER NOT NULL,
-              line_end INTEGER NOT NULL,
-              signature TEXT NOT NULL,
-              PRIMARY KEY (path, name, kind, line_start)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS imports (
-              path TEXT NOT NULL,
-              target TEXT NOT NULL,
-              line INTEGER NOT NULL,
-              PRIMARY KEY (path, target, line)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS meta (
-              key TEXT PRIMARY KEY,
-              value TEXT NOT NULL
-            )
-            """
-        )
-        fts_enabled = True
-        try:
-            conn.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS fts_files USING fts5(path UNINDEXED, content)"
-            )
-        except sqlite3.OperationalError:
-            fts_enabled = False
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-            ("fts_enabled", "true" if fts_enabled else "false"),
-        )
-        conn.commit()
-        return fts_enabled
-
-    def _fts_enabled(self, conn: sqlite3.Connection) -> bool:
-        self.initialize(conn)
-        row = conn.execute("SELECT value FROM meta WHERE key='fts_enabled'").fetchone()
-        return bool(row and row["value"] == "true")
+        self.store = ContextStore(config)
 
     def _iter_candidate_files(self, root: Path, max_files: int) -> list[CandidateFile]:
         files: list[CandidateFile] = []
@@ -159,124 +92,109 @@ class ContextIndex:
         whole_repo_refresh = root == self.config.repo_path
         indexed_at = now_iso()
         files = self._iter_candidate_files(root, max_files=max_files)
-        with self.connect() as conn:
-            fts_enabled = self.initialize(conn)
-            existing_rows = {
-                row["path"]: row
-                for row in conn.execute(
-                    "SELECT path, size, mtime_ns, sha256 FROM files"
-                ).fetchall()
-                if self._rel_in_refresh_scope(row["path"], root)
-            }
-            current_rels = {
-                str(candidate.path.relative_to(self.config.repo_path)).replace("\\", "/")
-                for candidate in files
-            }
-            removed_count = 0
-            updated_count = 0
-            unchanged_count = 0
+        existing_rows = {
+            str(row.get("path")): row
+            for _key, row in self.store.iter_json("index:file:")
+            if isinstance(row, dict)
+            and self._rel_in_refresh_scope(str(row.get("path")), root)
+        }
+        current_rels = {
+            str(candidate.path.relative_to(self.config.repo_path)).replace("\\", "/")
+            for candidate in files
+        }
+        removed_count = 0
+        updated_count = 0
+        unchanged_count = 0
+        previous_generated = self._get_meta("generated_at")
+
+        with self.store.write_txn() as txn:
             for rel in sorted(set(existing_rows) - current_rels):
-                self._delete_file_rows(conn, rel, fts_enabled)
+                self._delete_file_rows(rel, existing_rows.get(rel), txn)
                 removed_count += 1
             for candidate in files:
                 file_path = candidate.path
-                rel = str(file_path.relative_to(self.config.repo_path)).replace("\\", "/")
+                rel = str(file_path.relative_to(self.config.repo_path)).replace(
+                    "\\", "/"
+                )
                 existing = existing_rows.get(rel)
                 if (
                     existing
-                    and int(existing["size"]) == candidate.size
-                    and int(existing["mtime_ns"]) == candidate.mtime_ns
+                    and int(existing.get("size", -1)) == candidate.size
+                    and int(existing.get("mtime_ns", -1)) == candidate.mtime_ns
                 ):
                     unchanged_count += 1
                     continue
                 if is_likely_binary(file_path):
                     if existing:
-                        self._delete_file_rows(conn, rel, fts_enabled)
+                        self._delete_file_rows(rel, existing, txn)
                         removed_count += 1
                     continue
                 raw = file_path.read_bytes()
                 text = raw.decode("utf-8", errors="replace")
                 digest = sha256_bytes(raw)
-                self._delete_file_rows(conn, rel, fts_enabled)
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO files
-                    (path, size, mtime_ns, sha256, extension, language, line_count, indexed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        rel,
-                        candidate.size,
-                        candidate.mtime_ns,
-                        digest,
-                        file_path.suffix.lower(),
-                        language_for_path(rel),
-                        len(text.splitlines()),
-                        indexed_at,
-                    ),
-                )
-                if fts_enabled:
-                    conn.execute(
-                        "INSERT INTO fts_files(path, content) VALUES (?, ?)",
-                        (rel, text),
-                    )
                 symbols, imports = self.extract_file_intel(rel, text)
+                term_rows = self._term_rows(rel, text)
+                record = {
+                    "path": rel,
+                    "size": candidate.size,
+                    "mtime_ns": candidate.mtime_ns,
+                    "sha256": digest,
+                    "extension": file_path.suffix.lower(),
+                    "language": language_for_path(rel),
+                    "line_count": len(text.splitlines()),
+                    "indexed_at": indexed_at,
+                    "content": text,
+                    "terms": sorted(term_rows),
+                }
+                self._delete_file_rows(rel, existing, txn)
+                self.store.put_json(_file_key(rel), record, txn=txn)
+                for row in symbols:
+                    self.store.put_json(_symbol_key(row), row, txn=txn)
+                for row in imports:
+                    self.store.put_json(_import_key(row), row, txn=txn)
+                for term, row in term_rows.items():
+                    self.store.put_json(_term_key(term, rel), row, txn=txn)
                 updated_count += 1
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO symbols
-                    (path, name, kind, line_start, line_end, signature)
-                    VALUES (:path, :name, :kind, :line_start, :line_end, :signature)
-                    """,
-                    symbols,
-                )
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO imports(path, target, line)
-                    VALUES (:path, :target, :line)
-                    """,
-                    imports,
-                )
-            previous_generated = conn.execute(
-                "SELECT value FROM meta WHERE key='generated_at'"
-            ).fetchone()
+
             generated_at = (
                 indexed_at
-                if updated_count or removed_count or previous_generated is None
-                else previous_generated["value"]
+                if updated_count or removed_count or not previous_generated
+                else previous_generated
             )
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("generated_at", generated_at))
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("git_head", git_value(self.config.repo_path, "rev-parse", "HEAD")))
-            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("git_branch", git_value(self.config.repo_path, "branch", "--show-current")))
+            self._set_meta("generated_at", generated_at, txn)
+            self._set_meta(
+                "git_head", git_value(self.config.repo_path, "rev-parse", "HEAD"), txn
+            )
+            self._set_meta(
+                "git_branch",
+                git_value(self.config.repo_path, "branch", "--show-current"),
+                txn,
+            )
             if whole_repo_refresh:
                 signature = self.refresh_signature()
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                    ("refresh_signature", signature["signature"]),
+                self._set_meta("refresh_signature", signature["signature"], txn)
+                self._set_meta(
+                    "refresh_signature_available",
+                    "true" if signature["available"] else "false",
+                    txn,
                 )
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                    (
-                        "refresh_signature_available",
-                        "true" if signature["available"] else "false",
-                    ),
-                )
-            conn.commit()
-            total_files = conn.execute("SELECT COUNT(*) AS count FROM files").fetchone()["count"]
-            total_symbols = conn.execute("SELECT COUNT(*) AS count FROM symbols").fetchone()["count"]
-            total_imports = conn.execute("SELECT COUNT(*) AS count FROM imports").fetchone()["count"]
+            self._set_meta("storage_backend", self.store.backend, txn)
+
+        status = self.status()
         return {
             "schema": "context_index.refresh.v1",
             "generated_at": generated_at,
-            "index_path": self.config.display_path(self.config.index_db_path),
-            "file_count": int(total_files),
-            "symbol_count": int(total_symbols),
-            "import_count": int(total_imports),
+            "index_path": self.config.display_path(self.config.store_path),
+            "storage_backend": self.store.backend,
+            "file_count": status["file_count"],
+            "symbol_count": status["symbol_count"],
+            "import_count": status["import_count"],
             "files_considered": len(files),
             "updated_count": updated_count,
             "unchanged_count": unchanged_count,
             "removed_count": removed_count,
-            "fts_enabled": fts_enabled,
+            "fts_enabled": False,
+            "search_backend": "lmdb_terms",
         }
 
     def refresh_if_needed(
@@ -299,21 +217,16 @@ class ContextIndex:
             result["skipped"] = False
             result["reason"] = "signature_unavailable"
             return result
-        with self.connect() as conn:
-            self.initialize(conn)
-            meta = {
-                row["key"]: row["value"]
-                for row in conn.execute("SELECT key, value FROM meta")
-            }
-            file_count = conn.execute("SELECT COUNT(*) AS count FROM files").fetchone()[
-                "count"
-            ]
-        if file_count and meta.get("refresh_signature") == signature["signature"]:
-            status = self.status()
+        status = self.status()
+        if (
+            status["file_count"]
+            and status.get("refresh_signature") == signature["signature"]
+        ):
             return {
                 "schema": "context_index.refresh.v1",
                 "generated_at": status["generated_at"],
                 "index_path": status["index_path"],
+                "storage_backend": self.store.backend,
                 "file_count": status["file_count"],
                 "symbol_count": status["symbol_count"],
                 "import_count": status.get("import_count", 0),
@@ -322,6 +235,7 @@ class ContextIndex:
                 "unchanged_count": status["file_count"],
                 "removed_count": 0,
                 "fts_enabled": status["fts_enabled"],
+                "search_backend": status["search_backend"],
                 "skipped": True,
                 "reason": "signature_unchanged",
             }
@@ -358,16 +272,21 @@ class ContextIndex:
         }
 
     def _delete_file_rows(
-        self, conn: sqlite3.Connection, rel: str, fts_enabled: bool
+        self, rel: str, existing: dict[str, Any] | None, txn: Any
     ) -> None:
-        conn.execute("DELETE FROM files WHERE path = ?", (rel,))
-        conn.execute("DELETE FROM symbols WHERE path = ?", (rel,))
-        conn.execute("DELETE FROM imports WHERE path = ?", (rel,))
-        if fts_enabled:
-            try:
-                conn.execute("DELETE FROM fts_files WHERE path = ?", (rel,))
-            except sqlite3.OperationalError:
-                pass
+        terms = []
+        if isinstance(existing, dict):
+            terms = [str(term) for term in existing.get("terms", [])]
+        self.store.delete(_file_key(rel), txn=txn)
+        self.store.delete_prefix(_symbol_prefix(rel), txn=txn)
+        self.store.delete_prefix(_import_prefix(rel), txn=txn)
+        if terms:
+            for term in terms:
+                self.store.delete(_term_key(term, rel), txn=txn)
+            return
+        for key, row in self.store.iter_json("index:term:", txn=txn):
+            if isinstance(row, dict) and row.get("path") == rel:
+                self.store.delete(key, txn=txn)
 
     def _rel_in_refresh_scope(self, rel: str, root: Path) -> bool:
         if root == self.config.repo_path:
@@ -378,20 +297,20 @@ class ContextIndex:
         return rel == root_rel or rel.startswith(root_rel.rstrip("/") + "/")
 
     def status(self) -> dict[str, Any]:
-        with self.connect() as conn:
-            fts_enabled = self.initialize(conn)
-            file_count = conn.execute("SELECT COUNT(*) AS count FROM files").fetchone()["count"]
-            symbol_count = conn.execute("SELECT COUNT(*) AS count FROM symbols").fetchone()["count"]
-            import_count = conn.execute("SELECT COUNT(*) AS count FROM imports").fetchone()["count"]
-            meta = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM meta")}
+        meta = self._meta()
+        file_count = self.store.count("index:file:")
+        symbol_count = self.store.count("index:symbol:")
+        import_count = self.store.count("index:import:")
         return {
             "schema": "context_index.status.v1",
-            "index_path": self.config.display_path(self.config.index_db_path),
-            "exists": self.config.index_db_path.exists(),
+            "index_path": self.config.display_path(self.config.store_path),
+            "storage_backend": self.store.backend,
+            "exists": self.store.exists(),
             "file_count": int(file_count),
             "symbol_count": int(symbol_count),
             "import_count": int(import_count),
-            "fts_enabled": fts_enabled,
+            "fts_enabled": False,
+            "search_backend": "lmdb_terms",
             "generated_at": meta.get("generated_at", ""),
             "git_head": meta.get("git_head", ""),
             "git_branch": meta.get("git_branch", ""),
@@ -403,13 +322,23 @@ class ContextIndex:
         }
 
     def files(self, limit: int = 1000) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            self.initialize(conn)
-            rows = conn.execute(
-                "SELECT path, size, extension, language, line_count FROM files ORDER BY path LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [dict(row) for row in rows if self._runtime_visible_rel(row["path"])]
+        rows = []
+        for _key, row in self.store.iter_json("index:file:"):
+            if not isinstance(row, dict):
+                continue
+            if not self._runtime_visible_rel(str(row.get("path", ""))):
+                continue
+            rows.append(
+                {
+                    "path": row.get("path", ""),
+                    "size": int(row.get("size", 0)),
+                    "extension": row.get("extension", ""),
+                    "language": row.get("language", ""),
+                    "line_count": int(row.get("line_count", 0)),
+                }
+            )
+        rows.sort(key=lambda item: str(item["path"]))
+        return rows[:limit]
 
     def extract_file_intel(
         self, rel_path: str, text: str
@@ -440,18 +369,28 @@ class ContextIndex:
                         "name": node.name,
                         "kind": kind,
                         "line_start": int(getattr(node, "lineno", 1)),
-                        "line_end": int(getattr(node, "end_lineno", getattr(node, "lineno", 1))),
+                        "line_end": int(
+                            getattr(node, "end_lineno", getattr(node, "lineno", 1))
+                        ),
                         "signature": signature,
                     }
                 )
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     imports.append(
-                        {"path": rel_path, "target": alias.name.split(".", 1)[0], "line": int(node.lineno)}
+                        {
+                            "path": rel_path,
+                            "target": alias.name.split(".", 1)[0],
+                            "line": int(node.lineno),
+                        }
                     )
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imports.append(
-                    {"path": rel_path, "target": node.module.split(".", 1)[0], "line": int(node.lineno)}
+                    {
+                        "path": rel_path,
+                        "target": node.module.split(".", 1)[0],
+                        "line": int(node.lineno),
+                    }
                 )
         return symbols, imports
 
@@ -460,7 +399,10 @@ class ContextIndex:
         patterns = [
             ("function", re.compile(r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")),
             ("function", re.compile(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")),
-            ("class", re.compile(r"\b(class|struct|interface)\s+([A-Za-z_][A-Za-z0-9_]*)")),
+            (
+                "class",
+                re.compile(r"\b(class|struct|interface)\s+([A-Za-z_][A-Za-z0-9_]*)"),
+            ),
         ]
         for idx, line in enumerate(text.splitlines(), start=1):
             for kind, pattern in patterns:
@@ -496,39 +438,45 @@ class ContextIndex:
         root_rel = self.config.repo_relative(root_path)
         if root_rel == ".":
             root_rel = ""
-        with self.connect() as conn:
-            fts_enabled = self._fts_enabled(conn)
-            rows: list[dict[str, Any]] = []
-            if fts_enabled:
-                fts_query = " OR ".join(f'"{term}"' for term in terms)
-                try:
-                    path_clause = ""
-                    params: list[Any] = [fts_query]
-                    if root_rel:
-                        if root_path.is_file():
-                            path_clause = "AND path = ?"
-                            params.append(root_rel)
-                        else:
-                            path_clause = (
-                                "AND (path = ? OR path LIKE ? ESCAPE '\\')"
-                            )
-                            prefix = _sqlite_like_escape(root_rel.rstrip("/"))
-                            params.extend([root_rel, f"{prefix}/%"])
-                    params.append(max_results * 4)
-                    sql_rows = conn.execute(
-                        f"""
-                        SELECT path, snippet(fts_files, 1, '', '', ' ... ', 12) AS excerpt
-                        FROM fts_files
-                        WHERE fts_files MATCH ? {path_clause}
-                        LIMIT ?
-                        """,
-                        tuple(params),
-                    ).fetchall()
-                    rows = [{"path": row["path"], "excerpt": row["excerpt"], "source": "fts"} for row in sql_rows]
-                except sqlite3.OperationalError:
-                    rows = []
-            if not rows:
-                rows = self._fallback_search(terms, root_rel=root_rel, limit=max_results * 4)
+        matched: dict[str, dict[str, Any]] = {}
+        for term in terms:
+            for _key, row in self.store.iter_json(_term_prefix(term)):
+                if not isinstance(row, dict):
+                    continue
+                rel = str(row.get("path", ""))
+                if not rel:
+                    continue
+                if root_rel and rel != root_rel and not rel.startswith(
+                    root_rel.rstrip("/") + "/"
+                ):
+                    continue
+                if include_globs and not any(
+                    fnmatch.fnmatch(rel, glob) for glob in include_globs
+                ):
+                    continue
+                current = matched.setdefault(
+                    rel,
+                    {
+                        "path": rel,
+                        "line": int(row.get("first_line", 1) or 1),
+                        "excerpt": str(row.get("excerpt", "")),
+                        "source": "lmdb_terms",
+                        "term_hits": 0,
+                        "term_count": 0,
+                    },
+                )
+                current["term_hits"] = int(current.get("term_hits", 0)) + 1
+                current["term_count"] = int(current.get("term_count", 0)) + int(
+                    row.get("count", 1) or 1
+                )
+                if int(row.get("first_line", 1) or 1) < int(
+                    current.get("line", 1) or 1
+                ):
+                    current["line"] = int(row.get("first_line", 1) or 1)
+                    current["excerpt"] = str(row.get("excerpt", ""))
+        rows = list(matched.values())
+        if not rows:
+            rows = self._fallback_search(terms, root_rel=root_rel, limit=max_results * 4)
 
         filtered: list[dict[str, Any]] = []
         for row in rows:
@@ -540,7 +488,11 @@ class ContextIndex:
             if include_globs and not any(fnmatch.fnmatch(rel, glob) for glob in include_globs):
                 continue
             score = sum(2.0 for term in terms if term in rel.lower())
-            score += sum(1.0 for term in terms if term in str(row.get("excerpt", "")).lower())
+            score += sum(
+                1.0 for term in terms if term in str(row.get("excerpt", "")).lower()
+            )
+            score += float(row.get("term_hits", 0)) * 2.5
+            score += min(float(row.get("term_count", 0)), 8.0) * 0.25
             filtered.append({**row, "score": round(score, 4), "terms": terms})
         filtered.sort(key=lambda item: (-float(item["score"]), item["path"]))
         results = filtered[:max_results]
@@ -553,7 +505,9 @@ class ContextIndex:
             "index": self.status(),
         }
 
-    def _fallback_search(self, terms: list[str], root_rel: str, limit: int) -> list[dict[str, Any]]:
+    def _fallback_search(
+        self, terms: list[str], root_rel: str, limit: int
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         root = self.config.repo_path / root_rel if root_rel else self.config.repo_path
         for candidate in self._iter_candidate_files(root, max_files=5000):
@@ -583,28 +537,25 @@ class ContextIndex:
 
     def symbols(self, query: str = "", limit: int = 50) -> dict[str, Any]:
         terms = normalize_query_terms(query, max_terms=8)
-        with self.connect() as conn:
-            self.initialize(conn)
+        rows = []
+        for _key, row in self.store.iter_json("index:symbol:"):
+            if not isinstance(row, dict):
+                continue
+            if not self._runtime_visible_rel(str(row.get("path", ""))):
+                continue
             if terms:
-                like = [f"%{term}%" for term in terms]
-                clauses = " OR ".join(["LOWER(name) LIKE ?" for _ in like])
-                rows = conn.execute(
-                    f"""
-                    SELECT path, name, kind, line_start, line_end, signature
-                    FROM symbols WHERE {clauses}
-                    ORDER BY path, line_start LIMIT ?
-                    """,
-                    (*like, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT path, name, kind, line_start, line_end, signature
-                    FROM symbols ORDER BY path, line_start LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-        symbols = [dict(row) for row in rows if self._runtime_visible_rel(row["path"])]
+                haystack = " ".join(
+                    [
+                        str(row.get("path", "")),
+                        str(row.get("name", "")),
+                        str(row.get("signature", "")),
+                    ]
+                ).lower()
+                if not any(term in haystack for term in terms):
+                    continue
+            rows.append(row)
+        rows.sort(key=lambda item: (str(item.get("path", "")), int(item.get("line_start", 0))))
+        symbols = rows[:limit]
         return {"schema": "context_symbols.v1", "count": len(symbols), "symbols": symbols}
 
     def snippet(
@@ -625,7 +576,9 @@ class ContextIndex:
             raise ValueError("path is excluded by runtime skip rules")
         stat = file_path.stat()
         rel = self.config.repo_relative(file_path)
-        text = self._indexed_text(rel, size=int(stat.st_size), mtime_ns=int(stat.st_mtime_ns))
+        text = self._indexed_text(
+            rel, size=int(stat.st_size), mtime_ns=int(stat.st_mtime_ns)
+        )
         source = "index" if text is not None else "file"
         if text is None and stat.st_size > self.config.max_read_bytes:
             raise ValueError("file exceeds max_read_bytes")
@@ -664,7 +617,9 @@ class ContextIndex:
         except OSError:
             return 1
         rel = self.config.repo_relative(file_path)
-        text = self._indexed_text(rel, size=int(stat.st_size), mtime_ns=int(stat.st_mtime_ns))
+        text = self._indexed_text(
+            rel, size=int(stat.st_size), mtime_ns=int(stat.st_mtime_ns)
+        )
         if text is None:
             try:
                 text = file_path.read_text(encoding="utf-8", errors="replace")
@@ -677,26 +632,19 @@ class ContextIndex:
         return 1
 
     def _indexed_text(self, rel: str, size: int, mtime_ns: int) -> str | None:
-        with self.connect() as conn:
-            if not self._fts_enabled(conn):
-                return None
-            row = conn.execute(
-                """
-                SELECT f.content
-                FROM fts_files f
-                JOIN files meta ON meta.path = f.path
-                WHERE f.path = ?
-                  AND meta.size = ?
-                  AND meta.mtime_ns = ?
-                LIMIT 1
-                """,
-                (rel, size, mtime_ns),
-            ).fetchone()
-        if row is None:
+        row = self.store.get_json(_file_key(rel), {})
+        if not isinstance(row, dict):
             return None
-        return str(row["content"])
+        if int(row.get("size", -1)) != size:
+            return None
+        if int(row.get("mtime_ns", -1)) != mtime_ns:
+            return None
+        content = row.get("content")
+        return content if isinstance(content, str) else None
 
-    def tree(self, path: str = ".", max_entries: int = 200, max_depth: int = 2) -> dict[str, Any]:
+    def tree(
+        self, path: str = ".", max_entries: int = 200, max_depth: int = 2
+    ) -> dict[str, Any]:
         root = self.config.resolve_repo_path(path)
         if not root.exists():
             raise FileNotFoundError(path)
@@ -715,12 +663,19 @@ class ContextIndex:
                 continue
             entries.append(
                 {
-                    "path": str(candidate.relative_to(self.config.repo_path)).replace("\\", "/"),
+                    "path": str(candidate.relative_to(self.config.repo_path)).replace(
+                        "\\", "/"
+                    ),
                     "type": "dir" if candidate.is_dir() else "file",
                     "size": int(candidate.stat().st_size) if candidate.is_file() else 0,
                 }
             )
-        return {"schema": "context_tree.v1", "path": self.config.repo_relative(root), "count": len(entries), "entries": entries}
+        return {
+            "schema": "context_tree.v1",
+            "path": self.config.repo_relative(root),
+            "count": len(entries),
+            "entries": entries,
+        }
 
     def workspace_facts(self) -> dict[str, Any]:
         files = self.files(limit=10000)
@@ -730,7 +685,9 @@ class ContextIndex:
             ext_counts[ext] = ext_counts.get(ext, 0) + 1
         top_extensions = [
             {"extension": ext, "count": count}
-            for ext, count in sorted(ext_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+            for ext, count in sorted(
+                ext_counts.items(), key=lambda item: (-item[1], item[0])
+            )[:8]
         ]
         return {
             "schema": "workspace_facts.v1",
@@ -738,12 +695,62 @@ class ContextIndex:
             "top_extensions": top_extensions,
             "has_tests_dir": (self.config.repo_path / "tests").is_dir()
             or (self.config.repo_path / "test").is_dir(),
-            "has_readme": any((self.config.repo_path / name).is_file() for name in ["README.md", "README.rst", "README.txt"]),
+            "has_readme": any(
+                (self.config.repo_path / name).is_file()
+                for name in ["README.md", "README.rst", "README.txt"]
+            ),
             "is_git_repo": (self.config.repo_path / ".git").exists(),
             "git_branch": git_value(self.config.repo_path, "branch", "--show-current"),
             "git_head": git_value(self.config.repo_path, "rev-parse", "--short", "HEAD"),
             "index": self.status(),
         }
+
+    def _term_rows(self, rel: str, text: str) -> dict[str, dict[str, Any]]:
+        rows: dict[str, dict[str, Any]] = {}
+        for idx, line in enumerate(text.splitlines(), start=1):
+            for term in _tokens(line):
+                row = rows.get(term)
+                if row is None:
+                    rows[term] = {
+                        "path": rel,
+                        "term": term,
+                        "first_line": idx,
+                        "excerpt": line.strip()[:240],
+                        "count": 1,
+                    }
+                else:
+                    row["count"] = int(row.get("count", 0)) + 1
+            if len(rows) >= MAX_INDEX_TERMS_PER_FILE:
+                break
+        for term in _tokens(rel.replace("/", " ").replace(".", " ")):
+            row = rows.get(term)
+            if row is None:
+                rows[term] = {
+                    "path": rel,
+                    "term": term,
+                    "first_line": 1,
+                    "excerpt": rel,
+                    "count": 1,
+                }
+            else:
+                row["count"] = int(row.get("count", 0)) + 1
+        return rows
+
+    def _meta(self) -> dict[str, str]:
+        meta: dict[str, str] = {}
+        for key, value in self.store.iter_json("index:meta:"):
+            if isinstance(value, str):
+                meta[key.removeprefix("index:meta:")] = value
+            else:
+                meta[key.removeprefix("index:meta:")] = str(value)
+        return meta
+
+    def _get_meta(self, key: str) -> str:
+        value = self.store.get_json(f"index:meta:{key}", "")
+        return value if isinstance(value, str) else str(value or "")
+
+    def _set_meta(self, key: str, value: str, txn: Any) -> None:
+        self.store.put_json(f"index:meta:{key}", value or "", txn=txn)
 
     def _runtime_visible_rel(self, rel_path: str) -> bool:
         try:
@@ -755,5 +762,49 @@ class ContextIndex:
         )
 
 
-def _sqlite_like_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+def _tokens(text: str) -> Iterator[str]:
+    for token in TOKEN_RE.findall(text.lower()):
+        if token.isdigit():
+            continue
+        yield token
+
+
+def _rel_token(rel: str) -> str:
+    return sha256_text(rel)[:24]
+
+
+def _file_key(rel: str) -> str:
+    return f"index:file:{rel}"
+
+
+def _symbol_prefix(rel: str) -> str:
+    return f"index:symbol:{_rel_token(rel)}:"
+
+
+def _symbol_key(row: dict[str, Any]) -> str:
+    rel = str(row.get("path", ""))
+    line = int(row.get("line_start", 0))
+    name = str(row.get("name", ""))
+    kind = str(row.get("kind", ""))
+    digest = sha256_text(f"{rel}:{kind}:{name}:{line}")[:16]
+    return f"{_symbol_prefix(rel)}{line:010d}:{digest}"
+
+
+def _import_prefix(rel: str) -> str:
+    return f"index:import:{_rel_token(rel)}:"
+
+
+def _import_key(row: dict[str, Any]) -> str:
+    rel = str(row.get("path", ""))
+    line = int(row.get("line", 0))
+    target = str(row.get("target", ""))
+    digest = sha256_text(f"{rel}:{target}:{line}")[:16]
+    return f"{_import_prefix(rel)}{line:010d}:{digest}"
+
+
+def _term_prefix(term: str) -> str:
+    return f"index:term:{term}:"
+
+
+def _term_key(term: str, rel: str) -> str:
+    return f"{_term_prefix(term)}{rel}"

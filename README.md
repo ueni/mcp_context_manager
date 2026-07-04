@@ -219,15 +219,15 @@ Useful HTTP endpoints:
 In global mode, each selected project gets isolated state:
 
 ```text
-<state_dir>/projects/<slug>-<root_hash>/index/context.sqlite3
-<state_dir>/projects/<slug>-<root_hash>/memory/context_memory.json
-<state_dir>/projects/<slug>-<root_hash>/cache/tool_cache.json
+<state_dir>/projects/<slug>-<root_hash>/store/context.lmdb/
 <state_dir>/projects/<slug>-<root_hash>/references/
-<state_dir>/projects/<slug>-<root_hash>/reports/context_metrics.json
 ```
 
-The root hash is derived from the canonical MCP root URI. Generated state should
-not be committed unless it is an intentional fixture or documented sample.
+The LMDB store holds the repository index, search term index, cache, metrics,
+memory, budgets, and small result references. Large result references may still
+spill into `references/` with LMDB metadata. The root hash is derived from the
+canonical MCP root URI. Generated state should not be committed unless it is an
+intentional fixture or documented sample.
 
 ## Development
 

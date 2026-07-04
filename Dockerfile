@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 ENV HOME=/tmp \
     HOST=0.0.0.0 \
@@ -16,16 +16,31 @@ ENV HOME=/tmp \
 
 WORKDIR /app
 
-RUN python -m venv /opt/venv
-
-COPY pyproject.toml AGENTS.md ./
-COPY src ./src
-
-RUN pip install --no-compile . \
+RUN python -m venv /opt/venv \
     && groupadd --gid 10001 mcp \
     && useradd --uid 10001 --gid mcp --home-dir /tmp --shell /usr/sbin/nologin --no-create-home mcp \
     && mkdir -p /workspace-roots /state \
     && chown -R mcp:mcp /workspace-roots /state
+
+COPY pyproject.toml AGENTS.md ./
+COPY src ./src
+
+FROM base AS test
+
+COPY tests ./tests
+
+RUN pip install --no-compile ".[dev]"
+
+ENV PYTEST_ADDOPTS="-p no:cacheprovider" \
+    RUFF_CACHE_DIR=/tmp/ruff-cache
+
+USER mcp
+
+CMD ["python", "-m", "pytest"]
+
+FROM base AS runtime
+
+RUN pip install --no-compile .
 
 USER mcp
 
