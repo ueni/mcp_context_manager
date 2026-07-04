@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from types import SimpleNamespace
+from typing import Annotated, get_args, get_origin, get_type_hints
 
 import pytest
 
@@ -84,6 +86,69 @@ def test_create_mcp_advertises_server_instructions(monkeypatch, service) -> None
     assert captured["name"] == "mcp-context-manager"
     assert captured["instructions"] == MCP_SERVER_INSTRUCTIONS
     assert "call context_pack first" in MCP_SERVER_INSTRUCTIONS
+
+
+def test_create_mcp_tool_parameters_have_llm_descriptions(
+    monkeypatch, service
+) -> None:
+    registered_tools: dict[str, object] = {}
+
+    class FakeFastMCP:
+        def __init__(self, _name: str, **_kwargs: object):
+            pass
+
+        def tool(self):
+            def decorator(fn):
+                registered_tools[fn.__name__] = fn
+                return fn
+
+            return decorator
+
+        def resource(self, *_args: object, **_kwargs: object):
+            return lambda fn: fn
+
+        def prompt(self, *_args: object, **_kwargs: object):
+            return lambda fn: fn
+
+    monkeypatch.setattr(server_module, "FastMCP", FakeFastMCP)
+
+    server_module.create_mcp(service)
+
+    assert set(registered_tools) == {
+        "context_pack",
+        "context_lookup",
+        "context_memory",
+        "context_admin",
+        "result_reference_resolve",
+    }
+    for tool_name, tool in registered_tools.items():
+        hints = get_type_hints(tool, include_extras=True)
+        for name in inspect.signature(tool).parameters:
+            if name == "ctx":
+                continue
+            description = _annotation_description(hints[name])
+            assert description, f"{tool_name}.{name} is missing a description"
+
+    pack_hints = get_type_hints(registered_tools["context_pack"], include_extras=True)
+    assert "current coding" in _annotation_description(pack_hints["prompt"])
+    lookup_hints = get_type_hints(
+        registered_tools["context_lookup"], include_extras=True
+    )
+    assert "search text" in _annotation_description(lookup_hints["mode"])
+
+
+def _annotation_description(annotation: object) -> str:
+    if get_origin(annotation) is not Annotated:
+        for nested in get_args(annotation):
+            description = _annotation_description(nested)
+            if description:
+                return description
+        return ""
+    for metadata in get_args(annotation)[1:]:
+        description = getattr(metadata, "description", "")
+        if isinstance(description, str):
+            return description
+    return ""
 
 
 def test_mcp_roots_returns_empty_when_session_has_no_roots_support() -> None:
