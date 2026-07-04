@@ -287,6 +287,19 @@ class ProjectContextService:
         )
         return service.repo_metrics_resource()
 
+    def codex_guidance_resource(
+        self,
+        project_id: str | None = None,
+        root_uri: str | None = None,
+        mcp_roots: list[Any] | None = None,
+    ) -> str:
+        service, _project = self._service_for_request(
+            project_id=project_id,
+            root_uri=root_uri,
+            mcp_roots=mcp_roots,
+        )
+        return service.codex_guidance_resource()
+
     def _service_for_request(
         self,
         project_id: str | None = None,

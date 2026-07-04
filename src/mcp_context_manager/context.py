@@ -231,13 +231,276 @@ class ContextService:
             raise ValueError("prompt is required")
         started = time.perf_counter()
         self.config.ensure_state_dirs()
-        self._ensure_index_fresh(max_files=5000)
+        index_refresh = self._ensure_index_fresh(max_files=5000, force=refresh_index)
         profile = output_profile or self._budget()["default_output_profile"]
         budget = max_output_chars or int(self._budget()["max_output_chars"])
         route = classify_route(prompt)
         terms = normalize_query_terms(prompt, max_terms=12)
         explicit_paths = self._collect_paths(prompt, changed_files or [], focus_paths or [])
+        for rel in explicit_paths:
+            try:
+                self._ensure_index_fresh(path=rel, max_files=1, force=refresh_index)
+            except Exception:
+                pass
         memory_context = self._memory_context(route=route, session=memory_session)
+        cache_key = self._context_pack_cache_key(
+            prompt_sha256=sha256_text(prompt),
+            terms=terms,
+            changed_files=changed_files or [],
+            focus_paths=focus_paths or [],
+            explicit_paths=explicit_paths,
+            profile=profile,
+            budget=budget,
+            max_items=max_items,
+        )
+        cached = None if refresh_index else self._cache_get(cache_key)
+        cache_hit = cached is not None
+        if cached:
+            candidates = list(cached.get("candidates", []))
+            selected = list(cached.get("selected", []))
+            omitted = list(cached.get("omitted", []))
+        else:
+            candidates, omitted = self._context_pack_candidates(
+                terms=terms,
+                explicit_paths=explicit_paths,
+                profile=profile,
+                max_items=max_items,
+            )
+            selected, omitted_budget = self._select_candidates(
+                candidates,
+                max_items=max_items,
+                content_budget=max(1000, budget - 2400),
+            )
+            omitted.extend(omitted_budget)
+            self._cache_set(
+                cache_key,
+                {
+                    "schema": "context_pack.retrieval_cache.v1",
+                    "prompt_sha256": sha256_text(prompt),
+                    "route": route,
+                    "terms": terms,
+                    "candidates": candidates,
+                    "selected": selected,
+                    "omitted": omitted,
+                },
+            )
+        full_reference = self.references.create(
+            producer="context_pack",
+            payload={
+                "prompt_sha256": sha256_text(prompt),
+                "route": route,
+                "terms": terms,
+                "candidate_count": len(candidates),
+                "selected_count": len(selected),
+                "candidates": candidates,
+                "omitted": omitted,
+                "cache": {"hit": cache_hit, "key": cache_key},
+            },
+            summary={"route": route, "candidate_count": len(candidates), "selected_count": len(selected)},
+            ttl_hours=24,
+        )
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        estimated_tokens_saved = max(0, sum(int(item.get("raw_chars", 0)) for item in selected) // 4 - estimate_tokens(json.dumps(selected, ensure_ascii=False)))
+        result = {
+            "schema": "context_pack.v1",
+            "generated_at": now_iso(),
+            "repo": {
+                "path": self.config.display_path(self.config.repo_path),
+                "state_dir": self.config.display_path(self.config.state_dir),
+                "project_id": self.config.project_id,
+                "root_uri_hash": sha256_text(self.config.root_uri)
+                if self.config.root_uri
+                else "",
+            },
+            "request": {
+                "prompt": prompt,
+                "route": route,
+                "terms": terms,
+                "changed_files": changed_files or [],
+                "focus_paths": focus_paths or [],
+                "memory_session": memory_session,
+                "output_profile": profile,
+            },
+            "budget": {
+                "max_output_chars": budget,
+                "estimated_output_tokens": estimate_tokens(json.dumps(selected, ensure_ascii=False)),
+            },
+            "summary": {
+                "item_count": len(selected),
+                "candidate_count": len(candidates),
+                "omitted_count": len(omitted),
+                "route": route,
+            },
+            "items": selected,
+            "memory": memory_context,
+            "omitted": omitted,
+            "references": [full_reference],
+            "cache": {
+                "hit": cache_hit,
+                "key": cache_key,
+                "index_refresh": {
+                    "skipped": bool(index_refresh.get("skipped", False)),
+                    "reason": index_refresh.get("reason", ""),
+                },
+            },
+            "safety": {
+                "repository_boundary_enforced": True,
+                "generated_state_only": True,
+                "untrusted_content_signals": self._aggregate_signals(selected),
+            },
+            "metrics": {
+                "elapsed_ms": elapsed_ms,
+                "candidate_count": len(candidates),
+                "selected_count": len(selected),
+                "estimated_input_tokens_saved": estimated_tokens_saved,
+            },
+            "next_actions": [
+                {"action": "resolve_reference", "when": "Need full omitted candidate evidence", "reference_id": full_reference["reference_id"]}
+            ],
+        }
+        self.metrics.record_event(
+            "context_pack",
+            elapsed_ms=elapsed_ms,
+            cache_hit=cache_hit,
+            estimated_input_tokens_saved=estimated_tokens_saved,
+            result_count=len(selected),
+            candidate_count=len(candidates),
+            omitted_count=len(omitted),
+            route=route,
+        )
+        return result
+
+    def result_reference_resolve(
+        self,
+        reference_id: str = "",
+        reference: dict[str, Any] | None = None,
+        expected_hash: str = "",
+    ) -> dict[str, Any]:
+        return self.references.resolve(reference_id=reference_id, reference=reference, expected_hash=expected_hash)
+
+    def repo_summary_resource(self) -> str:
+        return json.dumps(self.index.workspace_facts(), indent=2, sort_keys=True)
+
+    def repo_file_resource(self, path: str) -> str:
+        snippet = self.index.snippet(path=path, start_line=1, end_line=100000, max_chars=self.config.max_output_chars)
+        return snippet["content"]
+
+    def repo_tree_resource(self, path: str) -> str:
+        return json.dumps(self.index.tree(path=path), indent=2, sort_keys=True)
+
+    def repo_context_resource(self, reference_id: str) -> str:
+        return json.dumps(self.references.resolve(reference_id=reference_id), indent=2, sort_keys=True)
+
+    def repo_metrics_resource(self) -> str:
+        return json.dumps(self.metrics.snapshot(), indent=2, sort_keys=True)
+
+    def codex_guidance_resource(self) -> str:
+        return json.dumps(
+            {
+                "schema": "codex_context_pack_first.instructions.v1",
+                "purpose": "Speed up Codex-style coding agents with a first-pass context pack.",
+                "boundary": (
+                    "Repository-side MCP config can strongly steer tool use, but it "
+                    "cannot force the model to call a tool on every turn."
+                ),
+                "instruction": (
+                    "For repository coding, review, debug, test, docs, security, or "
+                    "general questions, call context_pack first with the user's task. "
+                    "Pass changed_files and focus_paths when the user names them. "
+                    "Use compact output by default, inspect returned cited snippets, "
+                    "and resolve references only when raw evidence is needed. Avoid "
+                    "broad rg, tree, or whole-file reads until the pack is insufficient."
+                ),
+                "preferred_tool_order": [
+                    "context_pack",
+                    "context_lookup",
+                    "result_reference_resolve",
+                ],
+                "resource_uris": [
+                    "repo://instructions/codex-context-pack-first",
+                    "repo://project/{project_id}/instructions/codex-context-pack-first",
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+
+    def _ensure_index_fresh(
+        self, path: str = ".", max_files: int = 5000, force: bool = False
+    ) -> dict[str, Any]:
+        return self.index.refresh_if_needed(path=path, max_files=max_files, force=force)
+
+    def _record_metric(
+        self,
+        operation: str,
+        started: float,
+        cache_hit: bool | None = None,
+        result_count: int = 0,
+    ) -> None:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        self.metrics.record_event(
+            operation,
+            elapsed_ms=elapsed_ms,
+            cache_hit=cache_hit,
+            result_count=result_count,
+        )
+
+    def _collect_paths(self, prompt: str, changed: list[str], focus: list[str]) -> list[str]:
+        found: list[str] = []
+        for item in [*changed, *focus]:
+            if item and item not in found:
+                found.append(item)
+        for match in re.findall(r"(?<![\w/.-])[\w./-]+\.[A-Za-z0-9]{1,8}(?=\b|:)", prompt):
+            if match not in found:
+                found.append(match)
+        safe: list[str] = []
+        for rel in found:
+            try:
+                self.config.resolve_repo_path(rel)
+            except ValueError:
+                continue
+            safe.append(rel)
+        return safe[:12]
+
+    def _first_matching_line(self, path: str, terms: list[str]) -> int:
+        return self.index.first_matching_line(path, terms)
+
+    def _context_pack_cache_key(
+        self,
+        prompt_sha256: str,
+        terms: list[str],
+        changed_files: list[str],
+        focus_paths: list[str],
+        explicit_paths: list[str],
+        profile: str,
+        budget: int,
+        max_items: int,
+    ) -> str:
+        status = self.index.status()
+        return self._cache_key(
+            "context_pack",
+            {
+                "prompt_sha256": prompt_sha256,
+                "terms": terms,
+                "changed_files": changed_files,
+                "focus_paths": focus_paths,
+                "explicit_paths": explicit_paths,
+                "output_profile": profile,
+                "max_output_chars": budget,
+                "max_items": max_items,
+                "index_generated_at": status.get("generated_at", ""),
+                "refresh_signature": status.get("refresh_signature", ""),
+                "project_id": self.config.project_id,
+            },
+        )
+
+    def _context_pack_candidates(
+        self,
+        terms: list[str],
+        explicit_paths: list[str],
+        profile: str,
+        max_items: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         candidates: list[dict[str, Any]] = []
         omitted: list[dict[str, Any]] = []
 
@@ -258,11 +521,19 @@ class ContextService:
                     )
                 )
             except Exception as exc:
-                omitted.append({"path": rel, "reason_code": "unreadable_explicit_path", "detail": type(exc).__name__})
+                omitted.append(
+                    {
+                        "path": rel,
+                        "reason_code": "unreadable_explicit_path",
+                        "detail": type(exc).__name__,
+                    }
+                )
 
         if terms:
             try:
-                search = self.index.search(query=" ".join(terms), max_results=max(max_items * 3, 12))
+                search = self.index.search(
+                    query=" ".join(terms), max_results=max(max_items * 3, 12)
+                )
                 for row in search["results"]:
                     path = row["path"]
                     line = int(row.get("line") or self._first_matching_line(path, terms) or 1)
@@ -314,156 +585,7 @@ class ContextService:
         except Exception:
             pass
 
-        selected, omitted_budget = self._select_candidates(candidates, max_items=max_items, content_budget=max(1000, budget - 2400))
-        omitted.extend(omitted_budget)
-        full_reference = self.references.create(
-            producer="context_pack",
-            payload={
-                "prompt_sha256": sha256_text(prompt),
-                "route": route,
-                "terms": terms,
-                "candidate_count": len(candidates),
-                "selected_count": len(selected),
-                "candidates": candidates,
-                "omitted": omitted,
-            },
-            summary={"route": route, "candidate_count": len(candidates), "selected_count": len(selected)},
-            ttl_hours=24,
-        )
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
-        estimated_tokens_saved = max(0, sum(int(item.get("raw_chars", 0)) for item in selected) // 4 - estimate_tokens(json.dumps(selected, ensure_ascii=False)))
-        result = {
-            "schema": "context_pack.v1",
-            "generated_at": now_iso(),
-            "repo": {
-                "path": self.config.display_path(self.config.repo_path),
-                "state_dir": self.config.display_path(self.config.state_dir),
-                "project_id": self.config.project_id,
-                "root_uri_hash": sha256_text(self.config.root_uri)
-                if self.config.root_uri
-                else "",
-            },
-            "request": {
-                "prompt": prompt,
-                "route": route,
-                "terms": terms,
-                "changed_files": changed_files or [],
-                "focus_paths": focus_paths or [],
-                "memory_session": memory_session,
-                "output_profile": profile,
-            },
-            "budget": {
-                "max_output_chars": budget,
-                "estimated_output_tokens": estimate_tokens(json.dumps(selected, ensure_ascii=False)),
-            },
-            "summary": {
-                "item_count": len(selected),
-                "candidate_count": len(candidates),
-                "omitted_count": len(omitted),
-                "route": route,
-            },
-            "items": selected,
-            "memory": memory_context,
-            "omitted": omitted,
-            "references": [full_reference],
-            "safety": {
-                "repository_boundary_enforced": True,
-                "generated_state_only": True,
-                "untrusted_content_signals": self._aggregate_signals(selected),
-            },
-            "metrics": {
-                "elapsed_ms": elapsed_ms,
-                "candidate_count": len(candidates),
-                "selected_count": len(selected),
-                "estimated_input_tokens_saved": estimated_tokens_saved,
-            },
-            "next_actions": [
-                {"action": "resolve_reference", "when": "Need full omitted candidate evidence", "reference_id": full_reference["reference_id"]}
-            ],
-        }
-        self.metrics.record_event(
-            "context_pack",
-            elapsed_ms=elapsed_ms,
-            estimated_input_tokens_saved=estimated_tokens_saved,
-            result_count=len(selected),
-            candidate_count=len(candidates),
-            omitted_count=len(omitted),
-            route=route,
-        )
-        return result
-
-    def result_reference_resolve(
-        self,
-        reference_id: str = "",
-        reference: dict[str, Any] | None = None,
-        expected_hash: str = "",
-    ) -> dict[str, Any]:
-        return self.references.resolve(reference_id=reference_id, reference=reference, expected_hash=expected_hash)
-
-    def repo_summary_resource(self) -> str:
-        return json.dumps(self.index.workspace_facts(), indent=2, sort_keys=True)
-
-    def repo_file_resource(self, path: str) -> str:
-        snippet = self.index.snippet(path=path, start_line=1, end_line=100000, max_chars=self.config.max_output_chars)
-        return snippet["content"]
-
-    def repo_tree_resource(self, path: str) -> str:
-        return json.dumps(self.index.tree(path=path), indent=2, sort_keys=True)
-
-    def repo_context_resource(self, reference_id: str) -> str:
-        return json.dumps(self.references.resolve(reference_id=reference_id), indent=2, sort_keys=True)
-
-    def repo_metrics_resource(self) -> str:
-        return json.dumps(self.metrics.snapshot(), indent=2, sort_keys=True)
-
-    def _ensure_index_fresh(
-        self, path: str = ".", max_files: int = 5000
-    ) -> dict[str, Any]:
-        return self.index.refresh(path=path, max_files=max_files)
-
-    def _record_metric(
-        self,
-        operation: str,
-        started: float,
-        cache_hit: bool | None = None,
-        result_count: int = 0,
-    ) -> None:
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
-        self.metrics.record_event(
-            operation,
-            elapsed_ms=elapsed_ms,
-            cache_hit=cache_hit,
-            result_count=result_count,
-        )
-
-    def _collect_paths(self, prompt: str, changed: list[str], focus: list[str]) -> list[str]:
-        found: list[str] = []
-        for item in [*changed, *focus]:
-            if item and item not in found:
-                found.append(item)
-        for match in re.findall(r"(?<![\w/.-])[\w./-]+\.[A-Za-z0-9]{1,8}(?=\b|:)", prompt):
-            if match not in found:
-                found.append(match)
-        safe: list[str] = []
-        for rel in found:
-            try:
-                self.config.resolve_repo_path(rel)
-            except ValueError:
-                continue
-            safe.append(rel)
-        return safe[:12]
-
-    def _first_matching_line(self, path: str, terms: list[str]) -> int:
-        file_path = self.config.resolve_repo_path(path)
-        try:
-            lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            return 1
-        for idx, line in enumerate(lines, start=1):
-            low = line.lower()
-            if any(term in low for term in terms):
-                return idx
-        return 1
+        return candidates, omitted
 
     def _candidate_from_snippet(
         self,

@@ -9,6 +9,7 @@ import pytest
 
 from mcp_context_manager import server as server_module
 from mcp_context_manager.server import (
+    CODEX_CONTEXT_PACK_FIRST_PROMPT,
     MCP_SERVER_INSTRUCTIONS,
     _mcp_roots,
     _mcp_tools_http_payload,
@@ -135,6 +136,47 @@ def test_create_mcp_tool_parameters_have_llm_descriptions(
         registered_tools["context_lookup"], include_extras=True
     )
     assert "search text" in _annotation_description(lookup_hints["mode"])
+
+
+def test_create_mcp_advertises_codex_guidance_resource_and_prompt(
+    monkeypatch, service
+) -> None:
+    resources: list[str] = []
+    prompts: dict[str, object] = {}
+
+    class FakeFastMCP:
+        def __init__(self, _name: str, **_kwargs: object):
+            pass
+
+        def tool(self):
+            return lambda fn: fn
+
+        def resource(self, uri: str, *_args: object, **_kwargs: object):
+            def decorator(fn):
+                resources.append(uri)
+                return fn
+
+            return decorator
+
+        def prompt(self, *_args: object, **_kwargs: object):
+            def decorator(fn):
+                prompts[fn.__name__] = fn
+                return fn
+
+            return decorator
+
+    monkeypatch.setattr(server_module, "FastMCP", FakeFastMCP)
+
+    server_module.create_mcp(service)
+
+    assert "repo://instructions/codex-context-pack-first" in resources
+    assert (
+        "repo://project/{project_id}/instructions/codex-context-pack-first"
+        in resources
+    )
+    prompt = prompts["use_context_pack_first"]("review auth behavior")
+    assert CODEX_CONTEXT_PACK_FIRST_PROMPT in prompt
+    assert "Task: review auth behavior" in prompt
 
 
 def _annotation_description(annotation: object) -> str:

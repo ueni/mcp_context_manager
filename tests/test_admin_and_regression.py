@@ -33,6 +33,24 @@ def _count_python_read_bytes(repo: Path, monkeypatch) -> list[str]:
     return read_paths
 
 
+def _count_python_read_text(repo: Path, monkeypatch) -> list[str]:
+    original_read_text = Path.read_text
+    read_paths: list[str] = []
+
+    def counted_read_text(path: Path, *args, **kwargs) -> str:
+        try:
+            rel = path.resolve().relative_to(repo.resolve())
+        except ValueError:
+            pass
+        else:
+            if rel.suffix == ".py":
+                read_paths.append(str(rel))
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+    return read_paths
+
+
 def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     budget = service.context_admin(
         mode="budget", max_output_chars=4096, default_output_profile="normal"
@@ -110,6 +128,8 @@ def test_cold_then_warm_context_pack_flow(service: ContextService) -> None:
 
     assert cold["items"]
     assert warm["items"]
+    assert cold["cache"]["hit"] is False
+    assert warm["cache"]["hit"] is True
     assert warm["metrics"]["elapsed_ms"] >= 0
     assert warm["references"][0]["reference_id"].startswith("ctxref-")
 
@@ -193,6 +213,25 @@ def test_cached_search_does_not_reread_unchanged_files(
     assert read_paths == []
 
 
+def test_indexed_snippet_does_not_reread_source_text(
+    sample_repo: Path, monkeypatch
+) -> None:
+    service = ContextService(
+        ContextConfig(
+            repo_path=sample_repo.resolve(),
+            state_dir=(sample_repo / ".mcp-context-manager").resolve(),
+        )
+    )
+    service.context_admin(mode="index_refresh")
+
+    read_paths = _count_python_read_text(sample_repo, monkeypatch)
+
+    snippet = service.context_lookup(mode="snippet", path="src/auth.py")
+
+    assert snippet["source"] == "index"
+    assert read_paths == []
+
+
 def test_warm_context_pack_does_not_probe_every_unchanged_file(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -208,11 +247,25 @@ def test_warm_context_pack_does_not_probe_every_unchanged_file(
     service.context_pack("review needle", max_items=1)
 
     read_paths = _count_python_read_bytes(repo, monkeypatch)
+    text_paths = _count_python_read_text(repo, monkeypatch)
 
     pack = service.context_pack("review needle", max_items=1)
 
     assert pack["items"]
+    assert pack["cache"]["hit"] is True
     assert len(set(read_paths)) < 30
+    assert text_paths == []
+
+
+def test_codex_guidance_resource_states_pack_first_boundary(
+    service: ContextService,
+) -> None:
+    guidance = json.loads(service.codex_guidance_resource())
+
+    assert guidance["schema"] == "codex_context_pack_first.instructions.v1"
+    assert "cannot force the model" in guidance["boundary"]
+    assert "call context_pack first" in guidance["instruction"]
+    assert "repo://instructions/codex-context-pack-first" in guidance["resource_uris"]
 
 
 def test_index_refresh_streams_traversal_without_rglob(

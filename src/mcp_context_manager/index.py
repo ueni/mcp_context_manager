@@ -19,6 +19,7 @@ from .util import (
     prompt_injection_signals,
     redact_text,
     sha256_bytes,
+    sha256_text,
     should_skip_path,
     trim_text,
 )
@@ -155,6 +156,7 @@ class ContextIndex:
         root = self.config.resolve_repo_path(path)
         if not root.exists():
             raise FileNotFoundError(path)
+        whole_repo_refresh = root == self.config.repo_path
         indexed_at = now_iso()
         files = self._iter_candidate_files(root, max_files=max_files)
         with self.connect() as conn:
@@ -246,6 +248,19 @@ class ContextIndex:
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("generated_at", generated_at))
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("git_head", git_value(self.config.repo_path, "rev-parse", "HEAD")))
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("git_branch", git_value(self.config.repo_path, "branch", "--show-current")))
+            if whole_repo_refresh:
+                signature = self.refresh_signature()
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                    ("refresh_signature", signature["signature"]),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                    (
+                        "refresh_signature_available",
+                        "true" if signature["available"] else "false",
+                    ),
+                )
             conn.commit()
             total_files = conn.execute("SELECT COUNT(*) AS count FROM files").fetchone()["count"]
             total_symbols = conn.execute("SELECT COUNT(*) AS count FROM symbols").fetchone()["count"]
@@ -262,6 +277,84 @@ class ContextIndex:
             "unchanged_count": unchanged_count,
             "removed_count": removed_count,
             "fts_enabled": fts_enabled,
+        }
+
+    def refresh_if_needed(
+        self, path: str = ".", max_files: int = 5000, force: bool = False
+    ) -> dict[str, Any]:
+        if force:
+            result = self.refresh(path=path, max_files=max_files)
+            result["skipped"] = False
+            result["reason"] = "forced"
+            return result
+        root = self.config.resolve_repo_path(path)
+        if root != self.config.repo_path:
+            result = self.refresh(path=path, max_files=max_files)
+            result["skipped"] = False
+            result["reason"] = "scoped_refresh"
+            return result
+        signature = self.refresh_signature()
+        if not signature["available"]:
+            result = self.refresh(path=path, max_files=max_files)
+            result["skipped"] = False
+            result["reason"] = "signature_unavailable"
+            return result
+        with self.connect() as conn:
+            self.initialize(conn)
+            meta = {
+                row["key"]: row["value"]
+                for row in conn.execute("SELECT key, value FROM meta")
+            }
+            file_count = conn.execute("SELECT COUNT(*) AS count FROM files").fetchone()[
+                "count"
+            ]
+        if file_count and meta.get("refresh_signature") == signature["signature"]:
+            status = self.status()
+            return {
+                "schema": "context_index.refresh.v1",
+                "generated_at": status["generated_at"],
+                "index_path": status["index_path"],
+                "file_count": status["file_count"],
+                "symbol_count": status["symbol_count"],
+                "import_count": status.get("import_count", 0),
+                "files_considered": 0,
+                "updated_count": 0,
+                "unchanged_count": status["file_count"],
+                "removed_count": 0,
+                "fts_enabled": status["fts_enabled"],
+                "skipped": True,
+                "reason": "signature_unchanged",
+            }
+        result = self.refresh(path=path, max_files=max_files)
+        result["skipped"] = False
+        result["reason"] = "signature_changed"
+        return result
+
+    def refresh_signature(self) -> dict[str, Any]:
+        if not (self.config.repo_path / ".git").exists():
+            return {
+                "schema": "context_index.refresh_signature.v1",
+                "available": False,
+                "signature": "",
+                "source": "none",
+            }
+        git_head = git_value(self.config.repo_path, "rev-parse", "HEAD")
+        status = git_value(self.config.repo_path, "status", "--porcelain=v1", "-z")
+        if not git_head:
+            return {
+                "schema": "context_index.refresh_signature.v1",
+                "available": False,
+                "signature": "",
+                "source": "git",
+            }
+        status_hash = sha256_text(status)
+        return {
+            "schema": "context_index.refresh_signature.v1",
+            "available": True,
+            "signature": f"git:{git_head}:{status_hash}",
+            "source": "git",
+            "git_head": git_head,
+            "git_status_hash": status_hash,
         }
 
     def _delete_file_rows(
@@ -289,6 +382,7 @@ class ContextIndex:
             fts_enabled = self.initialize(conn)
             file_count = conn.execute("SELECT COUNT(*) AS count FROM files").fetchone()["count"]
             symbol_count = conn.execute("SELECT COUNT(*) AS count FROM symbols").fetchone()["count"]
+            import_count = conn.execute("SELECT COUNT(*) AS count FROM imports").fetchone()["count"]
             meta = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM meta")}
         return {
             "schema": "context_index.status.v1",
@@ -296,10 +390,16 @@ class ContextIndex:
             "exists": self.config.index_db_path.exists(),
             "file_count": int(file_count),
             "symbol_count": int(symbol_count),
+            "import_count": int(import_count),
             "fts_enabled": fts_enabled,
             "generated_at": meta.get("generated_at", ""),
             "git_head": meta.get("git_head", ""),
             "git_branch": meta.get("git_branch", ""),
+            "refresh_signature": meta.get("refresh_signature", ""),
+            "refresh_signature_available": meta.get(
+                "refresh_signature_available", "false"
+            )
+            == "true",
         }
 
     def files(self, limit: int = 1000) -> list[dict[str, Any]]:
@@ -523,11 +623,16 @@ class ContextIndex:
             raise FileNotFoundError(path)
         if should_skip_path(file_path, self.config.repo_path, self.config.state_dir):
             raise ValueError("path is excluded by runtime skip rules")
-        if file_path.stat().st_size > self.config.max_read_bytes:
+        stat = file_path.stat()
+        rel = self.config.repo_relative(file_path)
+        text = self._indexed_text(rel, size=int(stat.st_size), mtime_ns=int(stat.st_mtime_ns))
+        source = "index" if text is not None else "file"
+        if text is None and stat.st_size > self.config.max_read_bytes:
             raise ValueError("file exceeds max_read_bytes")
-        if is_likely_binary(file_path):
+        if text is None and is_likely_binary(file_path):
             raise ValueError("binary file is not readable as a snippet")
-        text = file_path.read_text(encoding="utf-8", errors="replace")
+        if text is None:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         total = len(lines)
         requested_end = end_line if end_line is not None else start_line
@@ -548,8 +653,48 @@ class ContextIndex:
             "content": content,
             "truncated": truncated,
             "redactions": redactions,
+            "source": source,
             "prompt_injection_signals": prompt_injection_signals(content),
         }
+
+    def first_matching_line(self, path: str, terms: list[str]) -> int:
+        file_path = self.config.resolve_repo_path(path)
+        try:
+            stat = file_path.stat()
+        except OSError:
+            return 1
+        rel = self.config.repo_relative(file_path)
+        text = self._indexed_text(rel, size=int(stat.st_size), mtime_ns=int(stat.st_mtime_ns))
+        if text is None:
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return 1
+        for idx, line in enumerate(text.splitlines(), start=1):
+            low = line.lower()
+            if any(term in low for term in terms):
+                return idx
+        return 1
+
+    def _indexed_text(self, rel: str, size: int, mtime_ns: int) -> str | None:
+        with self.connect() as conn:
+            if not self._fts_enabled(conn):
+                return None
+            row = conn.execute(
+                """
+                SELECT f.content
+                FROM fts_files f
+                JOIN files meta ON meta.path = f.path
+                WHERE f.path = ?
+                  AND meta.size = ?
+                  AND meta.mtime_ns = ?
+                LIMIT 1
+                """,
+                (rel, size, mtime_ns),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["content"])
 
     def tree(self, path: str = ".", max_entries: int = 200, max_depth: int = 2) -> dict[str, Any]:
         root = self.config.resolve_repo_path(path)

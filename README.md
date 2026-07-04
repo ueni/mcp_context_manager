@@ -74,16 +74,31 @@ they are not JSON-RPC methods named `context_pack`, `context_admin`, and so on.
 - `repo://context/{reference_id}`: resolved result reference for an unambiguous
   project.
 - `repo://metrics`: compact metrics for an unambiguous project.
+- `repo://instructions/codex-context-pack-first`: portable guidance telling
+  coding agents to call `context_pack` before broad repository inspection.
 - `repo://project/{project_id}/summary`
 - `repo://project/{project_id}/file/{path}`
 - `repo://project/{project_id}/tree/{path}`
 - `repo://project/{project_id}/context/{reference_id}`
 - `repo://project/{project_id}/metrics`
+- `repo://project/{project_id}/instructions/codex-context-pack-first`
 
 Metrics include request counts, cache hits and misses, estimated saved input
 tokens, retrieval counts, route totals, and recent latency benchmarks. They are
 stored under project-local generated state and do not include prompts, query
 text, file contents, or secrets.
+
+## Codex Speed Guidance
+
+Repository-side MCP configuration can make this server available and can provide
+strong server instructions, but it cannot force the model to call a tool on every
+turn. The practical speed path is to make the first `context_pack` call fast and
+useful enough that agents do not need broad `rg`, tree, or whole-file reads.
+
+Agents can read `repo://instructions/codex-context-pack-first` or use the
+`use_context_pack_first` prompt. For global multi-root sessions, use
+`repo://project/{project_id}/instructions/codex-context-pack-first` after
+selecting a project.
 
 ## Run With Docker Compose
 
