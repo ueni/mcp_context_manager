@@ -1,6 +1,10 @@
 services:
   mcp-context-manager:
-    build: .
+    build:
+      context: .
+      args:
+        MCP_CONTEXT_UID: ${MCP_CONTEXT_UID:-1000}
+        MCP_CONTEXT_GID: ${MCP_CONTEXT_GID:-1000}
     image: mcp-context-manager:local
     environment:
       HOST: 0.0.0.0

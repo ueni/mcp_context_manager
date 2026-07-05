@@ -213,6 +213,23 @@ Global parent mode for multiple repositories under one host directory:
 MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up --build
 ```
 
+The image runs as non-root UID/GID `1000` by default. This matches the first
+Ubuntu/WSL user and lets the container read owner-only repository files while
+the source mount stays read-only. If your repository is owned by another user,
+build with matching IDs:
+
+```bash
+MCP_CONTEXT_UID=$(id -u) MCP_CONTEXT_GID=$(id -g) docker compose up --build
+```
+
+If an existing named state volume was created with a different UID/GID, recreate
+it after changing these build args:
+
+```bash
+docker compose down -v
+MCP_CONTEXT_UID=$(id -u) MCP_CONTEXT_GID=$(id -g) docker compose up --build
+```
+
 This mounts the host parent read-only:
 
 ```text
@@ -307,6 +324,7 @@ Useful HTTP endpoints:
 | `MCP_CONTEXT_ALLOWED_ROOTS` | Host paths allowed for MCP root URIs. Required for global roots outside `REPO_PATH`. |
 | `MCP_CONTEXT_ROOT_MAPPINGS` | Host-to-container path mappings, such as `/home/user/source=/workspace-roots`. |
 | `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host parent mounted at `/workspace-roots`. |
+| `MCP_CONTEXT_UID` / `MCP_CONTEXT_GID` | Compose build args for the non-root container user. Defaults to `1000:1000` for Ubuntu/WSL repository ownership. |
 | `MCP_TRANSPORT` | `stdio` by default, or `streamable-http`. |
 | `HOST` / `PORT` | HTTP bind settings. Compose binds the published port to localhost. |
 | `MAX_READ_BYTES` | Maximum file bytes read for snippets/indexing. |

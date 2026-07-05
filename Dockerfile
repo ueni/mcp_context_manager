@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1.7
 FROM python:3.12-slim AS base
 
+ARG MCP_CONTEXT_UID=1000
+ARG MCP_CONTEXT_GID=1000
+
 ENV HOME=/tmp \
     HOST=0.0.0.0 \
     MCP_CONTEXT_STATE_DIR=/state \
@@ -17,8 +20,8 @@ ENV HOME=/tmp \
 WORKDIR /app
 
 RUN python -m venv /opt/venv \
-    && groupadd --gid 10001 mcp \
-    && useradd --uid 10001 --gid mcp --home-dir /tmp --shell /usr/sbin/nologin --no-create-home mcp \
+    && groupadd --gid "${MCP_CONTEXT_GID}" mcp \
+    && useradd --uid "${MCP_CONTEXT_UID}" --gid mcp --home-dir /tmp --shell /usr/sbin/nologin --no-create-home mcp \
     && mkdir -p /workspace-roots /state \
     && chown -R mcp:mcp /workspace-roots /state
 
