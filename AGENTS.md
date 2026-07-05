@@ -11,6 +11,31 @@ Use that project for ideas and contracts, but do not create a runtime dependency
 on it. This repo should become a focused context-management server, not a full
 clone of the broader codebase-tooling server.
 
+## MCP-First Agent Requirement
+
+Agents working in any repository where this server is available must use the
+`mcp-context-manager` MCP tools before broad local inspection. Repository
+instructions cannot technically force a model to call a tool, but agents that
+follow this file must treat the MCP-first flow as mandatory for coding, review,
+debug, test, docs, security, and general repository tasks.
+
+- Start with `context_pack` for the user's task. Pass `changed_files` and
+  `focus_paths` when the user names files, paths, branches, failing tests, or
+  review findings.
+- Include `root_uri` derived from the active checkout path, for example
+  `file://$PWD`; do not hard-code a host-specific repository path.
+- Use `output_profile="compact"` by default. Use `normal` or `verbose` only
+  when the user asks for more evidence or the compact pack is insufficient.
+- Use `context_lookup` for targeted follow-up search, snippets, trees, symbols,
+  or references after reading the pack. Avoid broad `rg`, `find`, `tree`, or
+  whole-file reads until the pack and targeted lookup are insufficient.
+- Use `result_reference_resolve` only when raw referenced evidence is needed.
+  Inspect raw evidence before destructive edits, release claims, or security
+  conclusions.
+- Use `context_admin` for health, index, cache, contracts, metrics, and
+  benchmark checks. Use `context_memory` only for structured, non-secret
+  repository-local facts, summaries, and decisions.
+
 ## Product Scope
 
 - Scope: one mounted project repository, configured by `REPO_PATH` and bounded to
@@ -185,8 +210,9 @@ context-pack loop is reliable and measured.
 ## Coding Workflow For Agents
 
 1. Inspect the destination repo state before editing and avoid unrelated churn.
-2. Start with `context_router(mode="pack", ...)` once it exists; until then, use
-   targeted `rg`, file reads, and source inspection instead of broad dumps.
+2. Start every repository task with `context_pack` through the MCP server, using
+   compact output and a checkout-derived `root_uri`; then use `context_lookup`
+   for narrow follow-up evidence before falling back to local shell inspection.
 3. Prefer compact schemas and deterministic helpers over free-form prose.
 4. When adding any public result field, document whether it is stable or
    experimental and add a focused test.
