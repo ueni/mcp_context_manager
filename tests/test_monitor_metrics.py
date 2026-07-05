@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any
 
 
@@ -139,6 +140,43 @@ class FakeClient:
         raise AssertionError(f"unexpected call: {name} {arguments}")
 
 
+class ConcurrentMetricsClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = Lock()
+        self._release = Event()
+        self._active_metrics = 0
+        self.metrics_started = 0
+        self.max_active_metrics = 0
+
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        mode = arguments.get("mode")
+        if mode != "metrics":
+            return super().call_tool(name, arguments)
+
+        with self._lock:
+            self.calls.append((name, arguments))
+            self._active_metrics += 1
+            self.metrics_started += 1
+            self.max_active_metrics = max(
+                self.max_active_metrics, self._active_metrics
+            )
+            if self.metrics_started >= 2:
+                self._release.set()
+        self._release.wait(timeout=0.5)
+        with self._lock:
+            self._active_metrics -= 1
+        project_id = arguments.get("project_id", "")
+        return {
+            "schema": "context_metrics.v1",
+            "project_id": project_id,
+            "requests": {"total": 1, "by_operation": {}},
+            "cache": {"hits": 0, "misses": 0, "hit_ratio": 0.0},
+            "tokens": {},
+            "references": {},
+        }
+
+
 class FailingProjectsClient(FakeClient):
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if arguments.get("mode") == "projects":
@@ -204,6 +242,22 @@ def test_collect_snapshots_enumerates_projects_and_calls_metrics() -> None:
         "context_admin",
         {"mode": "measurement_matrix", "project_id": "beta-456"},
     ) in client.calls
+
+
+def test_collect_snapshots_fetches_project_metrics_in_parallel() -> None:
+    monitor = load_monitor_module()
+    client = ConcurrentMetricsClient()
+
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=[],
+        root_uri="",
+        include_matrix=False,
+        max_workers=2,
+    )
+
+    assert [row.target.project_id for row in snapshots] == ["alpha-123", "beta-456"]
+    assert client.max_active_metrics == 2
 
 
 def test_collect_snapshots_project_id_survives_project_discovery_error() -> None:
@@ -324,6 +378,13 @@ def test_interactive_key_bindings_update_state() -> None:
     assert monitor.handle_key("enter", state, row_count=3, state_row_count=2) == "state_entry"
     assert monitor.handle_key("refresh", state, row_count=3, state_row_count=2) == "ignore"
     assert monitor.handle_key("plus", state, row_count=3, state_row_count=2) == "ignore"
+
+
+def test_default_refresh_interval_is_60_seconds() -> None:
+    monitor = load_monitor_module()
+
+    assert monitor.DEFAULT_INTERVAL == 60.0
+    assert monitor.MonitorState().refresh_interval == 60.0
 
 
 def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:

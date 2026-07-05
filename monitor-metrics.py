@@ -14,7 +14,7 @@ No third-party dependencies are required.
 Usage:
   python3 monitor-metrics.py
   python3 monitor-metrics.py --once
-  python3 monitor-metrics.py --interval 5
+  python3 monitor-metrics.py --interval 60
   python3 monitor-metrics.py --project-id my-repo-123abc
   python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp --color always
 
@@ -41,12 +41,14 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 DEFAULT_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
 DEFAULT_TIMEOUT = 15.0
-DEFAULT_INTERVAL = 5.0
+DEFAULT_INTERVAL = 60.0
+DEFAULT_FETCH_WORKERS = 8
 MIN_INTERVAL = 0.5
 MAX_INTERVAL = 3600.0
 INTERVAL_STEP = 1.0
@@ -131,20 +133,22 @@ class McpHttpClient:
         self.session_id = session_id or os.environ.get("MCP_SESSION_ID") or ""
         self.initialized = False
         self._request_id = 0
+        self._lock = RLock()
 
     def initialize(self) -> None:
-        if self.initialized:
-            return
-        self.rpc(
-            "initialize",
-            {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "monitor-metrics", "version": "0.2.0"},
-            },
-        )
-        self.rpc("notifications/initialized", {}, expect_result=False)
-        self.initialized = True
+        with self._lock:
+            if self.initialized:
+                return
+            self.rpc(
+                "initialize",
+                {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "monitor-metrics", "version": "0.2.0"},
+                },
+            )
+            self.rpc("notifications/initialized", {}, expect_result=False)
+            self.initialized = True
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.initialize()
@@ -163,23 +167,26 @@ class McpHttpClient:
         params: dict[str, Any] | None = None,
         expect_result: bool = True,
     ) -> dict[str, Any]:
-        self._request_id += 1
+        with self._lock:
+            self._request_id += 1
+            request_id = self._request_id
+            session_id = self.session_id
         payload: dict[str, Any] = {
             "jsonrpc": "2.0",
             "method": method,
             "params": params or {},
         }
         if expect_result:
-            payload["id"] = f"monitor-{self._request_id}"
+            payload["id"] = f"monitor-{request_id}"
         data = json.dumps(payload).encode("utf-8")
         headers = {
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
         }
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
         request = urllib.request.Request(
-            _with_session_query(self.url, self.session_id),
+            _with_session_query(self.url, session_id),
             data=data,
             headers=headers,
         )
@@ -190,7 +197,8 @@ class McpHttpClient:
                     or response.headers.get("mcp-session-id")
                 )
                 if response_session:
-                    self.session_id = response_session
+                    with self._lock:
+                        self.session_id = response_session
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -310,10 +318,15 @@ def collect_snapshots(
     project_ids: list[str],
     root_uri: str,
     include_matrix: bool,
+    max_workers: int = DEFAULT_FETCH_WORKERS,
 ) -> list[ProjectSnapshot]:
     if root_uri:
         target = ProjectTarget(project_id="", name=root_uri, source="root_uri")
-        return [_collect_one(client, target, root_uri=root_uri, include_matrix=include_matrix)]
+        return [
+            _collect_one(
+                client, target, root_uri=root_uri, include_matrix=include_matrix
+            )
+        ]
 
     known_projects = _safe_discover_projects(client)
     known_by_id = {target.project_id: target for target in known_projects}
@@ -326,10 +339,43 @@ def collect_snapshots(
         targets = known_projects
     if not targets:
         targets = [ProjectTarget(project_id="", name="default", source="fallback")]
-    return [
-        _collect_one(client, target, root_uri="", include_matrix=include_matrix)
-        for target in targets
-    ]
+    return _collect_targets(
+        client,
+        targets,
+        root_uri="",
+        include_matrix=include_matrix,
+        max_workers=max_workers,
+    )
+
+
+def _collect_targets(
+    client: Any,
+    targets: list[ProjectTarget],
+    root_uri: str,
+    include_matrix: bool,
+    max_workers: int,
+) -> list[ProjectSnapshot]:
+    if len(targets) <= 1:
+        return [
+            _collect_one(
+                client, targets[0], root_uri=root_uri, include_matrix=include_matrix
+            )
+        ]
+    worker_count = min(max(1, max_workers), len(targets))
+    with ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix="monitor-fetch"
+    ) as executor:
+        futures = [
+            executor.submit(
+                _collect_one,
+                client,
+                target,
+                root_uri,
+                include_matrix,
+            )
+            for target in targets
+        ]
+        return [future.result() for future in futures]
 
 
 def fetch_state_browser(
@@ -1800,8 +1846,9 @@ def main() -> int:
         type=float,
         default=None,
         help=(
-            "Refresh interval in seconds. Default is 5 in an interactive terminal "
-            "and one-shot output otherwise. 0 runs once and exits."
+            f"Refresh interval in seconds. Default is {DEFAULT_INTERVAL:g} in an "
+            "interactive terminal and one-shot output otherwise. 0 runs once and "
+            "exits."
         ),
     )
     parser.add_argument(
@@ -1834,7 +1881,7 @@ def main() -> int:
     parser.add_argument(
         "--no-matrix",
         action="store_true",
-        help="Skip measurement_matrix calls and render metrics only.",
+        help="Skip slower measurement_matrix calls and render metrics only.",
     )
     parser.add_argument(
         "--no-clear",
