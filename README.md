@@ -138,6 +138,55 @@ likely inspect without ranking. `output_tokens_est` estimates the selected pack
 items returned to the model. The formula is intentionally conservative: if the
 compact JSON is larger than the candidate evidence estimate, savings are `0`.
 
+## Live Metrics Monitor
+
+`monitor-metrics.py` is a small terminal dashboard that reads metrics directly
+from MCP tool calls. It calls `context_admin(mode="projects")`, then
+`context_admin(mode="metrics")` and `context_admin(mode="measurement_matrix")`
+for each project. It does not use MCP resources or direct state-file reads.
+
+Run it interactively:
+
+```bash
+python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp
+```
+
+Controls:
+
+| Key | Action |
+| --- | --- |
+| `Up` / `Down` | Select a project row. |
+| `Enter` | Open details for the selected project. |
+| `b` | Browse sanitized generated state for the selected project. |
+| `Esc` | Return to the project table. |
+| `+` / `-` | Increase or decrease the refresh interval. |
+| `r` | Refresh immediately. |
+| `q` | Quit. |
+
+Render one snapshot and exit:
+
+```bash
+python3 monitor-metrics.py --once
+```
+
+Print refreshed snapshots without key handling:
+
+```bash
+python3 monitor-metrics.py --interval 5 --non-interactive
+```
+
+Monitor one known project or root:
+
+```bash
+python3 monitor-metrics.py --project-id my-repo-123abc
+python3 monitor-metrics.py --root-uri file:///home/user/source/my-repo
+```
+
+The dashboard shows request volume, `context_pack` latency, cache hit bars,
+estimated tokens saved, deferred reference bytes, and measurement-matrix status.
+The state browser calls `context_admin(mode="state_browser")` for the selected
+project and shows bounded, redacted generated-state rows.
+
 Run the built-in offline benchmark through MCP/admin:
 
 ```bash
@@ -263,19 +312,22 @@ Useful HTTP endpoints:
 | `MAX_READ_BYTES` | Maximum file bytes read for snippets/indexing. |
 | `MAX_OUTPUT_CHARS` | Default output budget. |
 | `MCP_CONTEXT_OUTPUT_PROFILE` | `compact`, `normal`, or `verbose`. |
+| `MCP_CONTEXT_TOKEN_COUNTER` | `estimate` by default, or `target` to try an optional target tokenizer. |
+| `MCP_CONTEXT_TARGET_TOKENIZER` | Target tokenizer name for `target` mode, defaulting to `cl100k_base`. |
 
 ## Generated State
 
 In global mode, each selected project gets isolated state:
 
 ```text
-<state_dir>/projects/<slug>-<root_hash>/store/context.lmdb/
+<state_dir>/projects/<slug>-<root_hash>/store/
 <state_dir>/projects/<slug>-<root_hash>/references/
 ```
 
-The LMDB store holds the repository index, search term index, cache, metrics,
-memory, budgets, and small result references. Large result references may still
-spill into `references/` with LMDB metadata. The root hash is derived from the
+Generated state holds the repository index, search term index, cache, metrics,
+memory, budgets, and result-reference metadata. Large result references may use
+the project `references/` area while public responses keep only stable
+identifiers, hashes, TTLs, and resolver URIs. The root hash is derived from the
 canonical MCP root URI. Generated state should not be committed unless it is an
 intentional fixture or documented sample.
 

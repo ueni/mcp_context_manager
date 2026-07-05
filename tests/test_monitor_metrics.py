@@ -1,0 +1,344 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def load_monitor_module() -> Any:
+    path = Path(__file__).resolve().parents[1] / "monitor-metrics.py"
+    spec = importlib.util.spec_from_file_location("monitor_metrics", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((name, arguments))
+        mode = arguments.get("mode")
+        project_id = arguments.get("project_id", "")
+        if mode == "projects":
+            return {
+                "schema": "context_projects.list.v1",
+                "projects": [
+                    {"project_id": "beta-456", "name": "Beta", "source": "known"},
+                    {"project_id": "alpha-123", "name": "Alpha", "source": "known"},
+                ],
+            }
+        if mode == "metrics":
+            return {
+                "schema": "context_metrics.v1",
+                "project_id": project_id,
+                "requests": {
+                    "total": 10,
+                    "by_operation": {
+                        "context_pack": {"count": 3, "avg_elapsed_ms": 42.5}
+                    },
+                },
+                "cache": {"hits": 6, "misses": 2, "hit_ratio": 0.75},
+                "tokens": {"estimated_input_tokens_saved": 12345},
+                "references": {"bytes_deferred_est": 4096},
+            }
+        if mode == "measurement_matrix":
+            return {
+                "schema": "context_measurement_matrix.v1",
+                "checks": [
+                    {"key": "a", "status": "pass"},
+                    {"key": "b", "status": "pass"},
+                ],
+            }
+        if mode == "state_browser":
+            state_key = str(arguments.get("state_key") or "")
+            if state_key:
+                return {
+                    "schema": "context_state_browser.v1",
+                    "mode": "entry",
+                    "entry": {
+                        "key": state_key,
+                        "value_type": "dict",
+                        "size_chars": 42,
+                        "schema": "debug.sample.v1",
+                        "status": "active",
+                        "expires_at": "",
+                        "preview": '{\n  "hello": "world"\n}',
+                    },
+                }
+            return {
+                "schema": "context_state_browser.v1",
+                "mode": "list",
+                "rows": [
+                    {
+                        "key": "cache:abc",
+                        "value_type": "dict",
+                        "size_chars": 42,
+                        "schema": "debug.sample.v1",
+                        "status": "active",
+                        "expires_at": "",
+                        "preview": "{}",
+                    }
+                ],
+                "prefix_counts": [{"prefix": "cache:", "count": 1}],
+            }
+        raise AssertionError(f"unexpected call: {name} {arguments}")
+
+
+class FailingProjectsClient(FakeClient):
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if arguments.get("mode") == "projects":
+            self.calls.append((name, arguments))
+            raise RuntimeError("projects unavailable")
+        return super().call_tool(name, arguments)
+
+
+def test_extract_tool_payload_from_text_content() -> None:
+    monitor = load_monitor_module()
+
+    payload = monitor.extract_tool_payload(
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": '{"schema": "context_metrics.v1", "requests": {"total": 2}}',
+                }
+            ]
+        }
+    )
+
+    assert payload["schema"] == "context_metrics.v1"
+    assert payload["requests"]["total"] == 2
+
+
+def test_collect_snapshots_enumerates_projects_and_calls_metrics() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=[],
+        root_uri="",
+        include_matrix=True,
+    )
+
+    assert [row.target.project_id for row in snapshots] == ["alpha-123", "beta-456"]
+    assert all(row.metrics["schema"] == "context_metrics.v1" for row in snapshots)
+    assert ("context_admin", {"mode": "projects"}) in client.calls
+    assert (
+        "context_admin",
+        {"mode": "metrics", "project_id": "alpha-123"},
+    ) in client.calls
+    assert (
+        "context_admin",
+        {"mode": "measurement_matrix", "project_id": "beta-456"},
+    ) in client.calls
+
+
+def test_collect_snapshots_project_id_survives_project_discovery_error() -> None:
+    monitor = load_monitor_module()
+    client = FailingProjectsClient()
+
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["manual-project"],
+        root_uri="",
+        include_matrix=False,
+    )
+
+    assert len(snapshots) == 1
+    assert snapshots[0].target.project_id == "manual-project"
+    assert snapshots[0].metrics["schema"] == "context_metrics.v1"
+    assert (
+        "context_admin",
+        {"mode": "metrics", "project_id": "manual-project"},
+    ) in client.calls
+
+
+def test_render_dashboard_contains_visual_summary() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=True,
+    )
+
+    rendered = monitor.render_dashboard(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+    )
+
+    assert "mcp-context-manager metrics" in rendered
+    assert "| cache hit     | [##############----]  75.0% |" in rendered
+    assert "| project" in rendered
+    assert "| Alpha" in rendered
+    assert "| alpha-123" in rendered
+    assert "|    10 |     3 |" in rendered
+    assert "2 pass" in rendered
+
+
+def test_render_dashboard_keeps_long_project_names_readable() -> None:
+    monitor = load_monitor_module()
+    snapshot = monitor.ProjectSnapshot(
+        target=monitor.ProjectTarget(
+            project_id="akkodis-conan-center-index-1234567890abcdef",
+            name="akkodis-conan-center-index",
+            source="known",
+        ),
+        metrics={
+            "requests": {
+                "total": 4,
+                "by_operation": {
+                    "context_pack": {"count": 4, "avg_elapsed_ms": 413.9}
+                },
+            },
+            "cache": {"hits": 0, "misses": 4, "hit_ratio": 0.0},
+            "tokens": {"estimated_input_tokens_saved": 9400},
+            "references": {"bytes_deferred_est": 4096},
+        },
+        matrix={"checks": [{"status": "fail"}, {"status": "fail"}]},
+    )
+
+    rendered = monitor.render_dashboard(
+        [snapshot],
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+    )
+
+    assert "| akkodis-conan-center-index" in rendered
+    assert "akkodis-conan-center-index (" not in rendered
+    assert "2 fail" in rendered
+
+
+def test_interactive_key_bindings_update_state() -> None:
+    monitor = load_monitor_module()
+    state = monitor.MonitorState(selected_index=0, refresh_interval=5.0)
+
+    assert monitor.decode_key("\x1b[B") == "down"
+    assert monitor.decode_key("\x1b[A") == "up"
+    assert monitor.decode_key("\r") == "enter"
+    assert monitor.decode_key("\x1b") == "escape"
+    assert monitor.decode_key("+") == "plus"
+    assert monitor.decode_key("-") == "minus"
+    assert monitor.decode_key("b") == "browser"
+
+    assert monitor.handle_key("down", state, row_count=3) == "redraw"
+    assert state.selected_index == 1
+    assert monitor.handle_key("enter", state, row_count=3) == "redraw"
+    assert state.view == "detail"
+    assert monitor.handle_key("escape", state, row_count=3) == "redraw"
+    assert state.view == "table"
+    assert monitor.handle_key("plus", state, row_count=3) == "redraw"
+    assert state.refresh_interval == 6.0
+    assert monitor.handle_key("minus", state, row_count=3) == "redraw"
+    assert state.refresh_interval == 5.0
+    assert monitor.handle_key("browser", state, row_count=3) == "browser"
+    assert state.view == "state"
+    assert monitor.handle_key("down", state, row_count=3, state_row_count=2) == "redraw"
+    assert state.state_selected_index == 1
+    assert monitor.handle_key("enter", state, row_count=3, state_row_count=2) == "state_entry"
+
+
+def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=True,
+    )
+    state = monitor.MonitorState(
+        selected_index=0,
+        view="table",
+        refresh_interval=5.0,
+        last_updated="2026-07-05T13:00:00+00:00",
+    )
+
+    table = monitor.render_monitor_screen(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        state=state,
+    )
+
+    assert "| > | Alpha" in table
+    assert "Enter details" in table
+    assert "refresh=5.0s" in table
+
+    state.view = "detail"
+    detail = monitor.render_monitor_screen(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        state=state,
+    )
+
+    assert "mcp-context-manager project details" in detail
+    assert "| project       | Alpha" in detail
+    assert "| project id    | alpha-123" in detail
+    assert "| a                        |         pass" in detail
+
+
+def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=False,
+    )
+    state = monitor.MonitorState(selected_index=0, view="state", refresh_interval=5.0)
+
+    monitor._load_state_browser(client, state, snapshots)
+
+    assert state.state_payload["schema"] == "context_state_browser.v1"
+    assert state.state_target.project_id == "alpha-123"
+    assert (
+        "context_admin",
+        {
+            "mode": "state_browser",
+            "project_id": "alpha-123",
+            "max_entries": 80,
+            "max_output_chars": 1200,
+        },
+    ) in client.calls
+
+    rendered = monitor.render_monitor_screen(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        state=state,
+    )
+
+    assert "mcp-context-manager state browser" in rendered
+    assert "cache:abc" in rendered
+    assert "| > | cache:abc" in rendered
+
+    monitor._load_state_entry(client, state)
+    assert state.view == "state_detail"
+    detail = monitor.render_monitor_screen(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        state=state,
+    )
+
+    assert "mcp-context-manager state entry" in detail
+    assert "cache:abc" in detail
+    assert '"hello": "world"' in detail
