@@ -231,6 +231,7 @@ class ContextService:
             "index_status",
             "cache_stats",
             "cache_prune",
+            "warmup",
             "budget",
             "contracts",
             "metrics",
@@ -257,6 +258,12 @@ class ContextService:
             return {"schema": "context_cache.stats.v1", **self._cache_stats()}
         if mode == "cache_prune":
             return {"schema": "context_cache.prune.v1", **self._cache_prune(max_age_minutes)}
+        if mode == "warmup":
+            return self._cache_warmup(
+                path=path,
+                max_files=max_files,
+                max_entries=max_entries,
+            )
         if mode == "contracts":
             profile = contract_profile or "verbose"
             return output_contracts(tool_name=tool_name, profile=profile)
@@ -449,6 +456,11 @@ class ContextService:
             baseline_count.metadata(),
         )
         estimated_tokens_saved = max(0, baseline_tokens - output_tokens)
+        tokens_spared_reason = (
+            "MCP context_pack returned compact selected summaries and deferred "
+            "full evidence behind local references instead of sending all ranked "
+            "candidate evidence."
+        )
         reference_bytes_deferred = int(
             full_reference.get("content", {}).get("size_bytes", 0) or 0
         )
@@ -528,6 +540,8 @@ class ContextService:
                 "baseline_input_tokens_est": baseline_tokens,
                 "output_tokens_est": output_tokens,
                 "estimated_input_tokens_saved": estimated_tokens_saved,
+                "tokens_spared_by_mcp_est": estimated_tokens_saved,
+                "tokens_spared_by_mcp_reason": tokens_spared_reason,
                 "compression_ratio": round(output_tokens / baseline_tokens, 4)
                 if baseline_tokens
                 else 0.0,
@@ -535,6 +549,7 @@ class ContextService:
                 "references_bytes_deferred_est": reference_bytes_deferred,
                 "retrieval_plan": retrieval_stats,
                 "token_savings_formula": "max(0, baseline_input_tokens_est - output_tokens_est)",
+                "tokens_spared_by_mcp_formula": "max(0, baseline_input_tokens_est - output_tokens_est)",
             },
             "next_actions": [
                 {"action": "resolve_reference", "when": "Need full omitted candidate evidence", "reference_id": full_reference["reference_id"]}
@@ -596,21 +611,60 @@ class ContextService:
                 "schema": "codex_context_pack_first.instructions.v1",
                 "purpose": "Speed up Codex-style coding agents with a first-pass context pack.",
                 "boundary": (
-                    "Repository-side MCP config can strongly steer tool use, but it "
-                    "cannot force the model to call a tool on every turn."
+                    "Repository-side MCP config can require this server to "
+                    "initialize, but it cannot force the model to call a tool "
+                    "on every turn."
                 ),
+                "codex_config_example": {
+                    "config_file": "~/.codex/config.toml or trusted-project .codex/config.toml",
+                    "toml": (
+                        "[mcp_servers.mcp-context-manager]\n"
+                        "url = \"http://localhost:8000/mcp\"\n"
+                        "required = true\n"
+                        "enabled_tools = [\n"
+                        "  \"context_pack\",\n"
+                        "  \"context_lookup\",\n"
+                        "  \"context_memory\",\n"
+                        "  \"context_admin\",\n"
+                        "  \"result_reference_resolve\",\n"
+                        "]\n"
+                        "default_tools_approval_mode = \"auto\"\n"
+                    ),
+                    "effect": (
+                        "required=true fails startup or resume if this enabled "
+                        "server cannot initialize; enabled_tools keeps the "
+                        "advertised surface focused on this server's public tools."
+                    ),
+                },
+                "enforcement_layers": [
+                    "Codex config required=true for server availability",
+                    "MCP server instructions for tool-selection guidance",
+                    "AGENTS.md mandatory workflow for repository tasks",
+                    "Review or CI checks that reject work started with broad local inspection",
+                ],
                 "instruction": (
-                    "For repository coding, review, debug, test, docs, security, or "
-                    "general questions, call context_pack first with the user's task. "
-                    "Pass changed_files and focus_paths when the user names them. "
-                    "Use compact output by default, inspect returned cited snippets, "
-                    "and resolve references only when raw evidence is needed. Avoid "
-                    "broad rg, tree, or whole-file reads until the pack is insufficient."
+                    "Treat MCP-first usage as mandatory. For repository coding, "
+                    "review, debug, test, docs, security, or general questions, "
+                    "call context_pack first with the user's task. Pass "
+                    "changed_files and focus_paths when the user names them. "
+                    "Use compact output by default. Must use context_lookup for "
+                    "targeted follow-up snippets, search, trees, symbols, or "
+                    "references before broad shell inspection. Must use "
+                    "result_reference_resolve when raw referenced evidence is "
+                    "needed before destructive edits, release claims, or security "
+                    "conclusions. Must use context_admin for health, index, "
+                    "cache, budget, contracts, metrics, benchmark, warmup, or "
+                    "generated-state checks. Must use context_memory only for "
+                    "structured, non-secret repository facts, summaries, "
+                    "decisions, validation, or compaction. Avoid broad rg, tree, "
+                    "or whole-file reads until the MCP lookups are insufficient."
                 ),
                 "preferred_tool_order": [
                     "context_pack",
                     "context_lookup",
                     "result_reference_resolve",
+                    "context_admin",
+                    "context_memory",
                 ],
                 "resource_uris": [
                     "repo://instructions/codex-context-pack-first",
@@ -1094,6 +1148,212 @@ class ContextService:
             "measurement_matrix": self.metrics.measurement_matrix(),
         }
 
+    def _cache_warmup(
+        self,
+        path: str = ".",
+        max_files: int = 5000,
+        max_entries: int = 100,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        self.config.ensure_state_dirs()
+        store_existed_before = self.store.exists()
+        self.store.get_json("budget:default")
+        cache_before = self._cache_stats()
+        omitted: list[dict[str, Any]] = []
+
+        try:
+            index_refresh = self._ensure_index_fresh(path=path, max_files=max_files)
+        except Exception as exc:
+            index_refresh = {
+                "schema": "context_index.refresh.v1",
+                "index_available": False,
+                "skipped": False,
+                "reason": "index_refresh_failed",
+            }
+            omitted.append(
+                {
+                    "reason_code": "index_refresh_failed",
+                    "detail": type(exc).__name__,
+                }
+            )
+
+        facts: dict[str, Any] = {}
+        try:
+            facts = self.index.workspace_facts()
+        except Exception as exc:
+            omitted.append(
+                {
+                    "reason_code": "workspace_facts_failed",
+                    "detail": type(exc).__name__,
+                }
+            )
+
+        symbol_count = 0
+        try:
+            symbol_limit = max(0, min(int(max_entries), 100))
+            symbol_count = int(
+                self.index.symbols(query="", limit=symbol_limit).get("count", 0)
+            )
+        except Exception as exc:
+            omitted.append(
+                {
+                    "reason_code": "symbols_warmup_failed",
+                    "detail": type(exc).__name__,
+                }
+            )
+
+        search_rows = self._warm_search_caches(max_entries=max_entries)
+        omitted.extend(
+            row for row in search_rows if row.get("reason_code") == "search_warmup_failed"
+        )
+        warmed_searches = [
+            row for row in search_rows if row.get("reason_code") != "search_warmup_failed"
+        ]
+        cache_after = self._cache_stats()
+        elapsed_ms = self._elapsed_ms(started)
+        self.metrics.record_event(
+            "context_admin.warmup",
+            elapsed_ms=elapsed_ms,
+            result_count=len(warmed_searches),
+        )
+        return {
+            "schema": "context_cache.warmup.v1",
+            "generated_at": now_iso(),
+            "project_id": self.config.project_id,
+            "elapsed_ms": elapsed_ms,
+            "state": {
+                "state_dir": self.config.display_path(self.config.state_dir),
+                "store_existed_before": store_existed_before,
+                "store_exists": self.store.exists(),
+            },
+            "index": {
+                "schema": index_refresh.get("schema", "context_index.refresh.v1"),
+                "skipped": bool(index_refresh.get("skipped", False)),
+                "reason": str(index_refresh.get("reason", "")),
+                "file_count": int(index_refresh.get("file_count", 0) or 0),
+                "symbol_count": int(index_refresh.get("symbol_count", 0) or 0),
+                "import_count": int(index_refresh.get("import_count", 0) or 0),
+                "updated_count": int(index_refresh.get("updated_count", 0) or 0),
+                "unchanged_count": int(index_refresh.get("unchanged_count", 0) or 0),
+                "removed_count": int(index_refresh.get("removed_count", 0) or 0),
+                "search_mode": str(index_refresh.get("search_mode", "")),
+                "refresh_signature_available": bool(
+                    self.index.status().get("refresh_signature_available", False)
+                ),
+            },
+            "workspace": {
+                "schema": facts.get("schema", "workspace_facts.v1"),
+                "file_count": int(facts.get("file_count", 0) or 0),
+                "top_extensions": facts.get("top_extensions", []),
+                "has_tests_dir": bool(facts.get("has_tests_dir", False)),
+                "has_readme": bool(facts.get("has_readme", False)),
+                "is_git_repo": bool(facts.get("is_git_repo", False)),
+            },
+            "symbols": {
+                "warmed": symbol_count > 0,
+                "count": symbol_count,
+                "limit": max(0, min(int(max_entries), 100)),
+            },
+            "search_cache": {
+                "namespace": "context_lookup.search",
+                "query_count": len(warmed_searches),
+                "queries": warmed_searches,
+            },
+            "cache": {
+                "entry_count_before": int(cache_before.get("entry_count", 0) or 0),
+                "entry_count_after": int(cache_after.get("entry_count", 0) or 0),
+                "namespaces_before": sorted(cache_before.get("namespaces", {})),
+                "namespaces_after": sorted(cache_after.get("namespaces", {})),
+            },
+            "omitted": omitted,
+            "repo_boundary_enforced": True,
+            "generated_state_only": True,
+        }
+
+    def _warm_search_caches(self, max_entries: int = 100) -> list[dict[str, Any]]:
+        seed_queries = (
+            "test",
+            "debug",
+            "review",
+            "config",
+            "readme",
+            "build",
+            "cache",
+            "index",
+            "context",
+            "error",
+        )
+        query_limit = max(0, min(int(max_entries), len(seed_queries)))
+        max_results = 20
+        index_status = self.index.status()
+        rows: list[dict[str, Any]] = []
+        for query in seed_queries[:query_limit]:
+            cache_key = self._cache_key(
+                "context_lookup.search",
+                {
+                    "query": query,
+                    "path": ".",
+                    "max_results": max_results,
+                    "include_globs": [],
+                    "index": index_status.get("generated_at", ""),
+                    "refresh_signature": index_status.get("refresh_signature", ""),
+                    "project_id": self.config.project_id,
+                },
+            )
+            cache_lookup = self._cache_lookup(cache_key)
+            if cache_lookup["hit"]:
+                value = cache_lookup.get("value") if isinstance(cache_lookup, dict) else {}
+                rows.append(
+                    {
+                        "query": query,
+                        "cache_hit": True,
+                        "cache_reason": "hit",
+                        "result_count": int(
+                            value.get("count", 0) if isinstance(value, dict) else 0
+                        ),
+                        "key": cache_key,
+                    }
+                )
+                continue
+            try:
+                result = self.index.search(
+                    query=query,
+                    path=".",
+                    max_results=max_results,
+                    include_globs=None,
+                )
+            except Exception as exc:
+                rows.append(
+                    {
+                        "query": query,
+                        "reason_code": "search_warmup_failed",
+                        "detail": type(exc).__name__,
+                    }
+                )
+                continue
+            self._cache_set(
+                cache_key,
+                result,
+                namespace="context_lookup.search",
+                metadata={
+                    "query": query,
+                    "path": ".",
+                    "index_generated_at": index_status.get("generated_at", ""),
+                    "refresh_signature": index_status.get("refresh_signature", ""),
+                    "warmup": True,
+                },
+            )
+            rows.append(
+                {
+                    "query": query,
+                    "cache_hit": False,
+                    "cache_reason": str(cache_lookup.get("reason") or "miss"),
+                    "result_count": int(result.get("count", 0) or 0),
+                    "key": cache_key,
+                }
+            )
+        return rows
+
     def _benchmark_focus_paths(self) -> list[str]:
         files = self.index.files(limit=80)
         preferred: list[str] = []
@@ -1386,7 +1646,7 @@ class ContextService:
             if not isinstance(row, dict):
                 continue
             key = cache_key.removeprefix("cache:")
-            namespace = str(row["namespace"])
+            namespace = str(row.get("namespace") or "unknown")
             row_status = self._cache_row_status(row)
             stats = namespaces.setdefault(
                 namespace,

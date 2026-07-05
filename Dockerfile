@@ -31,6 +31,7 @@ COPY src ./src
 FROM base AS test
 
 COPY benchmarks ./benchmarks
+COPY monitor-metrics.py ./
 COPY tests ./tests
 
 RUN pip install --no-compile ".[dev]"

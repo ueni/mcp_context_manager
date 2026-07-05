@@ -48,6 +48,12 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert pack["metrics"]["baseline_input_tokens_est"] >= pack["metrics"]["output_tokens_est"]
     assert pack["metrics"]["token_counting"]["token_count_source"] == "estimate"
     assert pack["metrics"]["token_savings_formula"] == "max(0, baseline_input_tokens_est - output_tokens_est)"
+    assert pack["metrics"]["tokens_spared_by_mcp_formula"] == "max(0, baseline_input_tokens_est - output_tokens_est)"
+    assert (
+        pack["metrics"]["tokens_spared_by_mcp_est"]
+        == pack["metrics"]["estimated_input_tokens_saved"]
+    )
+    assert "MCP context_pack" in pack["metrics"]["tokens_spared_by_mcp_reason"]
     assert pack["metrics"]["external_tool_calls_saved_est"] >= 1
     assert pack["metrics"]["references_bytes_deferred_est"] > 0
     assert pack["metrics"]["retrieval_plan"]["detail_mode"] == "context_lookup.snippet"

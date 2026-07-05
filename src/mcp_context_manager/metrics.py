@@ -45,6 +45,13 @@ MEASUREMENT_TARGETS: tuple[dict[str, Any], ...] = (
         "min_samples": 1,
     },
     {
+        "key": "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack",
+        "operator": ">=",
+        "target": 500.0,
+        "unit": "tokens",
+        "min_samples": 1,
+    },
+    {
         "key": "tokens.context_pack.compression_ratio",
         "operator": "<=",
         "target": 0.7,
@@ -130,6 +137,9 @@ class ContextMetrics:
         totals["estimated_input_tokens_saved"] = int(
             totals.get("estimated_input_tokens_saved", 0)
         ) + max(0, int(estimated_input_tokens_saved))
+        totals["tokens_spared_by_mcp_est"] = int(
+            totals.get("tokens_spared_by_mcp_est", 0)
+        ) + max(0, int(estimated_input_tokens_saved))
         totals["baseline_input_tokens_est"] = int(
             totals.get("baseline_input_tokens_est", 0)
         ) + max(0, int(baseline_input_tokens_est))
@@ -193,6 +203,7 @@ class ContextMetrics:
                 "candidate_count": 0,
                 "omitted_count": 0,
                 "estimated_input_tokens_saved": 0,
+                "tokens_spared_by_mcp_est": 0,
                 "baseline_input_tokens_est": 0,
                 "output_tokens_est": 0,
                 "raw_candidate_chars": 0,
@@ -243,6 +254,7 @@ class ContextMetrics:
                     "candidate_count": 0,
                     "omitted_count": 0,
                     "estimated_input_tokens_saved": 0,
+                    "tokens_spared_by_mcp_est": 0,
                     "baseline_input_tokens_est": 0,
                     "output_tokens_est": 0,
                     "raw_candidate_chars": 0,
@@ -280,6 +292,9 @@ class ContextMetrics:
                 "candidate_count": max(0, int(candidate_count)),
                 "omitted_count": max(0, int(omitted_count)),
                 "estimated_input_tokens_saved": max(
+                    0, int(estimated_input_tokens_saved)
+                ),
+                "tokens_spared_by_mcp_est": max(
                     0, int(estimated_input_tokens_saved)
                 ),
                 "baseline_input_tokens_est": max(0, int(baseline_input_tokens_est)),
@@ -367,6 +382,7 @@ class ContextMetrics:
             },
             "tokens": {
                 "estimated_input_tokens_saved": tokens_saved,
+                "tokens_spared_by_mcp_est": tokens_saved,
                 "baseline_input_tokens_est": baseline_tokens,
                 "output_tokens_est": output_tokens,
                 "token_counting": TokenCounter(
@@ -378,6 +394,16 @@ class ContextMetrics:
                 )
                 if pack_count
                 else 0.0,
+                "avg_tokens_spared_by_mcp_est_per_pack": round(
+                    tokens_saved / pack_count, 3
+                )
+                if pack_count
+                else 0.0,
+                "tokens_spared_by_mcp_reason": (
+                    "context_pack returns compact selected context and defers "
+                    "full evidence behind local references instead of sending "
+                    "all ranked candidate evidence."
+                ),
                 "avg_baseline_input_tokens_per_pack": round(
                     baseline_tokens / pack_count, 3
                 )
@@ -446,6 +472,9 @@ class ContextMetrics:
                 "token_savings_formula": (
                     "max(0, baseline_input_tokens_est - output_tokens_est)"
                 ),
+                "tokens_spared_by_mcp_formula": (
+                    "max(0, baseline_input_tokens_est - output_tokens_est)"
+                ),
             },
         }
 
@@ -506,6 +535,9 @@ class ContextMetrics:
         stats["estimated_input_tokens_saved"] = int(
             stats.get("estimated_input_tokens_saved", 0)
         ) + max(0, int(estimated_input_tokens_saved))
+        stats["tokens_spared_by_mcp_est"] = int(
+            stats.get("tokens_spared_by_mcp_est", 0)
+        ) + max(0, int(estimated_input_tokens_saved))
         stats["baseline_input_tokens_est"] = int(
             stats.get("baseline_input_tokens_est", 0)
         ) + max(0, int(baseline_input_tokens_est))
@@ -550,6 +582,9 @@ class ContextMetrics:
                 "candidate_count": candidate_count,
                 "omitted_count": int(stats.get("omitted_count", 0)),
                 "estimated_input_tokens_saved": int(
+                    stats.get("estimated_input_tokens_saved", 0)
+                ),
+                "tokens_spared_by_mcp_est": int(
                     stats.get("estimated_input_tokens_saved", 0)
                 ),
                 "baseline_input_tokens_est": baseline_tokens,
@@ -661,6 +696,15 @@ class ContextMetrics:
                 float(
                     snapshot.get("tokens", {}).get(
                         "avg_estimated_input_tokens_saved_per_pack", 0.0
+                    )
+                ),
+                pack_count,
+            )
+        if key == "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack":
+            return (
+                float(
+                    snapshot.get("tokens", {}).get(
+                        "avg_tokens_spared_by_mcp_est_per_pack", 0.0
                     )
                 ),
                 pack_count,

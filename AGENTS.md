@@ -15,9 +15,31 @@ clone of the broader codebase-tooling server.
 
 Agents working in any repository where this server is available must use the
 `mcp-context-manager` MCP tools before broad local inspection. Repository
-instructions cannot technically force a model to call a tool, but agents that
-follow this file must treat the MCP-first flow as mandatory for coding, review,
-debug, test, docs, security, and general repository tasks.
+instructions alone cannot technically force a model to call a tool on every
+turn, so use configuration plus instructions:
+
+```toml
+# ~/.codex/config.toml or trusted-project .codex/config.toml
+[mcp_servers.mcp-context-manager]
+url = "http://localhost:8000/mcp"
+required = true
+enabled_tools = [
+  "context_pack",
+  "context_lookup",
+  "context_memory",
+  "context_admin",
+  "result_reference_resolve",
+]
+default_tools_approval_mode = "auto"
+```
+
+`required = true` makes Codex fail startup or resume if this enabled server
+cannot initialize. It does not guarantee the model calls a tool on every turn;
+that behavior is enforced by this `AGENTS.md`, the MCP server `instructions`
+field, and review/CI checks that reject work started with broad local
+inspection instead of `context_pack`. Agents that follow this file must treat
+the MCP-first flow as mandatory for coding, review, debug, test, docs,
+security, and general repository tasks.
 
 - Start with `context_pack` for the user's task. Pass `changed_files` and
   `focus_paths` when the user names files, paths, branches, failing tests, or

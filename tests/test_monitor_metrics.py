@@ -44,7 +44,10 @@ class FakeClient:
                     },
                 },
                 "cache": {"hits": 6, "misses": 2, "hit_ratio": 0.75},
-                "tokens": {"estimated_input_tokens_saved": 12345},
+                "tokens": {
+                    "estimated_input_tokens_saved": 12345,
+                    "tokens_spared_by_mcp_est": 12000,
+                },
                 "references": {"bytes_deferred_est": 4096},
             }
         if mode == "measurement_matrix":
@@ -265,7 +268,10 @@ def test_render_dashboard_keeps_long_project_names_readable() -> None:
                 },
             },
             "cache": {"hits": 0, "misses": 4, "hit_ratio": 0.0},
-            "tokens": {"estimated_input_tokens_saved": 9400},
+            "tokens": {
+                "estimated_input_tokens_saved": 9400,
+                "tokens_spared_by_mcp_est": 8700,
+            },
             "references": {"bytes_deferred_est": 4096},
         },
         matrix={"checks": [{"status": "fail"}, {"status": "fail"}]},
@@ -359,7 +365,28 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "mcp-context-manager project details" in detail
     assert "| project       | Alpha" in detail
     assert "| project id    | alpha-123" in detail
+    assert "mcp spared" in detail
     assert "| a                        |         pass" in detail
+
+
+def test_tokens_spared_by_mcp_prefers_explicit_metric_and_falls_back() -> None:
+    monitor = load_monitor_module()
+
+    assert (
+        monitor._tokens_spared_by_mcp(
+            {
+                "tokens": {
+                    "estimated_input_tokens_saved": 99,
+                    "tokens_spared_by_mcp_est": 7,
+                }
+            }
+        )
+        == 7
+    )
+    assert (
+        monitor._tokens_spared_by_mcp({"tokens": {"estimated_input_tokens_saved": 99}})
+        == 99
+    )
 
 
 def test_state_browser_fetches_selected_project_and_renders_entry() -> None:

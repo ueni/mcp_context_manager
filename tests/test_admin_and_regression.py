@@ -101,6 +101,13 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     assert metrics["cache"]["by_namespace"]["context_pack.retrieval"]["hits"] >= 1
     assert metrics["cache"]["by_namespace"]["context_lookup.search"]["hits"] >= 1
     assert metrics["tokens"]["estimated_input_tokens_saved"] >= pack["metrics"]["estimated_input_tokens_saved"]
+    assert metrics["tokens"]["tokens_spared_by_mcp_est"] >= pack["metrics"]["tokens_spared_by_mcp_est"]
+    assert (
+        metrics["tokens"]["tokens_spared_by_mcp_est"]
+        == metrics["tokens"]["estimated_input_tokens_saved"]
+    )
+    assert metrics["tokens"]["avg_tokens_spared_by_mcp_est_per_pack"] >= 0
+    assert "context_pack" in metrics["tokens"]["tokens_spared_by_mcp_reason"]
     assert metrics["tokens"]["baseline_input_tokens_est"] >= pack["metrics"]["baseline_input_tokens_est"]
     assert metrics["tokens"]["output_tokens_est"] >= pack["metrics"]["output_tokens_est"]
     assert metrics["tooling"]["external_tool_calls_saved_est"] >= pack["metrics"]["external_tool_calls_saved_est"]
@@ -128,6 +135,7 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
         "latency.context_pack.snippet_batch_avg_ms",
         "cache.context_pack_retrieval_hit_ratio",
         "tokens.context_pack.avg_saved_per_pack",
+        "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack",
         "tooling.contract_tokens_saved_est",
         "tooling.external_calls_saved_per_pack",
         "references.bytes_deferred_est",
@@ -135,6 +143,52 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     assert {
         check["status"] for check in matrix["checks"]
     }.issubset({"pass", "fail", "insufficient"})
+
+
+def test_context_admin_warmup_preinitializes_index_and_search_cache(
+    service: ContextService,
+) -> None:
+    warmup = service.context_admin(mode="warmup", max_entries=3)
+
+    assert warmup["schema"] == "context_cache.warmup.v1"
+    assert warmup["state"]["store_exists"] is True
+    assert warmup["index"]["file_count"] >= 3
+    assert warmup["workspace"]["file_count"] >= 3
+    assert warmup["search_cache"]["namespace"] == "context_lookup.search"
+    assert warmup["search_cache"]["query_count"] == 3
+    assert warmup["cache"]["entry_count_after"] >= warmup["search_cache"]["query_count"]
+    assert "context_lookup.search" in warmup["cache"]["namespaces_after"]
+    assert "context_pack.retrieval" not in warmup["cache"]["namespaces_after"]
+
+    lookup = service.context_lookup(mode="search", query="test")
+
+    assert lookup["cache"]["hit"] is True
+    assert lookup["cache"]["namespace"] == "context_lookup.search"
+
+    second = service.context_admin(mode="warmup", max_entries=3)
+
+    assert second["index"]["skipped"] is True
+    assert second["index"]["reason"] == "signature_unchanged"
+    assert all(row["cache_hit"] is True for row in second["search_cache"]["queries"])
+
+
+def test_cache_stats_tolerates_legacy_cache_rows_without_namespace(
+    service: ContextService,
+) -> None:
+    service.store.put_json(
+        "cache:legacy-row",
+        {
+            "status": "active",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+            "value": {"schema": "legacy.v1"},
+        },
+    )
+
+    stats = service.context_admin(mode="cache_stats")
+
+    assert stats["schema"] == "context_cache.stats.v1"
+    assert stats["namespaces"]["unknown"]["active_count"] == 1
+    assert "legacy-row" in stats["namespaces"]["unknown"]["sample_keys"]
 
 
 def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
@@ -555,7 +609,24 @@ def test_codex_guidance_resource_states_pack_first_boundary(
 
     assert guidance["schema"] == "codex_context_pack_first.instructions.v1"
     assert "cannot force the model" in guidance["boundary"]
+    assert "required = true" in guidance["codex_config_example"]["toml"]
+    assert "enabled_tools" in guidance["codex_config_example"]["toml"]
+    assert any(
+        "AGENTS.md mandatory workflow" in layer
+        for layer in guidance["enforcement_layers"]
+    )
+    assert "mandatory" in guidance["instruction"]
     assert "call context_pack first" in guidance["instruction"]
+    assert "Must use context_lookup" in guidance["instruction"]
+    assert "Must use context_admin" in guidance["instruction"]
+    assert "Must use context_memory only" in guidance["instruction"]
+    assert guidance["preferred_tool_order"] == [
+        "context_pack",
+        "context_lookup",
+        "result_reference_resolve",
+        "context_admin",
+        "context_memory",
+    ]
     assert "repo://instructions/codex-context-pack-first" in guidance["resource_uris"]
 
 

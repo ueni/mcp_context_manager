@@ -505,8 +505,8 @@ def render_project_detail(
         ),
         ("cache", f"{cache_hits}/{cache_misses} h/m  {cache_ratio * 100:5.1f}%"),
         (
-            "tokens saved",
-            fmt_int(_int_at(metrics, ("tokens", "estimated_input_tokens_saved"))),
+            "mcp spared",
+            fmt_int(_tokens_spared_by_mcp(metrics)),
         ),
         (
             "refs deferred",
@@ -684,7 +684,7 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
         "packs": 0,
         "cache_hits": 0,
         "cache_misses": 0,
-        "tokens_saved": 0,
+        "tokens_spared_by_mcp": 0,
         "bytes_deferred": 0,
     }
     for row in rows:
@@ -695,9 +695,7 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
         )
         totals["cache_hits"] += _int_at(metrics, ("cache", "hits"))
         totals["cache_misses"] += _int_at(metrics, ("cache", "misses"))
-        totals["tokens_saved"] += _int_at(
-            metrics, ("tokens", "estimated_input_tokens_saved")
-        )
+        totals["tokens_spared_by_mcp"] += _tokens_spared_by_mcp(metrics)
         totals["bytes_deferred"] += _int_at(
             metrics, ("references", "bytes_deferred_est")
         )
@@ -717,7 +715,7 @@ def _summary_table(
         ("requests", fmt_int(totals["requests"])),
         ("context_pack", fmt_int(totals["packs"])),
         ("cache hit", f"{_bar(ratio, 18, color)} {ratio * 100:5.1f}%"),
-        ("tokens saved", fmt_int(totals["tokens_saved"])),
+        ("mcp spared", fmt_int(totals["tokens_spared_by_mcp"])),
         ("refs deferred", fmt_bytes(totals["bytes_deferred"])),
     ]
     return _render_table(("metric", "value"), rows, aligns=("left", "right"))
@@ -735,7 +733,7 @@ def _project_table(
         for index, snapshot in enumerate(snapshots)
     ]
     rendered = _render_table(
-        ("", "project", "project id", "req", "pack", "avg ms", "cache", "tokens", "checks"),
+        ("", "project", "project id", "req", "pack", "avg ms", "cache", "mcp tok", "checks"),
         rows,
         widths=(
             widths["selector"],
@@ -817,7 +815,7 @@ def _project_cells(
         metrics, ("requests", "by_operation", "context_pack", "avg_elapsed_ms")
     )
     cache_ratio = _float_at(metrics, ("cache", "hit_ratio"))
-    tokens_saved = _int_at(metrics, ("tokens", "estimated_input_tokens_saved"))
+    tokens_spared_by_mcp = _tokens_spared_by_mcp(metrics)
     checks = _matrix_status(snapshot.matrix or {}, color)
     cache_bar_width = max(6, widths["cache"] - 9)
     return (
@@ -828,7 +826,7 @@ def _project_cells(
         fmt_int(packs),
         fmt_ms(avg_ms),
         f"{_bar(cache_ratio, cache_bar_width, color)} {cache_ratio * 100:5.1f}%",
-        fmt_int(tokens_saved),
+        fmt_int(tokens_spared_by_mcp),
         checks,
     )
 
@@ -1153,6 +1151,13 @@ def _int_at(payload: dict[str, Any], path: tuple[str, ...]) -> int:
             return 0
         value = value.get(key)
     return int(value or 0) if isinstance(value, (int, float)) else 0
+
+
+def _tokens_spared_by_mcp(metrics: dict[str, Any]) -> int:
+    tokens = metrics.get("tokens", {})
+    if isinstance(tokens, dict) and "tokens_spared_by_mcp_est" in tokens:
+        return _int_at(metrics, ("tokens", "tokens_spared_by_mcp_est"))
+    return _int_at(metrics, ("tokens", "estimated_input_tokens_saved"))
 
 
 def _float_at(payload: dict[str, Any], path: tuple[str, ...]) -> float:

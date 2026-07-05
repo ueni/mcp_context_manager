@@ -96,6 +96,29 @@ strong server instructions, but it cannot force the model to call a tool on ever
 turn. The practical speed path is to make the first `context_pack` call fast and
 useful enough that agents do not need broad `rg`, tree, or whole-file reads.
 
+To make MCP usage as mandatory as Codex supports, configure the server as
+required and limit the advertised tool surface to this server's public tools:
+
+```toml
+# ~/.codex/config.toml or trusted-project .codex/config.toml
+[mcp_servers.mcp-context-manager]
+url = "http://localhost:8000/mcp"
+required = true
+enabled_tools = [
+  "context_pack",
+  "context_lookup",
+  "context_memory",
+  "context_admin",
+  "result_reference_resolve",
+]
+default_tools_approval_mode = "approve"
+```
+
+`required = true` fails startup or resume when the enabled MCP server cannot
+initialize. It does not force every model turn to call a tool. Pair it with
+`AGENTS.md`, the server `instructions` field, and review/CI checks that reject
+work started with broad local inspection instead of `context_pack`.
+
 Agents can read `repo://instructions/codex-context-pack-first` or use the
 `use_context_pack_first` prompt. For global multi-root sessions, use
 `repo://project/{project_id}/instructions/codex-context-pack-first` after
@@ -118,6 +141,7 @@ matrix for context-pack speed and token economy. Current targets:
 | `latency.context_pack.p95_recent_ms` | `<= 1500 ms` after at least 3 samples |
 | `latency.context_pack.index_refresh_avg_ms` | `<= 250 ms` |
 | `tokens.context_pack.avg_saved_per_pack` | `>= 500 estimated input tokens` |
+| `tokens.context_pack.avg_tokens_spared_by_mcp_per_pack` | `>= 500 estimated input tokens` |
 | `tokens.context_pack.compression_ratio` | `<= 0.70` |
 | `retrieval.context_pack.candidates_per_selected` | `<= 8.0` |
 | `cache.hit_ratio` | `>= 0.20` after at least 2 cacheable requests |
@@ -129,6 +153,7 @@ matrix for context-pack speed and token economy. Current targets:
 Token savings are measured as:
 
 ```text
+tokens_spared_by_mcp_est =
 estimated_input_tokens_saved =
   max(0, baseline_input_tokens_est - output_tokens_est)
 ```
@@ -137,6 +162,8 @@ estimated_input_tokens_saved =
 likely inspect without ranking. `output_tokens_est` estimates the selected pack
 items returned to the model. The formula is intentionally conservative: if the
 compact JSON is larger than the candidate evidence estimate, savings are `0`.
+`tokens_spared_by_mcp_est` is the explicit MCP-facing name for the same current
+estimate; `estimated_input_tokens_saved` remains for compatibility.
 
 ## Live Metrics Monitor
 
@@ -191,7 +218,8 @@ python3 monitor-metrics.py --root-uri file:///home/user/source/my-repo
 ```
 
 The dashboard shows request volume, `context_pack` latency, cache hit bars,
-estimated tokens saved, deferred reference bytes, and measurement-matrix status.
+estimated MCP-spared tokens, deferred reference bytes, and measurement-matrix
+status.
 The state browser calls `context_admin(mode="state_browser")` for the selected
 project and shows bounded, redacted generated-state rows with searchable,
 scrollable entry inspection.

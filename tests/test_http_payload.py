@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from types import SimpleNamespace
-from typing import Annotated, get_args, get_origin, get_type_hints
+from typing import Annotated, Literal, get_args, get_origin, get_type_hints
 
 import pytest
 
@@ -86,7 +86,12 @@ def test_create_mcp_advertises_server_instructions(monkeypatch, service) -> None
 
     assert captured["name"] == "mcp-context-manager"
     assert captured["instructions"] == MCP_SERVER_INSTRUCTIONS
+    assert "Mandatory MCP-first workflow" in MCP_SERVER_INSTRUCTIONS
     assert "call context_pack first" in MCP_SERVER_INSTRUCTIONS
+    assert "Must use context_lookup" in MCP_SERVER_INSTRUCTIONS
+    assert "Must use result_reference_resolve" in MCP_SERVER_INSTRUCTIONS
+    assert "Must use context_admin" in MCP_SERVER_INSTRUCTIONS
+    assert "Must use context_memory only" in MCP_SERVER_INSTRUCTIONS
 
 
 def test_create_mcp_tool_parameters_have_llm_descriptions(
@@ -138,6 +143,66 @@ def test_create_mcp_tool_parameters_have_llm_descriptions(
     assert "search text" in _annotation_description(lookup_hints["mode"])
 
 
+def test_context_admin_mcp_tool_accepts_warmup_and_cache_stats(
+    monkeypatch, service
+) -> None:
+    registered_tools: dict[str, object] = {}
+
+    class FakeFastMCP:
+        def __init__(self, _name: str, **_kwargs: object):
+            pass
+
+        def tool(self):
+            def decorator(fn):
+                registered_tools[fn.__name__] = fn
+                return fn
+
+            return decorator
+
+        def resource(self, *_args: object, **_kwargs: object):
+            return lambda fn: fn
+
+        def prompt(self, *_args: object, **_kwargs: object):
+            return lambda fn: fn
+
+    monkeypatch.setattr(server_module, "FastMCP", FakeFastMCP)
+    service.store.put_json(
+        "cache:legacy-row",
+        {
+            "status": "active",
+            "expires_at": "2999-01-01T00:00:00+00:00",
+            "value": {"schema": "legacy.v1"},
+        },
+    )
+
+    server_module.create_mcp(service)
+
+    admin_tool = registered_tools["context_admin"]
+    hints = get_type_hints(admin_tool, include_extras=True)
+    assert "warmup" in _annotation_literal_values(hints["mode"])
+
+    root_uri = f"file://{service.config.repo_path}"
+    stats = asyncio.run(
+        admin_tool(
+            SimpleNamespace(),
+            mode="cache_stats",
+        )
+    )
+    warmup = asyncio.run(
+        admin_tool(
+            SimpleNamespace(),
+            mode="warmup",
+            max_entries=1,
+            root_uri=root_uri,
+        )
+    )
+
+    assert stats["schema"] == "context_cache.stats.v1"
+    assert stats["namespaces"]["unknown"]["active_count"] == 1
+    assert warmup["schema"] == "context_cache.warmup.v1"
+    assert warmup["search_cache"]["query_count"] == 1
+
+
 def test_create_mcp_advertises_codex_guidance_resource_and_prompt(
     monkeypatch, service
 ) -> None:
@@ -176,6 +241,9 @@ def test_create_mcp_advertises_codex_guidance_resource_and_prompt(
     )
     prompt = prompts["use_context_pack_first"]("review auth behavior")
     assert CODEX_CONTEXT_PACK_FIRST_PROMPT in prompt
+    assert "Must use context_lookup" in prompt
+    assert "Must use context_admin" in prompt
+    assert "Must use context_memory only" in prompt
     assert "Task: review auth behavior" in prompt
 
 
@@ -191,6 +259,18 @@ def _annotation_description(annotation: object) -> str:
         if isinstance(description, str):
             return description
     return ""
+
+
+def _annotation_literal_values(annotation: object) -> set[object]:
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        return _annotation_literal_values(get_args(annotation)[0])
+    if origin is Literal:
+        return set(get_args(annotation))
+    values: set[object] = set()
+    for nested in get_args(annotation):
+        values.update(_annotation_literal_values(nested))
+    return values
 
 
 def test_mcp_roots_returns_empty_when_session_has_no_roots_support() -> None:

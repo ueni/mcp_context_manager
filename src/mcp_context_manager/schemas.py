@@ -51,6 +51,18 @@ CONTEXT_BENCHMARK_SCHEMA: dict[str, Any] = {
     },
 }
 
+CONTEXT_CACHE_WARMUP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["schema", "index", "search_cache", "cache", "omitted"],
+    "properties": {
+        "schema": {"const": "context_cache.warmup.v1"},
+        "index": {"type": "object"},
+        "search_cache": {"type": "object"},
+        "cache": {"type": "object"},
+        "omitted": {"type": "array"},
+    },
+}
+
 TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "context_pack": CONTEXT_PACK_SCHEMA,
     "context_lookup": {"type": "object", "required": ["schema"], "properties": {"schema": {"type": "string"}}},
@@ -60,6 +72,7 @@ TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             CONTEXT_METRICS_SCHEMA,
             MEASUREMENT_MATRIX_SCHEMA,
             CONTEXT_BENCHMARK_SCHEMA,
+            CONTEXT_CACHE_WARMUP_SCHEMA,
             {
                 "type": "object",
                 "required": ["schema"],
@@ -125,7 +138,7 @@ TOOL_INPUT_PARAMS: dict[str, dict[str, str]] = {
         "root_uri": "Repo file URI.",
     },
     "context_admin": {
-        "mode": "health, projects, index, cache, budget, contracts, metrics, state_browser.",
+        "mode": "health, projects, index, cache, warmup, budget, contracts, metrics, state_browser.",
         "path": "Repo-relative path.",
         "max_files": "Index file cap.",
         "max_entries": "Max rows.",
@@ -171,6 +184,7 @@ TOOL_OUTPUT_SCHEMA_NAMES: dict[str, list[str]] = {
         "context_index.status.v1",
         "context_cache.stats.v1",
         "context_cache.prune.v1",
+        "context_cache.warmup.v1",
         "context_budget.v1",
         "tool_output_contracts.v1",
         "context_metrics.v1",
