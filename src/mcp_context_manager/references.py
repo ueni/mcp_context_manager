@@ -49,8 +49,7 @@ class ResultReferences:
         body = json.dumps(envelope, indent=2, sort_keys=True, ensure_ascii=False)
         digest = sha256_text(body)
         body_size = len(body.encode("utf-8"))
-        storage = "lmdb"
-        path = self.config.store_path
+        storage = "inline"
         record: dict[str, Any] = {
             "schema": "mcp_result_reference.store.v1",
             "reference_id": reference_id,
@@ -76,13 +75,16 @@ class ResultReferences:
                 "path": path.name,
             }
         self.store.put_json(f"reference:{reference_id}", record)
+        uri = self._public_uri(reference_id)
         return {
             "schema": "mcp_result_reference.v1",
             "reference_id": reference_id,
+            "uri": uri,
             "producer_tool": producer,
             "project_id": self.config.project_id,
             "created_at": created_at,
             "expires_at": expires_at,
+            "status": "active",
             "summary": sanitized_summary,
             "content": {
                 "mime_type": "application/json",
@@ -92,15 +94,10 @@ class ResultReferences:
             },
             "retention": {"ttl_hours": ttl_hours, "policy": "local_generated_state"},
             "sensitivity": {**sensitivity, "payload_embedded": False},
-            "storage": {"backend": self.store.backend, "mode": storage},
+            "repo_boundary_enforced": True,
             "resolver": {
                 "tool": "result_reference_resolve",
-                "uri": (
-                    f"repo://project/{self.config.project_id}/context/{reference_id}"
-                    if self.config.project_id
-                    else f"repo://context/{reference_id}"
-                ),
-                "path": self.config.display_path(path),
+                "uri": uri,
                 "repo_boundary_enforced": True,
             },
         }
@@ -129,15 +126,50 @@ class ResultReferences:
             parse_iso(str(reference.get("expires_at", ""))) if reference else None
         )
         if reference_expires_at and reference_expires_at < datetime.now(timezone.utc):
-            return {"schema": "mcp_result_reference.resolve.v1", "status": "expired", "reference_id": reference_id}
+            return self._resolve_status(
+                "expired",
+                reference_id,
+                reason="provided_reference_expired",
+            )
         record = self.store.get_json(f"reference:{reference_id}")
         if not isinstance(record, dict):
             return {"schema": "mcp_result_reference.resolve.v1", "status": "missing", "reference_id": reference_id}
+        record_status = self._record_status(record)
+        if record_status["status"] != "active":
+            return self._resolve_status(
+                str(record_status["status"]),
+                reference_id,
+                reason=str(record_status["reason"]),
+                expires_at=str(record.get("expires_at", "")),
+            )
         text = self._body_from_record(record)
         if not text:
-            return {"schema": "mcp_result_reference.resolve.v1", "status": "missing", "reference_id": reference_id}
+            return self._resolve_status(
+                "stale",
+                reference_id,
+                reason="payload_unavailable",
+                expires_at=str(record.get("expires_at", "")),
+            )
         digest = sha256_text(text)
-        content = json.loads(text)
+        if digest != str(record.get("sha256", digest)):
+            return {
+                **self._resolve_status(
+                    "stale",
+                    reference_id,
+                    reason="stored_hash_mismatch",
+                    expires_at=str(record.get("expires_at", "")),
+                ),
+                "actual_sha256": digest,
+            }
+        try:
+            content = json.loads(text)
+        except json.JSONDecodeError:
+            return self._resolve_status(
+                "stale",
+                reference_id,
+                reason="invalid_json_payload",
+                expires_at=str(record.get("expires_at", "")),
+            )
         metadata: dict[str, Any] = {}
         summary: dict[str, Any] = {}
         sensitivity: dict[str, Any] = {
@@ -151,7 +183,12 @@ class ResultReferences:
             summary = content.get("summary") if isinstance(content.get("summary"), dict) else {}
             envelope_expires_at = parse_iso(str(metadata.get("expires_at", "")))
             if envelope_expires_at and envelope_expires_at < datetime.now(timezone.utc):
-                return {"schema": "mcp_result_reference.resolve.v1", "status": "expired", "reference_id": reference_id}
+                return self._resolve_status(
+                    "expired",
+                    reference_id,
+                    reason="envelope_expired",
+                    expires_at=str(metadata.get("expires_at", "")),
+                )
             stored_reference_id = str(metadata.get("reference_id") or "")
             if stored_reference_id and stored_reference_id != reference_id:
                 return {
@@ -175,31 +212,34 @@ class ResultReferences:
             "schema": "mcp_result_reference.resolve.v1",
             "status": "resolved",
             "reference_id": reference_id,
+            "uri": self._public_uri(reference_id),
             "content": payload,
             "content_sha256": digest,
             "metadata": metadata,
             "summary": summary,
             "sensitivity": sensitivity,
+            "repo_boundary_enforced": True,
+            "warnings": [],
         }
 
     def _public_list_row(self, row: dict[str, Any]) -> dict[str, Any]:
-        storage = str(row.get("storage") or "lmdb")
-        if storage == "file":
-            path = self.config.references_dir / str(row.get("path", ""))
-        else:
-            path = self.config.store_path
+        reference_id = str(row.get("reference_id", ""))
+        status = self._record_status(row)
         return {
-            "reference_id": str(row.get("reference_id", "")),
+            "reference_id": reference_id,
+            "uri": self._public_uri(reference_id) if reference_id else "",
             "created_at": str(row.get("created_at", "")),
             "expires_at": str(row.get("expires_at", "")),
-            "path": self.config.display_path(path),
+            "sha256": str(row.get("sha256", "")),
             "size_bytes": int(row.get("size_bytes", 0) or 0),
-            "storage": storage,
+            "status": status["status"],
+            "warnings": status["warnings"],
+            "repo_boundary_enforced": True,
         }
 
     def _body_from_record(self, row: dict[str, Any]) -> str:
-        storage = str(row.get("storage") or "lmdb")
-        if storage == "lmdb":
+        storage = str(row.get("storage") or "inline")
+        if storage in {"inline", "lmdb"}:
             body = row.get("body")
             return body if isinstance(body, str) else ""
         file_name = str(row.get("path") or "")
@@ -211,3 +251,54 @@ class ResultReferences:
         if not path.is_file():
             return ""
         return path.read_text(encoding="utf-8")
+
+    def _public_uri(self, reference_id: str) -> str:
+        return (
+            f"repo://project/{self.config.project_id}/context/{reference_id}"
+            if self.config.project_id
+            else f"repo://context/{reference_id}"
+        )
+
+    def _record_status(self, row: dict[str, Any]) -> dict[str, Any]:
+        if str(row.get("status", "")).lower() in {"stale", "invalidated"}:
+            return {
+                "status": "stale",
+                "reason": "invalidated",
+                "warnings": [self._warning("reference_stale", "reference invalidated")],
+            }
+        if row.get("invalidated_at"):
+            return {
+                "status": "stale",
+                "reason": "invalidated",
+                "warnings": [self._warning("reference_stale", "reference invalidated")],
+            }
+        expires_at = parse_iso(str(row.get("expires_at", "")))
+        if expires_at and expires_at < datetime.now(timezone.utc):
+            return {
+                "status": "expired",
+                "reason": "expired",
+                "warnings": [self._warning("reference_expired", "reference expired")],
+            }
+        return {"status": "active", "reason": "", "warnings": []}
+
+    def _resolve_status(
+        self,
+        status: str,
+        reference_id: str,
+        reason: str,
+        expires_at: str = "",
+    ) -> dict[str, Any]:
+        warning_code = "reference_expired" if status == "expired" else "reference_stale"
+        return {
+            "schema": "mcp_result_reference.resolve.v1",
+            "status": status,
+            "reference_id": reference_id,
+            "uri": self._public_uri(reference_id),
+            "expires_at": expires_at,
+            "reason": reason,
+            "repo_boundary_enforced": True,
+            "warnings": [self._warning(warning_code, reason)],
+        }
+
+    def _warning(self, code: str, message: str) -> dict[str, str]:
+        return {"code": code, "message": message}

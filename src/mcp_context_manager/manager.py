@@ -146,10 +146,13 @@ class ProjectContextService:
         path: str = ".",
         max_files: int = 5000,
         max_age_minutes: int = 1440,
+        max_entries: int = 100,
         max_output_chars: int | None = None,
         default_output_profile: str | None = None,
         tool_name: str = "",
         contract_profile: str = "",
+        state_prefix: str = "",
+        state_key: str = "",
         project_id: str | None = None,
         root_uri: str | None = None,
         mcp_roots: list[Any] | None = None,
@@ -190,10 +193,13 @@ class ProjectContextService:
             path=path,
             max_files=max_files,
             max_age_minutes=max_age_minutes,
+            max_entries=max_entries,
             max_output_chars=max_output_chars,
             default_output_profile=default_output_profile,
             tool_name=tool_name,
             contract_profile=contract_profile,
+            state_prefix=state_prefix,
+            state_key=state_key,
         )
         result.setdefault("project_id", project.project_id)
         return result
@@ -337,6 +343,6 @@ class ProjectContextService:
         project_id = str(reference.get("project_id") or "")
         if project_id:
             return project_id
-        uri = str(reference.get("resolver", {}).get("uri") or "")
+        uri = str(reference.get("uri") or reference.get("resolver", {}).get("uri") or "")
         match = re.match(r"repo://project/([^/]+)/context/", uri)
         return match.group(1) if match else ""

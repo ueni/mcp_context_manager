@@ -179,21 +179,19 @@ class ContextIndex:
                 txn,
             )
             if whole_repo_refresh:
-                signature = self.refresh_signature()
+                signature = self.refresh_signature(max_files=max_files)
                 self._set_meta("refresh_signature", signature["signature"], txn)
                 self._set_meta(
                     "refresh_signature_available",
                     "true" if signature["available"] else "false",
                     txn,
                 )
-            self._set_meta("storage_backend", self.store.backend, txn)
 
         status = self.status()
         return {
             "schema": "context_index.refresh.v1",
             "generated_at": generated_at,
-            "index_path": self.config.display_path(self.config.store_path),
-            "storage_backend": self.store.backend,
+            "index_available": True,
             "file_count": status["file_count"],
             "symbol_count": status["symbol_count"],
             "import_count": status["import_count"],
@@ -202,7 +200,7 @@ class ContextIndex:
             "unchanged_count": unchanged_count,
             "removed_count": removed_count,
             "fts_enabled": False,
-            "search_backend": "lmdb_terms",
+            "search_mode": "term_index",
         }
 
     def refresh_if_needed(
@@ -219,7 +217,7 @@ class ContextIndex:
             result["skipped"] = False
             result["reason"] = "scoped_refresh"
             return result
-        signature = self.refresh_signature()
+        signature = self.refresh_signature(max_files=max_files)
         if not signature["available"]:
             result = self.refresh(path=path, max_files=max_files)
             result["skipped"] = False
@@ -233,8 +231,7 @@ class ContextIndex:
             return {
                 "schema": "context_index.refresh.v1",
                 "generated_at": status["generated_at"],
-                "index_path": status["index_path"],
-                "storage_backend": self.store.backend,
+                "index_available": True,
                 "file_count": status["file_count"],
                 "symbol_count": status["symbol_count"],
                 "import_count": status.get("import_count", 0),
@@ -243,7 +240,7 @@ class ContextIndex:
                 "unchanged_count": status["file_count"],
                 "removed_count": 0,
                 "fts_enabled": status["fts_enabled"],
-                "search_backend": status["search_backend"],
+                "search_mode": status["search_mode"],
                 "skipped": True,
                 "reason": "signature_unchanged",
             }
@@ -252,8 +249,28 @@ class ContextIndex:
         result["reason"] = "signature_changed"
         return result
 
-    def refresh_signature(self) -> dict[str, Any]:
+    def refresh_signature(self, max_files: int = 5000) -> dict[str, Any]:
         if not (self.config.repo_path / ".git").exists():
+            try:
+                files = self._iter_candidate_files(
+                    self.config.repo_path, max_files=max_files
+                )
+            except OSError:
+                files = []
+            if files:
+                rows = []
+                for candidate in files:
+                    rel = str(candidate.path.relative_to(self.config.repo_path)).replace(
+                        "\\", "/"
+                    )
+                    rows.append(f"{rel}:{candidate.size}:{candidate.mtime_ns}")
+                return {
+                    "schema": "context_index.refresh_signature.v1",
+                    "available": True,
+                    "signature": "files:" + sha256_text("\n".join(sorted(rows))),
+                    "source": "file_metadata",
+                    "file_count": len(rows),
+                }
             return {
                 "schema": "context_index.refresh_signature.v1",
                 "available": False,
@@ -311,14 +328,13 @@ class ContextIndex:
         import_count = self.store.count("index:import:")
         return {
             "schema": "context_index.status.v1",
-            "index_path": self.config.display_path(self.config.store_path),
-            "storage_backend": self.store.backend,
+            "index_available": self.store.exists(),
             "exists": self.store.exists(),
             "file_count": int(file_count),
             "symbol_count": int(symbol_count),
             "import_count": int(import_count),
             "fts_enabled": False,
-            "search_backend": "lmdb_terms",
+            "search_mode": "term_index",
             "generated_at": meta.get("generated_at", ""),
             "git_head": meta.get("git_head", ""),
             "git_branch": meta.get("git_branch", ""),
@@ -526,7 +542,7 @@ class ContextIndex:
                         "path": rel,
                         "line": int(row.get("first_line", 1) or 1),
                         "excerpt": str(row.get("excerpt", "")),
-                        "source": "lmdb_terms",
+                        "source": "term_index",
                         "term_hits": 0,
                         "term_count": 0,
                     },

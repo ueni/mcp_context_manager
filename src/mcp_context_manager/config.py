@@ -17,6 +17,8 @@ class ContextConfig:
     port: int = 8000
     bearer_token: str = ""
     lmdb_map_size: int = 1_073_741_824
+    token_counter_mode: str = "estimate"
+    target_tokenizer: str = "cl100k_base"
     project_id: str = ""
     root_uri: str = ""
     allowed_roots: tuple[str, ...] = field(default_factory=tuple)
@@ -48,6 +50,12 @@ class ContextConfig:
                 16_777_216,
                 int(os.getenv("MCP_CONTEXT_LMDB_MAP_SIZE", "1073741824")),
             ),
+            token_counter_mode=os.getenv(
+                "MCP_CONTEXT_TOKEN_COUNTER", "estimate"
+            ).strip().lower(),
+            target_tokenizer=os.getenv(
+                "MCP_CONTEXT_TARGET_TOKENIZER", "cl100k_base"
+            ).strip(),
         )
 
     def with_project(
@@ -72,6 +80,8 @@ class ContextConfig:
             port=self.port,
             bearer_token=self.bearer_token,
             lmdb_map_size=self.lmdb_map_size,
+            token_counter_mode=self.token_counter_mode,
+            target_tokenizer=self.target_tokenizer,
         )
 
     @property

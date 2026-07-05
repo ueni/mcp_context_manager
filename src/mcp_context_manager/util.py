@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .token_counter import estimate_tokens as _estimate_tokens
+
 SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
     re.compile(
@@ -159,9 +161,7 @@ def is_expired(value: str | None) -> bool:
 
 
 def estimate_tokens(text_or_value: Any) -> int:
-    if not isinstance(text_or_value, str):
-        text_or_value = json.dumps(text_or_value, ensure_ascii=False, sort_keys=True)
-    return max(1, (len(text_or_value) + 3) // 4)
+    return _estimate_tokens(text_or_value)
 
 
 def sha256_text(text: str) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import ContextConfig
@@ -12,11 +13,12 @@ from .metrics import ContextMetrics
 from .references import ResultReferences
 from .schemas import output_contracts
 from .store import ContextStore
+from .token_counter import TokenCount, TokenCounter
 from .util import (
     classify_route,
-    estimate_tokens,
     normalize_query_terms,
     now_iso,
+    parse_iso,
     prompt_injection_signals,
     sanitize_json,
     sha256_text,
@@ -31,6 +33,10 @@ class ContextService:
         self.memory = ContextMemory(config)
         self.metrics = ContextMetrics(config)
         self.references = ResultReferences(config)
+        self.token_counter = TokenCounter(
+            mode=config.token_counter_mode,
+            target_tokenizer=config.target_tokenizer,
+        )
 
     @classmethod
     def from_env(cls) -> "ContextService":
@@ -54,6 +60,7 @@ class ContextService:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
         if mode == "search":
             self._ensure_index_fresh(path=path)
+            index_status = self.index.status()
             cache_key = self._cache_key(
                 "context_lookup.search",
                 {
@@ -61,11 +68,14 @@ class ContextService:
                     "path": path,
                     "max_results": max_results,
                     "include_globs": include_globs or [],
-                    "index": self.index.status().get("generated_at", ""),
+                    "index": index_status.get("generated_at", ""),
+                    "refresh_signature": index_status.get("refresh_signature", ""),
+                    "project_id": self.config.project_id,
                 },
             )
-            cached = self._cache_get(cache_key)
-            if cached:
+            cache_lookup = self._cache_lookup(cache_key)
+            cached = cache_lookup.get("value") if cache_lookup["hit"] else None
+            if isinstance(cached, dict):
                 self._record_metric(
                     "context_lookup.search",
                     started,
@@ -76,12 +86,12 @@ class ContextService:
                 )
                 return {
                     **cached,
-                    "cache": {
-                        "hit": True,
-                        "key": cache_key,
-                        "namespace": "context_lookup.search",
-                        "reason": "hit",
-                    },
+                    "cache": self._cache_public_metadata(
+                        cache_key,
+                        "context_lookup.search",
+                        cache_lookup,
+                        reason="hit",
+                    ),
                 }
             result = self.index.search(
                 query=query,
@@ -96,7 +106,8 @@ class ContextService:
                 metadata={
                     "query": query,
                     "path": path,
-                    "index_generated_at": self.index.status().get("generated_at", ""),
+                    "index_generated_at": index_status.get("generated_at", ""),
+                    "refresh_signature": index_status.get("refresh_signature", ""),
                 },
             )
             self._record_metric(
@@ -104,17 +115,17 @@ class ContextService:
                 started,
                 cache_hit=False,
                 cache_namespace="context_lookup.search",
-                cache_reason="miss",
+                cache_reason=str(cache_lookup.get("reason") or "miss"),
                 result_count=int(result.get("count", 0)),
             )
             return {
                 **result,
-                "cache": {
-                    "hit": False,
-                    "key": cache_key,
-                    "namespace": "context_lookup.search",
-                    "reason": "miss",
-                },
+                "cache": self._cache_public_metadata(
+                    cache_key,
+                    "context_lookup.search",
+                    cache_lookup,
+                    reason=str(cache_lookup.get("reason") or "miss"),
+                ),
             }
         if mode == "snippet":
             self._ensure_index_fresh(path=path)
@@ -206,10 +217,13 @@ class ContextService:
         path: str = ".",
         max_files: int = 5000,
         max_age_minutes: int = 1440,
+        max_entries: int = 100,
         max_output_chars: int | None = None,
         default_output_profile: str | None = None,
         tool_name: str = "",
         contract_profile: str = "",
+        state_prefix: str = "",
+        state_key: str = "",
     ) -> dict[str, Any]:
         allowed = {
             "health",
@@ -222,6 +236,7 @@ class ContextService:
             "metrics",
             "measurement_matrix",
             "benchmark",
+            "state_browser",
         }
         if mode not in allowed:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
@@ -251,6 +266,13 @@ class ContextService:
             return self.metrics.measurement_matrix()
         if mode == "benchmark":
             return self._context_pack_benchmark(max_files=max_files)
+        if mode == "state_browser":
+            return self._state_browser(
+                prefix=state_prefix,
+                key=state_key,
+                max_entries=max_entries,
+                max_output_chars=max_output_chars,
+            )
         return self._budget(max_output_chars, default_output_profile)
 
     def context_pack(
@@ -292,29 +314,43 @@ class ContextService:
         memory_context = self._memory_context(route=route, session=memory_session)
         stage_timings["memory_lookup_ms"] = self._elapsed_ms(stage_started)
         prompt_sha256 = sha256_text(prompt)
+        token_counting = self.token_counter.metadata()
         cache_key = self._context_pack_retrieval_cache_key(
             route=route,
             terms=terms,
             explicit_paths=explicit_paths,
             profile=profile,
             max_items=max_items,
+            token_counting=token_counting,
         )
         stage_started = time.perf_counter()
-        cached = None if refresh_index else self._cache_get(cache_key)
+        if refresh_index:
+            cache_lookup = {
+                "hit": False,
+                "status": "disabled",
+                "reason": "disabled_refresh_index",
+                "warnings": [],
+            }
+        else:
+            cache_lookup = self._cache_lookup(cache_key)
+        cached = cache_lookup.get("value") if cache_lookup["hit"] else None
         stage_timings["cache_lookup_ms"] = self._elapsed_ms(stage_started)
-        cache_hit = cached is not None
-        cache_reason = "disabled_refresh_index" if refresh_index else "miss"
-        if cached:
+        cache_hit = isinstance(cached, dict)
+        cache_reason = str(cache_lookup.get("reason") or "miss")
+        if isinstance(cached, dict):
             candidates = list(cached.get("candidates", []))
             retrieval_omitted = list(cached.get("omitted", []))
             retrieval_stats = dict(cached.get("retrieval_stats", {}))
             stage_timings["candidate_retrieval_ms"] = 0.0
+            stage_timings["search_ranking_ms"] = 0.0
             stage_timings["snippet_batch_ms"] = 0.0
             cache_reason = "hit"
         else:
             cache_reason = (
                 "disabled_refresh_index"
                 if refresh_index
+                else cache_reason
+                if cache_reason in {"expired", "invalidated", "invalid_payload"}
                 else self._cache_miss_reason(
                     namespace="context_pack.retrieval",
                     metadata={
@@ -331,9 +367,12 @@ class ContextService:
                 terms=terms,
                 explicit_paths=explicit_paths,
                 profile=profile,
-                max_items=max(max_items, 8),
+                max_items=max(1, max_items),
             )
             stage_timings["candidate_retrieval_ms"] = self._elapsed_ms(stage_started)
+            stage_timings["search_ranking_ms"] = stage_timings[
+                "candidate_retrieval_ms"
+            ]
             stage_timings["snippet_batch_ms"] = round(
                 float(retrieval_stats.get("snippet_batch_ms", 0.0)), 3
             )
@@ -357,7 +396,8 @@ class ContextService:
                     ),
                     "terms_key": terms_key,
                     "profile": profile,
-                    "retrieval_item_floor": max(max_items, 8),
+                    "max_items": max(1, max_items),
+                    "token_counting": self.token_counter.cache_key_metadata(),
                 },
             )
         stage_started = time.perf_counter()
@@ -387,18 +427,27 @@ class ContextService:
                     "key": cache_key,
                     "namespace": "context_pack.retrieval",
                     "reason": cache_reason,
+                    "status": str(cache_lookup.get("status", "missing")),
+                    "warnings": list(cache_lookup.get("warnings") or []),
                 },
             },
             summary={"route": route, "candidate_count": len(candidates), "selected_count": len(selected)},
             ttl_hours=24,
         )
         stage_timings["reference_write_ms"] = self._elapsed_ms(stage_started)
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
-        stage_timings["total_ms"] = elapsed_ms
         candidate_chars = sum(int(item.get("raw_chars", 0)) for item in candidates)
         selected_chars = sum(int(item.get("raw_chars", 0)) for item in selected)
-        output_tokens = estimate_tokens(json.dumps(selected, ensure_ascii=False))
-        baseline_tokens = max(self._baseline_input_tokens(candidates), output_tokens)
+        output_token_count = self._token_count(
+            json.dumps(selected, ensure_ascii=False)
+        )
+        output_tokens = output_token_count.count
+        baseline_count = self._baseline_input_token_count(candidates)
+        baseline_tokens = max(baseline_count.count, output_tokens)
+        token_counting = self._merge_token_counting_metadata(
+            token_counting,
+            output_token_count.metadata(),
+            baseline_count.metadata(),
+        )
         estimated_tokens_saved = max(0, baseline_tokens - output_tokens)
         reference_bytes_deferred = int(
             full_reference.get("content", {}).get("size_bytes", 0) or 0
@@ -408,6 +457,7 @@ class ContextService:
             omitted=omitted,
             memory_context=memory_context,
         )
+        stage_started = time.perf_counter()
         result = {
             "schema": "context_pack.v1",
             "generated_at": now_iso(),
@@ -434,6 +484,7 @@ class ContextService:
             "budget": {
                 "max_output_chars": budget,
                 "estimated_output_tokens": output_tokens,
+                "token_counting": token_counting,
             },
             "summary": {
                 "item_count": len(selected),
@@ -453,6 +504,9 @@ class ContextService:
                 "key": cache_key,
                 "namespace": "context_pack.retrieval",
                 "reason": cache_reason,
+                "status": str(cache_lookup.get("status", "missing")),
+                "expires_at": str(cache_lookup.get("expires_at", "")),
+                "warnings": list(cache_lookup.get("warnings") or []),
                 "index_refresh": {
                     "skipped": bool(index_refresh.get("skipped", False)),
                     "reason": index_refresh.get("reason", ""),
@@ -464,12 +518,13 @@ class ContextService:
                 "untrusted_content_signals": self._aggregate_signals(selected),
             },
             "metrics": {
-                "elapsed_ms": elapsed_ms,
-                "stage_timings_ms": stage_timings,
+                "elapsed_ms": 0.0,
+                "stage_timings_ms": {},
                 "candidate_count": len(candidates),
                 "selected_count": len(selected),
                 "candidate_raw_chars": candidate_chars,
                 "selected_raw_chars": selected_chars,
+                "token_counting": token_counting,
                 "baseline_input_tokens_est": baseline_tokens,
                 "output_tokens_est": output_tokens,
                 "estimated_input_tokens_saved": estimated_tokens_saved,
@@ -485,6 +540,11 @@ class ContextService:
                 {"action": "resolve_reference", "when": "Need full omitted candidate evidence", "reference_id": full_reference["reference_id"]}
             ],
         }
+        stage_timings["response_assembly_ms"] = self._elapsed_ms(stage_started)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        stage_timings["total_ms"] = elapsed_ms
+        result["metrics"]["elapsed_ms"] = elapsed_ms
+        result["metrics"]["stage_timings_ms"] = stage_timings
         self.metrics.record_event(
             "context_pack",
             elapsed_ms=elapsed_ms,
@@ -664,6 +724,7 @@ class ContextService:
         explicit_paths: list[str],
         profile: str,
         max_items: int,
+        token_counting: dict[str, Any],
     ) -> str:
         status = self.index.status()
         return self._cache_key(
@@ -673,10 +734,19 @@ class ContextService:
                 "terms": sorted(set(terms)),
                 "explicit_paths": explicit_paths,
                 "output_profile": profile,
-                "retrieval_item_floor": max(max_items, 8),
+                "max_items": max(1, max_items),
                 "index_generated_at": status.get("generated_at", ""),
                 "refresh_signature": status.get("refresh_signature", ""),
                 "project_id": self.config.project_id,
+                "token_counting": {
+                    "tokenizer": token_counting.get("tokenizer", ""),
+                    "tokenizer_available": token_counting.get(
+                        "tokenizer_available", False
+                    ),
+                    "token_count_source": token_counting.get(
+                        "token_count_source", ""
+                    ),
+                },
             },
         )
 
@@ -741,7 +811,7 @@ class ContextService:
 
         if terms:
             try:
-                search_limit = max(max_items * 4, 12)
+                search_limit = max(max_items * 4, 8)
                 retrieval_stats["search_limit"] = search_limit
                 search = self.index.search(
                     query=" ".join(terms), max_results=search_limit
@@ -771,7 +841,7 @@ class ContextService:
                 omitted.append({"reason_code": "search_failed", "detail": type(exc).__name__})
 
         try:
-            symbol_limit = max(max_items, 4)
+            symbol_limit = max(max_items, 2)
             retrieval_stats["symbol_limit"] = symbol_limit
             queued_path_count = len({str(item.get("path", "")) for item in candidates})
             if (
@@ -893,7 +963,9 @@ class ContextService:
             selected.append(item)
         return selected, omitted
 
-    def _baseline_input_tokens(self, candidates: list[dict[str, Any]]) -> int:
+    def _baseline_input_token_count(
+        self, candidates: list[dict[str, Any]]
+    ) -> TokenCount:
         evidence = [
             {
                 "path": item.get("path", ""),
@@ -904,7 +976,38 @@ class ContextService:
             for item in candidates
         ]
         deferred_chars = sum(int(item.get("deferred_chars", 0) or 0) for item in candidates)
-        return estimate_tokens(evidence) + max(0, (deferred_chars + 3) // 4)
+        token_count = self._token_count(evidence)
+        return TokenCount(
+            count=token_count.count + max(0, (deferred_chars + 3) // 4),
+            tokenizer=token_count.tokenizer,
+            tokenizer_available=token_count.tokenizer_available,
+            token_count_source=token_count.token_count_source,
+            warnings=token_count.warnings,
+        )
+
+    def _count_tokens(self, text_or_value: Any) -> int:
+        return self._token_count(text_or_value).count
+
+    def _token_count(self, text_or_value: Any) -> TokenCount:
+        return self.token_counter.count(text_or_value)
+
+    def _merge_token_counting_metadata(
+        self, *metadata_rows: dict[str, Any]
+    ) -> dict[str, Any]:
+        merged = dict(metadata_rows[0]) if metadata_rows else {}
+        warnings: list[dict[str, str]] = []
+        for row in metadata_rows:
+            if row.get("token_count_source") == "estimate":
+                merged["token_count_source"] = "estimate"
+            if "tokenizer_available" in row:
+                merged["tokenizer_available"] = bool(row["tokenizer_available"])
+            if row.get("tokenizer"):
+                merged["tokenizer"] = row["tokenizer"]
+            for warning in row.get("warnings") or []:
+                if isinstance(warning, dict) and warning not in warnings:
+                    warnings.append(warning)
+        merged["warnings"] = warnings
+        return merged
 
     def _external_tool_calls_saved_estimate(
         self,
@@ -954,6 +1057,7 @@ class ContextService:
                         "baseline_input_tokens_est"
                     ],
                     "output_tokens_est": pack["metrics"]["output_tokens_est"],
+                    "token_counting": pack["metrics"]["token_counting"],
                     "estimated_input_tokens_saved": pack["metrics"][
                         "estimated_input_tokens_saved"
                     ],
@@ -1017,6 +1121,117 @@ class ContextService:
         )
         return f"review {terms} behavior and related tests"
 
+    def _state_browser(
+        self,
+        prefix: str = "",
+        key: str = "",
+        max_entries: int = 100,
+        max_output_chars: int | None = None,
+    ) -> dict[str, Any]:
+        self.config.ensure_state_dirs()
+        prefix = (prefix or "").strip()
+        key = (key or "").strip()
+        row_budget = max(200, min(int(max_output_chars or 1200), 8000))
+        entry_budget = max(500, min(int(max_output_chars or 12000), 50000))
+        if key:
+            value = self.store.get_json(key)
+            exists = value is not None
+            preview = self._state_value_preview(value, entry_budget) if exists else ""
+            return {
+                "schema": "context_state_browser.v1",
+                "mode": "entry",
+                "project_id": self.config.project_id,
+                "key": key,
+                "exists": exists,
+                "entry": {
+                    "key": key,
+                    "value_type": type(value).__name__ if exists else "missing",
+                    "size_chars": len(
+                        json.dumps(
+                            sanitize_json(value),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=str,
+                        )
+                    )
+                    if exists
+                    else 0,
+                    "preview": preview,
+                    "truncated": exists and len(preview) >= entry_budget,
+                    "schema": value.get("schema", "") if isinstance(value, dict) else "",
+                    "expires_at": value.get("expires_at", "")
+                    if isinstance(value, dict)
+                    else "",
+                    "status": value.get("status", "") if isinstance(value, dict) else "",
+                },
+                "repo_boundary_enforced": True,
+                "generated_state_only": True,
+            }
+
+        entries = self.store.iter_json(prefix)[: max(0, max_entries)]
+        all_keys = [row_key for row_key, _value in self.store.iter_json("")]
+        prefix_counts: dict[str, int] = {}
+        for row_key in all_keys:
+            group = row_key.split(":", 1)[0] + ":" if ":" in row_key else row_key
+            prefix_counts[group] = prefix_counts.get(group, 0) + 1
+        rows = [
+            self._state_browser_row(row_key, value, row_budget)
+            for row_key, value in entries
+        ]
+        return {
+            "schema": "context_state_browser.v1",
+            "mode": "list",
+            "project_id": self.config.project_id,
+            "prefix": prefix,
+            "entry_count": len(rows),
+            "max_entries": max_entries,
+            "truncated": len(self.store.iter_json(prefix)) > len(rows),
+            "prefix_counts": [
+                {"prefix": row_prefix, "count": count}
+                for row_prefix, count in sorted(prefix_counts.items())
+            ],
+            "rows": rows,
+            "repo_boundary_enforced": True,
+            "generated_state_only": True,
+        }
+
+    def _state_browser_row(
+        self,
+        key: str,
+        value: Any,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        return {
+            "key": key,
+            "value_type": type(value).__name__,
+            "size_chars": len(
+                json.dumps(
+                    sanitize_json(value),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            ),
+            "schema": value.get("schema", "") if isinstance(value, dict) else "",
+            "status": value.get("status", "") if isinstance(value, dict) else "",
+            "expires_at": value.get("expires_at", "")
+            if isinstance(value, dict)
+            else "",
+            "preview": self._state_value_preview(value, max_chars),
+        }
+
+    def _state_value_preview(self, value: Any, max_chars: int) -> str:
+        preview = json.dumps(
+            sanitize_json(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            default=str,
+        )
+        if len(preview) <= max_chars:
+            return preview
+        return preview[: max(0, max_chars - 14)] + "\n...[truncated]"
+
     def _memory_context(self, route: str, session: str) -> dict[str, Any]:
         namespaces = ["workspace", f"route/{route}", f"session/{session or 'default'}"]
         summaries = []
@@ -1071,10 +1286,50 @@ class ContextService:
         return f"{tool}:{sha256_text(json.dumps(args, sort_keys=True, default=str))[:24]}"
 
     def _cache_get(self, key: str) -> dict[str, Any] | None:
+        lookup = self._cache_lookup(key)
+        value = lookup.get("value")
+        return value if isinstance(value, dict) and lookup["hit"] else None
+
+    def _cache_lookup(self, key: str) -> dict[str, Any]:
         row = self.store.get_json(f"cache:{key}")
-        if isinstance(row, dict):
-            return row.get("value")
-        return None
+        if not isinstance(row, dict):
+            return {
+                "hit": False,
+                "status": "missing",
+                "reason": "miss",
+                "warnings": [],
+            }
+        status = self._cache_row_status(row)
+        if status["status"] != "active":
+            return {
+                "hit": False,
+                "status": status["status"],
+                "reason": status["reason"],
+                "expires_at": str(row.get("expires_at", "")),
+                "warnings": status["warnings"],
+            }
+        value = row.get("value")
+        if not isinstance(value, dict):
+            return {
+                "hit": False,
+                "status": "stale",
+                "reason": "invalid_payload",
+                "expires_at": str(row.get("expires_at", "")),
+                "warnings": [
+                    {
+                        "code": "cache_stale",
+                        "message": "cached payload is not valid",
+                    }
+                ],
+            }
+        return {
+            "hit": True,
+            "status": "active",
+            "reason": "hit",
+            "value": value,
+            "expires_at": str(row.get("expires_at", "")),
+            "warnings": [],
+        }
 
     def _cache_set(
         self,
@@ -1082,15 +1337,25 @@ class ContextService:
         value: dict[str, Any],
         namespace: str,
         metadata: dict[str, Any] | None = None,
+        ttl_seconds: int = 86_400,
     ) -> None:
         sanitized_value, sensitivity = sanitize_json(value)
+        updated_at = now_iso()
+        expires_at = (
+            datetime.fromtimestamp(time.time() + max(1, ttl_seconds), timezone.utc)
+            .isoformat()
+        )
         self.store.put_json(
             f"cache:{key}",
             {
-                "updated_at": now_iso(),
+                "created_at": updated_at,
+                "updated_at": updated_at,
+                "expires_at": expires_at,
+                "ttl_seconds": max(1, int(ttl_seconds)),
+                "status": "active",
                 "namespace": namespace,
                 "key": key,
-                "metadata": metadata or {},
+                "metadata": {**(metadata or {}), "project_id": self.config.project_id},
                 "value": sanitized_value,
                 "sensitivity": sensitivity,
             },
@@ -1122,10 +1387,14 @@ class ContextService:
                 continue
             key = cache_key.removeprefix("cache:")
             namespace = str(row["namespace"])
+            row_status = self._cache_row_status(row)
             stats = namespaces.setdefault(
                 namespace,
                 {
                     "entry_count": 0,
+                    "active_count": 0,
+                    "expired_count": 0,
+                    "stale_count": 0,
                     "sample_keys": [],
                     "hits": 0,
                     "misses": 0,
@@ -1133,6 +1402,8 @@ class ContextService:
                 },
             )
             stats["entry_count"] = int(stats["entry_count"]) + 1
+            status_key = f"{row_status['status']}_count"
+            stats[status_key] = int(stats.get(status_key, 0)) + 1
             if len(stats["sample_keys"]) < 5:
                 stats["sample_keys"].append(key)
         for namespace, metric_stats in metric_namespaces.items():
@@ -1140,6 +1411,9 @@ class ContextService:
                 namespace,
                 {
                     "entry_count": 0,
+                    "active_count": 0,
+                    "expired_count": 0,
+                    "stale_count": 0,
                     "sample_keys": [],
                     "hits": 0,
                     "misses": 0,
@@ -1153,11 +1427,12 @@ class ContextService:
             "entry_count": len(entries),
             "keys": sorted(keys)[:20],
             "namespaces": dict(sorted(namespaces.items())),
-            "storage_backend": self.store.backend,
         }
 
     def _cache_prune(self, max_age_minutes: int) -> dict[str, Any]:
         removed = 0
+        expired_removed = 0
+        stale_removed = 0
         cutoff_seconds = max_age_minutes * 60
         now = time.time()
         with self.store.write_txn() as txn:
@@ -1166,6 +1441,17 @@ class ContextService:
                 if not isinstance(row, dict):
                     self.store.delete(key, txn=txn)
                     removed += 1
+                    continue
+                status = self._cache_row_status(row)
+                if status["status"] == "expired":
+                    removed += 1
+                    expired_removed += 1
+                    self.store.delete(key, txn=txn)
+                    continue
+                if status["status"] == "stale":
+                    removed += 1
+                    stale_removed += 1
+                    self.store.delete(key, txn=txn)
                     continue
                 updated = row.get("updated_at", "")
                 try:
@@ -1177,7 +1463,12 @@ class ContextService:
                 if age > cutoff_seconds:
                     removed += 1
                     self.store.delete(key, txn=txn)
-        return {"removed_entries": removed, "entry_count": self.store.count("cache:")}
+        return {
+            "removed_entries": removed,
+            "expired_removed": expired_removed,
+            "stale_removed": stale_removed,
+            "entry_count": self.store.count("cache:"),
+        }
 
     def _reference_list(self, limit: int = 20) -> list[dict[str, Any]]:
         return self.references.list(limit=limit)
@@ -1219,3 +1510,48 @@ class ContextService:
                 return "stale_index"
             return "arg_changed"
         return "arg_changed"
+
+    def _cache_row_status(self, row: dict[str, Any]) -> dict[str, Any]:
+        if str(row.get("status", "")).lower() in {"stale", "invalidated"}:
+            return {
+                "status": "stale",
+                "reason": "invalidated",
+                "warnings": [
+                    {"code": "cache_stale", "message": "cache row invalidated"}
+                ],
+            }
+        if row.get("invalidated_at"):
+            return {
+                "status": "stale",
+                "reason": "invalidated",
+                "warnings": [
+                    {"code": "cache_stale", "message": "cache row invalidated"}
+                ],
+            }
+        expires_at = parse_iso(str(row.get("expires_at", "")))
+        if expires_at and expires_at < datetime.now(timezone.utc):
+            return {
+                "status": "expired",
+                "reason": "expired",
+                "warnings": [
+                    {"code": "cache_expired", "message": "cache row expired"}
+                ],
+            }
+        return {"status": "active", "reason": "", "warnings": []}
+
+    def _cache_public_metadata(
+        self,
+        key: str,
+        namespace: str,
+        lookup: dict[str, Any],
+        reason: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "hit": bool(lookup.get("hit")),
+            "key": key,
+            "namespace": namespace,
+            "reason": reason or str(lookup.get("reason") or "miss"),
+            "status": str(lookup.get("status") or "missing"),
+            "expires_at": str(lookup.get("expires_at", "")),
+            "warnings": list(lookup.get("warnings") or []),
+        }

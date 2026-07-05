@@ -275,15 +275,21 @@ AdminModeParam = Annotated[
         "metrics",
         "measurement_matrix",
         "benchmark",
+        "state_browser",
     ],
     _tool_param(
         "Administrative operation: health, projects, index refresh/status, cache "
-        "stats/prune, budget, output contracts, metrics, targets, or benchmarks."
+        "stats/prune, budget, output contracts, metrics, targets, benchmarks, "
+        "or generated-state browsing."
     ),
 ]
 MaxFilesParam = Annotated[
     int,
     _tool_param("Maximum number of files to visit during index_refresh."),
+]
+MaxEntriesParam = Annotated[
+    int,
+    _tool_param("Maximum number of rows to return for list-style operations."),
 ]
 MaxAgeMinutesParam = Annotated[
     int,
@@ -303,6 +309,19 @@ ToolNameParam = Annotated[
 ContractProfileParam = Annotated[
     Literal["", "verbose", "compact"],
     _tool_param("Optional contract profile for mode=contracts."),
+]
+StatePrefixParam = Annotated[
+    str,
+    _tool_param(
+        "Optional generated-state key prefix for mode=state_browser, for example "
+        "cache:, metrics:, memory:, reference:, or index:."
+    ),
+]
+StateKeyParam = Annotated[
+    str,
+    _tool_param(
+        "Optional exact generated-state key for mode=state_browser entry inspection."
+    ),
 ]
 ReferenceIdParam = Annotated[
     str,
@@ -502,10 +521,13 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         path: RepoPathParam = ".",
         max_files: MaxFilesParam = 5000,
         max_age_minutes: MaxAgeMinutesParam = 1440,
+        max_entries: MaxEntriesParam = 100,
         max_output_chars: MaxOutputCharsParam = None,
         default_output_profile: DefaultOutputProfileParam = None,
         tool_name: ToolNameParam = "",
         contract_profile: ContractProfileParam = "",
+        state_prefix: StatePrefixParam = "",
+        state_key: StateKeyParam = "",
         project_id: ProjectIdParam = None,
         root_uri: RootUriParam = None,
     ) -> dict[str, Any]:
@@ -515,10 +537,13 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
             path=path,
             max_files=max_files,
             max_age_minutes=max_age_minutes,
+            max_entries=max_entries,
             max_output_chars=max_output_chars,
             default_output_profile=default_output_profile,
             tool_name=tool_name,
             contract_profile=contract_profile,
+            state_prefix=state_prefix,
+            state_key=state_key,
             project_id=project_id,
             root_uri=root_uri,
             mcp_roots=await _mcp_roots(ctx),

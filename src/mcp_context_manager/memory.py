@@ -150,12 +150,11 @@ class ContextMemory:
         self._save(payload)
         return {
             "schema": "context_memory.upsert.v1",
-            "path": self.config.display_path(self.config.store_path),
-            "storage_backend": self.store.backend,
             "namespace": namespace,
             "key": key,
             "updated": True,
             "expires_at": expires_at,
+            "repo_boundary_enforced": True,
             "sensitivity": sensitivity,
         }
 
@@ -296,14 +295,13 @@ class ContextMemory:
         decisions = self.effective_decisions(namespace=namespace, include_expired=include_expired)[:max_entries]
         return {
             "schema": "context_memory.get.v1",
-            "path": self.config.display_path(self.config.store_path),
-            "storage_backend": self.store.backend,
             "count": len(entries),
             "entries": entries,
             "summary_count": len(summaries),
             "summaries": summaries,
             "effective_decision_count": len(decisions),
             "effective_decisions": decisions,
+            "repo_boundary_enforced": True,
         }
 
     def effective_decisions(

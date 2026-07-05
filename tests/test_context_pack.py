@@ -33,12 +33,20 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert all(item["detail_lookup"]["mode"] == "snippet" for item in pack["items"])
     assert pack["memory"]["summary_count"] >= 1
     assert pack["references"][0]["schema"] == "mcp_result_reference.v1"
+    assert pack["references"][0]["uri"].startswith("repo://context/")
+    assert "storage" not in pack["references"][0]
+    assert "path" not in pack["references"][0]["resolver"]
     assert pack["budget"]["estimated_output_tokens"] > 0
+    assert pack["budget"]["token_counting"]["token_count_source"] == "estimate"
     assert pack["safety"]["repository_boundary_enforced"] is True
     assert pack["items"][0]["confidence"] > 0
     assert pack["metrics"]["stage_timings_ms"]["index_refresh_ms"] >= 0
+    assert pack["metrics"]["stage_timings_ms"]["search_ranking_ms"] >= 0
+    assert pack["metrics"]["stage_timings_ms"]["reference_write_ms"] >= 0
+    assert pack["metrics"]["stage_timings_ms"]["response_assembly_ms"] >= 0
     assert pack["metrics"]["stage_timings_ms"]["snippet_batch_ms"] >= 0
     assert pack["metrics"]["baseline_input_tokens_est"] >= pack["metrics"]["output_tokens_est"]
+    assert pack["metrics"]["token_counting"]["token_count_source"] == "estimate"
     assert pack["metrics"]["token_savings_formula"] == "max(0, baseline_input_tokens_est - output_tokens_est)"
     assert pack["metrics"]["external_tool_calls_saved_est"] >= 1
     assert pack["metrics"]["references_bytes_deferred_est"] > 0
@@ -51,6 +59,7 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
         "stale_index",
         "disabled_refresh_index",
     }
+    assert pack["cache"]["status"] in {"missing", "active", "disabled"}
 
     resolved = service.result_reference_resolve(reference=pack["references"][0])
     assert resolved["status"] == "resolved"

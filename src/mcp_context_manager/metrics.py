@@ -5,6 +5,7 @@ from typing import Any
 from .config import ContextConfig
 from .schemas import contract_size_metrics
 from .store import ContextStore
+from .token_counter import TokenCounter
 from .util import now_iso
 
 MEASUREMENT_TARGETS: tuple[dict[str, Any], ...] = (
@@ -340,8 +341,6 @@ class ContextMetrics:
             "schema": "context_metrics.v1",
             "generated_at": now_iso(),
             "project_id": self.config.project_id,
-            "path": self.config.display_path(self.config.store_path),
-            "storage_backend": self.store.backend,
             "since": payload.get("created_at", ""),
             "updated_at": payload.get("updated_at", ""),
             "requests": {
@@ -370,6 +369,10 @@ class ContextMetrics:
                 "estimated_input_tokens_saved": tokens_saved,
                 "baseline_input_tokens_est": baseline_tokens,
                 "output_tokens_est": output_tokens,
+                "token_counting": TokenCounter(
+                    mode=self.config.token_counter_mode,
+                    target_tokenizer=self.config.target_tokenizer,
+                ).metadata(),
                 "avg_estimated_input_tokens_saved_per_pack": round(
                     tokens_saved / pack_count, 3
                 )
@@ -432,7 +435,6 @@ class ContextMetrics:
             "schema": "context_measurement_matrix.v1",
             "generated_at": now_iso(),
             "project_id": self.config.project_id,
-            "path": self.config.display_path(self.config.store_path),
             "checks": [
                 self._measurement_check(target, snapshot)
                 for target in MEASUREMENT_TARGETS

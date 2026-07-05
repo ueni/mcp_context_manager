@@ -52,11 +52,11 @@ class ProjectRoot:
             "state": {
                 "state_key": f"projects/{self.project_id}",
                 "exists": self.state_dir.exists(),
-                "storage_backend": "lmdb",
                 "store_exists": (self.state_dir / "store" / "context.lmdb").exists(),
                 "index_exists": (self.state_dir / "store" / "context.lmdb").exists(),
                 "memory_exists": (self.state_dir / "store" / "context.lmdb").exists(),
                 "cache_exists": (self.state_dir / "store" / "context.lmdb").exists(),
+                "repo_boundary_enforced": True,
             },
         }
 

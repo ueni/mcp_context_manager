@@ -107,6 +107,12 @@ def test_result_reference_resolve_statuses(service: ContextService) -> None:
         ttl_hours=24,
     )
 
+    assert ref["status"] == "active"
+    assert ref["uri"].startswith("repo://context/")
+    assert ref["repo_boundary_enforced"] is True
+    assert "storage" not in ref
+    assert "path" not in ref["resolver"]
+
     resolved = service.result_reference_resolve(reference=ref)
     assert resolved["status"] == "resolved"
     assert resolved["content"] == {"hello": "world"}
@@ -124,6 +130,25 @@ def test_result_reference_resolve_statuses(service: ContextService) -> None:
 
     missing = service.result_reference_resolve(reference_id="ctxref-0000000000000000")
     assert missing["status"] == "missing"
+
+
+def test_invalidated_reference_returns_stale_status(service: ContextService) -> None:
+    ref = service.references.create(
+        producer="test",
+        payload={"hello": "world"},
+        summary={"kind": "unit"},
+        ttl_hours=24,
+    )
+    record = service.references.store.get_json(f"reference:{ref['reference_id']}")
+    record["status"] = "invalidated"
+    record["invalidated_at"] = datetime.now(timezone.utc).isoformat()
+    service.references.store.put_json(f"reference:{ref['reference_id']}", record)
+
+    stale = service.result_reference_resolve(reference=ref)
+
+    assert stale["status"] == "stale"
+    assert stale["reason"] == "invalidated"
+    assert stale["warnings"][0]["code"] == "reference_stale"
 
 
 def test_memory_upsert_redacts_secret_values_before_persisting(

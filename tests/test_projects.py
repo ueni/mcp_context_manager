@@ -93,7 +93,7 @@ def test_project_context_service_auto_indexes_and_isolates_memory(tmp_path: Path
         manager.repo_metrics_resource(project_id=metrics_a["project_id"])
     )
 
-    assert metrics_a["path"] != metrics_b["path"]
+    assert metrics_a["project_id"] != metrics_b["project_id"]
     assert metrics_a["requests"]["by_operation"]["context_pack"]["count"] == 1
     assert metrics_b["requests"]["by_operation"].get("context_pack", {}).get("count", 0) == 0
     assert metrics_resource_a["project_id"] == metrics_a["project_id"]

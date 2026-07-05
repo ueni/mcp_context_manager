@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mcp_context_manager.config import ContextConfig
@@ -114,6 +115,8 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     assert metrics["benchmarks"]["latency_ms_by_operation"]["context_pack"]["count"] >= 1
     assert "stage_latency_ms_by_operation" in metrics["benchmarks"]
     assert "snippet_batch_ms" in metrics["benchmarks"]["stage_latency_ms_by_operation"]["context_pack"]
+    assert "search_ranking_ms" in metrics["benchmarks"]["stage_latency_ms_by_operation"]["context_pack"]
+    assert metrics["tokens"]["token_counting"]["token_count_source"] == "estimate"
     assert metrics["requests"]["by_operation"]["context_lookup.search"]["result_count"] >= first["count"]
     assert resource["schema"] == "context_metrics.v1"
     assert resource["requests"]["total"] == metrics["requests"]["total"]
@@ -147,6 +150,10 @@ def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
     ]
     assert benchmark["runs"][1]["cache_hit"] is True
     assert benchmark["runs"][2]["cache_hit"] is True
+    assert "search_ranking_ms" in benchmark["runs"][0]["stage_timings_ms"]
+    assert "reference_write_ms" in benchmark["runs"][0]["stage_timings_ms"]
+    assert "response_assembly_ms" in benchmark["runs"][0]["stage_timings_ms"]
+    assert benchmark["runs"][0]["token_counting"]["token_count_source"] == "estimate"
     assert benchmark["compact_contract_sample"]["schema"] == "tool_output_contracts.compact.v1"
     assert benchmark["compact_contract_sample"]["contract_tokens_saved_est"] > 0
     assert benchmark["measurement_matrix"]["schema"] == "context_measurement_matrix.v1"
@@ -168,6 +175,106 @@ def test_context_pack_benchmark_honors_max_files(
 
     assert 2 in seen_max_files
     assert 5000 not in seen_max_files
+
+
+def test_expired_search_cache_is_recomputed_and_pruned(
+    service: ContextService,
+) -> None:
+    first = service.context_lookup(mode="search", query="auth token")
+    cache_key = first["cache"]["key"]
+    row = service.store.get_json(f"cache:{cache_key}")
+    row["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    service.store.put_json(f"cache:{cache_key}", row)
+
+    second = service.context_lookup(mode="search", query="auth token")
+
+    assert second["cache"]["hit"] is False
+    assert second["cache"]["status"] == "expired"
+    assert second["cache"]["reason"] == "expired"
+    assert second["results"]
+
+    row = service.store.get_json(f"cache:{cache_key}")
+    row["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    service.store.put_json(f"cache:{cache_key}", row)
+    pruned = service.context_admin(mode="cache_prune", max_age_minutes=999999)
+
+    assert pruned["expired_removed"] >= 1
+
+
+def test_invalidated_context_pack_cache_reports_stale(
+    service: ContextService,
+) -> None:
+    first = service.context_pack("review auth token behavior", max_items=2)
+    cache_key = first["cache"]["key"]
+    row = service.store.get_json(f"cache:{cache_key}")
+    row["status"] = "invalidated"
+    row["invalidated_at"] = datetime.now(timezone.utc).isoformat()
+    service.store.put_json(f"cache:{cache_key}", row)
+
+    second = service.context_pack("review auth token behavior", max_items=2)
+
+    assert second["cache"]["hit"] is False
+    assert second["cache"]["status"] == "stale"
+    assert second["cache"]["reason"] == "invalidated"
+    assert second["cache"]["warnings"][0]["code"] == "cache_stale"
+
+
+def test_target_tokenizer_unavailable_falls_back_to_estimate(
+    sample_repo: Path,
+) -> None:
+    service = ContextService(
+        ContextConfig(
+            repo_path=sample_repo.resolve(),
+            state_dir=(sample_repo / ".mcp-context-manager").resolve(),
+            token_counter_mode="target",
+            target_tokenizer="definitely-not-a-real-tokenizer",
+        )
+    )
+
+    pack = service.context_pack("review auth token behavior", max_items=2)
+
+    token_counting = pack["metrics"]["token_counting"]
+    assert token_counting["tokenizer"] == "definitely-not-a-real-tokenizer"
+    assert token_counting["tokenizer_available"] is False
+    assert token_counting["token_count_source"] == "estimate"
+    assert token_counting["warnings"][0]["code"] == "target_tokenizer_unavailable"
+
+
+def test_target_tokenizer_encode_failure_falls_back_to_estimate(
+    sample_repo: Path,
+) -> None:
+    special_file = sample_repo / "src" / "special_token.py"
+    special_file.write_text('SPECIAL = "<|endoftext|>"\n', encoding="utf-8")
+    service = ContextService(
+        ContextConfig(
+            repo_path=sample_repo.resolve(),
+            state_dir=(sample_repo / ".mcp-context-manager").resolve(),
+            token_counter_mode="target",
+            target_tokenizer="fake-target",
+        )
+    )
+
+    class RejectingEncoding:
+        def encode(self, text: str) -> list[int]:
+            if "<|endoftext|>" in text:
+                raise ValueError("special token disallowed")
+            return [1] * max(1, len(text) // 4)
+
+    service.token_counter._target_encoding = RejectingEncoding()
+    service.token_counter._target_warning = None
+
+    pack = service.context_pack(
+        "review src/special_token.py special token handling",
+        focus_paths=["src/special_token.py"],
+        max_items=1,
+    )
+
+    token_counting = pack["metrics"]["token_counting"]
+    assert pack["items"][0]["path"] == "src/special_token.py"
+    assert token_counting["tokenizer"] == "fake-target"
+    assert token_counting["tokenizer_available"] is True
+    assert token_counting["token_count_source"] == "estimate"
+    assert token_counting["warnings"][0]["code"] == "target_tokenizer_encode_failed"
 
 
 def test_context_retrieval_regression_smoke(service: ContextService) -> None:
@@ -263,22 +370,68 @@ def test_external_state_dir_supports_container_layout(
 
     assert health["repo_path"] == "."
     assert health["state_dir"] == "state"
-    assert health["index"]["index_path"] == "state/store/context.lmdb"
-    assert health["index"]["storage_backend"] == "lmdb"
-    assert index["index_path"] == "state/store/context.lmdb"
-    assert index["storage_backend"] == "lmdb"
+    assert health["index"]["index_available"] is True
+    assert health["index"]["search_mode"] == "term_index"
+    assert index["index_available"] is True
+    assert index["search_mode"] == "term_index"
     assert pack["repo"]["path"] == "."
     assert pack["repo"]["state_dir"] == "state"
-    assert memory["path"] == "state/store/context.lmdb"
-    assert references["references"][0]["path"].startswith("state/store/context.lmdb")
-    assert metrics["path"] == "state/store/context.lmdb"
+    assert memory["repo_boundary_enforced"] is True
+    assert references["references"][0]["repo_boundary_enforced"] is True
+    assert references["references"][0]["uri"].startswith("repo://context/")
+    assert metrics["tokens"]["token_counting"]["token_count_source"] == "estimate"
 
     public_payload = json.dumps(
         [health, index, pack["repo"], memory, references, metrics],
         sort_keys=True,
     )
+    assert "context.lmdb" not in public_payload
+    assert "lmdb" not in public_payload.lower()
+    assert "storage_backend" not in public_payload
+    assert "index_path" not in public_payload
+    assert '"path": "state/store' not in public_payload
     assert str(sample_repo.resolve()) not in public_payload
     assert str(state_dir.resolve()) not in public_payload
+
+
+def test_state_browser_lists_and_inspects_generated_state(
+    service: ContextService, sample_repo: Path
+) -> None:
+    service.store.put_json(
+        "debug:sample",
+        {
+            "schema": "debug.sample.v1",
+            "path": str(sample_repo.resolve() / "src" / "auth.py"),
+            "value": {"nested": True},
+        },
+    )
+
+    listing = service.context_admin(
+        mode="state_browser",
+        state_prefix="debug:",
+        max_entries=10,
+        max_output_chars=500,
+    )
+
+    assert listing["schema"] == "context_state_browser.v1"
+    assert listing["mode"] == "list"
+    assert listing["repo_boundary_enforced"] is True
+    assert listing["generated_state_only"] is True
+    assert listing["rows"][0]["key"] == "debug:sample"
+    assert listing["rows"][0]["schema"] == "debug.sample.v1"
+    assert str(sample_repo.resolve()) not in json.dumps(listing, sort_keys=True)
+
+    entry = service.context_admin(
+        mode="state_browser",
+        state_key="debug:sample",
+        max_output_chars=1000,
+    )
+
+    assert entry["mode"] == "entry"
+    assert entry["entry"]["key"] == "debug:sample"
+    assert entry["entry"]["schema"] == "debug.sample.v1"
+    assert "[REDACTED_HOST_PATH]" in entry["entry"]["preview"]
+    assert str(sample_repo.resolve()) not in json.dumps(entry, sort_keys=True)
 
 
 def test_warm_index_refresh_skips_full_reads_for_unchanged_files(
