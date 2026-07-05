@@ -11,7 +11,7 @@ from .config import ContextConfig
 from .store import ContextStore
 from .util import (
     TEXT_EXTENSIONS,
-    git_value,
+    git_snapshot,
     is_likely_binary,
     language_for_path,
     normalize_query_terms,
@@ -170,13 +170,14 @@ class ContextIndex:
                 else previous_generated
             )
             self._set_meta("generated_at", generated_at, txn)
+            git = git_snapshot(self.config.repo_path)
+            self._set_meta("git_head", str(git.get("git_head", "")), txn)
+            self._set_meta("git_branch", str(git.get("git_branch", "")), txn)
             self._set_meta(
-                "git_head", git_value(self.config.repo_path, "rev-parse", "HEAD"), txn
+                "git_status_hash", str(git.get("git_status_hash", "")), txn
             )
             self._set_meta(
-                "git_branch",
-                git_value(self.config.repo_path, "branch", "--show-current"),
-                txn,
+                "git_changes_hash", str(git.get("git_changes_hash", "")), txn
             )
             if whole_repo_refresh:
                 signature = self.refresh_signature(max_files=max_files)
@@ -250,50 +251,53 @@ class ContextIndex:
         return result
 
     def refresh_signature(self, max_files: int = 5000) -> dict[str, Any]:
-        if not (self.config.repo_path / ".git").exists():
-            try:
-                files = self._iter_candidate_files(
-                    self.config.repo_path, max_files=max_files
-                )
-            except OSError:
-                files = []
-            if files:
-                rows = []
-                for candidate in files:
-                    rel = str(candidate.path.relative_to(self.config.repo_path)).replace(
-                        "\\", "/"
-                    )
-                    rows.append(f"{rel}:{candidate.size}:{candidate.mtime_ns}")
-                return {
-                    "schema": "context_index.refresh_signature.v1",
-                    "available": True,
-                    "signature": "files:" + sha256_text("\n".join(sorted(rows))),
-                    "source": "file_metadata",
-                    "file_count": len(rows),
-                }
+        git = git_snapshot(self.config.repo_path)
+        if git.get("available") and git.get("worktree_matches_path"):
+            git_head = str(git.get("git_head", ""))
+            status_hash = str(git.get("git_status_hash", ""))
+            changes_hash = str(git.get("git_changes_hash", "")) or status_hash
+            return {
+                "schema": "context_index.refresh_signature.v1",
+                "available": True,
+                "signature": f"git:{git_head}:{changes_hash}",
+                "source": "git",
+                "git_head": git_head,
+                "git_branch": str(git.get("git_branch", "")),
+                "git_status_hash": status_hash,
+                "git_changes_hash": changes_hash,
+            }
+        files_signature = self._file_metadata_refresh_signature(max_files=max_files)
+        if files_signature["available"]:
+            files_signature["git_available"] = bool(git.get("available"))
+            files_signature["git_worktree_matches_path"] = bool(
+                git.get("worktree_matches_path")
+            )
+        return files_signature
+
+    def _file_metadata_refresh_signature(self, max_files: int = 5000) -> dict[str, Any]:
+        try:
+            files = self._iter_candidate_files(self.config.repo_path, max_files=max_files)
+        except OSError:
+            files = []
+        if not files:
             return {
                 "schema": "context_index.refresh_signature.v1",
                 "available": False,
                 "signature": "",
                 "source": "none",
             }
-        git_head = git_value(self.config.repo_path, "rev-parse", "HEAD")
-        status = git_value(self.config.repo_path, "status", "--porcelain=v1", "-z")
-        if not git_head:
-            return {
-                "schema": "context_index.refresh_signature.v1",
-                "available": False,
-                "signature": "",
-                "source": "git",
-            }
-        status_hash = sha256_text(status)
+        rows = []
+        for candidate in files:
+            rel = str(candidate.path.relative_to(self.config.repo_path)).replace(
+                "\\", "/"
+            )
+            rows.append(f"{rel}:{candidate.size}:{candidate.mtime_ns}")
         return {
             "schema": "context_index.refresh_signature.v1",
             "available": True,
-            "signature": f"git:{git_head}:{status_hash}",
-            "source": "git",
-            "git_head": git_head,
-            "git_status_hash": status_hash,
+            "signature": "files:" + sha256_text("\n".join(sorted(rows))),
+            "source": "file_metadata",
+            "file_count": len(rows),
         }
 
     def _delete_file_rows(
@@ -338,6 +342,8 @@ class ContextIndex:
             "generated_at": meta.get("generated_at", ""),
             "git_head": meta.get("git_head", ""),
             "git_branch": meta.get("git_branch", ""),
+            "git_status_hash": meta.get("git_status_hash", ""),
+            "git_changes_hash": meta.get("git_changes_hash", ""),
             "refresh_signature": meta.get("refresh_signature", ""),
             "refresh_signature_available": meta.get(
                 "refresh_signature_available", "false"
@@ -872,6 +878,7 @@ class ContextIndex:
 
     def workspace_facts(self) -> dict[str, Any]:
         files = self.files(limit=10000)
+        git = git_snapshot(self.config.repo_path)
         ext_counts: dict[str, int] = {}
         for row in files:
             ext = row.get("extension") or "[none]"
@@ -892,9 +899,9 @@ class ContextIndex:
                 (self.config.repo_path / name).is_file()
                 for name in ["README.md", "README.rst", "README.txt"]
             ),
-            "is_git_repo": (self.config.repo_path / ".git").exists(),
-            "git_branch": git_value(self.config.repo_path, "branch", "--show-current"),
-            "git_head": git_value(self.config.repo_path, "rev-parse", "--short", "HEAD"),
+            "is_git_repo": bool(git.get("is_git_repo")),
+            "git_branch": str(git.get("git_branch", "")),
+            "git_head": str(git.get("git_head_short", "")),
             "index": self.status(),
         }
 

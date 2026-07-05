@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from mcp_context_manager.config import ContextConfig
 from mcp_context_manager.context import ContextService
+
+
+def git(repo: Path, *args: str) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git executable is not available")
+    subprocess.run(["git", *args], cwd=repo, check=True)
 
 
 def test_repo_path_boundary_rejects_escape(tmp_path: Path) -> None:
@@ -43,6 +51,98 @@ def test_index_refresh_search_symbols_and_snippet(service: ContextService) -> No
     assert snippet["schema"] == "context_snippet.v1"
     assert snippet["path"] == "src/auth.py"
     assert "class AuthService" in snippet["content"]
+
+
+def test_index_refresh_falls_back_when_git_metadata_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "app.py").write_text("value = 'tracked by files'\n", encoding="utf-8")
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    service.context_admin(mode="index_refresh")
+    status = service.context_admin(mode="index_status")
+    warm = service.index.refresh_if_needed()
+
+    assert status["git_head"] == ""
+    assert status["refresh_signature_available"] is True
+    assert status["refresh_signature"].startswith("files:")
+    assert warm["skipped"] is True
+    assert warm["reason"] == "signature_unchanged"
+
+
+def test_git_refresh_signature_tracks_dirty_content_changes(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init")
+    git(repo, "config", "user.email", "test@example.invalid")
+    git(repo, "config", "user.name", "Test User")
+    (repo / "app.py").write_text("value = 'committed'\n", encoding="utf-8")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-m", "initial")
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    clean = service.index.refresh_signature()
+    (repo / "app.py").write_text("value = 'dirty one'\n", encoding="utf-8")
+    dirty_one = service.index.refresh_signature()
+    (repo / "app.py").write_text("value = 'dirty two'\n", encoding="utf-8")
+    dirty_two = service.index.refresh_signature()
+
+    assert clean["source"] == "git"
+    assert dirty_one["source"] == "git"
+    assert dirty_one["git_status_hash"] == dirty_two["git_status_hash"]
+    assert dirty_one["git_changes_hash"] != dirty_two["git_changes_hash"]
+    assert clean["signature"] != dirty_one["signature"]
+    assert dirty_one["signature"] != dirty_two["signature"]
+
+
+def test_subdirectory_git_worktree_uses_file_metadata_signature(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    git(parent, "init")
+    git(parent, "config", "user.email", "test@example.invalid")
+    git(parent, "config", "user.name", "Test User")
+    git(parent, "commit", "--allow-empty", "-m", "initial")
+    subproject = parent / "subproject"
+    subproject.mkdir()
+    tracked = subproject / "app.py"
+    tracked.write_text("value = 'one'\n", encoding="utf-8")
+    service = ContextService(
+        ContextConfig(
+            repo_path=subproject.resolve(),
+            state_dir=(subproject / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    first = service.index.refresh_signature()
+    tracked.write_text("value = 'two with a different size'\n", encoding="utf-8")
+    second = service.index.refresh_signature()
+    service.context_admin(mode="index_refresh")
+    tracked.write_text("value = 'three with another different size'\n", encoding="utf-8")
+    refreshed = service.index.refresh_if_needed()
+
+    assert first["source"] == "file_metadata"
+    assert first["git_available"] is True
+    assert first["git_worktree_matches_path"] is False
+    assert first["signature"] != second["signature"]
+    assert refreshed["skipped"] is False
+    assert refreshed["reason"] == "signature_changed"
 
 
 def test_path_scoped_fts_search_applies_path_before_limit(tmp_path: Path) -> None:

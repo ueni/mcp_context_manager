@@ -186,6 +186,77 @@ def test_unsafe_global_parent_requires_explicit_project_selection(
     assert health["projects"]["count"] == 1
 
 
+def test_project_list_discovers_git_repositories_under_mapped_parent(
+    tmp_path: Path,
+) -> None:
+    host_parent = tmp_path / "host-source"
+    container_parent = tmp_path / "workspace-roots"
+    tracked_repo = make_repo(container_parent / "tracked", "tracked")
+    (tracked_repo / ".git").mkdir()
+    make_repo(container_parent / "plain", "plain")
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=container_parent.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(host_parent),),
+            root_mappings=((str(host_parent), str(container_parent)),),
+        )
+    )
+
+    listing = manager.context_admin(mode="projects")
+
+    assert listing["count"] == 1
+    project = listing["projects"][0]
+    assert project["name"] == "tracked"
+    assert project["source"] == "discovered_git"
+    assert project["root"]["mapped"] is True
+    assert project["git"]["is_repo"] is True
+    assert project["git"]["available"] is False
+    listing_text = json.dumps(listing, sort_keys=True)
+    assert str(host_parent) not in listing_text
+    assert str(container_parent) not in listing_text
+
+    health = manager.context_admin(mode="health", project_id=project["project_id"])
+
+    assert health["project_id"] == project["project_id"]
+
+
+def test_project_discovery_skips_symlinked_directories_before_git_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_parent = tmp_path / "host-source"
+    container_parent = tmp_path / "workspace-roots"
+    tracked_repo = make_repo(container_parent / "tracked", "tracked")
+    (tracked_repo / ".git").mkdir()
+    outside_repo = make_repo(tmp_path / "outside", "outside")
+    (outside_repo / ".git").mkdir()
+    (container_parent / "linked").symlink_to(outside_repo, target_is_directory=True)
+    probed_paths: list[Path] = []
+    original_probe = ProjectRegistry._is_git_project_root
+
+    def recording_probe(self: ProjectRegistry, path: Path) -> bool:
+        probed_paths.append(path)
+        return original_probe(self, path)
+
+    monkeypatch.setattr(ProjectRegistry, "_is_git_project_root", recording_probe)
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=container_parent.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(host_parent),),
+            root_mappings=((str(host_parent), str(container_parent)),),
+        )
+    )
+
+    listing = manager.context_admin(mode="projects")
+
+    assert listing["count"] == 1
+    assert listing["projects"][0]["name"] == "tracked"
+    assert container_parent / "linked" not in probed_paths
+    assert outside_repo.resolve() not in {path.resolve() for path in probed_paths}
+
+
 def test_mapped_project_metadata_uses_safe_locator_and_project_id_lookup(
     tmp_path: Path,
 ) -> None:

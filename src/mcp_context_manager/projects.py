@@ -8,7 +8,14 @@ from typing import Any
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from .config import ContextConfig
-from .util import load_json_file, now_iso, redact_text, save_json_file, sha256_text
+from .util import (
+    git_snapshot,
+    load_json_file,
+    now_iso,
+    redact_text,
+    save_json_file,
+    sha256_text,
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +46,7 @@ class ProjectRoot:
         )
 
     def public_metadata(self) -> dict[str, Any]:
+        git = git_snapshot(self.local_path)
         return {
             "schema": "context_project.v1",
             "project_id": self.project_id,
@@ -57,6 +65,15 @@ class ProjectRoot:
                 "memory_exists": (self.state_dir / "store" / "context.lmdb").exists(),
                 "cache_exists": (self.state_dir / "store" / "context.lmdb").exists(),
                 "repo_boundary_enforced": True,
+            },
+            "git": {
+                "is_repo": bool(git.get("is_git_repo")),
+                "available": bool(git.get("available")),
+                "head": str(git.get("git_head_short", "")),
+                "branch": str(git.get("git_branch", "")),
+                "status_hash": str(git.get("git_status_hash", "")),
+                "changes_hash": str(git.get("git_changes_hash", "")),
+                "dirty": bool(git.get("dirty", False)),
             },
         }
 
@@ -106,9 +123,16 @@ class ProjectRegistry:
     def list_projects(self, mcp_roots: list[Any] | None = None) -> dict[str, Any]:
         visible = self.roots_from_mcp(mcp_roots or [])
         known_by_id = {project.project_id: project for project in self.known_projects()}
+        for project in self.discovered_projects():
+            known_by_id.setdefault(project.project_id, project)
         for project in visible:
             known_by_id[project.project_id] = project
-        projects = [project.public_metadata() for project in sorted(known_by_id.values(), key=lambda item: item.project_id)]
+        projects = [
+            project.public_metadata()
+            for project in sorted(
+                known_by_id.values(), key=lambda item: item.project_id
+            )
+        ]
         return {
             "schema": "context_projects.list.v1",
             "count": len(projects),
@@ -217,6 +241,75 @@ class ProjectRegistry:
             projects.append(project)
         return projects
 
+    def discovered_projects(self, max_projects: int = 100) -> list[ProjectRoot]:
+        projects: list[ProjectRoot] = []
+        seen: set[str] = set()
+        for host_root, local_root in self._configured_scan_roots():
+            for local_path in self._git_project_candidates(local_root):
+                if len(projects) >= max_projects:
+                    return projects
+                try:
+                    rel = local_path.resolve().relative_to(local_root.resolve())
+                except ValueError:
+                    continue
+                host_path = host_root
+                if rel.parts:
+                    host_path = _norm_abs_posix(
+                        posixpath.join(host_root, *rel.parts)
+                    )
+                try:
+                    project = self.project_from_uri(
+                        _file_uri_from_path(host_path),
+                        name=local_path.name,
+                        source="discovered_git",
+                    )
+                except ValueError:
+                    continue
+                if project.project_id in seen:
+                    continue
+                seen.add(project.project_id)
+                projects.append(project)
+        return projects
+
+    def _configured_scan_roots(self) -> list[tuple[str, Path]]:
+        roots: list[tuple[str, Path]] = []
+        if self.config.allowed_roots:
+            for allowed in self.config.allowed_roots:
+                host_root = _allowed_root_to_path(allowed)
+                local_root, _mapped = self._map_host_path(host_root)
+                if local_root.is_dir():
+                    roots.append((host_root, local_root.resolve()))
+            return roots
+        if self.config.repo_path.is_dir():
+            roots.append(
+                (_norm_abs_posix(str(self.config.repo_path)), self.config.repo_path)
+            )
+        return roots
+
+    def _git_project_candidates(self, root: Path) -> list[Path]:
+        candidates = [root]
+        try:
+            candidates.extend(
+                child
+                for child in sorted(root.iterdir(), key=lambda path: path.name)
+                if not child.is_symlink()
+                and child.is_dir()
+                and not child.name.startswith(".")
+            )
+        except OSError:
+            pass
+        return [
+            candidate.resolve()
+            for candidate in candidates
+            if self._is_git_project_root(candidate)
+        ]
+
+    def _is_git_project_root(self, path: Path) -> bool:
+        if (path / ".git").exists():
+            return True
+        git = git_snapshot(path)
+        return bool(git.get("available") and git.get("worktree_matches_path"))
+
     def remember_project(self, project: ProjectRoot) -> None:
         if project.legacy:
             return
@@ -322,7 +415,11 @@ class ProjectRegistry:
     def _project_by_id(
         self, project_id: str, visible_roots: list[ProjectRoot]
     ) -> ProjectRoot:
-        candidates = [*visible_roots, *self.known_projects()]
+        candidates = [
+            *visible_roots,
+            *self.known_projects(),
+            *self.discovered_projects(),
+        ]
         if self.legacy_fallback_safe():
             candidates.append(self.legacy_project())
         for project in candidates:

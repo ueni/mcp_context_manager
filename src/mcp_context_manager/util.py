@@ -389,6 +389,55 @@ def git_value(repo_path: Path, *args: str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+def git_snapshot(repo_path: Path) -> dict[str, Any]:
+    git_dir = git_value(repo_path, "rev-parse", "--git-dir")
+    worktree = git_value(repo_path, "rev-parse", "--show-toplevel")
+    head = git_value(repo_path, "rev-parse", "HEAD")
+    branch = git_value(repo_path, "branch", "--show-current")
+    status = git_value(repo_path, "status", "--porcelain=v1", "-z")
+    unstaged_diff = git_value(repo_path, "diff", "--no-ext-diff", "--full-index")
+    staged_diff = git_value(
+        repo_path, "diff", "--cached", "--no-ext-diff", "--full-index"
+    )
+    is_git_repo = bool(git_dir or worktree or (repo_path / ".git").exists())
+    status_hash = sha256_text(status) if status else ""
+    changes_payload = "\0".join(
+        part for part in [status, unstaged_diff, staged_diff] if part
+    )
+    changes_hash = sha256_text(changes_payload) if changes_payload else status_hash
+    worktree_matches_path = False
+    if worktree:
+        try:
+            worktree_matches_path = Path(worktree).resolve() == repo_path.resolve()
+        except OSError:
+            worktree_matches_path = False
+    if not head:
+        return {
+            "schema": "git_snapshot.v1",
+            "is_git_repo": is_git_repo,
+            "available": False,
+            "worktree_matches_path": worktree_matches_path,
+            "git_head": "",
+            "git_head_short": "",
+            "git_branch": branch,
+            "git_status_hash": status_hash,
+            "git_changes_hash": changes_hash,
+            "dirty": bool(status),
+        }
+    return {
+        "schema": "git_snapshot.v1",
+        "is_git_repo": True,
+        "available": True,
+        "worktree_matches_path": worktree_matches_path,
+        "git_head": head,
+        "git_head_short": head[:12],
+        "git_branch": branch,
+        "git_status_hash": status_hash,
+        "git_changes_hash": changes_hash,
+        "dirty": bool(status),
+    }
+
+
 def load_json_file(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
