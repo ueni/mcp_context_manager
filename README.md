@@ -165,8 +165,11 @@ Controls:
 
 In the state browser, `Up` / `Down` scroll the row selection, `PgUp` / `PgDn`
 jump through rows, `/` starts a search filter, and `Enter` opens the selected
-entry as an overlay. The browser uses the loaded snapshot until you leave and
-re-enter it; periodic refresh is disabled there so inspection does not jump.
+entry as an overlay. With an entry open, `Up` / `Down`, `PgUp` / `PgDn`, and
+`Home` / `End` scroll the content preview. The browser uses the loaded snapshot
+until you leave and re-enter it; periodic refresh is disabled there so
+inspection does not jump. Interactive MCP calls run in the background and show a
+short loading status instead of freezing key handling.
 
 Render one snapshot and exit:
 

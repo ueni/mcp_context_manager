@@ -68,7 +68,22 @@ class FakeClient:
                         "schema": "debug.sample.v1",
                         "status": "active",
                         "expires_at": "",
-                        "preview": '{\n  "hello": "world"\n}',
+                        "preview": "\n".join(
+                            [
+                                "{",
+                                '  "hello": "world",',
+                                '  "line": 1',
+                                "}",
+                                "line 05",
+                                "line 06",
+                                "line 07",
+                                "line 08",
+                                "line 09",
+                                "line 10",
+                                "line 11",
+                                "line 12",
+                            ]
+                        ),
                     },
                 }
             return {
@@ -411,6 +426,89 @@ def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
     )
     assert state.view == "state"
     assert state.state_entry is None
+
+
+def test_state_entry_overlay_scrolls_content() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=False,
+    )
+    state = monitor.MonitorState(selected_index=0, view="state", refresh_interval=5.0)
+    monitor._load_state_browser(client, state, snapshots)
+    monitor._load_state_entry(client, state)
+
+    first_page = monitor.render_state_browser(
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        height=21,
+        state=state,
+    )
+    assert "preview lines 1-3 / 12" in first_page
+    assert '"hello": "world"' in first_page
+    assert "line 05" not in first_page
+
+    assert (
+        monitor.handle_key(
+            "page_down",
+            state,
+            row_count=len(snapshots),
+            state_row_count=monitor._state_row_count(state),
+        )
+        == "redraw"
+    )
+    second_page = monitor.render_state_browser(
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        height=21,
+        state=state,
+    )
+    assert "preview lines 10-12 / 12" in second_page
+    assert "line 10" in second_page
+    assert '"hello": "world"' not in second_page
+
+    assert (
+        monitor.handle_key(
+            "home",
+            state,
+            row_count=len(snapshots),
+            state_row_count=monitor._state_row_count(state),
+        )
+        == "redraw"
+    )
+    assert state.state_entry_scroll_offset == 0
+
+
+def test_background_mcp_operation_result_updates_state() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=False,
+    )
+    state = monitor.MonitorState(selected_index=0, view="state", refresh_interval=5.0)
+
+    with monitor.ThreadPoolExecutor(max_workers=1) as executor:
+        pending = monitor._submit_mcp_operation(
+            executor,
+            "state_browser",
+            lambda: monitor._fetch_state_browser_result(client, snapshots, 0),
+        )
+        pending.future.result(timeout=2)
+        updated = monitor._apply_mcp_operation_result(state, snapshots, pending)
+
+    assert updated == snapshots
+    assert state.mcp_status == ""
+    assert state.mcp_error == ""
+    assert state.state_target.project_id == "alpha-123"
+    assert state.state_payload["schema"] == "context_state_browser.v1"
 
 
 def test_state_browser_filters_rows_with_search_input() -> None:

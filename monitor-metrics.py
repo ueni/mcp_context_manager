@@ -37,6 +37,8 @@ import time
 import tty
 import urllib.error
 import urllib.request
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -85,12 +87,36 @@ class MonitorState:
     last_updated: str = ""
     state_selected_index: int = 0
     state_scroll_offset: int = 0
+    state_entry_scroll_offset: int = 0
     state_search: str = ""
     state_search_active: bool = False
     state_payload: dict[str, Any] | None = None
     state_entry: dict[str, Any] | None = None
     state_error: str = ""
     state_target: ProjectTarget | None = None
+    mcp_status: str = ""
+    mcp_error: str = ""
+
+
+@dataclass
+class StateBrowserResult:
+    target: ProjectTarget | None
+    payload: dict[str, Any] | None = None
+    error: str = ""
+
+
+@dataclass
+class StateEntryResult:
+    target: ProjectTarget | None
+    key: str
+    payload: dict[str, Any] | None = None
+    error: str = ""
+
+
+@dataclass
+class PendingMcpOperation:
+    kind: str
+    future: Future[Any]
 
 
 class McpHttpClient:
@@ -384,6 +410,7 @@ def render_dashboard(
     width: int | None = None,
     selected_index: int | None = None,
     refresh_interval: float | None = None,
+    status_line: str = "",
 ) -> str:
     width = width or shutil.get_terminal_size((120, 30)).columns
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -394,10 +421,16 @@ def render_dashboard(
         f"endpoint: {url}",
         f"updated:  {now}   projects: {len(snapshots)}   ok: {len(ok_rows)}   errors: {len(snapshots) - len(ok_rows)}",
         "",
-        *_summary_table(totals, snapshots, ok_rows, color),
-        "",
-        *_project_table(snapshots, color, width, selected_index=selected_index),
     ]
+    if status_line:
+        lines.extend([status_line, ""])
+    lines.extend(_summary_table(totals, snapshots, ok_rows, color))
+    lines.extend(
+        [
+            "",
+            *_project_table(snapshots, color, width, selected_index=selected_index),
+        ]
+    )
     lines.extend(["", _legend(color)])
     if refresh_interval is not None:
         lines.append(_controls(refresh_interval, color))
@@ -429,6 +462,7 @@ def render_monitor_screen(
         width=width,
         selected_index=state.selected_index,
         refresh_interval=state.refresh_interval,
+        status_line=_mcp_status_line(state, color),
     )
 
 
@@ -483,8 +517,11 @@ def render_project_detail(
         _style("mcp-context-manager project details", color, Ansi.BOLD + Ansi.CYAN),
         _controls(state.refresh_interval, color),
         "",
-        *_render_table(("field", "value"), details, aligns=("left", "left")),
     ]
+    status_line = _mcp_status_line(state, color)
+    if status_line:
+        lines.extend([status_line, ""])
+    lines.extend(_render_table(("field", "value"), details, aligns=("left", "left")))
     if snapshot.error:
         lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
     check_rows = _measurement_check_rows(snapshot.matrix or {}, color)
@@ -535,6 +572,9 @@ def render_state_browser(
         _browser_controls(state, color),
         "",
     ]
+    status_line = _mcp_status_line(state, color)
+    if status_line:
+        lines.extend([status_line, ""])
     if state.state_error:
         lines.append(_style(f"ERROR: {state.state_error}", color, Ansi.RED))
         return "\n".join(lines)
@@ -581,7 +621,7 @@ def render_state_browser(
     if not table_rows:
         lines.append("No generated-state rows for this project.")
     if state.state_entry:
-        lines.extend(["", *render_state_entry_overlay(color, width, state)])
+        lines.extend(["", *render_state_entry_overlay(color, width, state, height)])
     return "\n".join(lines)
 
 
@@ -589,7 +629,9 @@ def render_state_entry_overlay(
     color: bool,
     width: int,
     state: MonitorState,
+    height: int | None = None,
 ) -> list[str]:
+    height = height or shutil.get_terminal_size((120, 30)).lines
     payload = state.state_entry or {}
     entry = payload.get("entry") if isinstance(payload, dict) else {}
     entry = entry if isinstance(entry, dict) else {}
@@ -608,14 +650,30 @@ def render_state_entry_overlay(
         aligns=("left", "left"),
     )
     preview_lines = _wrap_block(preview, inner_width)
+    visible_count = _state_entry_visible_count(height)
+    state.state_entry_scroll_offset = _clamp_content_scroll_offset(
+        state.state_entry_scroll_offset,
+        visible_count,
+        len(preview_lines),
+    )
+    visible_preview = preview_lines[
+        state.state_entry_scroll_offset : state.state_entry_scroll_offset
+        + visible_count
+    ]
+    first_line = state.state_entry_scroll_offset + 1 if preview_lines else 0
+    last_line = state.state_entry_scroll_offset + len(visible_preview)
     body = [
         _style("state entry overlay", color, Ansi.BOLD + Ansi.CYAN),
-        "Esc closes overlay",
+        "Up/Down scroll content  PgUp/PgDn jump  Esc closes overlay",
         "",
         *lines,
         "",
-        _style("preview", color, Ansi.BOLD),
-        *preview_lines,
+        _style(
+            f"preview lines {first_line}-{last_line} / {len(preview_lines)}",
+            color,
+            Ansi.BOLD,
+        ),
+        *visible_preview,
     ]
     return _box_lines(body, width=inner_width + 4)
 
@@ -799,9 +857,20 @@ def _controls(refresh_interval: float, color: bool) -> str:
     )
 
 
+def _mcp_status_line(state: MonitorState, color: bool) -> str:
+    if state.mcp_error:
+        return _style(f"mcp: {state.mcp_error}", color, Ansi.RED)
+    if state.mcp_status:
+        return _style(f"mcp: {state.mcp_status}", color, Ansi.YELLOW)
+    return ""
+
+
 def _browser_controls(state: MonitorState, color: bool) -> str:
     if state.state_entry:
-        keys = "keys: Esc close overlay  q quit"
+        keys = (
+            "keys: Up/Down content  PgUp/PgDn jump  Home/End  "
+            "Esc close overlay  q quit"
+        )
     elif state.state_search_active:
         keys = "keys: type search  Backspace edit  Enter apply  Esc cancel"
     else:
@@ -868,6 +937,21 @@ def _state_row_matches(row: dict[str, Any], query: str) -> bool:
 def _state_visible_count(height: int, overlay_open: bool) -> int:
     reserved = 22 if overlay_open else 13
     return max(3, height - reserved)
+
+
+def _state_entry_visible_count(height: int) -> int:
+    return max(3, min(18, height - 18))
+
+
+def _clamp_content_scroll_offset(
+    offset: int,
+    visible_count: int,
+    line_count: int,
+) -> int:
+    if line_count <= 0:
+        return 0
+    max_offset = max(0, line_count - visible_count)
+    return max(0, min(offset, max_offset))
 
 
 def _adjust_scroll_offset(
@@ -1239,6 +1323,29 @@ def handle_key(
         if key == "escape":
             state.state_entry = None
             state.state_error = ""
+            state.state_entry_scroll_offset = 0
+            return "redraw"
+        if key == "up":
+            state.state_entry_scroll_offset = max(
+                0, state.state_entry_scroll_offset - 1
+            )
+            return "redraw"
+        if key == "down":
+            state.state_entry_scroll_offset += 1
+            return "redraw"
+        if key == "page_up":
+            state.state_entry_scroll_offset = max(
+                0, state.state_entry_scroll_offset - 10
+            )
+            return "redraw"
+        if key == "page_down":
+            state.state_entry_scroll_offset += 10
+            return "redraw"
+        if key == "home":
+            state.state_entry_scroll_offset = 0
+            return "redraw"
+        if key == "end":
+            state.state_entry_scroll_offset = 1_000_000
             return "redraw"
         return "ignore"
 
@@ -1277,6 +1384,7 @@ def handle_key(
         state.state_entry = None
         state.state_selected_index = 0
         state.state_scroll_offset = 0
+        state.state_entry_scroll_offset = 0
         return "browser"
     if key == "up":
         if state.view == "state":
@@ -1321,6 +1429,7 @@ def handle_key(
         state.state_entry = None
         state.state_selected_index = 0
         state.state_scroll_offset = 0
+        state.state_entry_scroll_offset = 0
         return "redraw"
     if key == "enter" and state.view == "state" and state_row_count:
         if state.state_entry:
@@ -1333,6 +1442,7 @@ def handle_key(
         if state.view == "state" and state.state_entry:
             state.state_entry = None
             state.state_error = ""
+            state.state_entry_scroll_offset = 0
             return "redraw"
         if state.view == "state" and state.state_search_active:
             state.state_search_active = False
@@ -1390,56 +1500,147 @@ def _state_row_count(state: MonitorState) -> int:
     return len(_filtered_state_rows(state))
 
 
+def _submit_mcp_operation(
+    executor: ThreadPoolExecutor,
+    kind: str,
+    work: Callable[[], Any],
+) -> PendingMcpOperation:
+    return PendingMcpOperation(kind=kind, future=executor.submit(work))
+
+
+def _set_mcp_loading(state: MonitorState, message: str) -> None:
+    state.mcp_status = message
+    state.mcp_error = ""
+
+
+def _clear_mcp_status(state: MonitorState) -> None:
+    state.mcp_status = ""
+    state.mcp_error = ""
+
+
+def _set_mcp_error(state: MonitorState, exc: Exception) -> None:
+    state.mcp_status = ""
+    state.mcp_error = friendly_mcp_error(exc)
+
+
+def _fetch_state_browser_result(
+    client: Any,
+    snapshots: list[ProjectSnapshot],
+    selected_index: int,
+) -> StateBrowserResult:
+    if not snapshots:
+        return StateBrowserResult(target=None, error="no project selected")
+    selected = _clamped_index(selected_index, len(snapshots))
+    target = snapshots[selected].target
+    try:
+        return StateBrowserResult(target=target, payload=fetch_state_browser(client, target))
+    except Exception as exc:
+        return StateBrowserResult(target=target, error=friendly_mcp_error(exc))
+
+
+def _apply_state_browser_result(
+    state: MonitorState,
+    result: StateBrowserResult,
+) -> None:
+    state.state_target = result.target
+    state.state_entry = None
+    state.state_entry_scroll_offset = 0
+    if result.error:
+        state.state_payload = None
+        state.state_error = result.error
+        return
+    state.state_payload = result.payload
+    state.state_error = ""
+    state.state_selected_index = _clamped_index(
+        state.state_selected_index, _state_row_count(state)
+    )
+    state.state_scroll_offset = _adjust_scroll_offset(
+        state.state_scroll_offset,
+        state.state_selected_index,
+        _state_visible_count(shutil.get_terminal_size((120, 30)).lines, False),
+        _state_row_count(state),
+    )
+
+
+def _selected_state_key(state: MonitorState) -> str:
+    rows = _filtered_state_rows(state)
+    if not rows:
+        state.state_error = "no state row selected"
+        return ""
+    row = rows[_clamped_index(state.state_selected_index, len(rows))]
+    key = str(row.get("key") or "")
+    if not key or state.state_target is None:
+        state.state_error = "no state key selected"
+        return ""
+    return key
+
+
+def _fetch_state_entry_result(
+    client: Any,
+    target: ProjectTarget | None,
+    key: str,
+) -> StateEntryResult:
+    if target is None:
+        return StateEntryResult(target=None, key=key, error="no state key selected")
+    try:
+        return StateEntryResult(
+            target=target,
+            key=key,
+            payload=fetch_state_browser(client, target, state_key=key),
+        )
+    except Exception as exc:
+        return StateEntryResult(target=target, key=key, error=friendly_mcp_error(exc))
+
+
+def _apply_state_entry_result(state: MonitorState, result: StateEntryResult) -> None:
+    state.state_target = result.target
+    if result.error:
+        state.state_error = result.error
+        return
+    state.state_entry = result.payload
+    state.state_entry_scroll_offset = 0
+    state.state_error = ""
+    state.view = "state"
+
+
+def _apply_mcp_operation_result(
+    state: MonitorState,
+    snapshots: list[ProjectSnapshot],
+    pending: PendingMcpOperation,
+) -> list[ProjectSnapshot]:
+    result = pending.future.result()
+    _clear_mcp_status(state)
+    if pending.kind == "refresh":
+        refreshed = result if isinstance(result, list) else []
+        state.selected_index = _clamped_index(state.selected_index, len(refreshed))
+        state.last_updated = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return refreshed
+    if pending.kind == "state_browser":
+        if isinstance(result, StateBrowserResult):
+            _apply_state_browser_result(state, result)
+        return snapshots
+    if pending.kind == "state_entry":
+        if isinstance(result, StateEntryResult):
+            _apply_state_entry_result(state, result)
+        return snapshots
+    return snapshots
+
+
 def _load_state_browser(
     client: Any,
     state: MonitorState,
     snapshots: list[ProjectSnapshot],
 ) -> None:
-    if not snapshots:
-        state.state_payload = None
-        state.state_error = "no project selected"
-        return
-    selected = _clamped_index(state.selected_index, len(snapshots))
-    target = snapshots[selected].target
-    state.state_target = target
-    state.state_entry = None
-    try:
-        state.state_payload = fetch_state_browser(client, target)
-        state.state_error = ""
-        state.state_entry = None
-        state.state_selected_index = _clamped_index(
-            state.state_selected_index, _state_row_count(state)
-        )
-        state.state_scroll_offset = _adjust_scroll_offset(
-            state.state_scroll_offset,
-            state.state_selected_index,
-            _state_visible_count(shutil.get_terminal_size((120, 30)).lines, False),
-            _state_row_count(state),
-        )
-    except Exception as exc:
-        state.state_payload = None
-        state.state_error = friendly_mcp_error(exc)
+    result = _fetch_state_browser_result(client, snapshots, state.selected_index)
+    _apply_state_browser_result(state, result)
 
 
 def _load_state_entry(client: Any, state: MonitorState) -> None:
-    rows = _filtered_state_rows(state)
-    if not rows:
-        state.state_error = "no state row selected"
+    key = _selected_state_key(state)
+    if not key:
         return
-    row = rows[_clamped_index(state.state_selected_index, len(rows))]
-    if not isinstance(row, dict):
-        state.state_error = "invalid state row"
-        return
-    key = str(row.get("key") or "")
-    if not key or state.state_target is None:
-        state.state_error = "no state key selected"
-        return
-    try:
-        state.state_entry = fetch_state_browser(client, state.state_target, state_key=key)
-        state.state_error = ""
-        state.view = "state"
-    except Exception as exc:
-        state.state_error = friendly_mcp_error(exc)
+    result = _fetch_state_entry_result(client, state.state_target, key)
+    _apply_state_entry_result(state, result)
 
 
 def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) -> int:
@@ -1448,26 +1649,59 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
     force_refresh = True
     next_refresh = 0.0
     dirty = True
+    pending: PendingMcpOperation | None = None
+    queued_browser_load = False
+    queued_refresh = False
     fd = sys.stdin.fileno()
 
-    with RawTerminal(enabled=True):
+    with ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="monitor-mcp"
+    ) as executor, RawTerminal(enabled=True):
         while True:
             now = time.monotonic()
-            browser_open = state.view == "state"
-            if force_refresh or (not browser_open and now >= next_refresh):
-                snapshots = collect_snapshots(
-                    client,
-                    project_ids=args.project_id,
-                    root_uri=args.root_uri,
-                    include_matrix=not args.no_matrix,
-                )
-                state.selected_index = _clamped_index(
-                    state.selected_index, len(snapshots)
-                )
-                state.last_updated = datetime.now(timezone.utc).isoformat(
-                    timespec="seconds"
-                )
+            if pending and pending.future.done():
+                try:
+                    snapshots = _apply_mcp_operation_result(state, snapshots, pending)
+                except Exception as exc:
+                    _set_mcp_error(state, exc)
+                pending = None
                 next_refresh = time.monotonic() + state.refresh_interval
+                if queued_browser_load and state.view == "state":
+                    queued_browser_load = False
+                    state.state_payload = None
+                    state.state_entry = None
+                    state.state_error = ""
+                    state.state_entry_scroll_offset = 0
+                    _set_mcp_loading(state, "loading state browser...")
+                    pending = _submit_mcp_operation(
+                        executor,
+                        "state_browser",
+                        lambda: _fetch_state_browser_result(
+                            client, snapshots, state.selected_index
+                        ),
+                    )
+                elif queued_refresh:
+                    queued_refresh = False
+                    force_refresh = True
+                else:
+                    force_refresh = False
+                dirty = True
+
+            browser_open = state.view == "state"
+            if pending is None and (
+                force_refresh or (not browser_open and now >= next_refresh)
+            ):
+                _set_mcp_loading(state, "loading metrics...")
+                pending = _submit_mcp_operation(
+                    executor,
+                    "refresh",
+                    lambda: collect_snapshots(
+                        client,
+                        project_ids=args.project_id,
+                        root_uri=args.root_uri,
+                        include_matrix=not args.no_matrix,
+                    ),
+                )
                 force_refresh = False
                 dirty = True
 
@@ -1487,11 +1721,12 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                 sys.stdout.flush()
                 dirty = False
 
-            timeout = (
-                0.5
-                if state.view == "state"
-                else min(0.5, max(0.0, next_refresh - time.monotonic()))
-            )
+            if pending:
+                timeout = 0.1
+            elif state.view == "state":
+                timeout = 0.5
+            else:
+                timeout = min(0.5, max(0.0, next_refresh - time.monotonic()))
             key = read_key(timeout, fd=fd)
             if key is None:
                 continue
@@ -1503,14 +1738,44 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
             )
             if action == "quit":
                 return 0
-            if action == "browser":
-                _load_state_browser(client, state, snapshots)
+            if action == "browser" and pending is None:
+                state.state_payload = None
+                state.state_entry = None
+                state.state_error = ""
+                state.state_entry_scroll_offset = 0
+                _set_mcp_loading(state, "loading state browser...")
+                pending = _submit_mcp_operation(
+                    executor,
+                    "state_browser",
+                    lambda: _fetch_state_browser_result(
+                        client, snapshots, state.selected_index
+                    ),
+                )
                 dirty = True
-            if action == "state_entry":
-                _load_state_entry(client, state)
+            elif action == "browser":
+                queued_browser_load = True
+                _set_mcp_loading(state, "waiting for current MCP request...")
+                dirty = True
+            if action == "state_entry" and pending is None:
+                key = _selected_state_key(state)
+                if key:
+                    target = state.state_target
+                    state.state_entry = None
+                    state.state_entry_scroll_offset = 0
+                    _set_mcp_loading(state, "loading state entry...")
+                    pending = _submit_mcp_operation(
+                        executor,
+                        "state_entry",
+                        lambda: _fetch_state_entry_result(client, target, key),
+                    )
                 dirty = True
             if action == "refresh":
-                force_refresh = True
+                if pending is None:
+                    force_refresh = True
+                else:
+                    queued_refresh = True
+                    _set_mcp_loading(state, "waiting for current MCP request...")
+                    dirty = True
             if action in {"redraw", "refresh"}:
                 next_refresh = time.monotonic() + state.refresh_interval
                 dirty = True
