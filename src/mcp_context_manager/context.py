@@ -26,6 +26,7 @@ from .util import (
 
 DEFAULT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
 DEFAULT_CACHE_MAX_AGE_MINUTES = DEFAULT_CACHE_TTL_SECONDS // 60
+CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR = 8
 
 
 class ContextService:
@@ -66,19 +67,21 @@ class ContextService:
             index_status = self.index.status()
             cache_key = self._cache_key(
                 "context_lookup.search",
-                {
-                    "query": query,
-                    "path": path,
-                    "max_results": max_results,
-                    "include_globs": include_globs or [],
-                    "index": index_status.get("generated_at", ""),
-                    "refresh_signature": index_status.get("refresh_signature", ""),
-                    "project_id": self.config.project_id,
-                },
+                self._context_lookup_search_cache_args(
+                    query=query,
+                    path=path,
+                    max_results=max_results,
+                    include_globs=include_globs,
+                    index_status=index_status,
+                ),
             )
             cache_lookup = self._cache_lookup(cache_key)
             cached = cache_lookup.get("value") if cache_lookup["hit"] else None
             if isinstance(cached, dict):
+                cached = self._context_lookup_search_cache_value(
+                    cached,
+                    query=query,
+                )
                 self._record_metric(
                     "context_lookup.search",
                     started,
@@ -325,12 +328,16 @@ class ContextService:
         stage_timings["memory_lookup_ms"] = self._elapsed_ms(stage_started)
         prompt_sha256 = sha256_text(prompt)
         token_counting = self.token_counter.metadata()
+        retrieval_max_items = max(
+            CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR,
+            max(1, max_items),
+        )
         cache_key = self._context_pack_retrieval_cache_key(
             route=route,
             terms=terms,
             explicit_paths=explicit_paths,
             profile=profile,
-            max_items=max_items,
+            retrieval_max_items=retrieval_max_items,
             token_counting=token_counting,
         )
         stage_started = time.perf_counter()
@@ -377,7 +384,7 @@ class ContextService:
                 terms=terms,
                 explicit_paths=explicit_paths,
                 profile=profile,
-                max_items=max(1, max_items),
+                max_items=retrieval_max_items,
             )
             stage_timings["candidate_retrieval_ms"] = self._elapsed_ms(stage_started)
             stage_timings["search_ranking_ms"] = stage_timings[
@@ -406,7 +413,8 @@ class ContextService:
                     ),
                     "terms_key": terms_key,
                     "profile": profile,
-                    "max_items": max(1, max_items),
+                    "retrieval_item_floor": CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR,
+                    "retrieval_max_items": retrieval_max_items,
                     "token_counting": self.token_counter.cache_key_metadata(),
                 },
             )
@@ -780,7 +788,7 @@ class ContextService:
         terms: list[str],
         explicit_paths: list[str],
         profile: str,
-        max_items: int,
+        retrieval_max_items: int,
         token_counting: dict[str, Any],
     ) -> str:
         status = self.index.status()
@@ -789,9 +797,12 @@ class ContextService:
             {
                 "route": route,
                 "terms": sorted(set(terms)),
-                "explicit_paths": explicit_paths,
+                "explicit_paths": self._canonical_cache_paths(explicit_paths),
                 "output_profile": profile,
-                "max_items": max(1, max_items),
+                "retrieval_max_items": max(
+                    CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR,
+                    max(1, retrieval_max_items),
+                ),
                 "index_generated_at": status.get("generated_at", ""),
                 "refresh_signature": status.get("refresh_signature", ""),
                 "project_id": self.config.project_id,
@@ -805,6 +816,64 @@ class ContextService:
                     ),
                 },
             },
+        )
+
+    def _context_lookup_search_cache_args(
+        self,
+        query: str,
+        path: str,
+        max_results: int,
+        include_globs: list[str] | None,
+        index_status: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "terms": sorted(set(normalize_query_terms(query, max_terms=8))),
+            "path": self._canonical_cache_path(path),
+            "max_results": max_results,
+            "include_globs": self._canonical_cache_globs(include_globs),
+            "index": index_status.get("generated_at", ""),
+            "refresh_signature": index_status.get("refresh_signature", ""),
+            "project_id": self.config.project_id,
+        }
+
+    def _context_lookup_search_cache_value(
+        self,
+        cached: dict[str, Any],
+        query: str,
+    ) -> dict[str, Any]:
+        terms = normalize_query_terms(query, max_terms=8)
+        results = [
+            {**row, "terms": terms}
+            for row in cached.get("results", [])
+            if isinstance(row, dict)
+        ]
+        return {**cached, "query": query, "terms": terms, "results": results}
+
+    def _canonical_cache_path(self, path: str) -> str:
+        try:
+            return self.config.repo_relative(path)
+        except ValueError:
+            normalized = str(path).strip().replace("\\", "/")
+            while normalized.startswith("./"):
+                normalized = normalized[2:]
+            return normalized or "."
+
+    def _canonical_cache_paths(self, paths: list[str]) -> list[str]:
+        return sorted(
+            {
+                canonical
+                for path in paths
+                if (canonical := self._canonical_cache_path(path))
+            }
+        )
+
+    def _canonical_cache_globs(self, include_globs: list[str] | None) -> list[str]:
+        return sorted(
+            {
+                glob.strip().replace("\\", "/")
+                for glob in include_globs or []
+                if glob.strip()
+            }
         )
 
     def _context_pack_candidates(
@@ -1296,15 +1365,13 @@ class ContextService:
         for query in seed_queries[:query_limit]:
             cache_key = self._cache_key(
                 "context_lookup.search",
-                {
-                    "query": query,
-                    "path": path,
-                    "max_results": max_results,
-                    "include_globs": [],
-                    "index": index_status.get("generated_at", ""),
-                    "refresh_signature": index_status.get("refresh_signature", ""),
-                    "project_id": self.config.project_id,
-                },
+                self._context_lookup_search_cache_args(
+                    query=query,
+                    path=path,
+                    max_results=max_results,
+                    include_globs=None,
+                    index_status=index_status,
+                ),
             )
             cache_lookup = self._cache_lookup(cache_key)
             if cache_lookup["hit"]:

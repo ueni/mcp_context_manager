@@ -85,6 +85,23 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     assert second["cache"]["namespace"] == "context_lookup.search"
     assert second["cache"]["reason"] == "hit"
 
+    varied_query = service.context_lookup(
+        mode="search",
+        query=" Auth   Token ",
+        path="./",
+        include_globs=["tests/**", "src/**", "src/**"],
+    )
+    normalized_query = service.context_lookup(
+        mode="search",
+        query="auth token",
+        path=".",
+        include_globs=["src/**", "tests/**"],
+    )
+    assert varied_query["cache"]["hit"] is False
+    assert normalized_query["cache"]["hit"] is True
+    assert normalized_query["query"] == "auth token"
+    assert normalized_query["terms"] == ["auth", "token"]
+
     stats = service.context_admin(mode="cache_stats")
     assert stats["entry_count"] >= 1
     assert "context_lookup.search" in stats["namespaces"]
@@ -430,6 +447,37 @@ def test_warm_context_pack_reuses_retrieval_for_response_assembly(
     assert warm["metrics"]["stage_timings_ms"]["candidate_retrieval_ms"] == 0.0
     assert warm["metrics"]["stage_timings_ms"]["snippet_batch_ms"] == 0.0
     assert warm["references"][0]["reference_id"] != first["references"][0]["reference_id"]
+
+
+def test_context_pack_retrieval_cache_normalizes_paths_and_item_floor(
+    service: ContextService, monkeypatch
+) -> None:
+    first = service.context_pack(
+        "review auth token behavior",
+        changed_files=["src/auth.py", "tests/test_auth.py"],
+        focus_paths=["src/auth.py"],
+        max_items=2,
+    )
+
+    def fail_retrieval(*_args, **_kwargs):
+        raise AssertionError("warm pack should reuse normalized retrieval cache")
+
+    monkeypatch.setattr(service.index, "search", fail_retrieval)
+    monkeypatch.setattr(service.index, "symbols", fail_retrieval)
+    monkeypatch.setattr(service.index, "snippet_batch", fail_retrieval)
+
+    warm = service.context_pack(
+        "review auth token behavior",
+        changed_files=["./tests/test_auth.py", "src/auth.py"],
+        focus_paths=["tests/test_auth.py", "./src/auth.py"],
+        max_items=4,
+    )
+
+    assert first["items"]
+    assert warm["items"]
+    assert warm["cache"]["hit"] is True
+    assert warm["cache"]["reason"] == "hit"
+    assert warm["metrics"]["stage_timings_ms"]["candidate_retrieval_ms"] == 0.0
 
 
 def test_external_state_dir_supports_container_layout(
