@@ -1202,7 +1202,7 @@ class ContextService:
                 }
             )
 
-        search_rows = self._warm_search_caches(max_entries=max_entries)
+        search_rows = self._warm_search_caches(path=path, max_entries=max_entries)
         omitted.extend(
             row for row in search_rows if row.get("reason_code") == "search_warmup_failed"
         )
@@ -1256,6 +1256,7 @@ class ContextService:
             },
             "search_cache": {
                 "namespace": "context_lookup.search",
+                "path": path,
                 "query_count": len(warmed_searches),
                 "queries": warmed_searches,
             },
@@ -1270,7 +1271,9 @@ class ContextService:
             "generated_state_only": True,
         }
 
-    def _warm_search_caches(self, max_entries: int = 100) -> list[dict[str, Any]]:
+    def _warm_search_caches(
+        self, path: str = ".", max_entries: int = 100
+    ) -> list[dict[str, Any]]:
         seed_queries = (
             "test",
             "debug",
@@ -1292,7 +1295,7 @@ class ContextService:
                 "context_lookup.search",
                 {
                     "query": query,
-                    "path": ".",
+                    "path": path,
                     "max_results": max_results,
                     "include_globs": [],
                     "index": index_status.get("generated_at", ""),
@@ -1306,6 +1309,7 @@ class ContextService:
                 rows.append(
                     {
                         "query": query,
+                        "path": path,
                         "cache_hit": True,
                         "cache_reason": "hit",
                         "result_count": int(
@@ -1318,7 +1322,7 @@ class ContextService:
             try:
                 result = self.index.search(
                     query=query,
-                    path=".",
+                    path=path,
                     max_results=max_results,
                     include_globs=None,
                 )
@@ -1337,7 +1341,7 @@ class ContextService:
                 namespace="context_lookup.search",
                 metadata={
                     "query": query,
-                    "path": ".",
+                    "path": path,
                     "index_generated_at": index_status.get("generated_at", ""),
                     "refresh_signature": index_status.get("refresh_signature", ""),
                     "warmup": True,
@@ -1346,6 +1350,7 @@ class ContextService:
             rows.append(
                 {
                     "query": query,
+                    "path": path,
                     "cache_hit": False,
                     "cache_reason": str(cache_lookup.get("reason") or "miss"),
                     "result_count": int(result.get("count", 0) or 0),

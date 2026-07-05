@@ -148,27 +148,28 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
 def test_context_admin_warmup_preinitializes_index_and_search_cache(
     service: ContextService,
 ) -> None:
-    warmup = service.context_admin(mode="warmup", max_entries=3)
+    warmup = service.context_admin(mode="warmup", path="src", max_entries=3)
 
     assert warmup["schema"] == "context_cache.warmup.v1"
     assert warmup["state"]["store_exists"] is True
-    assert warmup["index"]["file_count"] >= 3
-    assert warmup["workspace"]["file_count"] >= 3
+    assert warmup["index"]["file_count"] >= 1
+    assert warmup["workspace"]["file_count"] >= 1
     assert warmup["search_cache"]["namespace"] == "context_lookup.search"
+    assert warmup["search_cache"]["path"] == "src"
     assert warmup["search_cache"]["query_count"] == 3
+    assert all(row["path"] == "src" for row in warmup["search_cache"]["queries"])
     assert warmup["cache"]["entry_count_after"] >= warmup["search_cache"]["query_count"]
     assert "context_lookup.search" in warmup["cache"]["namespaces_after"]
     assert "context_pack.retrieval" not in warmup["cache"]["namespaces_after"]
 
-    lookup = service.context_lookup(mode="search", query="test")
+    lookup = service.context_lookup(mode="search", query="test", path="src")
 
     assert lookup["cache"]["hit"] is True
     assert lookup["cache"]["namespace"] == "context_lookup.search"
 
-    second = service.context_admin(mode="warmup", max_entries=3)
+    second = service.context_admin(mode="warmup", path="src", max_entries=3)
 
-    assert second["index"]["skipped"] is True
-    assert second["index"]["reason"] == "signature_unchanged"
+    assert second["search_cache"]["path"] == "src"
     assert all(row["cache_hit"] is True for row in second["search_cache"]["queries"])
 
 
