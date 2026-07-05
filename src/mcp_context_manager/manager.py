@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from .config import ContextConfig
-from .context import ContextService
+from .context import DEFAULT_CACHE_MAX_AGE_MINUTES, ContextService
 from .projects import ProjectRegistry, ProjectRoot
 
 
@@ -145,7 +145,7 @@ class ProjectContextService:
         mode: str = "health",
         path: str = ".",
         max_files: int = 5000,
-        max_age_minutes: int = 1440,
+        max_age_minutes: int = DEFAULT_CACHE_MAX_AGE_MINUTES,
         max_entries: int = 100,
         max_output_chars: int | None = None,
         default_output_profile: str | None = None,

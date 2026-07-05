@@ -24,6 +24,9 @@ from .util import (
     sha256_text,
 )
 
+DEFAULT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
+DEFAULT_CACHE_MAX_AGE_MINUTES = DEFAULT_CACHE_TTL_SECONDS // 60
+
 
 class ContextService:
     def __init__(self, config: ContextConfig):
@@ -216,7 +219,7 @@ class ContextService:
         mode: str = "health",
         path: str = ".",
         max_files: int = 5000,
-        max_age_minutes: int = 1440,
+        max_age_minutes: int = DEFAULT_CACHE_MAX_AGE_MINUTES,
         max_entries: int = 100,
         max_output_chars: int | None = None,
         default_output_profile: str | None = None,
@@ -1602,7 +1605,7 @@ class ContextService:
         value: dict[str, Any],
         namespace: str,
         metadata: dict[str, Any] | None = None,
-        ttl_seconds: int = 86_400,
+        ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
     ) -> None:
         sanitized_value, sensitivity = sanitize_json(value)
         updated_at = now_iso()

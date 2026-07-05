@@ -256,6 +256,30 @@ def test_expired_search_cache_is_recomputed_and_pruned(
     assert pruned["expired_removed"] >= 1
 
 
+def test_cache_default_ttl_and_prune_age_are_14_days(
+    service: ContextService,
+) -> None:
+    result = service.context_lookup(mode="search", query="auth token")
+    cache_key = result["cache"]["key"]
+    row = service.store.get_json(f"cache:{cache_key}")
+    updated_at = datetime.fromisoformat(row["updated_at"])
+    expires_at = datetime.fromisoformat(row["expires_at"])
+
+    assert row["ttl_seconds"] == 14 * 24 * 60 * 60
+    assert timedelta(days=13, hours=23) <= expires_at - updated_at <= timedelta(
+        days=14, minutes=1
+    )
+
+    row["updated_at"] = (datetime.now(timezone.utc) - timedelta(days=13)).isoformat()
+    row["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    service.store.put_json(f"cache:{cache_key}", row)
+
+    pruned = service.context_admin(mode="cache_prune")
+
+    assert pruned["removed_entries"] == 0
+    assert service.store.get_json(f"cache:{cache_key}") is not None
+
+
 def test_invalidated_context_pack_cache_reports_stale(
     service: ContextService,
 ) -> None:

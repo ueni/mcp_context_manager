@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from .config import ContextConfig
-from .context import ContextService
+from .context import DEFAULT_CACHE_MAX_AGE_MINUTES, ContextService
 from .manager import ProjectContextService
 
 try:  # pragma: no cover - optional transport dependency is integration-tested.
@@ -309,7 +309,10 @@ MaxEntriesParam = Annotated[
 ]
 MaxAgeMinutesParam = Annotated[
     int,
-    _tool_param("Maximum cache entry age in minutes for cache_prune."),
+    _tool_param(
+        "Maximum cache entry age in minutes for cache_prune. "
+        f"Default is {DEFAULT_CACHE_MAX_AGE_MINUTES} minutes (14 days)."
+    ),
 ]
 DefaultOutputProfileParam = Annotated[
     Literal["compact", "normal", "verbose"] | None,
@@ -536,7 +539,7 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         mode: AdminModeParam = "health",
         path: RepoPathParam = ".",
         max_files: MaxFilesParam = 5000,
-        max_age_minutes: MaxAgeMinutesParam = 1440,
+        max_age_minutes: MaxAgeMinutesParam = DEFAULT_CACHE_MAX_AGE_MINUTES,
         max_entries: MaxEntriesParam = 100,
         max_output_chars: MaxOutputCharsParam = None,
         default_output_profile: DefaultOutputProfileParam = None,
