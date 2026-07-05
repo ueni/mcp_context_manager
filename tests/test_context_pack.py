@@ -27,8 +27,10 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert pack["schema"] == "context_pack.v1"
     assert pack["summary"]["route"] in {"coding", "security", "test"}
     assert pack["items"]
+    assert {item["kind"] for item in pack["items"]} == {"summary"}
     assert any(item["path"] == "src/auth.py" for item in pack["items"])
     assert any(item["path"] == "tests/test_auth.py" for item in pack["items"])
+    assert all(item["detail_lookup"]["mode"] == "snippet" for item in pack["items"])
     assert pack["memory"]["summary_count"] >= 1
     assert pack["references"][0]["schema"] == "mcp_result_reference.v1"
     assert pack["budget"]["estimated_output_tokens"] > 0
@@ -40,6 +42,8 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert pack["metrics"]["token_savings_formula"] == "max(0, baseline_input_tokens_est - output_tokens_est)"
     assert pack["metrics"]["external_tool_calls_saved_est"] >= 1
     assert pack["metrics"]["references_bytes_deferred_est"] > 0
+    assert pack["metrics"]["retrieval_plan"]["detail_mode"] == "context_lookup.snippet"
+    assert pack["metrics"]["retrieval_plan"]["snippet_request_count"] == 0
     assert pack["cache"]["namespace"] == "context_pack.retrieval"
     assert pack["cache"]["reason"] in {
         "miss",
@@ -65,6 +69,60 @@ def test_context_pack_redacts_secret_like_content(service: ContextService, sampl
 
     assert "[REDACTED_SECRET_" in pack["items"][0]["content"]
     assert pack["items"][0]["redactions"]
+
+
+def test_context_pack_compact_does_not_build_snippets(
+    service: ContextService, monkeypatch
+) -> None:
+    def fail_snippet_batch(*_args, **_kwargs):
+        raise AssertionError("context_pack should return summaries, not snippets")
+
+    monkeypatch.setattr(service.index, "snippet_batch", fail_snippet_batch)
+
+    pack = service.context_pack(
+        prompt="review auth token behavior",
+        max_items=2,
+        output_profile="compact",
+    )
+
+    assert pack["items"]
+    assert {item["kind"] for item in pack["items"]} == {"summary"}
+    assert pack["metrics"]["retrieval_plan"]["snippet_request_count"] == 0
+    assert pack["metrics"]["stage_timings_ms"]["snippet_batch_ms"] == 0.0
+
+
+def test_file_summary_uses_matched_line_excerpt(
+    service: ContextService, sample_repo
+) -> None:
+    deep_file = sample_repo / "src" / "deep.py"
+    deep_file.write_text(
+        "\n".join(
+            [
+                "import os",
+                "import sys",
+                "",
+                "def unrelated():",
+                "    return 'header'",
+                "",
+                "",
+                "def target_marker():",
+                "    return 'needle'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    service.context_admin(mode="index_refresh")
+
+    summary = service.index.file_summary(
+        "src/deep.py",
+        matched_line=8,
+        max_chars=300,
+    )
+
+    assert "target_marker" in summary["content"]
+    assert "import os" not in summary["content"]
+    assert summary["start_line"] < 8 <= summary["end_line"]
 
 
 def test_context_pack_reads_explicit_text_file_that_is_not_indexed(

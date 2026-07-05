@@ -101,6 +101,12 @@ Agents can read `repo://instructions/codex-context-pack-first` or use the
 `repo://project/{project_id}/instructions/codex-context-pack-first` after
 selecting a project.
 
+`context_pack` is summary-first: pack `items` are compact file summaries with
+`path`, line hints, score, reason codes, `title_hint`, short `content`, and a
+stable `detail_lookup` object pointing back to `context_lookup(mode="snippet")`
+for the full evidence. `source_chars` and `deferred_chars` estimate how much
+source text was intentionally kept out of the model prompt.
+
 ## Measurement Matrix And Benchmarks
 
 Use `context_admin(mode="measurement_matrix")` to get the exact pass/fail target

@@ -279,6 +279,7 @@ class ContextService:
         budget = max_output_chars or int(self._budget()["max_output_chars"])
         route = classify_route(prompt)
         terms = normalize_query_terms(prompt, max_terms=12)
+        terms_key = " ".join(sorted(set(terms)))
         explicit_paths = self._collect_paths(prompt, changed_files or [], focus_paths or [])
         stage_started = time.perf_counter()
         explicit_refresh = self._refresh_explicit_paths(
@@ -292,10 +293,8 @@ class ContextService:
         stage_timings["memory_lookup_ms"] = self._elapsed_ms(stage_started)
         prompt_sha256 = sha256_text(prompt)
         cache_key = self._context_pack_retrieval_cache_key(
-            prompt_sha256=prompt_sha256,
+            route=route,
             terms=terms,
-            changed_files=changed_files or [],
-            focus_paths=focus_paths or [],
             explicit_paths=explicit_paths,
             profile=profile,
             max_items=max_items,
@@ -320,6 +319,7 @@ class ContextService:
                     namespace="context_pack.retrieval",
                     metadata={
                         "prompt_sha256": prompt_sha256,
+                        "terms_key": terms_key,
                         "refresh_signature": self.index.status().get(
                             "refresh_signature", ""
                         ),
@@ -355,6 +355,7 @@ class ContextService:
                     "refresh_signature": self.index.status().get(
                         "refresh_signature", ""
                     ),
+                    "terms_key": terms_key,
                     "profile": profile,
                     "retrieval_item_floor": max(max_items, 8),
                 },
@@ -658,10 +659,8 @@ class ContextService:
 
     def _context_pack_retrieval_cache_key(
         self,
-        prompt_sha256: str,
+        route: str,
         terms: list[str],
-        changed_files: list[str],
-        focus_paths: list[str],
         explicit_paths: list[str],
         profile: str,
         max_items: int,
@@ -670,10 +669,8 @@ class ContextService:
         return self._cache_key(
             "context_pack.retrieval",
             {
-                "prompt_sha256": prompt_sha256,
-                "terms": terms,
-                "changed_files": changed_files,
-                "focus_paths": focus_paths,
+                "route": route,
+                "terms": sorted(set(terms)),
                 "explicit_paths": explicit_paths,
                 "output_profile": profile,
                 "retrieval_item_floor": max(max_items, 8),
@@ -692,18 +689,18 @@ class ContextService:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         omitted: list[dict[str, Any]] = []
-        snippet_requests: list[dict[str, Any]] = []
         retrieval_stats: dict[str, Any] = {
             "schema": "context_pack.retrieval_plan.v1",
             "profile": profile,
+            "detail_mode": "context_lookup.snippet",
             "explicit_path_count": len(explicit_paths),
-            "explicit_snippet_count": 0,
+            "explicit_summary_count": 0,
             "search_limit": 0,
             "search_result_count": 0,
-            "search_snippet_count": 0,
+            "search_summary_count": 0,
             "symbol_limit": 0,
             "symbol_result_count": 0,
-            "symbol_snippet_count": 0,
+            "symbol_summary_count": 0,
             "symbol_lookup_skipped": False,
             "snippet_request_count": 0,
             "snippet_batch_ms": 0.0,
@@ -715,24 +712,36 @@ class ContextService:
             counts[source] = int(counts.get(source, 0)) + 1
 
         for rel in explicit_paths:
-            snippet_requests.append(
-                {
-                    "kind": "explicit",
-                    "path": rel,
-                    "start_line": 1,
-                    "end_line": 80 if profile != "compact" else 40,
-                    "max_chars": 1800 if profile != "compact" else 900,
-                    "score": 12.0,
-                    "reason_codes": ["explicit_path"],
-                    "source": "explicit_path",
-                    "error_reason": "unreadable_explicit_path",
-                    "indexed_only": False,
-                }
+            try:
+                summary = self.index.file_summary(
+                    rel,
+                    max_chars=900 if profile != "compact" else 360,
+                )
+            except Exception as exc:
+                omitted.append(
+                    {
+                        "path": rel,
+                        "reason_code": "unreadable_explicit_path",
+                        "detail": type(exc).__name__,
+                    }
+                )
+                continue
+            candidates.append(
+                self._candidate_from_summary(
+                    summary,
+                    score=12.0,
+                    reason_codes=["explicit_path"],
+                    source="explicit_path",
+                )
             )
+            retrieval_stats["explicit_summary_count"] = int(
+                retrieval_stats.get("explicit_summary_count", 0)
+            ) + 1
+            count_source("explicit_path")
 
         if terms:
             try:
-                search_limit = max(max_items * 2, 8) if profile == "compact" else max(max_items * 3, 12)
+                search_limit = max(max_items * 4, 12)
                 retrieval_stats["search_limit"] = search_limit
                 search = self.index.search(
                     query=" ".join(terms), max_results=search_limit
@@ -741,38 +750,33 @@ class ContextService:
                 for row in search["results"]:
                     path = row["path"]
                     line = int(row.get("line") or self._first_matching_line(path, terms) or 1)
-                    snippet_requests.append(
-                        {
-                            "kind": "search",
-                            "path": path,
-                            "start_line": line,
-                            "end_line": line,
-                            "context_before": 3,
-                            "context_after": 8,
-                            "max_chars": 1000 if profile == "compact" else 1800,
-                            "score": float(row.get("score", 1.0)) + 4.0,
-                            "reason_codes": ["lexical_match"],
-                            "source": str(row.get("source", "search")),
-                            "error_reason": "search_snippet_unavailable",
-                        }
+                    summary = self.index.file_summary(
+                        path,
+                        max_chars=420 if profile != "compact" else 260,
+                        matched_line=line,
                     )
+                    candidates.append(
+                        self._candidate_from_summary(
+                            summary,
+                            score=float(row.get("score", 1.0)) + 4.0,
+                            reason_codes=["lexical_match"],
+                            source=str(row.get("source", "search")),
+                        )
+                    )
+                    retrieval_stats["search_summary_count"] = int(
+                        retrieval_stats.get("search_summary_count", 0)
+                    ) + 1
+                    count_source(str(row.get("source", "search")))
             except Exception as exc:
                 omitted.append({"reason_code": "search_failed", "detail": type(exc).__name__})
 
         try:
-            symbol_limit = max(max_items, 4) if profile == "compact" else max_items * 2
+            symbol_limit = max(max_items, 4)
             retrieval_stats["symbol_limit"] = symbol_limit
-            queued_retrieval = [
-                request
-                for request in snippet_requests
-                if request.get("kind") in {"explicit", "search"}
-            ]
-            queued_path_count = len(
-                {str(request.get("path", "")) for request in queued_retrieval}
-            )
+            queued_path_count = len({str(item.get("path", "")) for item in candidates})
             if (
                 profile == "compact"
-                and len(queued_retrieval) >= max_items * 2
+                and len(candidates) >= max_items * 2
                 and queued_path_count >= max_items
             ):
                 retrieval_stats["symbol_lookup_skipped"] = True
@@ -780,102 +784,74 @@ class ContextService:
                     {
                         "reason_code": "early_stop_enough_ranked_candidates",
                         "detail": "symbol lookup skipped after explicit/search retrieval",
-                        "candidate_count": len(queued_retrieval),
+                        "candidate_count": len(candidates),
                     }
                 )
             else:
                 symbols = self.index.symbols(query=" ".join(terms), limit=symbol_limit)
                 retrieval_stats["symbol_result_count"] = len(symbols["symbols"])
                 for row in symbols["symbols"]:
-                    snippet_requests.append(
-                        {
-                            "kind": "symbol",
-                            "path": row["path"],
-                            "start_line": max(1, int(row["line_start"])),
-                            "end_line": max(1, int(row["line_end"])),
-                            "context_before": 2,
-                            "context_after": 6,
-                            "max_chars": 1000,
-                            "score": 8.0,
-                            "reason_codes": [
+                    summary = self.index.file_summary(
+                        str(row["path"]),
+                        max_chars=420 if profile != "compact" else 260,
+                        matched_line=max(1, int(row["line_start"])),
+                    )
+                    candidates.append(
+                        self._candidate_from_summary(
+                            summary,
+                            score=8.0,
+                            reason_codes=[
                                 "symbol_match",
                                 str(row.get("kind", "symbol")),
                             ],
-                            "source": "symbol_index",
-                            "symbol": row,
-                            "error_reason": "symbol_snippet_unavailable",
-                        }
+                            source="symbol_index",
+                            symbol=row,
+                        )
                     )
+                    retrieval_stats["symbol_summary_count"] = int(
+                        retrieval_stats.get("symbol_summary_count", 0)
+                    ) + 1
+                    count_source("symbol_index")
         except Exception:
             pass
 
-        retrieval_stats["snippet_request_count"] = len(snippet_requests)
-        stage_started = time.perf_counter()
-        snippets = self.index.snippet_batch(snippet_requests, indexed_only=True)
-        retrieval_stats["snippet_batch_ms"] = self._elapsed_ms(stage_started)
-        for request, snippet in zip(snippet_requests, snippets):
-            if snippet.get("schema") == "context_snippet.error.v1":
-                omitted.append(
-                    {
-                        "path": request.get("path", ""),
-                        "reason_code": request.get(
-                            "error_reason", "snippet_unavailable"
-                        ),
-                        "detail": snippet.get("error", "Error"),
-                    }
-                )
-                continue
-            candidates.append(
-                self._candidate_from_snippet(
-                    snippet,
-                    score=float(request.get("score", 1.0)),
-                    reason_codes=list(request.get("reason_codes", [])),
-                    source=str(request.get("source", "snippet_batch")),
-                    symbol=request.get("symbol"),
-                )
-            )
-            kind = str(request.get("kind", ""))
-            if kind == "explicit":
-                retrieval_stats["explicit_snippet_count"] = int(
-                    retrieval_stats.get("explicit_snippet_count", 0)
-                ) + 1
-            elif kind == "search":
-                retrieval_stats["search_snippet_count"] = int(
-                    retrieval_stats.get("search_snippet_count", 0)
-                ) + 1
-            elif kind == "symbol":
-                retrieval_stats["symbol_snippet_count"] = int(
-                    retrieval_stats.get("symbol_snippet_count", 0)
-                ) + 1
-            count_source(str(request.get("source", "snippet_batch")))
-
         return candidates, omitted, retrieval_stats
 
-    def _candidate_from_snippet(
+    def _candidate_from_summary(
         self,
-        snippet: dict[str, Any],
+        summary: dict[str, Any],
         score: float,
         reason_codes: list[str],
         source: str,
         symbol: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        content = str(snippet.get("content", ""))
+        content = str(summary.get("content") or summary.get("excerpt") or "")
+        source_chars = int(summary.get("source_chars", len(content)) or len(content))
         item = {
-            "kind": "snippet",
-            "path": snippet["path"],
-            "start_line": snippet["start_line"],
-            "end_line": snippet["end_line"],
+            "kind": "summary",
+            "path": summary["path"],
+            "start_line": summary["start_line"],
+            "end_line": summary["end_line"],
             "score": round(score, 4),
             "confidence": round(min(0.99, max(0.1, score / 14.0)), 3),
             "reason_codes": reason_codes,
             "source": source,
+            "title_hint": summary.get("title_hint", ""),
             "content": content,
             "raw_chars": len(content),
-            "redactions": snippet.get("redactions", []),
-            "prompt_injection_signals": snippet.get("prompt_injection_signals", prompt_injection_signals(content)),
-            "provenance": {
+            "source_chars": source_chars,
+            "deferred_chars": max(0, source_chars - len(content)),
+            "detail_lookup": {
                 "tool": "context_lookup",
                 "mode": "snippet",
+                "path": summary["path"],
+                "start_line": summary["start_line"],
+            },
+            "redactions": summary.get("redactions", []),
+            "prompt_injection_signals": summary.get("prompt_injection_signals", prompt_injection_signals(content)),
+            "provenance": {
+                "tool": "context_lookup",
+                "mode": "summary",
                 "repo_relative": True,
                 "symbol": symbol or {},
             },
@@ -927,7 +903,8 @@ class ContextService:
             }
             for item in candidates
         ]
-        return estimate_tokens(evidence)
+        deferred_chars = sum(int(item.get("deferred_chars", 0) or 0) for item in candidates)
+        return estimate_tokens(evidence) + max(0, (deferred_chars + 3) // 4)
 
     def _external_tool_calls_saved_estimate(
         self,
@@ -1223,6 +1200,14 @@ class ContextService:
                 if str(row.get("metadata", {}).get("prompt_sha256", ""))
                 == prompt_sha256
             ]
+            terms_key = str(metadata.get("terms_key", ""))
+            if not prompt_rows and terms_key:
+                prompt_rows = [
+                    row
+                    for row in rows
+                    if str(row.get("metadata", {}).get("terms_key", ""))
+                    == terms_key
+                ]
             if not prompt_rows:
                 return "arg_changed"
             expected_signature = str(metadata.get("refresh_signature", ""))

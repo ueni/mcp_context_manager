@@ -121,6 +121,7 @@ class ContextIndex:
                     existing
                     and int(existing.get("size", -1)) == candidate.size
                     and int(existing.get("mtime_ns", -1)) == candidate.mtime_ns
+                    and isinstance(existing.get("summary"), dict)
                 ):
                     unchanged_count += 1
                     continue
@@ -143,6 +144,13 @@ class ContextIndex:
                     "language": language_for_path(rel),
                     "line_count": len(text.splitlines()),
                     "indexed_at": indexed_at,
+                    "summary": self._file_summary_payload(
+                        rel=rel,
+                        text=text,
+                        symbols=symbols,
+                        size=candidate.size,
+                        source="index",
+                    ),
                     "content": text,
                     "terms": sorted(term_rows),
                 }
@@ -339,6 +347,64 @@ class ContextIndex:
             )
         rows.sort(key=lambda item: str(item["path"]))
         return rows[:limit]
+
+    def file_summary(
+        self,
+        path: str,
+        max_chars: int = 480,
+        matched_line: int | None = None,
+    ) -> dict[str, Any]:
+        file_path = self.config.resolve_repo_path(path)
+        if not file_path.is_file():
+            raise FileNotFoundError(path)
+        if should_skip_path(file_path, self.config.repo_path, self.config.state_dir):
+            raise ValueError("path is excluded by runtime skip rules")
+        stat = file_path.stat()
+        rel = self.config.repo_relative(file_path)
+        row = self._indexed_row(rel, size=int(stat.st_size), mtime_ns=int(stat.st_mtime_ns))
+        if matched_line is not None:
+            text = row.get("content") if row else None
+            if not isinstance(text, str):
+                if stat.st_size > self.config.max_read_bytes:
+                    raise ValueError("file exceeds max_read_bytes")
+                if is_likely_binary(file_path):
+                    raise ValueError("binary file is not readable")
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            symbols, _imports = self.extract_file_intel(rel, text)
+            summary = self._file_summary_payload(
+                rel=rel,
+                text=text,
+                symbols=symbols,
+                size=int(stat.st_size),
+                source="index" if row else "file",
+                anchor_line=max(1, int(matched_line)),
+            )
+        elif row and isinstance(row.get("summary"), dict):
+            summary = dict(row["summary"])
+            summary["source"] = "index"
+        else:
+            if stat.st_size > self.config.max_read_bytes:
+                raise ValueError("file exceeds max_read_bytes")
+            if is_likely_binary(file_path):
+                raise ValueError("binary file is not readable")
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            symbols, _imports = self.extract_file_intel(rel, text)
+            summary = self._file_summary_payload(
+                rel=rel,
+                text=text,
+                symbols=symbols,
+                size=int(stat.st_size),
+                source="file",
+            )
+
+        excerpt = str(summary.get("excerpt") or summary.get("content") or "")
+        excerpt, truncated = trim_text(excerpt, max_chars)
+        summary["excerpt"] = excerpt
+        summary["content"] = excerpt
+        summary["truncated"] = bool(summary.get("truncated", False) or truncated)
+        summary["schema"] = "context_file_summary.v1"
+        summary["prompt_injection_signals"] = prompt_injection_signals(excerpt)
+        return summary
 
     def extract_file_intel(
         self, rel_path: str, text: str
@@ -737,6 +803,13 @@ class ContextIndex:
         return 1
 
     def _indexed_text(self, rel: str, size: int, mtime_ns: int) -> str | None:
+        row = self._indexed_row(rel, size=size, mtime_ns=mtime_ns)
+        if not row:
+            return None
+        content = row.get("content")
+        return content if isinstance(content, str) else None
+
+    def _indexed_row(self, rel: str, size: int, mtime_ns: int) -> dict[str, Any] | None:
         row = self.store.get_json(_file_key(rel), {})
         if not isinstance(row, dict):
             return None
@@ -744,8 +817,7 @@ class ContextIndex:
             return None
         if int(row.get("mtime_ns", -1)) != mtime_ns:
             return None
-        content = row.get("content")
-        return content if isinstance(content, str) else None
+        return row
 
     def tree(
         self, path: str = ".", max_entries: int = 200, max_depth: int = 2
@@ -808,6 +880,59 @@ class ContextIndex:
             "git_branch": git_value(self.config.repo_path, "branch", "--show-current"),
             "git_head": git_value(self.config.repo_path, "rev-parse", "--short", "HEAD"),
             "index": self.status(),
+        }
+
+    def _file_summary_payload(
+        self,
+        rel: str,
+        text: str,
+        symbols: list[dict[str, Any]],
+        size: int,
+        source: str,
+        anchor_line: int | None = None,
+    ) -> dict[str, Any]:
+        lines = text.splitlines()
+        if anchor_line is not None:
+            first_line = max(1, min(anchor_line, max(1, len(lines))) - 2)
+            end_line = min(len(lines), first_line + 5)
+            picked = lines[first_line - 1 : end_line]
+        else:
+            first_line = 1
+            picked = []
+            for idx, line in enumerate(lines, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if not picked:
+                    first_line = idx
+                picked.append(stripped)
+                if len("\n".join(picked)) >= 480 or len(picked) >= 4:
+                    break
+            end_line = min(len(lines), first_line + max(0, len(picked) - 1))
+        excerpt_raw = "\n".join(picked)
+        excerpt_raw, truncated = trim_text(excerpt_raw, 480)
+        excerpt, redactions = redact_text(excerpt_raw)
+        title_hint = Path(rel).name
+        if symbols:
+            title_hint = str(symbols[0].get("signature") or symbols[0].get("name") or title_hint)
+        elif picked:
+            title_hint = picked[0][:160]
+        return {
+            "schema": "context_file_summary.v1",
+            "path": rel,
+            "start_line": first_line,
+            "end_line": end_line,
+            "title_hint": title_hint[:160],
+            "excerpt": excerpt,
+            "content": excerpt,
+            "line_count": len(lines),
+            "language": language_for_path(rel),
+            "size": int(size),
+            "source_chars": len(text),
+            "source": source,
+            "truncated": truncated,
+            "redactions": redactions,
+            "prompt_injection_signals": prompt_injection_signals(excerpt),
         }
 
     def _term_rows(self, rel: str, text: str) -> dict[str, dict[str, Any]]:
