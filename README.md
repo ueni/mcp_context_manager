@@ -158,10 +158,15 @@ Controls:
 | `Up` / `Down` | Select a project row. |
 | `Enter` | Open details for the selected project. |
 | `b` | Browse sanitized generated state for the selected project. |
-| `Esc` | Return to the project table. |
+| `Esc` | Return to the project table, or close a state-entry overlay. |
 | `+` / `-` | Increase or decrease the refresh interval. |
 | `r` | Refresh immediately. |
 | `q` | Quit. |
+
+In the state browser, `Up` / `Down` scroll the row selection, `PgUp` / `PgDn`
+jump through rows, `/` starts a search filter, and `Enter` opens the selected
+entry as an overlay. The browser uses the loaded snapshot until you leave and
+re-enter it; periodic refresh is disabled there so inspection does not jump.
 
 Render one snapshot and exit:
 
@@ -185,7 +190,8 @@ python3 monitor-metrics.py --root-uri file:///home/user/source/my-repo
 The dashboard shows request volume, `context_pack` latency, cache hit bars,
 estimated tokens saved, deferred reference bytes, and measurement-matrix status.
 The state browser calls `context_admin(mode="state_browser")` for the selected
-project and shows bounded, redacted generated-state rows.
+project and shows bounded, redacted generated-state rows with searchable,
+scrollable entry inspection.
 
 Run the built-in offline benchmark through MCP/admin:
 

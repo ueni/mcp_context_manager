@@ -84,6 +84,9 @@ class MonitorState:
     refresh_interval: float = DEFAULT_INTERVAL
     last_updated: str = ""
     state_selected_index: int = 0
+    state_scroll_offset: int = 0
+    state_search: str = ""
+    state_search_active: bool = False
     state_payload: dict[str, Any] | None = None
     state_entry: dict[str, Any] | None = None
     state_error: str = ""
@@ -322,6 +325,22 @@ def fetch_state_browser(
     return client.call_tool("context_admin", args)
 
 
+def friendly_mcp_error(exc: Exception) -> str:
+    message = str(exc)
+    if (
+        "context_adminArguments" in message
+        and "state_browser" in message
+        and "literal_error" in message
+    ):
+        return (
+            "The running MCP server does not support "
+            "context_admin(mode='state_browser') yet. Rebuild and restart it with "
+            "the current checkout, for example: "
+            "MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up -d --build"
+        )
+    return message
+
+
 def _safe_discover_projects(client: Any) -> list[ProjectTarget]:
     try:
         return discover_projects(client)
@@ -394,8 +413,6 @@ def render_monitor_screen(
 ) -> str:
     if state.view == "state":
         return render_state_browser(url=url, color=color, width=width, state=state)
-    if state.view == "state_detail":
-        return render_state_entry(url=url, color=color, width=width, state=state)
     if state.view == "detail" and snapshots:
         selected = _clamped_index(state.selected_index, len(snapshots))
         return render_project_detail(
@@ -492,17 +509,30 @@ def render_state_browser(
     color: bool,
     width: int | None,
     state: MonitorState,
+    height: int | None = None,
 ) -> str:
-    width = width or shutil.get_terminal_size((120, 30)).columns
+    terminal_size = shutil.get_terminal_size((120, 30))
+    width = width or terminal_size.columns
+    height = height or terminal_size.lines
     payload = state.state_payload or {}
-    rows = payload.get("rows") if isinstance(payload, dict) else []
-    rows = rows if isinstance(rows, list) else []
+    rows = _filtered_state_rows(state)
+    visible_count = _state_visible_count(height, bool(state.state_entry))
+    state.state_selected_index = _clamped_index(state.state_selected_index, len(rows))
+    state.state_scroll_offset = _adjust_scroll_offset(
+        state.state_scroll_offset,
+        state.state_selected_index,
+        visible_count,
+        len(rows),
+    )
+    visible_rows = rows[
+        state.state_scroll_offset : state.state_scroll_offset + visible_count
+    ]
     project = _project_name(state.state_target) if state.state_target else "-"
     lines = [
         _style("mcp-context-manager state browser", color, Ansi.BOLD + Ansi.CYAN),
         f"endpoint: {url}",
         f"project:  {project}",
-        _controls(state.refresh_interval, color),
+        _browser_controls(state, color),
         "",
     ]
     if state.state_error:
@@ -516,9 +546,28 @@ def render_state_browser(
             if isinstance(row, dict)
         )
         lines.extend([f"groups:   {summary}", ""])
+    lines.extend(
+        [
+            (
+                f"rows:     {len(rows)}"
+                f" / {len(_state_rows(state))}"
+                f"   selected: {state.state_selected_index + 1 if rows else 0}"
+                f"   window: {state.state_scroll_offset + 1 if rows else 0}-"
+                f"{state.state_scroll_offset + len(visible_rows) if rows else 0}"
+            ),
+            f"search:   {state.state_search or '-'}"
+            + ("  (typing)" if state.state_search_active else ""),
+            "",
+        ]
+    )
     table_rows = [
-        _state_row_cells(row, selected=index == state.state_selected_index)
-        for index, row in enumerate(rows)
+        _state_row_cells(
+            row,
+            selected=(
+                state.state_scroll_offset + index == state.state_selected_index
+            ),
+        )
+        for index, row in enumerate(visible_rows)
         if isinstance(row, dict)
     ]
     lines.extend(
@@ -531,46 +580,44 @@ def render_state_browser(
     )
     if not table_rows:
         lines.append("No generated-state rows for this project.")
+    if state.state_entry:
+        lines.extend(["", *render_state_entry_overlay(color, width, state)])
     return "\n".join(lines)
 
 
-def render_state_entry(
-    url: str,
+def render_state_entry_overlay(
     color: bool,
-    width: int | None,
+    width: int,
     state: MonitorState,
-) -> str:
-    width = width or shutil.get_terminal_size((120, 30)).columns
+) -> list[str]:
     payload = state.state_entry or {}
     entry = payload.get("entry") if isinstance(payload, dict) else {}
     entry = entry if isinstance(entry, dict) else {}
-    project = _project_name(state.state_target) if state.state_target else "-"
     preview = str(entry.get("preview") or "")
-    lines = [
-        _style("mcp-context-manager state entry", color, Ansi.BOLD + Ansi.CYAN),
-        f"endpoint: {url}",
-        f"project:  {project}",
-        _controls(state.refresh_interval, color),
+    inner_width = max(40, min(100, width - 6))
+    lines = _render_table(
+        ("field", "value"),
+        [
+            ("key", entry.get("key", "-")),
+            ("type", entry.get("value_type", "-")),
+            ("size", fmt_int(entry.get("size_chars", 0))),
+            ("schema", entry.get("schema", "-") or "-"),
+            ("status", entry.get("status", "-") or "-"),
+            ("expires", entry.get("expires_at", "-") or "-"),
+        ],
+        aligns=("left", "left"),
+    )
+    preview_lines = _wrap_block(preview, inner_width)
+    body = [
+        _style("state entry overlay", color, Ansi.BOLD + Ansi.CYAN),
+        "Esc closes overlay",
         "",
-        *_render_table(
-            ("field", "value"),
-            [
-                ("key", entry.get("key", "-")),
-                ("type", entry.get("value_type", "-")),
-                ("size", fmt_int(entry.get("size_chars", 0))),
-                ("schema", entry.get("schema", "-") or "-"),
-                ("status", entry.get("status", "-") or "-"),
-                ("expires", entry.get("expires_at", "-") or "-"),
-            ],
-            aligns=("left", "left"),
-        ),
+        *lines,
         "",
         _style("preview", color, Ansi.BOLD),
-        *_wrap_block(preview, max(40, width - 2)),
+        *preview_lines,
     ]
-    if state.state_error:
-        lines.extend(["", _style(f"ERROR: {state.state_error}", color, Ansi.RED)])
-    return "\n".join(lines)
+    return _box_lines(body, width=inner_width + 4)
 
 
 def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
@@ -752,6 +799,19 @@ def _controls(refresh_interval: float, color: bool) -> str:
     )
 
 
+def _browser_controls(state: MonitorState, color: bool) -> str:
+    if state.state_entry:
+        keys = "keys: Esc close overlay  q quit"
+    elif state.state_search_active:
+        keys = "keys: type search  Backspace edit  Enter apply  Esc cancel"
+    else:
+        keys = (
+            "keys: Up/Down scroll  PgUp/PgDn jump  / search  "
+            "Enter inspect  Esc table  q quit"
+        )
+    return _style(keys, color, Ansi.DIM) if color else keys
+
+
 def _measurement_check_rows(
     matrix: dict[str, Any],
     color: bool,
@@ -773,6 +833,58 @@ def _measurement_check_rows(
             )
         )
     return rows
+
+
+def _state_rows(state: MonitorState) -> list[dict[str, Any]]:
+    rows = (state.state_payload or {}).get("rows")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _filtered_state_rows(state: MonitorState) -> list[dict[str, Any]]:
+    rows = _state_rows(state)
+    query = state.state_search.strip().lower()
+    if not query:
+        return rows
+    return [row for row in rows if _state_row_matches(row, query)]
+
+
+def _state_row_matches(row: dict[str, Any], query: str) -> bool:
+    haystack = " ".join(
+        str(row.get(key, ""))
+        for key in (
+            "key",
+            "value_type",
+            "schema",
+            "status",
+            "expires_at",
+            "preview",
+        )
+    ).lower()
+    return query in haystack
+
+
+def _state_visible_count(height: int, overlay_open: bool) -> int:
+    reserved = 22 if overlay_open else 13
+    return max(3, height - reserved)
+
+
+def _adjust_scroll_offset(
+    offset: int,
+    selected: int,
+    visible_count: int,
+    row_count: int,
+) -> int:
+    if row_count <= 0:
+        return 0
+    max_offset = max(0, row_count - visible_count)
+    offset = max(0, min(offset, max_offset))
+    if selected < offset:
+        return selected
+    if selected >= offset + visible_count:
+        return min(max_offset, selected - visible_count + 1)
+    return offset
 
 
 def _state_row_cells(row: dict[str, Any], selected: bool = False) -> tuple[str, ...]:
@@ -806,6 +918,26 @@ def _wrap_block(text: str, width: int) -> list[str]:
             line = line[width:]
         lines.append(line)
     return lines
+
+
+def _box_lines(lines: list[str], width: int) -> list[str]:
+    width = max(10, width)
+    border = "+" + "-" * (width - 2) + "+"
+    boxed = [border]
+    for line in lines:
+        visible = _visible_len(line)
+        if visible <= width - 4:
+            boxed.append("| " + line + " " * (width - 4 - visible) + " |")
+            continue
+        for wrapped in _wrap_block(line, width - 4):
+            boxed.append(
+                "| "
+                + wrapped
+                + " " * max(0, width - 4 - _visible_len(wrapped))
+                + " |"
+            )
+    boxed.append(border)
+    return boxed
 
 
 def _status_text(status: str, color: bool) -> str:
@@ -1019,10 +1151,22 @@ def decode_key(sequence: str) -> str | None:
         return "up"
     if sequence in {"\x1b[B", "\x1bOB"}:
         return "down"
+    if sequence == "\x1b[5~":
+        return "page_up"
+    if sequence == "\x1b[6~":
+        return "page_down"
+    if sequence in {"\x1b[H", "\x1bOH"}:
+        return "home"
+    if sequence in {"\x1b[F", "\x1bOF"}:
+        return "end"
     if sequence in {"\r", "\n"}:
         return "enter"
     if sequence == "\x1b":
         return "escape"
+    if sequence in {"\x7f", "\b"}:
+        return "backspace"
+    if sequence == "/":
+        return "search"
     if sequence in {"+", "="}:
         return "plus"
     if sequence in {"-", "_"}:
@@ -1031,8 +1175,12 @@ def decode_key(sequence: str) -> str | None:
         return "refresh"
     if sequence in {"b", "B"}:
         return "browser"
-    if sequence in {"q", "Q", "\x03"}:
+    if sequence == "\x03":
+        return "interrupt"
+    if sequence in {"q", "Q"}:
         return "quit"
+    if len(sequence) == 1 and sequence.isprintable():
+        return f"text:{sequence}"
     return None
 
 
@@ -1049,10 +1197,34 @@ def read_key(timeout: float, fd: int | None = None) -> str | None:
             if not ready:
                 break
             sequence += os.read(fd, 1).decode("utf-8", errors="ignore")
-            if sequence in {"\x1b[A", "\x1b[B", "\x1bOA", "\x1bOB"}:
+            if sequence in {
+                "\x1b[A",
+                "\x1b[B",
+                "\x1bOA",
+                "\x1bOB",
+                "\x1b[5~",
+                "\x1b[6~",
+                "\x1b[H",
+                "\x1b[F",
+                "\x1bOH",
+                "\x1bOF",
+            }:
                 break
         return decode_key(sequence)
     return decode_key(data)
+
+
+def _search_text_for_key(key: str) -> str:
+    if key.startswith("text:"):
+        return key[len("text:") :]
+    return {
+        "plus": "+",
+        "minus": "-",
+        "refresh": "r",
+        "browser": "b",
+        "quit": "q",
+        "search": "/",
+    }.get(key, "")
 
 
 def handle_key(
@@ -1061,16 +1233,55 @@ def handle_key(
     row_count: int,
     state_row_count: int = 0,
 ) -> str:
-    if key == "quit":
+    if state.view == "state" and state.state_entry:
+        if key in {"quit", "interrupt"}:
+            return "quit"
+        if key == "escape":
+            state.state_entry = None
+            state.state_error = ""
+            return "redraw"
+        return "ignore"
+
+    if state.view == "state" and state.state_search_active:
+        if key == "interrupt":
+            return "quit"
+        if key == "escape":
+            state.state_search_active = False
+            return "redraw"
+        if key == "enter":
+            state.state_search_active = False
+            state.state_selected_index = _clamped_index(
+                state.state_selected_index, state_row_count
+            )
+            state.state_scroll_offset = 0
+            return "redraw"
+        if key == "backspace":
+            state.state_search = state.state_search[:-1]
+            state.state_selected_index = 0
+            state.state_scroll_offset = 0
+            return "redraw"
+        text = _search_text_for_key(key)
+        if text:
+            state.state_search += text
+            state.state_selected_index = 0
+            state.state_scroll_offset = 0
+            return "redraw"
+        return "ignore"
+
+    if key in {"quit", "interrupt"}:
         return "quit"
-    if key == "refresh":
+    if key == "refresh" and state.view != "state":
         return "refresh"
     if key == "browser" and row_count:
         state.view = "state"
+        state.state_entry = None
         state.state_selected_index = 0
+        state.state_scroll_offset = 0
         return "browser"
     if key == "up":
         if state.view == "state":
+            if state.state_entry:
+                return "ignore"
             state.state_selected_index = _clamped_index(
                 state.state_selected_index - 1, state_row_count
             )
@@ -1079,27 +1290,62 @@ def handle_key(
         return "redraw"
     if key == "down":
         if state.view == "state":
+            if state.state_entry:
+                return "ignore"
             state.state_selected_index = _clamped_index(
                 state.state_selected_index + 1, state_row_count
             )
         else:
             state.selected_index = _clamped_index(state.selected_index + 1, row_count)
         return "redraw"
+    if key == "page_up" and state.view == "state":
+        state.state_selected_index = _clamped_index(
+            state.state_selected_index - 10, state_row_count
+        )
+        return "redraw"
+    if key == "page_down" and state.view == "state":
+        state.state_selected_index = _clamped_index(
+            state.state_selected_index + 10, state_row_count
+        )
+        return "redraw"
+    if key == "home" and state.view == "state":
+        state.state_selected_index = 0
+        state.state_scroll_offset = 0
+        return "redraw"
+    if key == "end" and state.view == "state":
+        state.state_selected_index = _clamped_index(state_row_count - 1, state_row_count)
+        return "redraw"
+    if key == "search" and state.view == "state":
+        state.state_search = ""
+        state.state_search_active = True
+        state.state_entry = None
+        state.state_selected_index = 0
+        state.state_scroll_offset = 0
+        return "redraw"
     if key == "enter" and state.view == "state" and state_row_count:
+        if state.state_entry:
+            return "ignore"
         return "state_entry"
     if key == "enter" and row_count:
         state.view = "detail"
         return "redraw"
     if key == "escape":
+        if state.view == "state" and state.state_entry:
+            state.state_entry = None
+            state.state_error = ""
+            return "redraw"
+        if state.view == "state" and state.state_search_active:
+            state.state_search_active = False
+            return "redraw"
         state.view = "table"
         state.state_error = ""
         return "redraw"
-    if key == "plus":
+    if key == "plus" and state.view != "state":
         state.refresh_interval = min(
             MAX_INTERVAL, state.refresh_interval + INTERVAL_STEP
         )
         return "redraw"
-    if key == "minus":
+    if key == "minus" and state.view != "state":
         state.refresh_interval = max(
             MIN_INTERVAL, state.refresh_interval - INTERVAL_STEP
         )
@@ -1141,8 +1387,7 @@ def run_poll_loop(client: Any, args: argparse.Namespace, color: bool) -> int:
 
 
 def _state_row_count(state: MonitorState) -> int:
-    rows = (state.state_payload or {}).get("rows")
-    return len(rows) if isinstance(rows, list) else 0
+    return len(_filtered_state_rows(state))
 
 
 def _load_state_browser(
@@ -1161,17 +1406,24 @@ def _load_state_browser(
     try:
         state.state_payload = fetch_state_browser(client, target)
         state.state_error = ""
+        state.state_entry = None
         state.state_selected_index = _clamped_index(
             state.state_selected_index, _state_row_count(state)
         )
+        state.state_scroll_offset = _adjust_scroll_offset(
+            state.state_scroll_offset,
+            state.state_selected_index,
+            _state_visible_count(shutil.get_terminal_size((120, 30)).lines, False),
+            _state_row_count(state),
+        )
     except Exception as exc:
         state.state_payload = None
-        state.state_error = str(exc)
+        state.state_error = friendly_mcp_error(exc)
 
 
 def _load_state_entry(client: Any, state: MonitorState) -> None:
-    rows = (state.state_payload or {}).get("rows")
-    if not isinstance(rows, list) or not rows:
+    rows = _filtered_state_rows(state)
+    if not rows:
         state.state_error = "no state row selected"
         return
     row = rows[_clamped_index(state.state_selected_index, len(rows))]
@@ -1185,9 +1437,9 @@ def _load_state_entry(client: Any, state: MonitorState) -> None:
     try:
         state.state_entry = fetch_state_browser(client, state.state_target, state_key=key)
         state.state_error = ""
-        state.view = "state_detail"
+        state.view = "state"
     except Exception as exc:
-        state.state_error = str(exc)
+        state.state_error = friendly_mcp_error(exc)
 
 
 def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) -> int:
@@ -1201,7 +1453,8 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
     with RawTerminal(enabled=True):
         while True:
             now = time.monotonic()
-            if force_refresh or now >= next_refresh:
+            browser_open = state.view == "state"
+            if force_refresh or (not browser_open and now >= next_refresh):
                 snapshots = collect_snapshots(
                     client,
                     project_ids=args.project_id,
@@ -1214,8 +1467,6 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                 state.last_updated = datetime.now(timezone.utc).isoformat(
                     timespec="seconds"
                 )
-                if state.view in {"state", "state_detail"}:
-                    _load_state_browser(client, state, snapshots)
                 next_refresh = time.monotonic() + state.refresh_interval
                 force_refresh = False
                 dirty = True
@@ -1236,7 +1487,11 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                 sys.stdout.flush()
                 dirty = False
 
-            timeout = min(0.5, max(0.0, next_refresh - time.monotonic()))
+            timeout = (
+                0.5
+                if state.view == "state"
+                else min(0.5, max(0.0, next_refresh - time.monotonic()))
+            )
             key = read_key(timeout, fd=fd)
             if key is None:
                 continue

@@ -82,10 +82,41 @@ class FakeClient:
                         "schema": "debug.sample.v1",
                         "status": "active",
                         "expires_at": "",
-                        "preview": "{}",
-                    }
+                        "preview": "cache preview",
+                    },
+                    {
+                        "key": "memory:def",
+                        "value_type": "dict",
+                        "size_chars": 64,
+                        "schema": "memory.sample.v1",
+                        "status": "active",
+                        "expires_at": "",
+                        "preview": "memory preview",
+                    },
+                    {
+                        "key": "reference:ghi",
+                        "value_type": "str",
+                        "size_chars": 96,
+                        "schema": "reference.sample.v1",
+                        "status": "active",
+                        "expires_at": "",
+                        "preview": "reference preview",
+                    },
+                    {
+                        "key": "cache:xyz",
+                        "value_type": "dict",
+                        "size_chars": 12,
+                        "schema": "debug.sample.v1",
+                        "status": "active",
+                        "expires_at": "",
+                        "preview": "second cache preview",
+                    },
                 ],
-                "prefix_counts": [{"prefix": "cache:", "count": 1}],
+                "prefix_counts": [
+                    {"prefix": "cache:", "count": 2},
+                    {"prefix": "memory:", "count": 1},
+                    {"prefix": "reference:", "count": 1},
+                ],
             }
         raise AssertionError(f"unexpected call: {name} {arguments}")
 
@@ -95,6 +126,23 @@ class FailingProjectsClient(FakeClient):
         if arguments.get("mode") == "projects":
             self.calls.append((name, arguments))
             raise RuntimeError("projects unavailable")
+        return super().call_tool(name, arguments)
+
+
+class OldStateBrowserServerClient(FakeClient):
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if arguments.get("mode") == "state_browser":
+            self.calls.append((name, arguments))
+            raise RuntimeError(
+                "MCP tool returned an error: {'content': [{'type': 'text', "
+                "'text': \"Error executing tool context_admin: 1 validation "
+                "error for context_adminArguments\\nmode\\n  Input should be "
+                "'health', 'projects', 'index_refresh', 'index_status', "
+                "'cache_stats', 'cache_prune', 'budget', 'contracts', "
+                "'metrics', 'measurement_matrix' or 'benchmark' "
+                "[type=literal_error, input_value='state_browser', "
+                "input_type=str]\"}], 'isError': True}"
+            )
         return super().call_tool(name, arguments)
 
 
@@ -228,6 +276,11 @@ def test_interactive_key_bindings_update_state() -> None:
     assert monitor.decode_key("\x1b[A") == "up"
     assert monitor.decode_key("\r") == "enter"
     assert monitor.decode_key("\x1b") == "escape"
+    assert monitor.decode_key("\x1b[5~") == "page_up"
+    assert monitor.decode_key("\x1b[6~") == "page_down"
+    assert monitor.decode_key("/") == "search"
+    assert monitor.decode_key("\x7f") == "backspace"
+    assert monitor.decode_key("x") == "text:x"
     assert monitor.decode_key("+") == "plus"
     assert monitor.decode_key("-") == "minus"
     assert monitor.decode_key("b") == "browser"
@@ -247,6 +300,8 @@ def test_interactive_key_bindings_update_state() -> None:
     assert monitor.handle_key("down", state, row_count=3, state_row_count=2) == "redraw"
     assert state.state_selected_index == 1
     assert monitor.handle_key("enter", state, row_count=3, state_row_count=2) == "state_entry"
+    assert monitor.handle_key("refresh", state, row_count=3, state_row_count=2) == "ignore"
+    assert monitor.handle_key("plus", state, row_count=3, state_row_count=2) == "ignore"
 
 
 def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
@@ -330,7 +385,8 @@ def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
     assert "| > | cache:abc" in rendered
 
     monitor._load_state_entry(client, state)
-    assert state.view == "state_detail"
+    assert state.view == "state"
+    assert state.state_entry is not None
     detail = monitor.render_monitor_screen(
         snapshots,
         url="http://localhost:8000/mcp",
@@ -339,6 +395,115 @@ def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
         state=state,
     )
 
-    assert "mcp-context-manager state entry" in detail
+    assert "mcp-context-manager state browser" in detail
+    assert "state entry overlay" in detail
     assert "cache:abc" in detail
     assert '"hello": "world"' in detail
+
+    assert (
+        monitor.handle_key(
+            "escape",
+            state,
+            row_count=len(snapshots),
+            state_row_count=monitor._state_row_count(state),
+        )
+        == "redraw"
+    )
+    assert state.view == "state"
+    assert state.state_entry is None
+
+
+def test_state_browser_filters_rows_with_search_input() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=False,
+    )
+    state = monitor.MonitorState(selected_index=0, view="state", refresh_interval=5.0)
+    monitor._load_state_browser(client, state, snapshots)
+
+    assert monitor.handle_key("search", state, row_count=1, state_row_count=4) == "redraw"
+    for key in ("text:m", "text:e", "text:m"):
+        assert monitor.handle_key(key, state, row_count=1, state_row_count=4) == "redraw"
+
+    assert state.state_search == "mem"
+    assert state.state_search_active
+    assert monitor._state_row_count(state) == 1
+
+    rendered = monitor.render_state_browser(
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        height=20,
+        state=state,
+    )
+
+    assert "rows:     1 / 4" in rendered
+    assert "search:   mem  (typing)" in rendered
+    assert "memory:def" in rendered
+    assert "cache:abc" not in rendered
+
+    assert monitor.handle_key("enter", state, row_count=1, state_row_count=1) == "redraw"
+    assert not state.state_search_active
+
+
+def test_state_browser_scrolls_visible_window() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=False,
+    )
+    state = monitor.MonitorState(
+        selected_index=0,
+        view="state",
+        refresh_interval=5.0,
+        state_selected_index=3,
+    )
+    monitor._load_state_browser(client, state, snapshots)
+
+    rendered = monitor.render_state_browser(
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        height=16,
+        state=state,
+    )
+
+    assert "rows:     4 / 4" in rendered
+    assert "window: 2-4" in rendered
+    assert "memory:def" in rendered
+    assert "reference:ghi" in rendered
+    assert "| > | cache:xyz" in rendered
+    assert "cache:abc" not in rendered
+
+
+def test_state_browser_old_server_error_is_actionable() -> None:
+    monitor = load_monitor_module()
+    client = OldStateBrowserServerClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=False,
+    )
+    state = monitor.MonitorState(selected_index=0, view="state", refresh_interval=5.0)
+
+    monitor._load_state_browser(client, state, snapshots)
+
+    assert state.state_payload is None
+    assert "does not support context_admin(mode='state_browser')" in state.state_error
+    assert "docker compose up -d --build" in state.state_error
+    rendered = monitor.render_monitor_screen(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        state=state,
+    )
+    assert "Rebuild and restart" in rendered
