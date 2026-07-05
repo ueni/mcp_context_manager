@@ -505,7 +505,7 @@ def render_project_detail(
         ),
         ("cache", f"{cache_hits}/{cache_misses} h/m  {cache_ratio * 100:5.1f}%"),
         (
-            "mcp spared",
+            "token spared/saved",
             fmt_int(_tokens_spared_by_mcp(metrics)),
         ),
         (
@@ -715,7 +715,7 @@ def _summary_table(
         ("requests", fmt_int(totals["requests"])),
         ("context_pack", fmt_int(totals["packs"])),
         ("cache hit", f"{_bar(ratio, 18, color)} {ratio * 100:5.1f}%"),
-        ("mcp spared", fmt_int(totals["tokens_spared_by_mcp"])),
+        ("token spared/saved", fmt_int(totals["tokens_spared_by_mcp"])),
         ("refs deferred", fmt_bytes(totals["bytes_deferred"])),
     ]
     return _render_table(("metric", "value"), rows, aligns=("left", "right"))

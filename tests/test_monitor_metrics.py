@@ -244,7 +244,8 @@ def test_render_dashboard_contains_visual_summary() -> None:
     )
 
     assert "mcp-context-manager metrics" in rendered
-    assert "| cache hit     | [##############----]  75.0% |" in rendered
+    assert "| cache hit          | [##############----]  75.0% |" in rendered
+    assert "| token spared/saved |                       12.0k |" in rendered
     assert "| project" in rendered
     assert "| Alpha" in rendered
     assert "| alpha-123" in rendered
@@ -363,9 +364,9 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     )
 
     assert "mcp-context-manager project details" in detail
-    assert "| project       | Alpha" in detail
-    assert "| project id    | alpha-123" in detail
-    assert "mcp spared" in detail
+    assert "| project            | Alpha" in detail
+    assert "| project id         | alpha-123" in detail
+    assert "token spared/saved" in detail
     assert "| a                        |         pass" in detail
 
 
