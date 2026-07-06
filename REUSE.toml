@@ -13,6 +13,7 @@ path = [
   "Dockerfile",
   "README.md",
   "compose.yaml",
+  "doc/**",
   "pyproject.toml",
   "src/**",
   "tests/**",

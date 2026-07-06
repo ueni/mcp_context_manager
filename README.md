@@ -1,85 +1,159 @@
 # mcp-context-manager
 
-Focused MCP server for compact, project-scoped repository context packs.
+`mcp-context-manager` is a focused Model Context Protocol server for coding
+agents. It builds small, task-specific repository context packs so an agent can
+start from the most relevant files, symbols, snippets, memory, and references
+instead of spending tokens on broad `rg`, tree, and whole-file reads.
 
-The server helps coding agents retrieve the smallest useful context for a task:
-repo facts, search hits, snippets, symbols, memory, and large-result references.
-It is read-only for source files. Generated state is stored under the configured
-state directory.
+The server is read-only for source files. It writes only generated state such as
+indexes, cache entries, metrics, memory, and result references under the
+configured state directory.
 
-## What It Does
+## What It Is
 
-- Builds bounded context packs for coding, review, debug, test, docs, security,
-  and general tasks.
-- Indexes files incrementally by content hash and refreshes changed files before
-  lookup and pack operations.
-- Keeps per-project index, cache, memory, and references isolated.
-- Uses MCP Roots as the preferred project boundary model.
-- Supports Docker global mode by mapping host root URIs to container paths.
-- Preserves large evidence through local result references instead of dumping
-  bulky payloads into model context.
+The project is a compact context authority for one or more repositories exposed
+through MCP roots or explicit `root_uri` / `project_id` selection.
+
+It provides:
+
+- Bounded context packs for coding, review, debug, test, docs, security, and
+  general repository tasks.
+- Targeted lookup for search hits, snippets, trees, symbols, references,
+  related symbols, test owners, chunks, and cache explanation.
+- Project-scoped generated state for indexes, caches, memory, references, and
+  metrics.
+- Stable local result references for omitted or bulky evidence.
+- Tools-only fallbacks for MCP clients that do not support resources or prompts.
+
+The implementation details are described in
+[`doc/technical-paper.md`](doc/technical-paper.md).
+
+## Why Use It
+
+Modern coding agents are powerful, but repository discovery is still expensive.
+Without a context layer, every turn can become another round of broad search,
+tree walking, whole-file reads, and repeated explanations of the same project
+facts. `mcp-context-manager` turns that scattered discovery work into one fast,
+bounded, evidence-backed context packet.
+
+Use it when you want agents to:
+
+- Start with signal, not noise. The first tool call returns the files, symbols,
+  snippets, tests, memory, and references most likely to matter for the task.
+- Spend tokens on reasoning instead of repository archaeology. Compact packs
+  summarize and rank evidence while keeping full details available on demand.
+- Stay fast across follow-up turns. Incremental indexing, retrieval cache,
+  fragment cache, and chunk reuse keep unchanged repository work from being
+  repeated.
+- Review and debug with traceable evidence. Every selected item carries path,
+  line hints, reasons, confidence, provenance, and a `detail_lookup` route back
+  to raw snippets.
+- Keep large evidence out of the prompt until it is actually needed. Omitted
+  candidates and diagnostics stay behind local references that can be resolved
+  later.
+- Work cleanly across many repositories. MCP roots, explicit `root_uri`, and
+  `project_id` keep indexes, cache, memory, metrics, and references isolated per
+  project.
+- Optimize without guessing. Metrics, benchmark runs, and gold-anchor fixtures
+  show whether token savings, latency, cache reuse, and retrieval recall are
+  actually improving.
+
+The result is a tighter agent loop: less context churn, fewer repeated local
+reads, smaller prompts, and better evidence discipline before code changes.
+
+## Implemented Techniques
+
+`mcp-context-manager` combines several token, latency, and safety techniques:
+
+- Summary-first `context_pack` output with `minimal`, `compact`, `normal`, and
+  `verbose` profiles.
+- Client profiles for Codex, Claude, Copilot, and generic MCP hosts.
+- Prompt echo and volatile runtime metadata disabled by default.
+- Diagnostics and omitted evidence moved behind `diagnostics_ref` and
+  `omitted_ref`.
+- Deterministic public JSON fields and confidence buckets for compact output.
+- Incremental indexing by file metadata, content digest, symbols, imports, and
+  search terms.
+- Git or file-metadata refresh signatures to skip unchanged repository scans.
+- Chunk-addressed summary metadata by chunk id, line range, content digest,
+  extractor version, and redaction version.
+- Request-level retrieval cache plus fragment caches for search terms and file
+  summaries.
+- Route-aware candidate ranking using task terms, explicit paths, changed files,
+  symbol matches, related symbols, likely tests, and diversity limits.
+- Budget planning before final serialization, with low-value or bulky evidence
+  deferred to references.
+- Repository-local structured memory with facts, summaries, decisions, TTLs,
+  validation, and compaction.
+- Prompt-injection signal detection on returned repository text.
+- Secret and host-path redaction before generated-state storage.
+- Gold-anchor retrieval-quality fixtures and measurement-matrix benchmarks.
+
+## Why LMDB Instead Of SQLite
+
+The generated-state workload is closer to a local key-value cache than a
+relational application database. `mcp-context-manager` stores indexes, term
+rows, cache fragments, memory rows, metrics, and reference metadata as small
+JSON documents behind stable key prefixes. LMDB fits that shape directly.
+
+Why that matters for coding agents:
+
+- Fast read-heavy access: context packs repeatedly scan prefix ranges such as
+  indexed files, symbols, terms, cache entries, and metrics.
+- Fewer moving parts on the hot path: lookup code reads JSON rows by key or
+  prefix instead of planning SQL queries, joining tables, or maintaining a
+  relational schema for every cache variant.
+- Low operational overhead: LMDB is embedded, local, and does not need schema
+  migrations for every new diagnostic or cache payload.
+- Transactional generated state: index refreshes can update file, symbol,
+  import, and term rows together.
+- Batched refresh writes: a changed file can replace its `index:file`,
+  `index:symbol`, `index:import`, and `index:term` rows in one write
+  transaction, keeping the index consistent without extra coordination.
+- Deterministic storage model: sorted JSON values plus stable key prefixes make
+  cache entries and diagnostics easy to inspect and compare.
+- Good fit for disposable state: generated indexes and caches can be pruned,
+  rebuilt, or isolated per project without treating them as authoritative
+  source data.
+
+That shape is why the context-pack hot path stays small: the server can refresh
+only changed paths, iterate contiguous key ranges for search and metrics, reuse
+cached fragments, and write reference metadata without paying for relational
+query planning or schema evolution. SQLite would work, but most of its strength
+would sit unused because the server does not need joins, foreign keys, or ad hoc
+analytics to build a compact context pack.
+
+SQLite is excellent when the data model is relational and ad hoc SQL queries
+are the product. This server mostly needs bounded prefix lookup, fast local
+reuse, and simple project-scoped cache state, so LMDB keeps the hot path small.
 
 ## MCP Tools
 
-- `context_pack`: build a minimal/compact task-focused context pack. It accepts
-  client/profile hints, prompt-echo and runtime-metadata opt-ins, diagnostics
-  levels, source/diagnostic budgets, and cache strategy controls.
-- `context_lookup`: search, read snippets, list trees, query symbols, list
-  references, inspect chunks/cache, or ask for related symbols and test owners.
-- `context_memory`: manage project-local compact memory and decisions.
-- `context_admin`: health, index, cache, budget, contracts, quality evaluation,
-  tools-only resource proxies, instructions, profile calibration, and project
-  listing.
-- `result_reference_resolve`: resolve large local result references.
+The public tool surface is intentionally small:
+
+| Tool | Purpose |
+| --- | --- |
+| `context_pack` | Build a task-focused context pack with ranked evidence and references. |
+| `context_lookup` | Search, snippet, tree, symbols, references, impact, related symbols, test owners, chunk, or cache explanation. |
+| `context_memory` | Store, retrieve, validate, and compact structured repository-local memory. |
+| `context_admin` | Health, projects, index, cache, budget, contracts, metrics, benchmark, quality evaluation, instructions, and resource proxy. |
+| `result_reference_resolve` | Resolve local result references after boundary, expiry, and hash checks. |
 
 Project-aware tools accept optional `project_id` or `root_uri`. If omitted, the
-server uses MCP Roots from the client. If multiple roots are visible and the
-project cannot be inferred from request paths, the request is rejected as
-ambiguous. Clients that do not implement MCP `roots/list` fall back to explicit
-`project_id` / `root_uri` selection or legacy `REPO_PATH`.
+server uses MCP roots from the client. If multiple roots are visible and the
+project cannot be inferred from path hints, the request is rejected as
+ambiguous.
 
-## MCP Client Configuration
+## MCP Resources And Prompts
 
-Streamable HTTP clients should point at the MCP endpoint:
+Resources mirror bounded repository data for hosts that support them:
 
-```yaml
-mcpServers:
-  - name: context-manager
-    type: streamable-http
-    url: http://localhost:8000/mcp
-```
-
-Some clients still have better compatibility with the older SSE transport. The
-server exposes a compatibility endpoint for those clients:
-
-```yaml
-mcpServers:
-  - name: context-manager
-    type: sse
-    url: http://localhost:8000/legacy/sse
-```
-
-If a client reports `Method not found` for a tool such as `context_pack`, verify
-the server-visible tool names:
-
-```bash
-curl http://localhost:8000/v1/mcp/tools
-```
-
-The response lists MCP tool names and transport endpoints. MCP tools are called
-through the protocol method `tools/call` with the tool name in `params.name`;
-they are not JSON-RPC methods named `context_pack`, `context_admin`, and so on.
-
-## MCP Resources
-
-- `repo://summary`: workspace facts for an unambiguous project.
-- `repo://file/{path}`: bounded file content for an unambiguous project.
-- `repo://tree/{path}`: bounded tree listing for an unambiguous project.
-- `repo://context/{reference_id}`: resolved result reference for an unambiguous
-  project.
-- `repo://metrics`: compact metrics for an unambiguous project.
-- `repo://instructions/codex-context-pack-first`: portable guidance telling
-  coding agents to call `context_pack` before broad repository inspection.
+- `repo://summary`
+- `repo://file/{path}`
+- `repo://tree/{path}`
+- `repo://context/{reference_id}`
+- `repo://metrics`
+- `repo://instructions/codex-context-pack-first`
 - `repo://project/{project_id}/summary`
 - `repo://project/{project_id}/file/{path}`
 - `repo://project/{project_id}/tree/{path}`
@@ -87,24 +161,51 @@ they are not JSON-RPC methods named `context_pack`, `context_admin`, and so on.
 - `repo://project/{project_id}/metrics`
 - `repo://project/{project_id}/instructions/codex-context-pack-first`
 
-Metrics include request counts, cache hits and misses, estimated saved input
-tokens, baseline/output token estimates, retrieval counts, route totals, stage
-timings, tooling-call savings, and recent latency benchmarks. They are stored
-under project-local generated state and do not include prompts, query text, file
-contents, or secrets.
+For tools-only clients, use:
 
-## Codex Speed Guidance
+```json
+{"mode": "instructions"}
+```
 
-Repository-side MCP configuration can make this server available and can provide
-strong server instructions, but it cannot force the model to call a tool on every
-turn. The practical speed path is to make the first `context_pack` call fast and
-useful enough that agents do not need broad `rg`, tree, or whole-file reads.
+or:
 
-To make MCP usage as mandatory as Codex supports, configure the server as
-required and limit the advertised tool surface to this server's public tools:
+```json
+{"mode": "resource_proxy", "path": "repo://summary"}
+```
+
+with `context_admin`.
+
+## Agent Onboarding
+
+Repository-side MCP configuration can make this server available and provide
+server instructions, but it cannot force a model to call a tool on every turn.
+Pair MCP configuration with global or project agent instructions.
+
+Use this prompt when onboarding an agent or MCP host:
+
+```text
+Adopt the mcp-context-manager MCP instructions into your global agent
+instructions outside this repository. Use
+repo://instructions/codex-context-pack-first as the source of truth for
+repository tasks. Keep context_pack first, set client_profile per request, and
+pass output_profile only when intentionally overriding the client/default
+profile.
+```
+
+Use this prompt when creating or updating an `AGENTS.md` file:
+
+```text
+Create or update AGENTS.md for this repository. Preserve existing project
+instructions, and add the mcp-context-manager MCP-first workflow: use
+repo://instructions/codex-context-pack-first as the source of truth, call
+context_pack before broad repository inspection, set client_profile per
+request, and pass output_profile only when intentionally overriding the
+client/default profile.
+```
+
+Recommended Codex configuration:
 
 ```toml
-# ~/.codex/config.toml or trusted-project .codex/config.toml
 [mcp_servers.mcp-context-manager]
 url = "http://localhost:8000/mcp"
 required = true
@@ -115,27 +216,17 @@ enabled_tools = [
   "context_admin",
   "result_reference_resolve",
 ]
-default_tools_approval_mode = "approve"
+default_tools_approval_mode = "auto"
 ```
 
-`required = true` fails startup or resume when the enabled MCP server cannot
-initialize. It does not force every model turn to call a tool. Pair it with
-`AGENTS.md`, the server `instructions` field, and review/CI checks that reject
-work started with broad local inspection instead of `context_pack`.
+`required = true` fails startup or resume when the enabled server cannot
+initialize. It does not guarantee a tool call on every turn.
 
-Agents can read `repo://instructions/codex-context-pack-first` or use the
-`use_context_pack_first` prompt. For global multi-root sessions, use
-`repo://project/{project_id}/instructions/codex-context-pack-first` after
-selecting a project.
+## Profiles
 
-`context_pack` is summary-first. The fastest profile is
-`output_profile="minimal"`, which returns cache-stable evidence with path, line
-range, reason codes, a confidence bucket, short content, and a stable
-`detail_lookup` object pointing back to `context_lookup(mode="snippet")` for the
-full evidence. It does not echo the raw prompt and keeps runtime diagnostics
-behind `diagnostics_ref` / `omitted_ref`. The `compact`, `normal`, and `verbose`
-profiles expose progressively more inline diagnostics; raw prompt echo and
-volatile runtime metadata are opt-in.
+`context_pack` is summary-first. The fastest profile is `minimal`; `compact`,
+`normal`, and `verbose` progressively expose more inline diagnostics. Raw prompt
+echo and volatile runtime metadata are opt-in.
 
 Client profiles tune defaults without changing the public tool surface:
 
@@ -155,148 +246,6 @@ server does not auto-detect the host client. Explicit `output_profile` wins over
 `model_profile="github"` for GitHub Copilot. `context_admin(mode="profile_calibrate")`
 reports recommendations only; it does not mutate server or session state.
 
-### Onboarding Prompt
-
-Use this prompt when onboarding an agent or MCP host to this repository:
-
-```text
-Adopt the mcp-context-manager MCP instructions into your global 
-agent instructions (outside this repository). Use repo://instructions/codex-context-pack-first as the
-source of truth for repository tasks. Keep context_pack first, set
-client_profile per request, and pass output_profile only when intentionally
-overriding the client/default profile.
-```
-
-Use this prompt when creating or updating an `AGENTS.md` file:
-
-```text
-Create or update AGENTS.md for this repository. Preserve existing project
-instructions, and add the mcp-context-manager MCP-first workflow: use
-repo://instructions/codex-context-pack-first as the source of truth, call
-context_pack before broad repository inspection, set client_profile per
-request, and pass output_profile only when intentionally overriding the
-client/default profile.
-```
-
-Lookup modes `impact`, `related_symbols`, `test_owners`, `chunk`, and
-`explain_cache` provide targeted follow-up without broad file scans. Chunk and
-fragment cache diagnostics report reuse after prompt variations or unrelated
-file edits while keeping raw evidence resolvable through local references.
-
-## Measurement Matrix And Benchmarks
-
-Use `context_admin(mode="measurement_matrix")` to get the exact pass/fail target
-matrix for context-pack speed and token economy. Current targets:
-
-| Key | Pass Target |
-| --- | --- |
-| `latency.context_pack.avg_elapsed_ms` | `<= 750 ms` |
-| `latency.context_pack.p95_recent_ms` | `<= 1500 ms` after at least 3 samples |
-| `latency.context_pack.index_refresh_avg_ms` | `<= 250 ms` |
-| `latency.context_pack.snippet_batch_avg_ms` | `<= 250 ms` |
-| `tokens.context_pack.avg_saved_per_pack` | `>= 500 estimated input tokens` |
-| `tokens.context_pack.avg_tokens_spared_by_mcp_per_pack` | `>= 500 estimated input tokens` |
-| `tokens.context_pack.compression_ratio` | `<= 0.70` |
-| `retrieval.context_pack.candidates_per_selected` | `<= 8.0` |
-| `cache.hit_ratio` | `>= 0.20` after at least 2 cacheable requests |
-| `cache.context_pack_retrieval_hit_ratio` | `>= 0.20` after at least 2 pack retrievals |
-| `cache.context_pack_fragment_hit_ratio` | `>= 0.20` after at least 2 fragment lookups |
-| `tooling.external_calls_saved_per_pack` | `>= 2.0 estimated calls` |
-| `tooling.contract_tokens_saved_est` | `>= 1 estimated token` |
-| `references.bytes_deferred_est` | `>= 1 byte` |
-
-Token savings are measured as:
-
-```text
-tokens_spared_by_mcp_est =
-estimated_input_tokens_saved =
-  max(0, baseline_input_tokens_est - output_tokens_est)
-```
-
-`baseline_input_tokens_est` estimates the candidate evidence an agent would
-likely inspect without ranking. `output_tokens_est` estimates the selected pack
-items returned to the model. The formula is intentionally conservative: if the
-compact JSON is larger than the candidate evidence estimate, savings are `0`.
-`tokens_spared_by_mcp_est` is the explicit MCP-facing name for the same current
-estimate; `estimated_input_tokens_saved` remains for compatibility.
-
-Use `context_admin(mode="quality_eval")` to run retrieval-quality fixtures from
-`benchmarks/gold_anchors/*.json`. The report includes anchor recall@3/5, first
-anchor rank, noise ratio, required-anchor omissions, detail-lookup resolution,
-stale-context rate, and regression rows. These fixtures make token/latency
-optimizations measurable against required evidence, not just smaller output.
-
-## Live Metrics Monitor
-
-`monitor-metrics.py` is a small terminal dashboard that reads metrics directly
-from MCP tool calls. It calls `context_admin(mode="projects")`, then
-`context_admin(mode="metrics")` and `context_admin(mode="measurement_matrix")`
-for each project. It does not use MCP resources or direct state-file reads.
-
-Run it interactively:
-
-```bash
-python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp
-```
-
-Controls:
-
-| Key | Action |
-| --- | --- |
-| `Up` / `Down` | Select a project row. |
-| `Enter` | Open details for the selected project. |
-| `b` | Browse sanitized generated state for the selected project. |
-| `Esc` | Return to the project table, or close a state-entry overlay. |
-| `+` / `-` | Increase or decrease the refresh interval. |
-| `r` | Refresh immediately. |
-| `q` | Quit. |
-
-In the state browser, `Up` / `Down` scroll the row selection, `PgUp` / `PgDn`
-jump through rows, `/` starts a search filter, and `Enter` opens the selected
-entry as an overlay. With an entry open, `Up` / `Down`, `PgUp` / `PgDn`, and
-`Home` / `End` scroll the content preview. The browser uses the loaded snapshot
-until you leave and re-enter it; periodic refresh is disabled there so
-inspection does not jump. Interactive MCP calls run in the background and show a
-short loading status instead of freezing key handling.
-
-Render one snapshot and exit:
-
-```bash
-python3 monitor-metrics.py --once
-```
-
-Print refreshed snapshots without key handling:
-
-```bash
-python3 monitor-metrics.py --interval 5 --non-interactive
-```
-
-Monitor one known project or root:
-
-```bash
-python3 monitor-metrics.py --project-id my-repo-123abc
-python3 monitor-metrics.py --root-uri file:///home/user/source/my-repo
-```
-
-The dashboard shows request volume, `context_pack` latency, cache hit bars,
-estimated MCP-spared tokens, deferred reference bytes, and measurement-matrix
-status.
-The state browser calls `context_admin(mode="state_browser")` for the selected
-project and shows bounded, redacted generated-state rows with searchable,
-scrollable entry inspection.
-
-Run the built-in offline benchmark through MCP/admin:
-
-```bash
-python3 benchmarks/context_pack_benchmark.py --repo .
-```
-
-The benchmark executes deterministic pack runs for forced cold refresh, warm
-cache reuse, repeated prompt reuse, prompt-variation fragment reuse, and compact
-focused retrieval. It returns per-run stage timings, token estimates, external
-tool-call savings, reference bytes deferred, a compact contract sample, and the
-same measurement matrix used by live metrics.
-
 ## Run With Docker Compose
 
 Single-repo default from this checkout:
@@ -311,10 +260,8 @@ Global parent mode for multiple repositories under one host directory:
 MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up --build
 ```
 
-The image runs as non-root UID/GID `1000` by default. This matches the first
-Ubuntu/WSL user and lets the container read owner-only repository files while
-the source mount stays read-only. If your repository is owned by another user,
-build with matching IDs:
+The image runs as non-root UID/GID `1000` by default. If your repository is
+owned by another user, build with matching IDs:
 
 ```bash
 MCP_CONTEXT_UID=$(id -u) MCP_CONTEXT_GID=$(id -g) docker compose up --build
@@ -328,7 +275,7 @@ docker compose down -v
 MCP_CONTEXT_UID=$(id -u) MCP_CONTEXT_GID=$(id -g) docker compose up --build
 ```
 
-This mounts the host parent read-only:
+Compose mounts the host parent read-only:
 
 ```text
 Host:      /home/user/source
@@ -337,49 +284,8 @@ Mapping:   /home/user/source=/workspace-roots
 Allowed:   /home/user/source
 ```
 
-An MCP root URI such as:
-
-```text
-file:///home/user/source/my-repo
-```
-
-is resolved inside the container as:
-
-```text
-/workspace-roots/my-repo
-```
-
-Request paths are then repository-relative, for example `src/app.py`.
-
-## Multiple Roots
-
-Multiple roots come from the MCP client via the MCP Roots protocol. Compose only
-mounts and maps the allowed parent directory.
-
-Selection order for a request:
-
-1. explicit `root_uri`
-2. explicit `project_id`
-3. the only visible MCP root
-4. path hints such as `focus_paths`, `changed_files`, or `path`
-5. legacy `REPO_PATH` fallback only in safe single-project configurations
-
-Example explicit request payload:
-
-```json
-{
-  "root_uri": "file:///home/user/source/my-repo",
-  "prompt": "review auth handling",
-  "focus_paths": ["src/auth.py"]
-}
-```
-
-If the MCP client exposes `/home/user/source` as one root, the server treats that
-whole directory as one project. For per-repo isolation, expose or pass roots like
-`file:///home/user/source/my-repo`. When `REPO_PATH` is a configured parent such
-as `/workspace-roots`, unqualified project-scoped calls require `root_uri` or
-`project_id`; health remains available and reports that project selection is
-required.
+An MCP root URI such as `file:///home/user/source/my-repo` is resolved inside
+the container as `/workspace-roots/my-repo`.
 
 ## Non-Docker Run
 
@@ -402,6 +308,18 @@ MCP_CONTEXT_STATE_DIR=/home/user/.local/state/mcp-context-manager \
 mcp-context-manager
 ```
 
+Streamable HTTP clients should point at:
+
+```yaml
+mcpServers:
+  - name: context-manager
+    type: streamable-http
+    url: http://localhost:8000/mcp
+```
+
+The legacy SSE compatibility endpoint is available at
+`http://localhost:8000/legacy/sse`.
+
 Useful HTTP endpoints:
 
 | Endpoint | Purpose |
@@ -413,6 +331,33 @@ Useful HTTP endpoints:
 | `POST /mcp` | MCP Streamable HTTP endpoint. |
 | `GET /legacy/sse` | MCP legacy SSE compatibility endpoint. |
 
+## Multiple Roots
+
+Multiple roots come from the MCP client through the MCP Roots protocol. Compose
+only mounts and maps the allowed parent directory.
+
+Selection order for a request:
+
+1. explicit `root_uri`
+2. explicit `project_id`
+3. the only visible MCP root
+4. path hints such as `focus_paths`, `changed_files`, or `path`
+5. legacy `REPO_PATH` fallback only in safe single-project configurations
+
+Example explicit request payload:
+
+```json
+{
+  "root_uri": "file:///home/user/source/my-repo",
+  "prompt": "review auth handling",
+  "focus_paths": ["src/auth.py"]
+}
+```
+
+If a client exposes `/home/user/source` as one root, the server treats that
+whole directory as one project. For per-repo isolation, expose or pass roots like
+`file:///home/user/source/my-repo`.
+
 ## Configuration
 
 | Variable | Purpose |
@@ -422,14 +367,78 @@ Useful HTTP endpoints:
 | `MCP_CONTEXT_ALLOWED_ROOTS` | Host paths allowed for MCP root URIs. Required for global roots outside `REPO_PATH`. |
 | `MCP_CONTEXT_ROOT_MAPPINGS` | Host-to-container path mappings, such as `/home/user/source=/workspace-roots`. |
 | `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host parent mounted at `/workspace-roots`. |
-| `MCP_CONTEXT_UID` / `MCP_CONTEXT_GID` | Compose build args for the non-root container user. Defaults to `1000:1000` for Ubuntu/WSL repository ownership. |
+| `MCP_CONTEXT_UID` / `MCP_CONTEXT_GID` | Compose build args for the non-root container user. Defaults to `1000:1000`. |
 | `MCP_TRANSPORT` | `stdio` by default, or `streamable-http`. |
 | `HOST` / `PORT` | HTTP bind settings. Compose binds the published port to localhost. |
 | `MAX_READ_BYTES` | Maximum file bytes read for snippets/indexing. |
 | `MAX_OUTPUT_CHARS` | Default output budget. |
-| `MCP_CONTEXT_OUTPUT_PROFILE` | `compact`, `normal`, or `verbose`. |
+| `MCP_CONTEXT_OUTPUT_PROFILE` | Default profile: `minimal`, `compact`, `normal`, or `verbose`. |
 | `MCP_CONTEXT_TOKEN_COUNTER` | `estimate` by default, or `target` to try an optional target tokenizer. |
 | `MCP_CONTEXT_TARGET_TOKENIZER` | Target tokenizer name for `target` mode, defaulting to `cl100k_base`. |
+
+## Metrics And Evaluation
+
+Use `context_admin(mode="measurement_matrix")` to get the pass/fail target
+matrix for context-pack speed and token economy. Current metrics include
+context-pack latency, index-refresh latency, saved input tokens, compression
+ratio, candidate-to-selected ratio, cache hit ratios, external calls saved, and
+reference bytes deferred.
+
+Token savings are measured as:
+
+```text
+tokens_spared_by_mcp_est =
+estimated_input_tokens_saved =
+  max(0, baseline_input_tokens_est - output_tokens_est)
+```
+
+`baseline_input_tokens_est` estimates the candidate evidence an agent would
+likely inspect without ranking. `output_tokens_est` estimates the selected pack
+items returned to the model.
+
+Use `context_admin(mode="quality_eval")` to run retrieval-quality fixtures from
+`benchmarks/gold_anchors/*.json`. The report includes anchor recall@3/5, first
+anchor rank, noise ratio, required-anchor omissions, detail-lookup resolution,
+stale-context rate, and regression rows.
+
+Run the built-in offline benchmark:
+
+```bash
+python3 benchmarks/context_pack_benchmark.py --repo .
+```
+
+The benchmark covers forced cold refresh, warm cache reuse, repeated prompt
+reuse, prompt-variation fragment reuse, and compact focused retrieval.
+
+## Live Metrics Monitor
+
+`monitor-metrics.py` is a terminal dashboard that reads metrics through MCP tool
+calls. It calls `context_admin(mode="projects")`, then
+`context_admin(mode="metrics")` and `context_admin(mode="measurement_matrix")`
+for each project.
+
+Run it interactively:
+
+```bash
+python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp
+```
+
+Render one snapshot and exit:
+
+```bash
+python3 monitor-metrics.py --once
+```
+
+Monitor one known project or root:
+
+```bash
+python3 monitor-metrics.py --project-id my-repo-123abc
+python3 monitor-metrics.py --root-uri file:///home/user/source/my-repo
+```
+
+The dashboard shows request volume, `context_pack` latency, cache hit bars,
+estimated MCP-spared tokens, deferred reference bytes, measurement-matrix
+status, and bounded generated-state rows.
 
 ## Generated State
 
@@ -443,9 +452,10 @@ In global mode, each selected project gets isolated state:
 Generated state holds the repository index, search term index, cache, metrics,
 memory, budgets, and result-reference metadata. Large result references may use
 the project `references/` area while public responses keep only stable
-identifiers, hashes, TTLs, and resolver URIs. The root hash is derived from the
-canonical MCP root URI. Generated state should not be committed unless it is an
-intentional fixture or documented sample.
+identifiers, hashes, TTLs, and resolver URIs.
+
+Generated state should not be committed unless it is an intentional fixture or
+documented sample.
 
 ## Development
 
