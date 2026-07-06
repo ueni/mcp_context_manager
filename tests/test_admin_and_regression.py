@@ -5,7 +5,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mcp_context_manager.config import ContextConfig
-from mcp_context_manager.context import DEFAULT_WARMUP_MAX_FILES, ContextService
+from mcp_context_manager.context import (
+    CACHE_LAST_PRUNED_KEY,
+    DEFAULT_CACHE_TTL_SECONDS,
+    DEFAULT_WARMUP_MAX_FILES,
+    ContextService,
+)
 
 
 def _write_many_python_files(repo: Path, count: int = 12) -> None:
@@ -306,7 +311,7 @@ def test_expired_search_cache_is_recomputed_and_pruned(
     assert pruned["expired_removed"] >= 1
 
 
-def test_cache_default_ttl_and_prune_age_are_14_days(
+def test_cache_default_ttl_and_prune_age_are_30_days(
     service: ContextService,
 ) -> None:
     service.context_lookup(mode="search", query="auth token")
@@ -314,12 +319,13 @@ def test_cache_default_ttl_and_prune_age_are_14_days(
     updated_at = datetime.fromisoformat(row["updated_at"])
     expires_at = datetime.fromisoformat(row["expires_at"])
 
-    assert row["ttl_seconds"] == 14 * 24 * 60 * 60
-    assert timedelta(days=13, hours=23) <= expires_at - updated_at <= timedelta(
-        days=14, minutes=1
+    assert row["ttl_seconds"] == 30 * 24 * 60 * 60
+    assert row["ttl_seconds"] == DEFAULT_CACHE_TTL_SECONDS
+    assert timedelta(days=29, hours=23) <= expires_at - updated_at <= timedelta(
+        days=30, minutes=1
     )
 
-    row["updated_at"] = (datetime.now(timezone.utc) - timedelta(days=13)).isoformat()
+    row["updated_at"] = (datetime.now(timezone.utc) - timedelta(days=29)).isoformat()
     row["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     service.store.put_json(cache_key, row)
 
@@ -327,6 +333,43 @@ def test_cache_default_ttl_and_prune_age_are_14_days(
 
     assert pruned["removed_entries"] == 0
     assert service.store.get_json(cache_key) is not None
+
+
+def test_cache_prune_runs_opportunistically_when_due(
+    service: ContextService,
+) -> None:
+    expired_key = "cache:manual-expired"
+    service.store.put_json(
+        expired_key,
+        {
+            "schema": "context_cache.entry.v2",
+            "schema_version": 2,
+            "created_at": (datetime.now(timezone.utc) - timedelta(days=31)).isoformat(),
+            "updated_at": (datetime.now(timezone.utc) - timedelta(days=31)).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+            "ttl_seconds": DEFAULT_CACHE_TTL_SECONDS,
+            "status": "active",
+            "namespace": "test",
+            "key": "manual-expired",
+            "metadata": {"schema_version": 2},
+            "value": {"schema": "test.v1"},
+        },
+    )
+    service.store.put_json(
+        CACHE_LAST_PRUNED_KEY,
+        {
+            "schema": "context_cache.last_pruned.v1",
+            "timestamp": 0.0,
+            "updated_at": "1970-01-01T00:00:00+00:00",
+        },
+    )
+
+    service.context_lookup(mode="search", query="auth token")
+
+    assert service.store.get_json(expired_key) is None
+    last_pruned = service.store.get_json(CACHE_LAST_PRUNED_KEY)
+    assert isinstance(last_pruned, dict)
+    assert last_pruned["result"]["expired_removed"] >= 1
 
 
 def test_invalidated_context_pack_cache_reports_stale(

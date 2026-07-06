@@ -161,7 +161,7 @@ TOOL_INPUT_PARAMS: dict[str, dict[str, str]] = {
         "path": "Repo-relative path.",
         "max_files": "Index file cap.",
         "max_entries": "Max rows.",
-        "max_age_minutes": "Cache prune age, default 14 days.",
+        "max_age_minutes": "Cache prune age, default 30 days.",
         "max_output_chars": "Budget override.",
         "default_output_profile": "Budget output profile.",
         "tool_name": "Filter to one tool.",

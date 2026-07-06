@@ -26,8 +26,10 @@ from .util import (
     trim_text,
 )
 
-DEFAULT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
+DEFAULT_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_CACHE_MAX_AGE_MINUTES = DEFAULT_CACHE_TTL_SECONDS // 60
+DEFAULT_CACHE_PRUNE_INTERVAL_SECONDS = 5 * 60 * 60
+CACHE_LAST_PRUNED_KEY = "cache:__meta__:last_pruned_at"
 DEFAULT_INDEX_MAX_FILES = 5000
 DEFAULT_WARMUP_MAX_FILES = 100
 CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR = 6
@@ -145,6 +147,7 @@ class ContextService:
                 cache_reason=str(cache_metadata.get("reason") or "miss"),
                 result_count=int(result.get("count", 0)),
             )
+            self._cache_prune_if_due_best_effort()
             return {
                 **result,
                 "cache": cache_metadata,
@@ -775,6 +778,7 @@ class ContextService:
             fragment_cache_hits=fragment_hits,
             fragment_cache_misses=fragment_misses,
         )
+        self._cache_prune_if_due_best_effort()
         return result
 
     def result_reference_resolve(
@@ -3059,7 +3063,11 @@ class ContextService:
                 "sensitivity": sensitivity,
             },
         )
-        entries = self.store.iter_json("cache:")
+        entries = [
+            entry
+            for entry in self.store.iter_json("cache:")
+            if entry[0] != CACHE_LAST_PRUNED_KEY
+        ]
         if len(entries) > 200:
             ordered = sorted(
                 entries,
@@ -3074,8 +3082,53 @@ class ContextService:
                     if cache_key not in keep:
                         self.store.delete(cache_key, txn=txn)
 
+    def _cache_prune_if_due(
+        self,
+        interval_seconds: int = DEFAULT_CACHE_PRUNE_INTERVAL_SECONDS,
+    ) -> dict[str, Any]:
+        now = time.time()
+        row = self.store.get_json(CACHE_LAST_PRUNED_KEY)
+        last_pruned = 0.0
+        if isinstance(row, dict):
+            try:
+                last_pruned = float(row.get("timestamp", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                last_pruned = 0.0
+        if last_pruned and now - last_pruned < interval_seconds:
+            return {
+                "schema": "context_cache.prune_if_due.v1",
+                "pruned": False,
+                "reason": "not_due",
+            }
+        result = self._cache_prune(DEFAULT_CACHE_MAX_AGE_MINUTES)
+        self.store.put_json(
+            CACHE_LAST_PRUNED_KEY,
+            {
+                "schema": "context_cache.last_pruned.v1",
+                "timestamp": now,
+                "updated_at": now_iso(),
+                "interval_seconds": interval_seconds,
+                "result": result,
+            },
+        )
+        return {
+            "schema": "context_cache.prune_if_due.v1",
+            "pruned": True,
+            **result,
+        }
+
+    def _cache_prune_if_due_best_effort(self) -> None:
+        try:
+            self._cache_prune_if_due()
+        except Exception:
+            return
+
     def _cache_stats(self) -> dict[str, Any]:
-        entries = self.store.iter_json("cache:")
+        entries = [
+            entry
+            for entry in self.store.iter_json("cache:")
+            if entry[0] != CACHE_LAST_PRUNED_KEY
+        ]
         keys = [key.removeprefix("cache:") for key, _row in entries]
         namespaces: dict[str, dict[str, Any]] = {}
         metric_namespaces = self.metrics.snapshot().get("cache", {}).get(
@@ -3141,6 +3194,8 @@ class ContextService:
         with self.store.write_txn() as txn:
             entries = self.store.iter_json("cache:", txn=txn)
             for key, row in entries:
+                if key == CACHE_LAST_PRUNED_KEY:
+                    continue
                 if not isinstance(row, dict):
                     self.store.delete(key, txn=txn)
                     removed += 1
@@ -3170,7 +3225,13 @@ class ContextService:
             "removed_entries": removed,
             "expired_removed": expired_removed,
             "stale_removed": stale_removed,
-            "entry_count": self.store.count("cache:"),
+            "entry_count": len(
+                [
+                    key
+                    for key, _row in self.store.iter_json("cache:")
+                    if key != CACHE_LAST_PRUNED_KEY
+                ]
+            ),
         }
 
     def _reference_list(self, limit: int = 20) -> list[dict[str, Any]]:

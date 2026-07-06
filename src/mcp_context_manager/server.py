@@ -386,7 +386,7 @@ MaxAgeMinutesParam = Annotated[
     int,
     _tool_param(
         "Maximum cache entry age in minutes for cache_prune. "
-        f"Default is {DEFAULT_CACHE_MAX_AGE_MINUTES} minutes (14 days)."
+        f"Default is {DEFAULT_CACHE_MAX_AGE_MINUTES} minutes (30 days)."
     ),
 ]
 DefaultOutputProfileParam = Annotated[
