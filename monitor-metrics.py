@@ -52,6 +52,8 @@ DEFAULT_FETCH_WORKERS = 8
 MIN_INTERVAL = 0.5
 MAX_INTERVAL = 3600.0
 INTERVAL_STEP = 1.0
+DEFAULT_TERMINAL_COLUMNS = 160
+DEFAULT_TERMINAL_LINES = 30
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -458,7 +460,9 @@ def render_dashboard(
     refresh_interval: float | None = None,
     status_line: str = "",
 ) -> str:
-    width = width or shutil.get_terminal_size((120, 30)).columns
+    width = width or shutil.get_terminal_size(
+        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+    ).columns
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     ok_rows = [row for row in snapshots if row.metrics and not row.error]
     totals = _aggregate_totals(ok_rows)
@@ -468,8 +472,6 @@ def render_dashboard(
         f"updated:  {now}   projects: {len(snapshots)}   ok: {len(ok_rows)}   errors: {len(snapshots) - len(ok_rows)}",
         "",
     ]
-    if status_line:
-        lines.extend([status_line, ""])
     lines.extend(_summary_table(totals, snapshots, ok_rows, color))
     lines.extend(
         [
@@ -479,7 +481,7 @@ def render_dashboard(
     )
     lines.extend(["", _legend(color)])
     if refresh_interval is not None:
-        lines.append(_controls(refresh_interval, color))
+        lines.append(_controls(refresh_interval, color, status_line=status_line))
     return "\n".join(lines)
 
 
@@ -519,12 +521,17 @@ def render_project_detail(
     width: int | None,
     state: MonitorState,
 ) -> str:
-    width = width or shutil.get_terminal_size((120, 30)).columns
+    width = width or shutil.get_terminal_size(
+        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+    ).columns
     metrics = snapshot.metrics or {}
     cache_hits = _int_at(metrics, ("cache", "hits"))
     cache_misses = _int_at(metrics, ("cache", "misses"))
     cache_total = cache_hits + cache_misses
     cache_ratio = (cache_hits / cache_total) if cache_total else 0.0
+    fragment_hits = _int_at(metrics, ("cache", "context_pack_fragment_hits"))
+    fragment_misses = _int_at(metrics, ("cache", "context_pack_fragment_misses"))
+    fragment_ratio = _fragment_cache_ratio(metrics)
     details = [
         ("project", _project_name(snapshot.target)),
         ("project id", _project_identifier(snapshot.target)),
@@ -551,6 +558,10 @@ def render_project_detail(
         ),
         ("cache", f"{cache_hits}/{cache_misses} h/m  {cache_ratio * 100:5.1f}%"),
         (
+            "fragment cache",
+            f"{fragment_hits}/{fragment_misses} h/m  {fragment_ratio * 100:5.1f}%",
+        ),
+        (
             "token spared/saved",
             fmt_int(_tokens_spared_by_mcp(metrics)),
         ),
@@ -561,12 +572,13 @@ def render_project_detail(
     ]
     lines = [
         _style("mcp-context-manager project details", color, Ansi.BOLD + Ansi.CYAN),
-        _controls(state.refresh_interval, color),
+        _controls(
+            state.refresh_interval,
+            color,
+            status_line=_mcp_status_line(state, color),
+        ),
         "",
     ]
-    status_line = _mcp_status_line(state, color)
-    if status_line:
-        lines.extend([status_line, ""])
     lines.extend(_render_table(("field", "value"), details, aligns=("left", "left")))
     if snapshot.error:
         lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
@@ -594,12 +606,18 @@ def render_state_browser(
     state: MonitorState,
     height: int | None = None,
 ) -> str:
-    terminal_size = shutil.get_terminal_size((120, 30))
+    if state.state_entry:
+        return render_state_entry_view(
+            url=url, color=color, width=width, state=state, height=height
+        )
+    terminal_size = shutil.get_terminal_size(
+        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+    )
     width = width or terminal_size.columns
     height = height or terminal_size.lines
     payload = state.state_payload or {}
     rows = _filtered_state_rows(state)
-    visible_count = _state_visible_count(height, bool(state.state_entry))
+    visible_count = _state_visible_count(height, False)
     state.state_selected_index = _clamped_index(state.state_selected_index, len(rows))
     state.state_scroll_offset = _adjust_scroll_offset(
         state.state_scroll_offset,
@@ -615,12 +633,9 @@ def render_state_browser(
         _style("mcp-context-manager state browser", color, Ansi.BOLD + Ansi.CYAN),
         f"endpoint: {url}",
         f"project:  {project}",
-        _browser_controls(state, color),
+        _browser_controls(state, color, status_line=_mcp_status_line(state, color)),
         "",
     ]
-    status_line = _mcp_status_line(state, color)
-    if status_line:
-        lines.extend([status_line, ""])
     if state.state_error:
         lines.append(_style(f"ERROR: {state.state_error}", color, Ansi.RED))
         return "\n".join(lines)
@@ -666,23 +681,25 @@ def render_state_browser(
     )
     if not table_rows:
         lines.append("No generated-state rows for this project.")
-    if state.state_entry:
-        lines.extend(["", *render_state_entry_overlay(color, width, state, height)])
     return "\n".join(lines)
 
 
-def render_state_entry_overlay(
+def render_state_entry_view(
+    url: str,
     color: bool,
-    width: int,
+    width: int | None,
     state: MonitorState,
     height: int | None = None,
-) -> list[str]:
-    height = height or shutil.get_terminal_size((120, 30)).lines
+) -> str:
+    terminal_size = shutil.get_terminal_size(
+        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+    )
+    width = width or terminal_size.columns
+    height = height or terminal_size.lines
     payload = state.state_entry or {}
     entry = payload.get("entry") if isinstance(payload, dict) else {}
     entry = entry if isinstance(entry, dict) else {}
     preview = str(entry.get("preview") or "")
-    inner_width = max(40, min(100, width - 6))
     lines = _render_table(
         ("field", "value"),
         [
@@ -695,7 +712,8 @@ def render_state_entry_overlay(
         ],
         aligns=("left", "left"),
     )
-    preview_lines = _wrap_block(preview, inner_width)
+    preview_width = max(40, width - 2)
+    preview_lines = _wrap_block(preview, preview_width)
     visible_count = _state_entry_visible_count(height)
     state.state_entry_scroll_offset = _clamp_content_scroll_offset(
         state.state_entry_scroll_offset,
@@ -708,9 +726,12 @@ def render_state_entry_overlay(
     ]
     first_line = state.state_entry_scroll_offset + 1 if preview_lines else 0
     last_line = state.state_entry_scroll_offset + len(visible_preview)
+    project = _project_name(state.state_target) if state.state_target else "-"
     body = [
-        _style("state entry overlay", color, Ansi.BOLD + Ansi.CYAN),
-        "Up/Down scroll content  PgUp/PgDn jump  Esc closes overlay",
+        _style("mcp-context-manager state entry", color, Ansi.BOLD + Ansi.CYAN),
+        f"endpoint: {url}",
+        f"project:  {project}",
+        _browser_controls(state, color, status_line=_mcp_status_line(state, color)),
         "",
         *lines,
         "",
@@ -721,7 +742,9 @@ def render_state_entry_overlay(
         ),
         *visible_preview,
     ]
-    return _box_lines(body, width=inner_width + 4)
+    if state.state_error:
+        body.extend(["", _style(f"ERROR: {state.state_error}", color, Ansi.RED)])
+    return "\n".join(body)
 
 
 def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
@@ -730,6 +753,8 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
         "packs": 0,
         "cache_hits": 0,
         "cache_misses": 0,
+        "fragment_hits": 0,
+        "fragment_misses": 0,
         "tokens_spared_by_mcp": 0,
         "bytes_deferred": 0,
     }
@@ -741,6 +766,12 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
         )
         totals["cache_hits"] += _int_at(metrics, ("cache", "hits"))
         totals["cache_misses"] += _int_at(metrics, ("cache", "misses"))
+        totals["fragment_hits"] += _int_at(
+            metrics, ("cache", "context_pack_fragment_hits")
+        )
+        totals["fragment_misses"] += _int_at(
+            metrics, ("cache", "context_pack_fragment_misses")
+        )
         totals["tokens_spared_by_mcp"] += _tokens_spared_by_mcp(metrics)
         totals["bytes_deferred"] += _int_at(
             metrics, ("references", "bytes_deferred_est")
@@ -756,11 +787,19 @@ def _summary_table(
 ) -> list[str]:
     cache_total = int(totals["cache_hits"]) + int(totals["cache_misses"])
     ratio = (int(totals["cache_hits"]) / cache_total) if cache_total else 0.0
+    fragment_total = int(totals["fragment_hits"]) + int(totals["fragment_misses"])
+    fragment_ratio = (
+        int(totals["fragment_hits"]) / fragment_total if fragment_total else 0.0
+    )
     rows = [
         ("projects", f"{len(snapshots)} total / {len(ok_rows)} ok"),
         ("requests", fmt_int(totals["requests"])),
         ("context_pack", fmt_int(totals["packs"])),
         ("cache hit", f"{_bar(ratio, 18, color)} {ratio * 100:5.1f}%"),
+        (
+            "fragment cache",
+            f"{_bar(fragment_ratio, 18, color)} {fragment_ratio * 100:5.1f}%",
+        ),
         ("token spared/saved", fmt_int(totals["tokens_spared_by_mcp"])),
         ("refs deferred", fmt_bytes(totals["bytes_deferred"])),
     ]
@@ -779,7 +818,18 @@ def _project_table(
         for index, snapshot in enumerate(snapshots)
     ]
     rendered = _render_table(
-        ("", "project", "project id", "req", "pack", "avg ms", "cache", "mcp tok", "checks"),
+        (
+            "",
+            "project",
+            "project id",
+            "req",
+            "pack",
+            "avg ms",
+            "cache",
+            "frag",
+            "mcp tok",
+            "checks",
+        ),
         rows,
         widths=(
             widths["selector"],
@@ -789,6 +839,7 @@ def _project_table(
             widths["pack"],
             widths["avg_ms"],
             widths["cache"],
+            widths["fragment"],
             widths["tokens"],
             widths["checks"],
         ),
@@ -802,34 +853,41 @@ def _project_table(
             "right",
             "right",
             "right",
+            "right",
         ),
     )
     if selected_index is not None and color:
         header_rows = 3
         selected_row = header_rows + _clamped_index(selected_index, len(snapshots))
         if 0 <= selected_row < len(rendered) - 1:
-            rendered[selected_row] = _style(rendered[selected_row], color, Ansi.REVERSE)
+            rendered[selected_row] = _style_full_line(
+                rendered[selected_row], color, Ansi.REVERSE
+            )
     return rendered
 
 
 def _project_column_widths(width: int) -> dict[str, int]:
     widths = {
         "selector": 1,
-        "project": 28,
-        "project_id": 22,
-        "req": 5,
-        "pack": 5,
-        "avg_ms": 7,
-        "cache": 19,
+        "project": 20,
+        "project_id": 50,
+        "req": 4,
+        "pack": 4,
+        "avg_ms": 6,
+        "cache": 16,
+        "fragment": 6,
         "tokens": 8,
-        "checks": 8,
+        "checks": 6,
     }
-    target_width = max(100, width)
+    target_width = min(DEFAULT_TERMINAL_COLUMNS, max(100, width))
     overhead = len(widths) * 3 + 1
     while overhead + sum(widths.values()) > target_width and widths["project_id"] > 12:
         widths["project_id"] -= 1
     while overhead + sum(widths.values()) > target_width and widths["project"] > 16:
         widths["project"] -= 1
+    extra = target_width - (overhead + sum(widths.values()))
+    if extra > 0:
+        widths["project"] += extra
     return widths
 
 
@@ -861,6 +919,7 @@ def _project_cells(
         metrics, ("requests", "by_operation", "context_pack", "avg_elapsed_ms")
     )
     cache_ratio = _float_at(metrics, ("cache", "hit_ratio"))
+    fragment_ratio = _fragment_cache_ratio(metrics)
     tokens_spared_by_mcp = _tokens_spared_by_mcp(metrics)
     checks = _matrix_status(snapshot.matrix or {}, color)
     cache_bar_width = max(6, widths["cache"] - 9)
@@ -872,6 +931,7 @@ def _project_cells(
         fmt_int(packs),
         fmt_ms(avg_ms),
         f"{_bar(cache_ratio, cache_bar_width, color)} {cache_ratio * 100:5.1f}%",
+        f"{fragment_ratio * 100:5.1f}%",
         fmt_int(tokens_spared_by_mcp),
         checks,
     )
@@ -889,16 +949,21 @@ def _project_identifier(target: ProjectTarget) -> str:
     return target.source or "-"
 
 
-def _controls(refresh_interval: float, color: bool) -> str:
+def _controls(
+    refresh_interval: float,
+    color: bool,
+    status_line: str = "",
+) -> str:
     keys = (
         "keys: Up/Down select  Enter details  b state  Esc table  "
         "+/- refresh  r reload  q quit"
     )
-    return (
+    controls = (
         f"{keys}   refresh={fmt_seconds(refresh_interval)}"
         if not color
         else f"{_style(keys, color, Ansi.DIM)}   refresh={fmt_seconds(refresh_interval)}"
     )
+    return f"{controls}   {status_line}" if status_line else controls
 
 
 def _mcp_status_line(state: MonitorState, color: bool) -> str:
@@ -909,11 +974,15 @@ def _mcp_status_line(state: MonitorState, color: bool) -> str:
     return ""
 
 
-def _browser_controls(state: MonitorState, color: bool) -> str:
+def _browser_controls(
+    state: MonitorState,
+    color: bool,
+    status_line: str = "",
+) -> str:
     if state.state_entry:
         keys = (
             "keys: Up/Down content  PgUp/PgDn jump  Home/End  "
-            "Esc close overlay  q quit"
+            "Esc state list  q quit"
         )
     elif state.state_search_active:
         keys = "keys: type search  Backspace edit  Enter apply  Esc cancel"
@@ -922,7 +991,8 @@ def _browser_controls(state: MonitorState, color: bool) -> str:
             "keys: Up/Down scroll  PgUp/PgDn jump  / search  "
             "Enter inspect  Esc table  q quit"
         )
-    return _style(keys, color, Ansi.DIM) if color else keys
+    controls = _style(keys, color, Ansi.DIM) if color else keys
+    return f"{controls}   {status_line}" if status_line else controls
 
 
 def _measurement_check_rows(
@@ -978,13 +1048,13 @@ def _state_row_matches(row: dict[str, Any], query: str) -> bool:
     return query in haystack
 
 
-def _state_visible_count(height: int, overlay_open: bool) -> int:
-    reserved = 22 if overlay_open else 13
+def _state_visible_count(height: int, entry_open: bool) -> int:
+    reserved = 22 if entry_open else 13
     return max(3, height - reserved)
 
 
 def _state_entry_visible_count(height: int) -> int:
-    return max(3, min(18, height - 18))
+    return max(3, height - 13)
 
 
 def _clamp_content_scroll_offset(
@@ -1176,12 +1246,19 @@ def _bar(ratio: float, width: int, color: bool) -> str:
 def _legend(color: bool) -> str:
     return (
         f"{_style('checks', color, Ansi.BOLD)} come from "
-        "context_admin(mode='measurement_matrix'); cache bars show hit ratio."
+        "context_admin(mode='measurement_matrix'); cache bars show request and "
+        "fragment hit ratios."
     )
 
 
 def _style(text: str, color: bool, code: str) -> str:
     return f"{code}{text}{Ansi.RESET}" if color else text
+
+
+def _style_full_line(text: str, color: bool, code: str) -> str:
+    if not color:
+        return text
+    return f"{code}{text.replace(Ansi.RESET, Ansi.RESET + code)}{Ansi.RESET}"
 
 
 def _trim(text: str, width: int) -> str:
@@ -1204,6 +1281,16 @@ def _tokens_spared_by_mcp(metrics: dict[str, Any]) -> int:
     if isinstance(tokens, dict) and "tokens_spared_by_mcp_est" in tokens:
         return _int_at(metrics, ("tokens", "tokens_spared_by_mcp_est"))
     return _int_at(metrics, ("tokens", "estimated_input_tokens_saved"))
+
+
+def _fragment_cache_ratio(metrics: dict[str, Any]) -> float:
+    explicit = _float_at(metrics, ("cache", "context_pack_fragment_hit_ratio"))
+    if explicit:
+        return explicit
+    hits = _int_at(metrics, ("cache", "context_pack_fragment_hits"))
+    misses = _int_at(metrics, ("cache", "context_pack_fragment_misses"))
+    total = hits + misses
+    return (hits / total) if total else 0.0
 
 
 def _float_at(payload: dict[str, Any], path: tuple[str, ...]) -> float:
@@ -1608,7 +1695,12 @@ def _apply_state_browser_result(
     state.state_scroll_offset = _adjust_scroll_offset(
         state.state_scroll_offset,
         state.state_selected_index,
-        _state_visible_count(shutil.get_terminal_size((120, 30)).lines, False),
+                _state_visible_count(
+                    shutil.get_terminal_size(
+                        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+                    ).lines,
+                    False,
+                ),
         _state_row_count(state),
     )
 
@@ -1764,7 +1856,9 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                         snapshots,
                         args.url,
                         color,
-                        shutil.get_terminal_size((120, 30)).columns,
+                        shutil.get_terminal_size(
+                            (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+                        ).columns,
                         state,
                     )
                 )

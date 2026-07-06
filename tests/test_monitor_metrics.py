@@ -44,7 +44,14 @@ class FakeClient:
                         "context_pack": {"count": 3, "avg_elapsed_ms": 42.5}
                     },
                 },
-                "cache": {"hits": 6, "misses": 2, "hit_ratio": 0.75},
+                "cache": {
+                    "hits": 6,
+                    "misses": 2,
+                    "hit_ratio": 0.75,
+                    "context_pack_fragment_hits": 8,
+                    "context_pack_fragment_misses": 2,
+                    "context_pack_fragment_hit_ratio": 0.8,
+                },
                 "tokens": {
                     "estimated_input_tokens_saved": 12345,
                     "tokens_spared_by_mcp_est": 12000,
@@ -171,7 +178,14 @@ class ConcurrentMetricsClient(FakeClient):
             "schema": "context_metrics.v1",
             "project_id": project_id,
             "requests": {"total": 1, "by_operation": {}},
-            "cache": {"hits": 0, "misses": 0, "hit_ratio": 0.0},
+            "cache": {
+                "hits": 0,
+                "misses": 0,
+                "hit_ratio": 0.0,
+                "context_pack_fragment_hits": 0,
+                "context_pack_fragment_misses": 0,
+                "context_pack_fragment_hit_ratio": 0.0,
+            },
             "tokens": {},
             "references": {},
         }
@@ -299,11 +313,13 @@ def test_render_dashboard_contains_visual_summary() -> None:
 
     assert "mcp-context-manager metrics" in rendered
     assert "| cache hit          | [##############----]  75.0% |" in rendered
+    assert "| fragment cache     | [##############----]  80.0% |" in rendered
     assert "| token spared/saved |                       12.0k |" in rendered
     assert "| project" in rendered
     assert "| Alpha" in rendered
     assert "| alpha-123" in rendered
-    assert "|    10 |     3 |" in rendered
+    assert "|   10 |    3 |" in rendered
+    assert "|  80.0% |" in rendered
     assert "2 pass" in rendered
 
 
@@ -322,7 +338,14 @@ def test_render_dashboard_keeps_long_project_names_readable() -> None:
                     "context_pack": {"count": 4, "avg_elapsed_ms": 413.9}
                 },
             },
-            "cache": {"hits": 0, "misses": 4, "hit_ratio": 0.0},
+            "cache": {
+                "hits": 0,
+                "misses": 4,
+                "hit_ratio": 0.0,
+                "context_pack_fragment_hits": 1,
+                "context_pack_fragment_misses": 3,
+                "context_pack_fragment_hit_ratio": 0.25,
+            },
             "tokens": {
                 "estimated_input_tokens_saved": 9400,
                 "tokens_spared_by_mcp_est": 8700,
@@ -427,8 +450,61 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "mcp-context-manager project details" in detail
     assert "| project            | Alpha" in detail
     assert "| project id         | alpha-123" in detail
+    assert "| fragment cache     | 8/2 h/m   80.0%" in detail
     assert "token spared/saved" in detail
     assert "| a                        |         pass" in detail
+
+
+def test_mcp_loading_status_renders_in_controls() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=True,
+    )
+    state = monitor.MonitorState(
+        selected_index=0,
+        view="table",
+        refresh_interval=5.0,
+        mcp_status="loading metrics...",
+    )
+
+    rendered = monitor.render_monitor_screen(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        state=state,
+    )
+
+    line = next(line for line in rendered.splitlines() if "r reload" in line)
+    assert "mcp: loading metrics..." in line
+    assert rendered.splitlines().count("mcp: loading metrics...") == 0
+
+
+def test_selected_project_row_highlight_survives_cache_bar_reset() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=True,
+    )
+
+    rendered = monitor.render_dashboard(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=True,
+        width=120,
+        selected_index=0,
+    )
+
+    selected_line = next(line for line in rendered.splitlines() if "Alpha" in line)
+    assert f"{monitor.Ansi.RESET}{monitor.Ansi.REVERSE}" in selected_line
+    assert selected_line.endswith(monitor.Ansi.RESET)
 
 
 def test_tokens_spared_by_mcp_prefers_explicit_metric_and_falls_back() -> None:
@@ -499,8 +575,7 @@ def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
         state=state,
     )
 
-    assert "mcp-context-manager state browser" in detail
-    assert "state entry overlay" in detail
+    assert "mcp-context-manager state entry" in detail
     assert "cache:abc" in detail
     assert '"hello": "world"' in detail
 
@@ -517,7 +592,7 @@ def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
     assert state.state_entry is None
 
 
-def test_state_entry_overlay_scrolls_content() -> None:
+def test_state_entry_view_scrolls_content() -> None:
     monitor = load_monitor_module()
     client = FakeClient()
     snapshots = monitor.collect_snapshots(
@@ -537,9 +612,11 @@ def test_state_entry_overlay_scrolls_content() -> None:
         height=21,
         state=state,
     )
-    assert "preview lines 1-3 / 12" in first_page
+    assert "mcp-context-manager state entry" in first_page
+    assert "preview lines 1-8 / 12" in first_page
     assert '"hello": "world"' in first_page
-    assert "line 05" not in first_page
+    assert "line 08" in first_page
+    assert "line 09" not in first_page
 
     assert (
         monitor.handle_key(
@@ -557,7 +634,8 @@ def test_state_entry_overlay_scrolls_content() -> None:
         height=21,
         state=state,
     )
-    assert "preview lines 10-12 / 12" in second_page
+    assert "preview lines 5-12 / 12" in second_page
+    assert "line 05" in second_page
     assert "line 10" in second_page
     assert '"hello": "world"' not in second_page
 
