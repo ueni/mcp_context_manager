@@ -843,9 +843,19 @@ class ContextService:
                     "review, debug, test, docs, security, or general questions, "
                     "call context_pack first with the user's task. Pass "
                     "changed_files and focus_paths when the user names them. "
-                    "Use compact output by default. Must use context_lookup for "
-                    "targeted follow-up snippets, search, trees, symbols, or "
-                    "references before broad shell inspection. Must use "
+                    "The MCP caller sets client_profile per context_pack "
+                    "request: use codex for Codex, claude with "
+                    "model_profile=anthropic for Claude, copilot with "
+                    "model_profile=github for GitHub Copilot, and generic "
+                    "otherwise. Explicit output_profile wins over "
+                    "client_profile; when output_profile is omitted, "
+                    "client_profile=codex uses minimal and other clients use "
+                    "the configured default. "
+                    "context_admin(mode=\"profile_calibrate\") reports "
+                    "recommendations only; it does not set active state. Must "
+                    "use context_lookup for targeted follow-up snippets, "
+                    "search, trees, symbols, or references before broad shell "
+                    "inspection. Must use "
                     "result_reference_resolve when raw referenced evidence is "
                     "needed before destructive edits, release claims, or security "
                     "conclusions. Must use context_admin for health, index, "
@@ -862,6 +872,38 @@ class ContextService:
                     "context_admin",
                     "context_memory",
                 ],
+                "profile_selection": {
+                    "set_by": "MCP caller per context_pack request",
+                    "auto_detection": False,
+                    "precedence": [
+                        "explicit output_profile",
+                        "client_profile=codex implies output_profile=minimal when omitted",
+                        "configured default_output_profile",
+                    ],
+                    "client_profiles": {
+                        "codex": {
+                            "model_profile": "openai",
+                            "recommended_output_profile": "minimal",
+                        },
+                        "claude": {
+                            "model_profile": "anthropic",
+                            "recommended_output_profile": "compact",
+                        },
+                        "copilot": {
+                            "model_profile": "github",
+                            "recommended_output_profile": "compact",
+                            "tools_only": True,
+                        },
+                        "generic": {
+                            "model_profile": "unknown",
+                            "recommended_output_profile": "configured default",
+                        },
+                    },
+                    "calibration": (
+                        "context_admin(mode=\"profile_calibrate\") reports "
+                        "recommendations but does not mutate session or server state."
+                    ),
+                },
                 "resource_uris": [
                     "repo://instructions/codex-context-pack-first",
                     "repo://project/{project_id}/instructions/codex-context-pack-first",

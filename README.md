@@ -146,6 +146,38 @@ Client profiles tune defaults without changing the public tool surface:
 | `copilot` | Keep a tools-only path through `context_admin(mode="instructions")` and `context_admin(mode="resource_proxy")`. |
 | `generic` | Use the configured default output profile. |
 
+Profiles are selected by the MCP caller on each `context_pack` request. The
+server does not auto-detect the host client. Explicit `output_profile` wins over
+`client_profile`; if `output_profile` is omitted, `client_profile="codex"` uses
+`minimal`, and other clients use the configured default output profile.
+`model_profile` is a provider hint, so use `client_profile="claude"` with
+`model_profile="anthropic"` for Claude and `client_profile="copilot"` with
+`model_profile="github"` for GitHub Copilot. `context_admin(mode="profile_calibrate")`
+reports recommendations only; it does not mutate server or session state.
+
+### Onboarding Prompt
+
+Use this prompt when onboarding an agent or MCP host to this repository:
+
+```text
+Adopt the mcp-context-manager MCP instructions into your global 
+agent instructions (outside this repository). Use repo://instructions/codex-context-pack-first as the
+source of truth for repository tasks. Keep context_pack first, set
+client_profile per request, and pass output_profile only when intentionally
+overriding the client/default profile.
+```
+
+Use this prompt when creating or updating an `AGENTS.md` file:
+
+```text
+Create or update AGENTS.md for this repository. Preserve existing project
+instructions, and add the mcp-context-manager MCP-first workflow: use
+repo://instructions/codex-context-pack-first as the source of truth, call
+context_pack before broad repository inspection, set client_profile per
+request, and pass output_profile only when intentionally overriding the
+client/default profile.
+```
+
 Lookup modes `impact`, `related_symbols`, `test_owners`, `chunk`, and
 `explain_cache` provide targeted follow-up without broad file scans. Chunk and
 fragment cache diagnostics report reuse after prompt variations or unrelated

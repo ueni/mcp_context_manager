@@ -88,6 +88,8 @@ def test_create_mcp_advertises_server_instructions(monkeypatch, service) -> None
     assert captured["instructions"] == MCP_SERVER_INSTRUCTIONS
     assert "Mandatory MCP-first workflow" in MCP_SERVER_INSTRUCTIONS
     assert "call context_pack first" in MCP_SERVER_INSTRUCTIONS
+    assert "sets client_profile per request" in MCP_SERVER_INSTRUCTIONS
+    assert "passes output_profile only when overriding" in MCP_SERVER_INSTRUCTIONS
     assert "Must use context_lookup" in MCP_SERVER_INSTRUCTIONS
     assert "Must use result_reference_resolve" in MCP_SERVER_INSTRUCTIONS
     assert "Must use context_admin" in MCP_SERVER_INSTRUCTIONS
@@ -241,6 +243,8 @@ def test_create_mcp_advertises_codex_guidance_resource_and_prompt(
     )
     prompt = prompts["use_context_pack_first"]("review auth behavior")
     assert CODEX_CONTEXT_PACK_FIRST_PROMPT in prompt
+    assert "The MCP caller sets client_profile" in prompt
+    assert "Explicit output_profile wins" in prompt
     assert "Must use context_lookup" in prompt
     assert "Must use context_admin" in prompt
     assert "Must use context_memory only" in prompt

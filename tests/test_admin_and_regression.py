@@ -886,9 +886,23 @@ def test_codex_guidance_resource_states_pack_first_boundary(
     )
     assert "mandatory" in guidance["instruction"]
     assert "call context_pack first" in guidance["instruction"]
+    assert "The MCP caller sets client_profile" in guidance["instruction"]
     assert "Must use context_lookup" in guidance["instruction"]
     assert "Must use context_admin" in guidance["instruction"]
     assert "Must use context_memory only" in guidance["instruction"]
+    assert guidance["profile_selection"]["set_by"] == (
+        "MCP caller per context_pack request"
+    )
+    assert guidance["profile_selection"]["auto_detection"] is False
+    assert guidance["profile_selection"]["precedence"] == [
+        "explicit output_profile",
+        "client_profile=codex implies output_profile=minimal when omitted",
+        "configured default_output_profile",
+    ]
+    assert guidance["profile_selection"]["client_profiles"]["claude"] == {
+        "model_profile": "anthropic",
+        "recommended_output_profile": "compact",
+    }
     assert guidance["preferred_tool_order"] == [
         "context_pack",
         "context_lookup",
