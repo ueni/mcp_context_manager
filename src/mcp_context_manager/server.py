@@ -300,8 +300,11 @@ AdminModeParam = Annotated[
     ),
 ]
 MaxFilesParam = Annotated[
-    int,
-    _tool_param("Maximum number of files to visit during index_refresh."),
+    int | None,
+    _tool_param(
+        "Maximum number of files to visit. Defaults to full index_refresh scope "
+        "and a smaller bounded warmup scope."
+    ),
 ]
 MaxEntriesParam = Annotated[
     int,
@@ -538,7 +541,7 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         ctx: MCPContext,
         mode: AdminModeParam = "health",
         path: RepoPathParam = ".",
-        max_files: MaxFilesParam = 5000,
+        max_files: MaxFilesParam = None,
         max_age_minutes: MaxAgeMinutesParam = DEFAULT_CACHE_MAX_AGE_MINUTES,
         max_entries: MaxEntriesParam = 100,
         max_output_chars: MaxOutputCharsParam = None,

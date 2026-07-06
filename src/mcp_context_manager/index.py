@@ -518,6 +518,7 @@ class ContextIndex:
         path: str = ".",
         max_results: int = 20,
         include_globs: list[str] | None = None,
+        allow_fallback: bool = True,
     ) -> dict[str, Any]:
         terms = normalize_query_terms(query, max_terms=8)
         if not terms:
@@ -563,7 +564,7 @@ class ContextIndex:
                     current["line"] = int(row.get("first_line", 1) or 1)
                     current["excerpt"] = str(row.get("excerpt", ""))
         rows = list(matched.values())
-        if not rows:
+        if not rows and allow_fallback:
             rows = self._fallback_search(terms, root_rel=root_rel, limit=max_results * 4)
 
         filtered: list[dict[str, Any]] = []

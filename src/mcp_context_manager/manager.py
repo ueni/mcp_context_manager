@@ -144,7 +144,7 @@ class ProjectContextService:
         self,
         mode: str = "health",
         path: str = ".",
-        max_files: int = 5000,
+        max_files: int | None = None,
         max_age_minutes: int = DEFAULT_CACHE_MAX_AGE_MINUTES,
         max_entries: int = 100,
         max_output_chars: int | None = None,

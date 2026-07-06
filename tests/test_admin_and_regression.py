@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mcp_context_manager.config import ContextConfig
-from mcp_context_manager.context import ContextService
+from mcp_context_manager.context import DEFAULT_WARMUP_MAX_FILES, ContextService
 
 
 def _write_many_python_files(repo: Path, count: int = 12) -> None:
@@ -164,17 +164,30 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
 
 def test_context_admin_warmup_preinitializes_index_and_search_cache(
     service: ContextService,
+    monkeypatch,
 ) -> None:
+    original_search = service.index.search
+    fallback_flags: list[bool] = []
+
+    def counted_search(*args, **kwargs):
+        fallback_flags.append(bool(kwargs.get("allow_fallback", True)))
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setattr(service.index, "search", counted_search)
+
     warmup = service.context_admin(mode="warmup", path="src", max_entries=3)
 
     assert warmup["schema"] == "context_cache.warmup.v1"
     assert warmup["state"]["store_exists"] is True
+    assert warmup["index"]["max_files"] == DEFAULT_WARMUP_MAX_FILES
+    assert warmup["index"]["default_limited"] is True
     assert warmup["index"]["file_count"] >= 1
     assert warmup["workspace"]["file_count"] >= 1
     assert warmup["search_cache"]["namespace"] == "context_lookup.search"
     assert warmup["search_cache"]["path"] == "src"
     assert warmup["search_cache"]["query_count"] == 3
     assert all(row["path"] == "src" for row in warmup["search_cache"]["queries"])
+    assert fallback_flags == [False, False, False]
     assert warmup["cache"]["entry_count_after"] >= warmup["search_cache"]["query_count"]
     assert "context_lookup.search" in warmup["cache"]["namespaces_after"]
     assert "context_pack.retrieval" not in warmup["cache"]["namespaces_after"]
@@ -188,6 +201,13 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
 
     assert second["search_cache"]["path"] == "src"
     assert all(row["cache_hit"] is True for row in second["search_cache"]["queries"])
+
+    explicit = service.context_admin(
+        mode="warmup", path="src", max_files=7, max_entries=0
+    )
+
+    assert explicit["index"]["max_files"] == 7
+    assert explicit["index"]["default_limited"] is False
 
 
 def test_cache_stats_tolerates_legacy_cache_rows_without_namespace(

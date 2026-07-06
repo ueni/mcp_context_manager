@@ -26,6 +26,8 @@ from .util import (
 
 DEFAULT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
 DEFAULT_CACHE_MAX_AGE_MINUTES = DEFAULT_CACHE_TTL_SECONDS // 60
+DEFAULT_INDEX_MAX_FILES = 5000
+DEFAULT_WARMUP_MAX_FILES = 100
 CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR = 8
 
 
@@ -221,7 +223,7 @@ class ContextService:
         self,
         mode: str = "health",
         path: str = ".",
-        max_files: int = 5000,
+        max_files: int | None = None,
         max_age_minutes: int = DEFAULT_CACHE_MAX_AGE_MINUTES,
         max_entries: int = 100,
         max_output_chars: int | None = None,
@@ -257,7 +259,12 @@ class ContextService:
                 "index": self.index.status(),
             }
         if mode == "index_refresh":
-            return self.index.refresh(path=path, max_files=max_files)
+            return self.index.refresh(
+                path=path,
+                max_files=max_files
+                if max_files is not None
+                else DEFAULT_INDEX_MAX_FILES,
+            )
         if mode == "index_status":
             return self.index.status()
         if mode == "cache_stats":
@@ -278,7 +285,11 @@ class ContextService:
         if mode == "measurement_matrix":
             return self.metrics.measurement_matrix()
         if mode == "benchmark":
-            return self._context_pack_benchmark(max_files=max_files)
+            return self._context_pack_benchmark(
+                max_files=max_files
+                if max_files is not None
+                else DEFAULT_INDEX_MAX_FILES
+            )
         if mode == "state_browser":
             return self._state_browser(
                 prefix=state_prefix,
@@ -1223,7 +1234,7 @@ class ContextService:
     def _cache_warmup(
         self,
         path: str = ".",
-        max_files: int = 5000,
+        max_files: int | None = None,
         max_entries: int = 100,
     ) -> dict[str, Any]:
         started = time.perf_counter()
@@ -1232,9 +1243,15 @@ class ContextService:
         self.store.get_json("budget:default")
         cache_before = self._cache_stats()
         omitted: list[dict[str, Any]] = []
+        effective_max_files = (
+            max_files if max_files is not None else DEFAULT_WARMUP_MAX_FILES
+        )
 
         try:
-            index_refresh = self._ensure_index_fresh(path=path, max_files=max_files)
+            index_refresh = self._ensure_index_fresh(
+                path=path,
+                max_files=effective_max_files,
+            )
         except Exception as exc:
             index_refresh = {
                 "schema": "context_index.refresh.v1",
@@ -1300,6 +1317,8 @@ class ContextService:
             },
             "index": {
                 "schema": index_refresh.get("schema", "context_index.refresh.v1"),
+                "max_files": effective_max_files,
+                "default_limited": max_files is None,
                 "skipped": bool(index_refresh.get("skipped", False)),
                 "reason": str(index_refresh.get("reason", "")),
                 "file_count": int(index_refresh.get("file_count", 0) or 0),
@@ -1395,6 +1414,7 @@ class ContextService:
                     path=path,
                     max_results=max_results,
                     include_globs=None,
+                    allow_fallback=False,
                 )
             except Exception as exc:
                 rows.append(
