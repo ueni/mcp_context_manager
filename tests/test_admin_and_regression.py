@@ -52,6 +52,15 @@ def _count_python_read_text(repo: Path, monkeypatch) -> list[str]:
     return read_paths
 
 
+def _search_fragment_cache_row(
+    service: ContextService, term: str = "auth"
+) -> tuple[str, dict]:
+    for key, row in service.store.iter_json("cache:retrieval.search_term:"):
+        if isinstance(row, dict) and row.get("metadata", {}).get("term") == term:
+            return key, row
+    raise AssertionError(f"missing search fragment cache row for {term}")
+
+
 def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     budget = service.context_admin(
         mode="budget", max_output_chars=4096, default_output_profile="normal"
@@ -151,6 +160,7 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
         "latency.context_pack.avg_elapsed_ms",
         "latency.context_pack.snippet_batch_avg_ms",
         "cache.context_pack_retrieval_hit_ratio",
+        "cache.context_pack_fragment_hit_ratio",
         "tokens.context_pack.avg_saved_per_pack",
         "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack",
         "tooling.contract_tokens_saved_est",
@@ -189,7 +199,7 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert all(row["path"] == "src" for row in warmup["search_cache"]["queries"])
     assert fallback_flags == [False, False, False]
     assert warmup["cache"]["entry_count_after"] >= warmup["search_cache"]["query_count"]
-    assert "context_lookup.search" in warmup["cache"]["namespaces_after"]
+    assert "retrieval.search_term" in warmup["cache"]["namespaces_after"]
     assert "context_pack.retrieval" not in warmup["cache"]["namespaces_after"]
 
     lookup = service.context_lookup(mode="search", query="test", path="src")
@@ -233,15 +243,18 @@ def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
     benchmark = service.context_admin(mode="benchmark")
 
     assert benchmark["schema"] == "context_benchmark.v1"
-    assert benchmark["run_count"] == 4
+    assert benchmark["run_count"] == 5
     assert [run["name"] for run in benchmark["runs"]] == [
         "cold_refresh",
         "warm_cache",
         "repeated_prompt",
+        "prompt_variation_reuse",
         "compact_focus",
     ]
     assert benchmark["runs"][1]["cache_hit"] is True
     assert benchmark["runs"][2]["cache_hit"] is True
+    assert benchmark["runs"][3]["cache_hit"] is False
+    assert benchmark["runs"][3]["fragment_hit_ratio"] >= 0.2
     assert "search_ranking_ms" in benchmark["runs"][0]["stage_timings_ms"]
     assert "reference_write_ms" in benchmark["runs"][0]["stage_timings_ms"]
     assert "response_assembly_ms" in benchmark["runs"][0]["stage_timings_ms"]
@@ -273,21 +286,21 @@ def test_expired_search_cache_is_recomputed_and_pruned(
     service: ContextService,
 ) -> None:
     first = service.context_lookup(mode="search", query="auth token")
-    cache_key = first["cache"]["key"]
-    row = service.store.get_json(f"cache:{cache_key}")
+    cache_key, row = _search_fragment_cache_row(service, term="auth")
     row["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-    service.store.put_json(f"cache:{cache_key}", row)
+    service.store.put_json(cache_key, row)
 
     second = service.context_lookup(mode="search", query="auth token")
 
+    assert first["cache"]["hit"] is False
     assert second["cache"]["hit"] is False
     assert second["cache"]["status"] == "expired"
     assert second["cache"]["reason"] == "expired"
     assert second["results"]
 
-    row = service.store.get_json(f"cache:{cache_key}")
+    row = service.store.get_json(cache_key)
     row["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-    service.store.put_json(f"cache:{cache_key}", row)
+    service.store.put_json(cache_key, row)
     pruned = service.context_admin(mode="cache_prune", max_age_minutes=999999)
 
     assert pruned["expired_removed"] >= 1
@@ -296,9 +309,8 @@ def test_expired_search_cache_is_recomputed_and_pruned(
 def test_cache_default_ttl_and_prune_age_are_14_days(
     service: ContextService,
 ) -> None:
-    result = service.context_lookup(mode="search", query="auth token")
-    cache_key = result["cache"]["key"]
-    row = service.store.get_json(f"cache:{cache_key}")
+    service.context_lookup(mode="search", query="auth token")
+    cache_key, row = _search_fragment_cache_row(service, term="auth")
     updated_at = datetime.fromisoformat(row["updated_at"])
     expires_at = datetime.fromisoformat(row["expires_at"])
 
@@ -309,12 +321,12 @@ def test_cache_default_ttl_and_prune_age_are_14_days(
 
     row["updated_at"] = (datetime.now(timezone.utc) - timedelta(days=13)).isoformat()
     row["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
-    service.store.put_json(f"cache:{cache_key}", row)
+    service.store.put_json(cache_key, row)
 
     pruned = service.context_admin(mode="cache_prune")
 
     assert pruned["removed_entries"] == 0
-    assert service.store.get_json(f"cache:{cache_key}") is not None
+    assert service.store.get_json(cache_key) is not None
 
 
 def test_invalidated_context_pack_cache_reports_stale(
@@ -440,6 +452,102 @@ def test_cold_then_warm_context_pack_flow(service: ContextService) -> None:
     assert warm["cache"]["hit"] is True
     assert warm["metrics"]["elapsed_ms"] >= 0
     assert warm["references"][0]["reference_id"].startswith("ctxref-")
+
+
+def test_context_pack_prompt_variation_reuses_fragments(
+    service: ContextService,
+) -> None:
+    first = service.context_pack(
+        "review auth token behavior", max_items=1, output_profile="compact"
+    )
+    varied = service.context_pack(
+        "inspect auth token flow", max_items=4, output_profile="normal"
+    )
+
+    assert first["items"]
+    assert varied["items"]
+    assert varied["cache"]["hit"] is False
+    assert varied["cache"]["fragment_hits"] > 0
+    assert varied["cache"]["fragment_hit_ratio"] >= 0.2
+
+    metrics = service.context_admin(mode="metrics")
+    assert metrics["cache"]["context_pack_fragment_hits"] >= varied["cache"][
+        "fragment_hits"
+    ]
+    assert metrics["cache"]["context_pack_fragment_hit_ratio"] >= 0.2
+
+
+def test_context_pack_cache_miss_uses_specific_reason(
+    service: ContextService,
+) -> None:
+    service.context_pack("review auth token behavior", max_items=2)
+
+    changed_terms = service.context_pack("review config settings behavior", max_items=2)
+
+    assert changed_terms["cache"]["hit"] is False
+    assert changed_terms["cache"]["reason"] == "terms_changed"
+
+
+def test_context_pack_changed_signature_invalidates_fragments(
+    service: ContextService, sample_repo: Path
+) -> None:
+    service.context_pack("review auth token behavior", max_items=2)
+    auth_file = sample_repo / "src" / "auth.py"
+    auth_file.write_text(
+        auth_file.read_text(encoding="utf-8") + "\ndef token_refresh():\n    return True\n",
+        encoding="utf-8",
+    )
+
+    changed = service.context_pack("inspect auth token flow", max_items=2)
+
+    assert changed["cache"]["fragment_misses"] > 0
+    assert any(
+        detail["reason"] == "index_changed"
+        for detail in changed["cache"]["miss_details"]
+    )
+
+
+def test_context_pack_missing_refresh_signature_skips_fragment_writes(
+    service: ContextService, monkeypatch
+) -> None:
+    monkeypatch.setattr(service, "_current_refresh_signature", lambda: ("", False))
+
+    pack = service.context_pack("review auth token behavior", max_items=2)
+    stats = service.context_admin(mode="cache_stats")
+
+    assert pack["cache"]["reason"] == "signature_unavailable"
+    assert pack["cache"]["fragment_hits"] == 0
+    assert all(
+        detail["reason"] == "signature_unavailable"
+        for detail in pack["cache"]["miss_details"]
+    )
+    assert "retrieval.search_term" not in stats["namespaces"]
+    assert "retrieval.file_summary" not in stats["namespaces"]
+
+
+def test_legacy_retrieval_cache_rows_are_stale_and_pruned(
+    service: ContextService,
+) -> None:
+    service.store.put_json(
+        "cache:legacy-search-fragment",
+        {
+            "status": "active",
+            "namespace": "retrieval.search_term",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+            "metadata": {"term": "auth"},
+            "value": {"schema": "retrieval.search_term.v0"},
+        },
+    )
+
+    stats = service.context_admin(mode="cache_stats")
+
+    assert stats["namespaces"]["retrieval.search_term"]["stale_count"] == 1
+    assert stats["namespaces"]["retrieval.search_term"]["legacy_count"] == 1
+
+    pruned = service.context_admin(mode="cache_prune")
+
+    assert pruned["stale_removed"] >= 1
+    assert service.store.get_json("cache:legacy-search-fragment") is None
 
 
 def test_warm_context_pack_reuses_retrieval_for_response_assembly(

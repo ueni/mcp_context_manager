@@ -22,6 +22,7 @@ from .util import (
     prompt_injection_signals,
     sanitize_json,
     sha256_text,
+    trim_text,
 )
 
 DEFAULT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
@@ -29,6 +30,49 @@ DEFAULT_CACHE_MAX_AGE_MINUTES = DEFAULT_CACHE_TTL_SECONDS // 60
 DEFAULT_INDEX_MAX_FILES = 5000
 DEFAULT_WARMUP_MAX_FILES = 100
 CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR = 8
+RETRIEVAL_SEARCH_TERM_SCHEMA = "retrieval.search_term.v1"
+RETRIEVAL_FILE_SUMMARY_SCHEMA = "retrieval.file_summary.v1"
+RETRIEVAL_SEARCH_TERM_POOL_SIZE = 40
+RETRIEVAL_FILE_SUMMARY_MAX_CHARS = 1200
+CACHE_ENTRY_SCHEMA_VERSION = 2
+FRAGMENT_CACHE_NAMESPACES = {
+    "context_lookup.search",
+    "context_pack.retrieval",
+    "retrieval.search_term",
+    "retrieval.file_summary",
+}
+GENERIC_RETRIEVAL_TERMS = {
+    "add",
+    "and",
+    "behavior",
+    "bug",
+    "build",
+    "change",
+    "code",
+    "debug",
+    "diff",
+    "fix",
+    "for",
+    "implement",
+    "implementation",
+    "issue",
+    "merge",
+    "plan",
+    "pr",
+    "real",
+    "refactor",
+    "regression",
+    "related",
+    "review",
+    "run",
+    "test",
+    "tests",
+    "update",
+    "verify",
+    "with",
+    "work",
+    "world",
+}
 
 
 class ContextService:
@@ -66,74 +110,24 @@ class ContextService:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
         if mode == "search":
             self._ensure_index_fresh(path=path)
-            index_status = self.index.status()
-            cache_key = self._cache_key(
-                "context_lookup.search",
-                self._context_lookup_search_cache_args(
-                    query=query,
-                    path=path,
-                    max_results=max_results,
-                    include_globs=include_globs,
-                    index_status=index_status,
-                ),
-            )
-            cache_lookup = self._cache_lookup(cache_key)
-            cached = cache_lookup.get("value") if cache_lookup["hit"] else None
-            if isinstance(cached, dict):
-                cached = self._context_lookup_search_cache_value(
-                    cached,
-                    query=query,
-                )
-                self._record_metric(
-                    "context_lookup.search",
-                    started,
-                    cache_hit=True,
-                    cache_namespace="context_lookup.search",
-                    cache_reason="hit",
-                    result_count=int(cached.get("count", 0)),
-                )
-                return {
-                    **cached,
-                    "cache": self._cache_public_metadata(
-                        cache_key,
-                        "context_lookup.search",
-                        cache_lookup,
-                        reason="hit",
-                    ),
-                }
-            result = self.index.search(
+            result, cache_metadata = self._cached_search(
                 query=query,
                 path=path,
                 max_results=max_results,
                 include_globs=include_globs,
-            )
-            self._cache_set(
-                cache_key,
-                result,
-                namespace="context_lookup.search",
-                metadata={
-                    "query": query,
-                    "path": path,
-                    "index_generated_at": index_status.get("generated_at", ""),
-                    "refresh_signature": index_status.get("refresh_signature", ""),
-                },
+                public_namespace="context_lookup.search",
             )
             self._record_metric(
                 "context_lookup.search",
                 started,
-                cache_hit=False,
+                cache_hit=bool(cache_metadata.get("hit")),
                 cache_namespace="context_lookup.search",
-                cache_reason=str(cache_lookup.get("reason") or "miss"),
+                cache_reason=str(cache_metadata.get("reason") or "miss"),
                 result_count=int(result.get("count", 0)),
             )
             return {
                 **result,
-                "cache": self._cache_public_metadata(
-                    cache_key,
-                    "context_lookup.search",
-                    cache_lookup,
-                    reason=str(cache_lookup.get("reason") or "miss"),
-                ),
+                "cache": cache_metadata,
             }
         if mode == "snippet":
             self._ensure_index_fresh(path=path)
@@ -339,6 +333,7 @@ class ContextService:
         stage_timings["memory_lookup_ms"] = self._elapsed_ms(stage_started)
         prompt_sha256 = sha256_text(prompt)
         token_counting = self.token_counter.metadata()
+        refresh_signature, refresh_signature_available = self._current_refresh_signature()
         retrieval_max_items = max(
             CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR,
             max(1, max_items),
@@ -347,9 +342,7 @@ class ContextService:
             route=route,
             terms=terms,
             explicit_paths=explicit_paths,
-            profile=profile,
-            retrieval_max_items=retrieval_max_items,
-            token_counting=token_counting,
+            refresh_signature=refresh_signature,
         )
         stage_started = time.perf_counter()
         if refresh_index:
@@ -365,10 +358,18 @@ class ContextService:
         stage_timings["cache_lookup_ms"] = self._elapsed_ms(stage_started)
         cache_hit = isinstance(cached, dict)
         cache_reason = str(cache_lookup.get("reason") or "miss")
+        fragment_hits = 0
+        fragment_misses = 0
+        fragment_miss_details: list[dict[str, Any]] = []
         if isinstance(cached, dict):
             candidates = list(cached.get("candidates", []))
             retrieval_omitted = list(cached.get("omitted", []))
             retrieval_stats = dict(cached.get("retrieval_stats", {}))
+            retrieval_stats["fragment_hits"] = 0
+            retrieval_stats["fragment_misses"] = 0
+            retrieval_stats["fragment_hit_ratio"] = 0.0
+            retrieval_stats["fragment_miss_details"] = []
+            retrieval_stats["whole_pack_cache_hit"] = True
             stage_timings["candidate_retrieval_ms"] = 0.0
             stage_timings["search_ranking_ms"] = 0.0
             stage_timings["snippet_batch_ms"] = 0.0
@@ -382,11 +383,11 @@ class ContextService:
                 else self._cache_miss_reason(
                     namespace="context_pack.retrieval",
                     metadata={
+                        "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
                         "prompt_sha256": prompt_sha256,
                         "terms_key": terms_key,
-                        "refresh_signature": self.index.status().get(
-                            "refresh_signature", ""
-                        ),
+                        "explicit_paths": self._canonical_cache_paths(explicit_paths),
+                        "refresh_signature": refresh_signature,
                     },
                 )
             )
@@ -396,6 +397,8 @@ class ContextService:
                 explicit_paths=explicit_paths,
                 profile=profile,
                 max_items=retrieval_max_items,
+                refresh_signature=refresh_signature,
+                refresh_signature_available=refresh_signature_available,
             )
             stage_timings["candidate_retrieval_ms"] = self._elapsed_ms(stage_started)
             stage_timings["search_ranking_ms"] = stage_timings[
@@ -404,35 +407,41 @@ class ContextService:
             stage_timings["snippet_batch_ms"] = round(
                 float(retrieval_stats.get("snippet_batch_ms", 0.0)), 3
             )
-            self._cache_set(
-                cache_key,
-                {
-                    "schema": "context_pack.retrieval_cache.v1",
-                    "prompt_sha256": prompt_sha256,
-                    "route": route,
-                    "terms": terms,
-                    "candidates": candidates,
-                    "omitted": retrieval_omitted,
-                    "retrieval_stats": retrieval_stats,
-                },
-                namespace="context_pack.retrieval",
-                metadata={
-                    "prompt_sha256": prompt_sha256,
-                    "route": route,
-                    "refresh_signature": self.index.status().get(
-                        "refresh_signature", ""
-                    ),
-                    "terms_key": terms_key,
-                    "profile": profile,
-                    "retrieval_item_floor": CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR,
-                    "retrieval_max_items": retrieval_max_items,
-                    "token_counting": self.token_counter.cache_key_metadata(),
-                },
-            )
+            fragment_hits = int(retrieval_stats.get("fragment_hits", 0) or 0)
+            fragment_misses = int(retrieval_stats.get("fragment_misses", 0) or 0)
+            fragment_miss_details = [
+                row
+                for row in retrieval_stats.get("fragment_miss_details", [])
+                if isinstance(row, dict)
+            ]
+            if refresh_signature_available:
+                self._cache_set(
+                    cache_key,
+                    {
+                        "schema": "context_pack.retrieval_cache.v1",
+                        "prompt_sha256": prompt_sha256,
+                        "route": route,
+                        "terms": terms,
+                        "candidates": candidates,
+                        "omitted": retrieval_omitted,
+                        "retrieval_stats": retrieval_stats,
+                    },
+                    namespace="context_pack.retrieval",
+                    metadata={
+                        "prompt_sha256": prompt_sha256,
+                        "route": route,
+                        "refresh_signature": refresh_signature,
+                        "terms_key": terms_key,
+                        "explicit_paths": self._canonical_cache_paths(explicit_paths),
+                    },
+                )
+            elif cache_reason == "no_compatible_entry":
+                cache_reason = "signature_unavailable"
         stage_started = time.perf_counter()
         omitted = list(retrieval_omitted)
+        response_candidates = self._profile_candidates(candidates, profile)
         selected, omitted_budget = self._select_candidates(
-            candidates,
+            response_candidates,
             max_items=max_items,
             content_budget=max(1000, budget - 2400),
             per_path_limit=1 if profile == "compact" else 2,
@@ -446,9 +455,9 @@ class ContextService:
                 "prompt_sha256": sha256_text(prompt),
                 "route": route,
                 "terms": terms,
-                "candidate_count": len(candidates),
+                "candidate_count": len(response_candidates),
                 "selected_count": len(selected),
-                "candidates": candidates,
+                "candidates": response_candidates,
                 "omitted": omitted,
                 "retrieval_stats": retrieval_stats,
                 "cache": {
@@ -458,19 +467,25 @@ class ContextService:
                     "reason": cache_reason,
                     "status": str(cache_lookup.get("status", "missing")),
                     "warnings": list(cache_lookup.get("warnings") or []),
+                    "fragment_hits": fragment_hits,
+                    "fragment_misses": fragment_misses,
+                    "fragment_hit_ratio": self._hit_ratio(
+                        fragment_hits, fragment_misses
+                    ),
+                    "miss_details": fragment_miss_details[:12],
                 },
             },
-            summary={"route": route, "candidate_count": len(candidates), "selected_count": len(selected)},
+            summary={"route": route, "candidate_count": len(response_candidates), "selected_count": len(selected)},
             ttl_hours=24,
         )
         stage_timings["reference_write_ms"] = self._elapsed_ms(stage_started)
-        candidate_chars = sum(int(item.get("raw_chars", 0)) for item in candidates)
+        candidate_chars = sum(int(item.get("raw_chars", 0)) for item in response_candidates)
         selected_chars = sum(int(item.get("raw_chars", 0)) for item in selected)
         output_token_count = self._token_count(
             json.dumps(selected, ensure_ascii=False)
         )
         output_tokens = output_token_count.count
-        baseline_count = self._baseline_input_token_count(candidates)
+        baseline_count = self._baseline_input_token_count(response_candidates)
         baseline_tokens = max(baseline_count.count, output_tokens)
         token_counting = self._merge_token_counting_metadata(
             token_counting,
@@ -522,10 +537,10 @@ class ContextService:
             },
             "summary": {
                 "item_count": len(selected),
-                "candidate_count": len(candidates),
+                "candidate_count": len(response_candidates),
                 "omitted_count": len(omitted),
                 "route": route,
-                "candidates_per_selected": round(len(candidates) / len(selected), 3)
+                "candidates_per_selected": round(len(response_candidates) / len(selected), 3)
                 if selected
                 else 0.0,
             },
@@ -541,6 +556,12 @@ class ContextService:
                 "status": str(cache_lookup.get("status", "missing")),
                 "expires_at": str(cache_lookup.get("expires_at", "")),
                 "warnings": list(cache_lookup.get("warnings") or []),
+                "fragment_hits": fragment_hits,
+                "fragment_misses": fragment_misses,
+                "fragment_hit_ratio": self._hit_ratio(
+                    fragment_hits, fragment_misses
+                ),
+                "miss_details": fragment_miss_details[:12],
                 "index_refresh": {
                     "skipped": bool(index_refresh.get("skipped", False)),
                     "reason": index_refresh.get("reason", ""),
@@ -554,7 +575,7 @@ class ContextService:
             "metrics": {
                 "elapsed_ms": 0.0,
                 "stage_timings_ms": {},
-                "candidate_count": len(candidates),
+                "candidate_count": len(response_candidates),
                 "selected_count": len(selected),
                 "candidate_raw_chars": candidate_chars,
                 "selected_raw_chars": selected_chars,
@@ -594,12 +615,14 @@ class ContextService:
             external_tool_calls_saved=external_calls_saved,
             references_bytes_deferred_est=reference_bytes_deferred,
             result_count=len(selected),
-            candidate_count=len(candidates),
+            candidate_count=len(response_candidates),
             omitted_count=len(omitted),
             route=route,
             stage_timings_ms=stage_timings,
             cache_namespace="context_pack.retrieval",
             cache_reason=cache_reason,
+            fragment_cache_hits=fragment_hits,
+            fragment_cache_misses=fragment_misses,
         )
         return result
 
@@ -798,67 +821,309 @@ class ContextService:
         route: str,
         terms: list[str],
         explicit_paths: list[str],
-        profile: str,
-        retrieval_max_items: int,
-        token_counting: dict[str, Any],
+        refresh_signature: str,
     ) -> str:
-        status = self.index.status()
         return self._cache_key(
             "context_pack.retrieval",
             {
+                "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
                 "route": route,
                 "terms": sorted(set(terms)),
                 "explicit_paths": self._canonical_cache_paths(explicit_paths),
-                "output_profile": profile,
-                "retrieval_max_items": max(
-                    CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR,
-                    max(1, retrieval_max_items),
-                ),
-                "index_generated_at": status.get("generated_at", ""),
-                "refresh_signature": status.get("refresh_signature", ""),
+                "refresh_signature": refresh_signature,
                 "project_id": self.config.project_id,
-                "token_counting": {
-                    "tokenizer": token_counting.get("tokenizer", ""),
-                    "tokenizer_available": token_counting.get(
-                        "tokenizer_available", False
-                    ),
-                    "token_count_source": token_counting.get(
-                        "token_count_source", ""
-                    ),
-                },
             },
         )
 
-    def _context_lookup_search_cache_args(
+    def _current_refresh_signature(self) -> tuple[str, bool]:
+        status = self.index.status()
+        status_signature = str(status.get("refresh_signature", ""))
+        if status_signature and bool(status.get("refresh_signature_available", False)):
+            return status_signature, True
+        signature = self.index.refresh_signature(max_files=DEFAULT_INDEX_MAX_FILES)
+        if bool(signature.get("available", False)) and signature.get("signature"):
+            return str(signature["signature"]), True
+        return "", False
+
+    def _search_pool_size(self, requested: int) -> int:
+        requested = max(1, int(requested))
+        if requested <= RETRIEVAL_SEARCH_TERM_POOL_SIZE:
+            return RETRIEVAL_SEARCH_TERM_POOL_SIZE
+        return requested
+
+    def _search_term_cache_key(
+        self,
+        term: str,
+        path: str,
+        include_globs: list[str] | None,
+        pool_size: int,
+        refresh_signature: str,
+    ) -> str:
+        return self._cache_key(
+            "retrieval.search_term",
+            {
+                "schema": RETRIEVAL_SEARCH_TERM_SCHEMA,
+                "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                "project_id": self.config.project_id,
+                "refresh_signature": refresh_signature,
+                "path": self._canonical_cache_path(path),
+                "include_globs": self._canonical_cache_globs(include_globs),
+                "term": term,
+                "pool_size": self._search_pool_size(pool_size),
+            },
+        )
+
+    def _cached_search(
         self,
         query: str,
         path: str,
         max_results: int,
         include_globs: list[str] | None,
-        index_status: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "terms": sorted(set(normalize_query_terms(query, max_terms=8))),
-            "path": self._canonical_cache_path(path),
-            "max_results": max_results,
-            "include_globs": self._canonical_cache_globs(include_globs),
-            "index": index_status.get("generated_at", ""),
-            "refresh_signature": index_status.get("refresh_signature", ""),
-            "project_id": self.config.project_id,
+        public_namespace: str,
+        reusable_terms: list[str] | None = None,
+        allow_fallback: bool = True,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        terms = normalize_query_terms(query, max_terms=8)
+        if not terms:
+            raise ValueError("query must contain at least one searchable term")
+        refresh_signature, refresh_signature_available = self._current_refresh_signature()
+        shard_terms = reusable_terms if reusable_terms is not None else terms
+        shard_terms = [term for term in shard_terms if term]
+        pool_size = self._search_pool_size(max_results)
+        fragments: list[dict[str, Any]] = []
+        miss_details: list[dict[str, Any]] = []
+        fragment_hits = 0
+        fragment_misses = 0
+        for term in shard_terms:
+            fragment = self._cached_search_term(
+                term=term,
+                path=path,
+                include_globs=include_globs,
+                pool_size=pool_size,
+                refresh_signature=refresh_signature,
+                refresh_signature_available=refresh_signature_available,
+                allow_fallback=allow_fallback,
+            )
+            fragments.append(fragment)
+            if fragment["cache_hit"]:
+                fragment_hits += 1
+            else:
+                fragment_misses += 1
+                miss_details.append(fragment["miss_detail"])
+        rows = self._merge_search_fragments(
+            terms=terms,
+            fragments=fragments,
+            max_results=max_results,
+        )
+        result = {
+            "schema": "context_search.v1",
+            "query": query,
+            "terms": terms,
+            "count": len(rows),
+            "results": rows,
+            "index": self.index.status(),
+        }
+        public_key = self._cache_key(
+            public_namespace,
+            {
+                "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                "project_id": self.config.project_id,
+                "refresh_signature": refresh_signature,
+                "path": self._canonical_cache_path(path),
+                "include_globs": self._canonical_cache_globs(include_globs),
+                "terms": sorted(set(terms)),
+                "pool_size": pool_size,
+            },
+        )
+        miss_reasons = [
+            str(detail.get("reason", ""))
+            for detail in miss_details
+            if isinstance(detail, dict) and detail.get("reason")
+        ]
+        if fragment_misses == 0 and shard_terms:
+            reason = "hit"
+        elif miss_reasons and len(set(miss_reasons)) == 1:
+            reason = miss_reasons[0]
+        elif miss_reasons:
+            reason = "fragment_miss"
+        else:
+            reason = "no_compatible_entry"
+        status = "active"
+        if any(reason == "expired" for reason in miss_reasons):
+            status = "expired"
+        elif any(reason in {"invalidated", "legacy_schema_version", "legacy_missing_refresh_signature"} for reason in miss_reasons):
+            status = "stale"
+        if not refresh_signature_available:
+            reason = "signature_unavailable"
+            status = "disabled"
+        return result, {
+            "hit": fragment_misses == 0 and bool(shard_terms),
+            "key": public_key,
+            "namespace": public_namespace,
+            "reason": reason,
+            "status": status,
+            "expires_at": "",
+            "warnings": [],
+            "fragment_hits": fragment_hits,
+            "fragment_misses": fragment_misses,
+            "fragment_hit_ratio": self._hit_ratio(fragment_hits, fragment_misses),
+            "miss_details": miss_details[:12],
         }
 
-    def _context_lookup_search_cache_value(
+    def _cached_search_term(
         self,
-        cached: dict[str, Any],
-        query: str,
+        term: str,
+        path: str,
+        include_globs: list[str] | None,
+        pool_size: int,
+        refresh_signature: str,
+        refresh_signature_available: bool,
+        allow_fallback: bool = True,
     ) -> dict[str, Any]:
-        terms = normalize_query_terms(query, max_terms=8)
-        results = [
-            {**row, "terms": terms}
-            for row in cached.get("results", [])
-            if isinstance(row, dict)
-        ]
-        return {**cached, "query": query, "terms": terms, "results": results}
+        canonical_path = self._canonical_cache_path(path)
+        canonical_globs = self._canonical_cache_globs(include_globs)
+        key = self._search_term_cache_key(
+            term=term,
+            path=canonical_path,
+            include_globs=canonical_globs,
+            pool_size=pool_size,
+            refresh_signature=refresh_signature,
+        )
+        miss_detail = {
+            "schema": "cache_miss_detail.v1",
+            "namespace": "retrieval.search_term",
+            "term": term,
+            "path": canonical_path,
+            "include_globs": canonical_globs,
+            "reason": "signature_unavailable"
+            if not refresh_signature_available
+            else "no_compatible_entry",
+        }
+        if refresh_signature_available:
+            lookup = self._cache_lookup(key)
+            cached = lookup.get("value") if lookup["hit"] else None
+            if isinstance(cached, dict) and cached.get("schema") == RETRIEVAL_SEARCH_TERM_SCHEMA:
+                return {
+                    "term": term,
+                    "results": [
+                        row for row in cached.get("results", []) if isinstance(row, dict)
+                    ],
+                    "cache_hit": True,
+                    "cache_key": key,
+                    "miss_detail": {},
+                }
+            lookup_reason = str(lookup.get("reason") or "")
+            miss_detail["reason"] = (
+                lookup_reason
+                if lookup_reason not in {"", "miss", "hit"}
+                else self._cache_miss_reason(
+                    namespace="retrieval.search_term",
+                    metadata={
+                        "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                        "term": term,
+                        "path": canonical_path,
+                        "include_globs": canonical_globs,
+                        "refresh_signature": refresh_signature,
+                        "pool_size": self._search_pool_size(pool_size),
+                    },
+                )
+            )
+        result = self.index.search(
+            query=term,
+            path=canonical_path,
+            max_results=self._search_pool_size(pool_size),
+            include_globs=canonical_globs or None,
+            allow_fallback=allow_fallback,
+        )
+        rows = [row for row in result.get("results", []) if isinstance(row, dict)]
+        if refresh_signature_available:
+            self._cache_set(
+                key,
+                {
+                    "schema": RETRIEVAL_SEARCH_TERM_SCHEMA,
+                    "term": term,
+                    "path": canonical_path,
+                    "include_globs": canonical_globs,
+                    "refresh_signature": refresh_signature,
+                    "pool_size": self._search_pool_size(pool_size),
+                    "count": len(rows),
+                    "results": rows,
+                },
+                namespace="retrieval.search_term",
+                metadata={
+                    "schema": RETRIEVAL_SEARCH_TERM_SCHEMA,
+                    "term": term,
+                    "path": canonical_path,
+                    "include_globs": canonical_globs,
+                    "refresh_signature": refresh_signature,
+                    "pool_size": self._search_pool_size(pool_size),
+                },
+            )
+        return {
+            "term": term,
+            "results": rows,
+            "cache_hit": False,
+            "cache_key": key,
+            "miss_detail": miss_detail,
+        }
+
+    def _merge_search_fragments(
+        self,
+        terms: list[str],
+        fragments: list[dict[str, Any]],
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        matched: dict[str, dict[str, Any]] = {}
+        for fragment in fragments:
+            fragment_term = str(fragment.get("term", ""))
+            for row in fragment.get("results", []):
+                if not isinstance(row, dict):
+                    continue
+                path = str(row.get("path", ""))
+                if not path:
+                    continue
+                current = matched.setdefault(
+                    path,
+                    {
+                        "path": path,
+                        "line": int(row.get("line", 1) or 1),
+                        "excerpt": str(row.get("excerpt", "")),
+                        "source": str(row.get("source", "term_index")),
+                        "term_hits": 0,
+                        "term_count": 0,
+                        "_matched_terms": set(),
+                    },
+                )
+                current["term_hits"] = int(current.get("term_hits", 0)) + int(
+                    row.get("term_hits", 1) or 1
+                )
+                current["term_count"] = int(current.get("term_count", 0)) + int(
+                    row.get("term_count", 1) or 1
+                )
+                current["_matched_terms"].add(fragment_term)
+                row_line = int(row.get("line", 1) or 1)
+                if row_line < int(current.get("line", 1) or 1):
+                    current["line"] = row_line
+                    current["excerpt"] = str(row.get("excerpt", ""))
+                    current["source"] = str(row.get("source", current["source"]))
+        rows: list[dict[str, Any]] = []
+        for row in matched.values():
+            path = str(row["path"])
+            excerpt = str(row.get("excerpt", ""))
+            score = sum(2.0 for term in terms if term in path.lower())
+            score += sum(1.0 for term in terms if term in excerpt.lower())
+            score += float(row.get("term_hits", 0)) * 2.5
+            score += min(float(row.get("term_count", 0)), 8.0) * 0.25
+            public_row = {
+                key: value
+                for key, value in row.items()
+                if key != "_matched_terms"
+            }
+            public_row["score"] = round(score, 4)
+            public_row["terms"] = terms
+            rows.append(public_row)
+        rows.sort(key=lambda item: (-float(item["score"]), item["path"]))
+        return rows[:max_results]
 
     def _canonical_cache_path(self, path: str) -> str:
         try:
@@ -887,12 +1152,164 @@ class ContextService:
             }
         )
 
+    def _reusable_retrieval_terms(self, terms: list[str]) -> list[str]:
+        reusable: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            if term in seen or term in GENERIC_RETRIEVAL_TERMS:
+                continue
+            seen.add(term)
+            reusable.append(term)
+            if len(reusable) >= 8:
+                break
+        return reusable
+
+    def _file_fingerprint(self, path: str) -> dict[str, Any]:
+        file_path = self.config.resolve_repo_path(path)
+        stat = file_path.stat()
+        rel = self.config.repo_relative(file_path)
+        row = self.store.get_json(f"index:file:{rel}", {})
+        digest = ""
+        if (
+            isinstance(row, dict)
+            and int(row.get("size", -1)) == int(stat.st_size)
+            and int(row.get("mtime_ns", -1)) == int(stat.st_mtime_ns)
+        ):
+            digest = str(row.get("sha256", ""))
+        return {
+            "path": rel,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "sha256": digest,
+            "cache_token": digest or f"stat:{int(stat.st_size)}:{int(stat.st_mtime_ns)}",
+        }
+
+    def _file_summary_cache_key(
+        self,
+        fingerprint: dict[str, Any],
+        line_anchor: int,
+    ) -> str:
+        return self._cache_key(
+            "retrieval.file_summary",
+            {
+                "schema": RETRIEVAL_FILE_SUMMARY_SCHEMA,
+                "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                "project_id": self.config.project_id,
+                "path": fingerprint.get("path", ""),
+                "fingerprint": fingerprint.get("cache_token", ""),
+                "line_anchor": max(0, int(line_anchor)),
+                "max_chars": RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
+            },
+        )
+
+    def _cached_file_summary(
+        self,
+        path: str,
+        line_anchor: int,
+        refresh_signature: str,
+        refresh_signature_available: bool,
+    ) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+        fingerprint = self._file_fingerprint(path)
+        anchor = max(0, int(line_anchor))
+        key = self._file_summary_cache_key(fingerprint, anchor)
+        miss_detail = {
+            "schema": "cache_miss_detail.v1",
+            "namespace": "retrieval.file_summary",
+            "path": fingerprint["path"],
+            "line_anchor": anchor,
+            "reason": "signature_unavailable"
+            if not refresh_signature_available
+            else "no_compatible_entry",
+        }
+        if refresh_signature_available:
+            lookup = self._cache_lookup(key)
+            cached = lookup.get("value") if lookup["hit"] else None
+            if isinstance(cached, dict) and cached.get("schema") == RETRIEVAL_FILE_SUMMARY_SCHEMA:
+                row = self.store.get_json(f"cache:{key}", {})
+                row_metadata = row.get("metadata", {}) if isinstance(row, dict) else {}
+                row_metadata = row_metadata if isinstance(row_metadata, dict) else {}
+                if str(row_metadata.get("refresh_signature", "")) == refresh_signature:
+                    summary = cached.get("summary")
+                    if isinstance(summary, dict):
+                        return summary, True, {}
+            lookup_reason = str(lookup.get("reason") or "")
+            miss_detail["reason"] = (
+                lookup_reason
+                if lookup_reason not in {"", "miss", "hit"}
+                else self._cache_miss_reason(
+                    namespace="retrieval.file_summary",
+                    metadata={
+                        "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                        "path": fingerprint["path"],
+                        "refresh_signature": refresh_signature,
+                        "line_anchor": anchor,
+                    },
+                )
+            )
+        summary = self.index.file_summary(
+            fingerprint["path"],
+            max_chars=RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
+            matched_line=anchor or None,
+        )
+        if refresh_signature_available:
+            self._cache_set(
+                key,
+                {
+                    "schema": RETRIEVAL_FILE_SUMMARY_SCHEMA,
+                    "path": fingerprint["path"],
+                    "file_fingerprint": fingerprint,
+                    "line_anchor": anchor,
+                    "max_chars": RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
+                    "summary": summary,
+                },
+                namespace="retrieval.file_summary",
+                metadata={
+                    "schema": RETRIEVAL_FILE_SUMMARY_SCHEMA,
+                    "path": fingerprint["path"],
+                    "file_fingerprint": fingerprint,
+                    "line_anchor": anchor,
+                    "refresh_signature": refresh_signature,
+                    "max_chars": RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
+                },
+            )
+        return summary, False, miss_detail
+
+    def _profile_candidates(
+        self, candidates: list[dict[str, Any]], profile: str
+    ) -> list[dict[str, Any]]:
+        profiled = []
+        for item in candidates:
+            copied = dict(item)
+            source_chars = int(copied.get("source_chars", 0) or 0)
+            is_explicit = "explicit_path" in set(copied.get("reason_codes", []))
+            if profile == "compact":
+                max_chars = 360 if is_explicit else 260
+            elif profile == "verbose":
+                max_chars = 900
+            else:
+                max_chars = 420
+            content, truncated = trim_text(str(copied.get("content", "")), max_chars)
+            copied["content"] = content
+            copied["raw_chars"] = len(content)
+            copied["deferred_chars"] = max(0, source_chars - len(content))
+            copied["prompt_injection_signals"] = prompt_injection_signals(content)
+            if truncated:
+                copied["truncated"] = True
+            profiled.append(copied)
+        return profiled
+
+    def _hit_ratio(self, hits: int, misses: int) -> float:
+        total = max(0, int(hits)) + max(0, int(misses))
+        return round(max(0, int(hits)) / total, 4) if total else 0.0
+
     def _context_pack_candidates(
         self,
         terms: list[str],
         explicit_paths: list[str],
         profile: str,
         max_items: int,
+        refresh_signature: str,
+        refresh_signature_available: bool,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         omitted: list[dict[str, Any]] = []
@@ -912,18 +1329,38 @@ class ContextService:
             "snippet_request_count": 0,
             "snippet_batch_ms": 0.0,
             "source_counts": {},
+            "reusable_terms": self._reusable_retrieval_terms(terms),
+            "fragment_hits": 0,
+            "fragment_misses": 0,
+            "fragment_hit_ratio": 0.0,
+            "fragment_miss_details": [],
         }
 
         def count_source(source: str) -> None:
             counts = retrieval_stats.setdefault("source_counts", {})
             counts[source] = int(counts.get(source, 0)) + 1
 
+        def count_fragment(hit: bool, detail: dict[str, Any]) -> None:
+            if hit:
+                retrieval_stats["fragment_hits"] = int(
+                    retrieval_stats.get("fragment_hits", 0)
+                ) + 1
+                return
+            retrieval_stats["fragment_misses"] = int(
+                retrieval_stats.get("fragment_misses", 0)
+            ) + 1
+            if detail:
+                retrieval_stats.setdefault("fragment_miss_details", []).append(detail)
+
         for rel in explicit_paths:
             try:
-                summary = self.index.file_summary(
+                summary, summary_hit, miss_detail = self._cached_file_summary(
                     rel,
-                    max_chars=900 if profile != "compact" else 360,
+                    line_anchor=0,
+                    refresh_signature=refresh_signature,
+                    refresh_signature_available=refresh_signature_available,
                 )
+                count_fragment(summary_hit, miss_detail)
             except Exception as exc:
                 omitted.append(
                     {
@@ -950,18 +1387,38 @@ class ContextService:
             try:
                 search_limit = max(max_items * 4, 8)
                 retrieval_stats["search_limit"] = search_limit
-                search = self.index.search(
-                    query=" ".join(terms), max_results=search_limit
+                reusable_terms = self._reusable_retrieval_terms(terms)
+                retrieval_stats["reusable_terms"] = reusable_terms
+                search, search_cache = self._cached_search(
+                    query=" ".join(terms),
+                    path=".",
+                    max_results=search_limit,
+                    include_globs=None,
+                    public_namespace="context_pack.search",
+                    reusable_terms=reusable_terms,
+                )
+                retrieval_stats["fragment_hits"] = int(
+                    retrieval_stats.get("fragment_hits", 0)
+                ) + int(search_cache.get("fragment_hits", 0) or 0)
+                retrieval_stats["fragment_misses"] = int(
+                    retrieval_stats.get("fragment_misses", 0)
+                ) + int(search_cache.get("fragment_misses", 0) or 0)
+                retrieval_stats.setdefault("fragment_miss_details", []).extend(
+                    row
+                    for row in search_cache.get("miss_details", [])
+                    if isinstance(row, dict)
                 )
                 retrieval_stats["search_result_count"] = len(search["results"])
                 for row in search["results"]:
                     path = row["path"]
                     line = int(row.get("line") or self._first_matching_line(path, terms) or 1)
-                    summary = self.index.file_summary(
+                    summary, summary_hit, miss_detail = self._cached_file_summary(
                         path,
-                        max_chars=420 if profile != "compact" else 260,
-                        matched_line=line,
+                        line_anchor=line,
+                        refresh_signature=refresh_signature,
+                        refresh_signature_available=refresh_signature_available,
                     )
+                    count_fragment(summary_hit, miss_detail)
                     candidates.append(
                         self._candidate_from_summary(
                             summary,
@@ -998,11 +1455,13 @@ class ContextService:
                 symbols = self.index.symbols(query=" ".join(terms), limit=symbol_limit)
                 retrieval_stats["symbol_result_count"] = len(symbols["symbols"])
                 for row in symbols["symbols"]:
-                    summary = self.index.file_summary(
+                    summary, summary_hit, miss_detail = self._cached_file_summary(
                         str(row["path"]),
-                        max_chars=420 if profile != "compact" else 260,
-                        matched_line=max(1, int(row["line_start"])),
+                        line_anchor=max(1, int(row["line_start"])),
+                        refresh_signature=refresh_signature,
+                        refresh_signature_available=refresh_signature_available,
                     )
+                    count_fragment(summary_hit, miss_detail)
                     candidates.append(
                         self._candidate_from_summary(
                             summary,
@@ -1022,6 +1481,13 @@ class ContextService:
         except Exception:
             pass
 
+        retrieval_stats["fragment_hit_ratio"] = self._hit_ratio(
+            int(retrieval_stats.get("fragment_hits", 0) or 0),
+            int(retrieval_stats.get("fragment_misses", 0) or 0),
+        )
+        retrieval_stats["fragment_miss_details"] = retrieval_stats.get(
+            "fragment_miss_details", []
+        )[:20]
         return candidates, omitted, retrieval_stats
 
     def _candidate_from_summary(
@@ -1167,15 +1633,17 @@ class ContextService:
             self.index.refresh(max_files=max_files)
         focus_paths = self._benchmark_focus_paths()
         prompt = self._benchmark_prompt(focus_paths)
+        variation_prompt = self._benchmark_prompt_variation(focus_paths)
         runs = []
-        for name, refresh_index, max_items in [
-            ("cold_refresh", True, 4),
-            ("warm_cache", False, 4),
-            ("repeated_prompt", False, 4),
-            ("compact_focus", False, 2),
+        for name, run_prompt, refresh_index, max_items in [
+            ("cold_refresh", prompt, True, 4),
+            ("warm_cache", prompt, False, 4),
+            ("repeated_prompt", prompt, False, 4),
+            ("prompt_variation_reuse", variation_prompt, False, 4),
+            ("compact_focus", prompt, False, 2),
         ]:
             pack = self.context_pack(
-                prompt=prompt,
+                prompt=run_prompt,
                 focus_paths=focus_paths,
                 max_items=max_items,
                 refresh_index=refresh_index,
@@ -1185,7 +1653,14 @@ class ContextService:
             runs.append(
                 {
                     "name": name,
+                    "prompt": run_prompt,
                     "cache_hit": bool(pack["cache"]["hit"]),
+                    "cache_reason": pack["cache"]["reason"],
+                    "fragment_hits": int(pack["cache"].get("fragment_hits", 0)),
+                    "fragment_misses": int(pack["cache"].get("fragment_misses", 0)),
+                    "fragment_hit_ratio": float(
+                        pack["cache"].get("fragment_hit_ratio", 0.0)
+                    ),
                     "elapsed_ms": pack["metrics"]["elapsed_ms"],
                     "stage_timings_ms": pack["metrics"]["stage_timings_ms"],
                     "candidate_count": pack["metrics"]["candidate_count"],
@@ -1379,41 +1854,15 @@ class ContextService:
         )
         query_limit = max(0, min(int(max_entries), len(seed_queries)))
         max_results = 20
-        index_status = self.index.status()
         rows: list[dict[str, Any]] = []
         for query in seed_queries[:query_limit]:
-            cache_key = self._cache_key(
-                "context_lookup.search",
-                self._context_lookup_search_cache_args(
-                    query=query,
-                    path=path,
-                    max_results=max_results,
-                    include_globs=None,
-                    index_status=index_status,
-                ),
-            )
-            cache_lookup = self._cache_lookup(cache_key)
-            if cache_lookup["hit"]:
-                value = cache_lookup.get("value") if isinstance(cache_lookup, dict) else {}
-                rows.append(
-                    {
-                        "query": query,
-                        "path": path,
-                        "cache_hit": True,
-                        "cache_reason": "hit",
-                        "result_count": int(
-                            value.get("count", 0) if isinstance(value, dict) else 0
-                        ),
-                        "key": cache_key,
-                    }
-                )
-                continue
             try:
-                result = self.index.search(
+                result, cache = self._cached_search(
                     query=query,
                     path=path,
                     max_results=max_results,
                     include_globs=None,
+                    public_namespace="context_lookup.search",
                     allow_fallback=False,
                 )
             except Exception as exc:
@@ -1425,26 +1874,16 @@ class ContextService:
                     }
                 )
                 continue
-            self._cache_set(
-                cache_key,
-                result,
-                namespace="context_lookup.search",
-                metadata={
-                    "query": query,
-                    "path": path,
-                    "index_generated_at": index_status.get("generated_at", ""),
-                    "refresh_signature": index_status.get("refresh_signature", ""),
-                    "warmup": True,
-                },
-            )
             rows.append(
                 {
                     "query": query,
                     "path": path,
-                    "cache_hit": False,
-                    "cache_reason": str(cache_lookup.get("reason") or "miss"),
+                    "cache_hit": bool(cache.get("hit")),
+                    "cache_reason": str(cache.get("reason") or "miss"),
+                    "fragment_hits": int(cache.get("fragment_hits", 0) or 0),
+                    "fragment_misses": int(cache.get("fragment_misses", 0) or 0),
                     "result_count": int(result.get("count", 0) or 0),
-                    "key": cache_key,
+                    "key": str(cache.get("key", "")),
                 }
             )
         return rows
@@ -1475,6 +1914,14 @@ class ContextService:
             path.replace("/", " ").replace(".", " ") for path in focus_paths[:3]
         )
         return f"review {terms} behavior and related tests"
+
+    def _benchmark_prompt_variation(self, focus_paths: list[str]) -> str:
+        if not focus_paths:
+            return "inspect repository context retrieval cache behavior"
+        terms = " ".join(
+            path.replace("/", " ").replace(".", " ") for path in focus_paths[:3]
+        )
+        return f"inspect {terms} retrieval cache and implementation details"
 
     def _state_browser(
         self,
@@ -1703,6 +2150,8 @@ class ContextService:
         self.store.put_json(
             f"cache:{key}",
             {
+                "schema": "context_cache.entry.v2",
+                "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
                 "created_at": updated_at,
                 "updated_at": updated_at,
                 "expires_at": expires_at,
@@ -1710,7 +2159,11 @@ class ContextService:
                 "status": "active",
                 "namespace": namespace,
                 "key": key,
-                "metadata": {**(metadata or {}), "project_id": self.config.project_id},
+                "metadata": {
+                    **(metadata or {}),
+                    "project_id": self.config.project_id,
+                    "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                },
                 "value": sanitized_value,
                 "sensitivity": sensitivity,
             },
@@ -1750,6 +2203,7 @@ class ContextService:
                     "active_count": 0,
                     "expired_count": 0,
                     "stale_count": 0,
+                    "legacy_count": 0,
                     "sample_keys": [],
                     "hits": 0,
                     "misses": 0,
@@ -1759,6 +2213,8 @@ class ContextService:
             stats["entry_count"] = int(stats["entry_count"]) + 1
             status_key = f"{row_status['status']}_count"
             stats[status_key] = int(stats.get(status_key, 0)) + 1
+            if str(row_status.get("reason", "")).startswith("legacy_"):
+                stats["legacy_count"] = int(stats.get("legacy_count", 0)) + 1
             if len(stats["sample_keys"]) < 5:
                 stats["sample_keys"].append(key)
         for namespace, metric_stats in metric_namespaces.items():
@@ -1769,6 +2225,7 @@ class ContextService:
                     "active_count": 0,
                     "expired_count": 0,
                     "stale_count": 0,
+                    "legacy_count": 0,
                     "sample_keys": [],
                     "hits": 0,
                     "misses": 0,
@@ -1837,34 +2294,60 @@ class ContextService:
             if isinstance(row, dict) and row.get("namespace") == namespace:
                 rows.append(row)
         if not rows:
-            return "miss"
-        prompt_sha256 = str(metadata.get("prompt_sha256", ""))
-        if prompt_sha256:
-            prompt_rows = [
+            return "no_compatible_entry"
+        row_metadata = [
+            row.get("metadata", {}) if isinstance(row.get("metadata", {}), dict) else {}
+            for row in rows
+        ]
+        expected_schema_version = int(metadata.get("schema_version", 0) or 0)
+        if expected_schema_version and not any(
+            int(row.get("schema_version", 0) or 0) >= expected_schema_version
+            for row in row_metadata
+        ):
+            return "schema_version_changed"
+        expected_signature = str(metadata.get("refresh_signature", ""))
+        signature_rows = row_metadata
+        if expected_signature:
+            signature_rows = [
                 row
-                for row in rows
-                if str(row.get("metadata", {}).get("prompt_sha256", ""))
-                == prompt_sha256
+                for row in row_metadata
+                if str(row.get("refresh_signature", "")) == expected_signature
             ]
-            terms_key = str(metadata.get("terms_key", ""))
-            if not prompt_rows and terms_key:
-                prompt_rows = [
-                    row
-                    for row in rows
-                    if str(row.get("metadata", {}).get("terms_key", ""))
-                    == terms_key
-                ]
-            if not prompt_rows:
-                return "arg_changed"
-            expected_signature = str(metadata.get("refresh_signature", ""))
-            if expected_signature and any(
-                str(row.get("metadata", {}).get("refresh_signature", ""))
-                != expected_signature
-                for row in prompt_rows
-            ):
-                return "stale_index"
-            return "arg_changed"
-        return "arg_changed"
+            if not signature_rows:
+                return "index_changed"
+        expected_paths = metadata.get("explicit_paths")
+        if expected_paths is not None:
+            canonical_paths = list(expected_paths)
+            if not any(row.get("explicit_paths") == canonical_paths for row in signature_rows):
+                return "path_changed"
+        expected_path = str(metadata.get("path", ""))
+        if expected_path and not any(
+            str(row.get("path", "")) == expected_path for row in signature_rows
+        ):
+            return "path_changed"
+        expected_globs = metadata.get("include_globs")
+        if expected_globs is not None and not any(
+            row.get("include_globs") == expected_globs for row in signature_rows
+        ):
+            return "path_changed"
+        expected_terms_key = str(metadata.get("terms_key", ""))
+        if expected_terms_key and not any(
+            str(row.get("terms_key", "")) == expected_terms_key
+            for row in signature_rows
+        ):
+            return "terms_changed"
+        expected_term = str(metadata.get("term", ""))
+        if expected_term and not any(
+            str(row.get("term", "")) == expected_term for row in signature_rows
+        ):
+            return "terms_changed"
+        expected_pool_size = metadata.get("pool_size")
+        if expected_pool_size is not None and not any(
+            int(row.get("pool_size", 0) or 0) == int(expected_pool_size)
+            for row in signature_rows
+        ):
+            return "limit_bucket_changed"
+        return "no_compatible_entry"
 
     def _cache_row_status(self, row: dict[str, Any]) -> dict[str, Any]:
         if str(row.get("status", "")).lower() in {"stale", "invalidated"}:
@@ -1883,6 +2366,37 @@ class ContextService:
                     {"code": "cache_stale", "message": "cache row invalidated"}
                 ],
             }
+        namespace = str(row.get("namespace", ""))
+        metadata = row.get("metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if namespace in FRAGMENT_CACHE_NAMESPACES:
+            schema_version = int(
+                row.get("schema_version")
+                or metadata.get("schema_version")
+                or 0
+            )
+            if schema_version < CACHE_ENTRY_SCHEMA_VERSION:
+                return {
+                    "status": "stale",
+                    "reason": "legacy_schema_version",
+                    "warnings": [
+                        {
+                            "code": "cache_legacy",
+                            "message": "cache row predates current schema version",
+                        }
+                    ],
+                }
+            if not str(metadata.get("refresh_signature", "")):
+                return {
+                    "status": "stale",
+                    "reason": "legacy_missing_refresh_signature",
+                    "warnings": [
+                        {
+                            "code": "cache_legacy",
+                            "message": "cache row has no refresh signature",
+                        }
+                    ],
+                }
         expires_at = parse_iso(str(row.get("expires_at", "")))
         if expires_at and expires_at < datetime.now(timezone.utc):
             return {

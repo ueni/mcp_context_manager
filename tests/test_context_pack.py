@@ -61,11 +61,20 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert pack["cache"]["namespace"] == "context_pack.retrieval"
     assert pack["cache"]["reason"] in {
         "miss",
-        "arg_changed",
+        "no_compatible_entry",
+        "terms_changed",
+        "path_changed",
+        "index_changed",
+        "schema_version_changed",
+        "limit_bucket_changed",
         "stale_index",
         "disabled_refresh_index",
+        "signature_unavailable",
     }
     assert pack["cache"]["status"] in {"missing", "active", "disabled"}
+    assert "fragment_hits" in pack["cache"]
+    assert "fragment_misses" in pack["cache"]
+    assert "fragment_hit_ratio" in pack["cache"]
 
     resolved = service.result_reference_resolve(reference=pack["references"][0])
     assert resolved["status"] == "resolved"

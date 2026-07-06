@@ -80,6 +80,13 @@ MEASUREMENT_TARGETS: tuple[dict[str, Any], ...] = (
         "min_samples": 2,
     },
     {
+        "key": "cache.context_pack_fragment_hit_ratio",
+        "operator": ">=",
+        "target": 0.2,
+        "unit": "ratio",
+        "min_samples": 2,
+    },
+    {
         "key": "tooling.external_calls_saved_per_pack",
         "operator": ">=",
         "target": 2.0,
@@ -127,6 +134,8 @@ class ContextMetrics:
         omitted_count: int = 0,
         route: str = "",
         stage_timings_ms: dict[str, float] | None = None,
+        fragment_cache_hits: int = 0,
+        fragment_cache_misses: int = 0,
     ) -> None:
         payload = self._load()
         now = now_iso()
@@ -191,6 +200,15 @@ class ContextMetrics:
                 namespace_stats["misses"] = int(namespace_stats.get("misses", 0)) + 1
             namespace_reasons = namespace_stats.setdefault("reasons", {})
             namespace_reasons[reason] = int(namespace_reasons.get(reason, 0)) + 1
+        fragment_hits = max(0, int(fragment_cache_hits))
+        fragment_misses = max(0, int(fragment_cache_misses))
+        if fragment_hits or fragment_misses:
+            totals["context_pack_fragment_cache_hits"] = int(
+                totals.get("context_pack_fragment_cache_hits", 0)
+            ) + fragment_hits
+            totals["context_pack_fragment_cache_misses"] = int(
+                totals.get("context_pack_fragment_cache_misses", 0)
+            ) + fragment_misses
 
         op_stats = payload.setdefault("operations", {}).setdefault(
             operation,
@@ -303,6 +321,8 @@ class ContextMetrics:
                 "references_bytes_deferred_est": max(
                     0, int(references_bytes_deferred_est)
                 ),
+                "fragment_cache_hits": fragment_hits,
+                "fragment_cache_misses": fragment_misses,
                 "stage_timings_ms": {
                     key: round(float(value), 3)
                     for key, value in sorted((stage_timings_ms or {}).items())
@@ -318,6 +338,9 @@ class ContextMetrics:
         cache_hits = int(totals.get("cache_hits", 0))
         cache_misses = int(totals.get("cache_misses", 0))
         cache_total = cache_hits + cache_misses
+        fragment_hits = int(totals.get("context_pack_fragment_cache_hits", 0))
+        fragment_misses = int(totals.get("context_pack_fragment_cache_misses", 0))
+        fragment_total = fragment_hits + fragment_misses
         cache_namespaces = {
             name: self._public_cache_namespace(stats)
             for name, stats in sorted(
@@ -368,6 +391,13 @@ class ContextMetrics:
                 "misses": cache_misses,
                 "hit_ratio": round(cache_hits / cache_total, 4)
                 if cache_total
+                else 0.0,
+                "context_pack_fragment_hits": fragment_hits,
+                "context_pack_fragment_misses": fragment_misses,
+                "context_pack_fragment_hit_ratio": round(
+                    fragment_hits / fragment_total, 4
+                )
+                if fragment_total
                 else 0.0,
                 "reasons": dict(sorted(totals.get("cache_reason_counts", {}).items())),
                 "by_namespace": cache_namespaces,
@@ -730,6 +760,12 @@ class ContextMetrics:
                 namespace.get("misses", 0) or 0
             )
             return float(namespace.get("hit_ratio", 0.0)), samples
+        if key == "cache.context_pack_fragment_hit_ratio":
+            cache = snapshot.get("cache", {})
+            samples = int(cache.get("context_pack_fragment_hits", 0) or 0) + int(
+                cache.get("context_pack_fragment_misses", 0) or 0
+            )
+            return float(cache.get("context_pack_fragment_hit_ratio", 0.0)), samples
         if key == "tooling.external_calls_saved_per_pack":
             return (
                 float(
