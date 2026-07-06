@@ -40,6 +40,8 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert pack["budget"]["token_counting"]["token_count_source"] == "estimate"
     assert pack["safety"]["repository_boundary_enforced"] is True
     assert pack["items"][0]["confidence"] > 0
+    assert "prompt" not in pack["request"]
+    assert pack["request"]["prompt_sha256"]
     assert pack["metrics"]["stage_timings_ms"]["index_refresh_ms"] >= 0
     assert pack["metrics"]["stage_timings_ms"]["search_ranking_ms"] >= 0
     assert pack["metrics"]["stage_timings_ms"]["reference_write_ms"] >= 0
@@ -75,6 +77,7 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert "fragment_hits" in pack["cache"]
     assert "fragment_misses" in pack["cache"]
     assert "fragment_hit_ratio" in pack["cache"]
+    assert "chunk_hit_ratio" in pack["cache"]
 
     resolved = service.result_reference_resolve(reference=pack["references"][0])
     assert resolved["status"] == "resolved"
@@ -93,6 +96,55 @@ def test_context_pack_redacts_secret_like_content(service: ContextService, sampl
 
     assert "[REDACTED_SECRET_" in pack["items"][0]["content"]
     assert pack["items"][0]["redactions"]
+
+
+def test_minimal_pack_is_cache_stable_and_reference_backed(
+    service: ContextService,
+) -> None:
+    raw_prompt = "review auth token behavior never-echo-this"
+
+    pack = service.context_pack(
+        raw_prompt,
+        max_items=2,
+        output_profile="minimal",
+        diagnostics="none",
+    )
+
+    assert list(pack) == [
+        "schema",
+        "route",
+        "summary",
+        "items",
+        "omitted_ref",
+        "diagnostics_ref",
+        "request",
+    ]
+    assert pack["schema"] == "context_pack.minimal.v1"
+    assert "generated_at" not in pack
+    assert "metrics" not in pack
+    assert "cache" not in pack
+    assert "prompt" not in pack["request"]
+    assert raw_prompt not in json.dumps(pack)
+    assert pack["items"]
+    item = pack["items"][0]
+    assert list(item) == ["path", "lines", "reason", "confidence", "content", "detail_lookup"]
+    assert item["confidence"] in {"high", "medium", "low"}
+    assert item["detail_lookup"]["mode"] == "snippet"
+
+    omitted = service.result_reference_resolve(reference_id=pack["omitted_ref"])
+    diagnostics = service.result_reference_resolve(reference_id=pack["diagnostics_ref"])
+    assert omitted["status"] == "resolved"
+    assert diagnostics["status"] == "resolved"
+
+
+def test_context_pack_prompt_echo_is_opt_in(service: ContextService) -> None:
+    prompt = "review auth token behavior opt-in-prompt-echo"
+
+    hidden = service.context_pack(prompt, max_items=1)
+    shown = service.context_pack(prompt, max_items=1, include_request_prompt=True)
+
+    assert "prompt" not in hidden["request"]
+    assert shown["request"]["prompt"] == prompt
 
 
 def test_context_pack_compact_does_not_build_snippets(

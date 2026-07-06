@@ -21,11 +21,15 @@ state directory.
 
 ## MCP Tools
 
-- `context_pack`: build a compact task-focused context pack.
-- `context_lookup`: search, read snippets, list trees, query symbols, or list
-  references.
+- `context_pack`: build a minimal/compact task-focused context pack. It accepts
+  client/profile hints, prompt-echo and runtime-metadata opt-ins, diagnostics
+  levels, source/diagnostic budgets, and cache strategy controls.
+- `context_lookup`: search, read snippets, list trees, query symbols, list
+  references, inspect chunks/cache, or ask for related symbols and test owners.
 - `context_memory`: manage project-local compact memory and decisions.
-- `context_admin`: health, index, cache, budget, contracts, and project listing.
+- `context_admin`: health, index, cache, budget, contracts, quality evaluation,
+  tools-only resource proxies, instructions, profile calibration, and project
+  listing.
 - `result_reference_resolve`: resolve large local result references.
 
 Project-aware tools accept optional `project_id` or `root_uri`. If omitted, the
@@ -124,11 +128,28 @@ Agents can read `repo://instructions/codex-context-pack-first` or use the
 `repo://project/{project_id}/instructions/codex-context-pack-first` after
 selecting a project.
 
-`context_pack` is summary-first: pack `items` are compact file summaries with
-`path`, line hints, score, reason codes, `title_hint`, short `content`, and a
-stable `detail_lookup` object pointing back to `context_lookup(mode="snippet")`
-for the full evidence. `source_chars` and `deferred_chars` estimate how much
-source text was intentionally kept out of the model prompt.
+`context_pack` is summary-first. The fastest profile is
+`output_profile="minimal"`, which returns cache-stable evidence with path, line
+range, reason codes, a confidence bucket, short content, and a stable
+`detail_lookup` object pointing back to `context_lookup(mode="snippet")` for the
+full evidence. It does not echo the raw prompt and keeps runtime diagnostics
+behind `diagnostics_ref` / `omitted_ref`. The `compact`, `normal`, and `verbose`
+profiles expose progressively more inline diagnostics; raw prompt echo and
+volatile runtime metadata are opt-in.
+
+Client profiles tune defaults without changing the public tool surface:
+
+| Profile | Default intent |
+| --- | --- |
+| `codex` | Prefer fast minimal packs for MCP-first agent loops. |
+| `claude` | Prefer compact summaries plus stable references for compaction-friendly sessions. |
+| `copilot` | Keep a tools-only path through `context_admin(mode="instructions")` and `context_admin(mode="resource_proxy")`. |
+| `generic` | Use the configured default output profile. |
+
+Lookup modes `impact`, `related_symbols`, `test_owners`, `chunk`, and
+`explain_cache` provide targeted follow-up without broad file scans. Chunk and
+fragment cache diagnostics report reuse after prompt variations or unrelated
+file edits while keeping raw evidence resolvable through local references.
 
 ## Measurement Matrix And Benchmarks
 
@@ -140,12 +161,14 @@ matrix for context-pack speed and token economy. Current targets:
 | `latency.context_pack.avg_elapsed_ms` | `<= 750 ms` |
 | `latency.context_pack.p95_recent_ms` | `<= 1500 ms` after at least 3 samples |
 | `latency.context_pack.index_refresh_avg_ms` | `<= 250 ms` |
+| `latency.context_pack.snippet_batch_avg_ms` | `<= 250 ms` |
 | `tokens.context_pack.avg_saved_per_pack` | `>= 500 estimated input tokens` |
 | `tokens.context_pack.avg_tokens_spared_by_mcp_per_pack` | `>= 500 estimated input tokens` |
 | `tokens.context_pack.compression_ratio` | `<= 0.70` |
 | `retrieval.context_pack.candidates_per_selected` | `<= 8.0` |
 | `cache.hit_ratio` | `>= 0.20` after at least 2 cacheable requests |
 | `cache.context_pack_retrieval_hit_ratio` | `>= 0.20` after at least 2 pack retrievals |
+| `cache.context_pack_fragment_hit_ratio` | `>= 0.20` after at least 2 fragment lookups |
 | `tooling.external_calls_saved_per_pack` | `>= 2.0 estimated calls` |
 | `tooling.contract_tokens_saved_est` | `>= 1 estimated token` |
 | `references.bytes_deferred_est` | `>= 1 byte` |
@@ -164,6 +187,12 @@ items returned to the model. The formula is intentionally conservative: if the
 compact JSON is larger than the candidate evidence estimate, savings are `0`.
 `tokens_spared_by_mcp_est` is the explicit MCP-facing name for the same current
 estimate; `estimated_input_tokens_saved` remains for compatibility.
+
+Use `context_admin(mode="quality_eval")` to run retrieval-quality fixtures from
+`benchmarks/gold_anchors/*.json`. The report includes anchor recall@3/5, first
+anchor rank, noise ratio, required-anchor omissions, detail-lookup resolution,
+stale-context rate, and regression rows. These fixtures make token/latency
+optimizations measurable against required evidence, not just smaller output.
 
 ## Live Metrics Monitor
 
@@ -230,11 +259,11 @@ Run the built-in offline benchmark through MCP/admin:
 python3 benchmarks/context_pack_benchmark.py --repo .
 ```
 
-The benchmark executes four deterministic pack runs: forced cold refresh, warm
-cache reuse, repeated prompt reuse, and compact focused retrieval. It returns
-per-run stage timings, token estimates, external tool-call savings, reference
-bytes deferred, a compact contract sample, and the same measurement matrix used
-by live metrics.
+The benchmark executes deterministic pack runs for forced cold refresh, warm
+cache reuse, repeated prompt reuse, prompt-variation fragment reuse, and compact
+focused retrieval. It returns per-run stage timings, token estimates, external
+tool-call savings, reference bytes deferred, a compact contract sample, and the
+same measurement matrix used by live metrics.
 
 ## Run With Docker Compose
 

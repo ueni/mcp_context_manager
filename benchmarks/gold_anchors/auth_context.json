@@ -1,0 +1,31 @@
+[
+  {
+    "task": "Implement minimal context_pack profile and suppress prompt echo",
+    "changed_files": ["src/mcp_context_manager/context.py"],
+    "focus_paths": [],
+    "expected_anchors": [
+      {"path": "src/mcp_context_manager/context.py", "symbol": "context_pack", "required": true},
+      {"path": "tests/test_context_pack.py", "symbol": "test_context_pack", "required": true}
+    ],
+    "must_not_include": []
+  },
+  {
+    "task": "Add context_lookup impact mode for related tests",
+    "changed_files": ["src/mcp_context_manager/context.py"],
+    "focus_paths": [],
+    "expected_anchors": [
+      {"path": "src/mcp_context_manager/context.py", "symbol": "context_lookup", "required": true},
+      {"path": "src/mcp_context_manager/index.py", "symbol": "symbols", "required": false}
+    ],
+    "must_not_include": []
+  },
+  {
+    "task": "Update the README docs for measurement matrix behavior",
+    "changed_files": [],
+    "focus_paths": ["README.md"],
+    "expected_anchors": [
+      {"path": "README.md", "symbol": "", "required": true}
+    ],
+    "must_not_include": []
+  }
+]

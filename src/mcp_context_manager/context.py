@@ -4,6 +4,7 @@ import json
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .config import ContextConfig
@@ -29,12 +30,20 @@ DEFAULT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
 DEFAULT_CACHE_MAX_AGE_MINUTES = DEFAULT_CACHE_TTL_SECONDS // 60
 DEFAULT_INDEX_MAX_FILES = 5000
 DEFAULT_WARMUP_MAX_FILES = 100
-CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR = 8
+CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR = 6
 RETRIEVAL_SEARCH_TERM_SCHEMA = "retrieval.search_term.v1"
 RETRIEVAL_FILE_SUMMARY_SCHEMA = "retrieval.file_summary.v1"
 RETRIEVAL_SEARCH_TERM_POOL_SIZE = 40
 RETRIEVAL_FILE_SUMMARY_MAX_CHARS = 1200
 CACHE_ENTRY_SCHEMA_VERSION = 2
+CHUNK_LINE_COUNT = 80
+CHUNK_EXTRACTOR_VERSION = "chunk-lines-1"
+CHUNK_REDACTION_VERSION = "redact-1"
+OUTPUT_PROFILES = {"minimal", "compact", "normal", "verbose"}
+CLIENT_PROFILES = {"generic", "codex", "claude", "copilot"}
+MODEL_PROFILES = {"unknown", "openai", "anthropic", "github"}
+DIAGNOSTIC_LEVELS = {"none", "summary", "full"}
+CACHE_STRATEGIES = {"stable", "fresh", "cold"}
 FRAGMENT_CACHE_NAMESPACES = {
     "context_lookup.search",
     "context_pack.retrieval",
@@ -105,7 +114,18 @@ class ContextService:
         include_globs: list[str] | None = None,
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        allowed = {"search", "snippet", "tree", "symbols", "references"}
+        allowed = {
+            "search",
+            "snippet",
+            "tree",
+            "symbols",
+            "references",
+            "impact",
+            "related_symbols",
+            "test_owners",
+            "chunk",
+            "explain_cache",
+        }
         if mode not in allowed:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
         if mode == "search":
@@ -148,6 +168,48 @@ class ContextService:
             result = self.index.symbols(query=query, limit=max_results)
             self._record_metric(
                 "context_lookup.symbols",
+                started,
+                result_count=int(result.get("count", 0)),
+            )
+            return result
+        if mode == "chunk":
+            self._ensure_index_fresh(path=path)
+            result = self._chunk_lookup(path=path, start_line=start_line, end_line=end_line)
+            self._record_metric("context_lookup.chunk", started, result_count=1)
+            return result
+        if mode == "impact":
+            self._ensure_index_fresh(path=path)
+            result = self._impact_lookup(path=path, max_results=max_results)
+            self._record_metric(
+                "context_lookup.impact",
+                started,
+                result_count=int(result.get("count", 0)),
+            )
+            return result
+        if mode == "related_symbols":
+            self._ensure_index_fresh(path=path)
+            result = self._related_symbols_lookup(
+                path=path, query=query, max_results=max_results
+            )
+            self._record_metric(
+                "context_lookup.related_symbols",
+                started,
+                result_count=int(result.get("count", 0)),
+            )
+            return result
+        if mode == "test_owners":
+            self._ensure_index_fresh(path=path)
+            result = self._test_owners_lookup(path=path, max_results=max_results)
+            self._record_metric(
+                "context_lookup.test_owners",
+                started,
+                result_count=int(result.get("count", 0)),
+            )
+            return result
+        if mode == "explain_cache":
+            result = self._explain_cache(path=path, max_results=max_results)
+            self._record_metric(
+                "context_lookup.explain_cache",
                 started,
                 result_count=int(result.get("count", 0)),
             )
@@ -240,6 +302,12 @@ class ContextService:
             "measurement_matrix",
             "benchmark",
             "state_browser",
+            "quality_eval",
+            "cache_plan",
+            "profile_calibrate",
+            "instructions",
+            "resource_proxy",
+            "schema_minify",
         }
         if mode not in allowed:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
@@ -284,6 +352,18 @@ class ContextService:
                 if max_files is not None
                 else DEFAULT_INDEX_MAX_FILES
             )
+        if mode == "quality_eval":
+            return self._quality_eval(max_entries=max_entries)
+        if mode == "cache_plan":
+            return self._cache_plan(max_output_chars=max_output_chars)
+        if mode == "profile_calibrate":
+            return self._profile_calibrate()
+        if mode == "instructions":
+            return json.loads(self.codex_guidance_resource())
+        if mode == "resource_proxy":
+            return self._resource_proxy(path=path, max_output_chars=max_output_chars)
+        if mode == "schema_minify":
+            return output_contracts(tool_name=tool_name, profile="compact")
         if mode == "state_browser":
             return self._state_browser(
                 prefix=state_prefix,
@@ -304,18 +384,32 @@ class ContextService:
         max_items: int = 8,
         refresh_index: bool = False,
         index_max_files: int = 5000,
+        client_profile: str = "generic",
+        model_profile: str = "unknown",
+        evidence_policy: str = "summary_first",
+        diagnostics: str = "summary",
+        include_request_prompt: bool = False,
+        include_runtime_metadata: bool = False,
+        max_source_tokens: int = 1200,
+        max_diagnostic_tokens: int = 300,
+        cache_strategy: str = "stable",
     ) -> dict[str, Any]:
         if not prompt.strip():
             raise ValueError("prompt is required")
         started = time.perf_counter()
         stage_timings: dict[str, float] = {}
         self.config.ensure_state_dirs()
+        client_profile = self._normalize_client_profile(client_profile)
+        model_profile = self._normalize_model_profile(model_profile)
+        diagnostics = self._normalize_diagnostics(diagnostics)
+        cache_strategy = self._normalize_cache_strategy(cache_strategy)
+        refresh_index = refresh_index or cache_strategy in {"fresh", "cold"}
         stage_started = time.perf_counter()
         index_refresh = self._ensure_index_fresh(
             max_files=index_max_files, force=refresh_index
         )
         stage_timings["index_refresh_ms"] = self._elapsed_ms(stage_started)
-        profile = output_profile or self._budget()["default_output_profile"]
+        profile = self._effective_output_profile(output_profile, client_profile)
         budget = max_output_chars or int(self._budget()["max_output_chars"])
         route = classify_route(prompt)
         terms = normalize_query_terms(prompt, max_terms=12)
@@ -345,11 +439,13 @@ class ContextService:
             refresh_signature=refresh_signature,
         )
         stage_started = time.perf_counter()
-        if refresh_index:
+        if refresh_index or cache_strategy == "cold":
             cache_lookup = {
                 "hit": False,
                 "status": "disabled",
-                "reason": "disabled_refresh_index",
+                "reason": "disabled_cache_strategy"
+                if cache_strategy == "cold"
+                else "disabled_refresh_index",
                 "warnings": [],
             }
         else:
@@ -376,7 +472,9 @@ class ContextService:
             cache_reason = "hit"
         else:
             cache_reason = (
-                "disabled_refresh_index"
+                "disabled_cache_strategy"
+                if cache_strategy == "cold"
+                else "disabled_refresh_index"
                 if refresh_index
                 else cache_reason
                 if cache_reason in {"expired", "invalidated", "invalid_payload"}
@@ -396,6 +494,7 @@ class ContextService:
                 terms=terms,
                 explicit_paths=explicit_paths,
                 profile=profile,
+                route=route,
                 max_items=retrieval_max_items,
                 refresh_signature=refresh_signature,
                 refresh_signature_available=refresh_signature_available,
@@ -443,8 +542,12 @@ class ContextService:
         selected, omitted_budget = self._select_candidates(
             response_candidates,
             max_items=max_items,
-            content_budget=max(1000, budget - 2400),
-            per_path_limit=1 if profile == "compact" else 2,
+            content_budget=self._planned_content_budget(
+                budget=budget,
+                profile=profile,
+                max_source_tokens=max_source_tokens,
+            ),
+            per_path_limit=1 if profile in {"minimal", "compact"} else 2,
         )
         stage_timings["selection_ms"] = self._elapsed_ms(stage_started)
         omitted.extend(omitted_budget)
@@ -471,6 +574,11 @@ class ContextService:
                     "fragment_misses": fragment_misses,
                     "fragment_hit_ratio": self._hit_ratio(
                         fragment_hits, fragment_misses
+                    ),
+                    "chunk_hits": int(retrieval_stats.get("chunk_hits", 0) or 0),
+                    "chunk_misses": int(retrieval_stats.get("chunk_misses", 0) or 0),
+                    "chunk_hit_ratio": float(
+                        retrieval_stats.get("chunk_hit_ratio", 0.0) or 0.0
                     ),
                     "miss_details": fragment_miss_details[:12],
                 },
@@ -507,26 +615,35 @@ class ContextService:
             memory_context=memory_context,
         )
         stage_started = time.perf_counter()
+        request_metadata = {
+            "prompt_sha256": prompt_sha256,
+            "route": route,
+            "terms": terms,
+            "changed_files": changed_files or [],
+            "focus_paths": focus_paths or [],
+            "memory_session": memory_session,
+            "output_profile": profile,
+            "client_profile": client_profile,
+            "model_profile": model_profile,
+            "evidence_policy": evidence_policy,
+            "diagnostics": diagnostics,
+            "include_request_prompt": include_request_prompt,
+            "include_runtime_metadata": include_runtime_metadata,
+            "cache_strategy": cache_strategy,
+        }
+        if include_request_prompt:
+            request_metadata["prompt"] = prompt
         result = {
             "schema": "context_pack.v1",
-            "generated_at": now_iso(),
             "repo": {
                 "path": self.config.display_path(self.config.repo_path),
                 "state_dir": self.config.display_path(self.config.state_dir),
                 "project_id": self.config.project_id,
                 "root_uri_hash": sha256_text(self.config.root_uri)
                 if self.config.root_uri
-                else "",
+                    else "",
             },
-            "request": {
-                "prompt": prompt,
-                "route": route,
-                "terms": terms,
-                "changed_files": changed_files or [],
-                "focus_paths": focus_paths or [],
-                "memory_session": memory_session,
-                "output_profile": profile,
-            },
+            "request": request_metadata,
             "indexing": {
                 "explicit_path_refresh": explicit_refresh,
             },
@@ -560,6 +677,11 @@ class ContextService:
                 "fragment_misses": fragment_misses,
                 "fragment_hit_ratio": self._hit_ratio(
                     fragment_hits, fragment_misses
+                ),
+                "chunk_hits": int(retrieval_stats.get("chunk_hits", 0) or 0),
+                "chunk_misses": int(retrieval_stats.get("chunk_misses", 0) or 0),
+                "chunk_hit_ratio": float(
+                    retrieval_stats.get("chunk_hit_ratio", 0.0) or 0.0
                 ),
                 "miss_details": fragment_miss_details[:12],
                 "index_refresh": {
@@ -598,11 +720,40 @@ class ContextService:
                 {"action": "resolve_reference", "when": "Need full omitted candidate evidence", "reference_id": full_reference["reference_id"]}
             ],
         }
+        if include_runtime_metadata or profile in {"normal", "verbose"}:
+            result["generated_at"] = now_iso()
         stage_timings["response_assembly_ms"] = self._elapsed_ms(stage_started)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
         stage_timings["total_ms"] = elapsed_ms
         result["metrics"]["elapsed_ms"] = elapsed_ms
         result["metrics"]["stage_timings_ms"] = stage_timings
+        diagnostics_reference = self._diagnostics_reference(
+            request=request_metadata,
+            repo=result["repo"],
+            indexing=result["indexing"],
+            cache=result["cache"],
+            safety=result["safety"],
+            metrics=result["metrics"],
+            max_diagnostic_tokens=max_diagnostic_tokens,
+        )
+        result["diagnostics_ref"] = diagnostics_reference["reference_id"]
+        result["omitted_ref"] = full_reference["reference_id"]
+        if profile == "minimal":
+            result = self._minimal_context_pack(
+                route=route,
+                selected=selected,
+                omitted=omitted,
+                full_reference=full_reference,
+                diagnostics_reference=diagnostics_reference,
+                request=request_metadata,
+                memory_context=memory_context,
+            )
+        elif diagnostics != "full":
+            result["cache"] = self._cache_summary(result["cache"])
+            result["metrics"] = self._metrics_summary(result["metrics"], diagnostics)
+            if diagnostics == "none":
+                result.pop("indexing", None)
+                result.pop("safety", None)
         self.metrics.record_event(
             "context_pack",
             elapsed_ms=elapsed_ms,
@@ -1189,6 +1340,7 @@ class ContextService:
         fingerprint: dict[str, Any],
         line_anchor: int,
     ) -> str:
+        chunk = self._chunk_metadata(fingerprint, line_anchor)
         return self._cache_key(
             "retrieval.file_summary",
             {
@@ -1198,9 +1350,42 @@ class ContextService:
                 "path": fingerprint.get("path", ""),
                 "fingerprint": fingerprint.get("cache_token", ""),
                 "line_anchor": max(0, int(line_anchor)),
+                "chunk_id": chunk["chunk_id"],
+                "content_digest": chunk["content_digest"],
+                "extractor_version": CHUNK_EXTRACTOR_VERSION,
+                "redaction_version": CHUNK_REDACTION_VERSION,
                 "max_chars": RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
             },
         )
+
+    def _chunk_metadata(
+        self,
+        fingerprint: dict[str, Any],
+        line_anchor: int,
+        end_line: int | None = None,
+    ) -> dict[str, Any]:
+        start = max(1, int(line_anchor or 1))
+        chunk_start = ((start - 1) // CHUNK_LINE_COUNT) * CHUNK_LINE_COUNT + 1
+        chunk_end = max(
+            chunk_start,
+            int(end_line or chunk_start + CHUNK_LINE_COUNT - 1),
+        )
+        path = str(fingerprint.get("path", ""))
+        token = str(fingerprint.get("cache_token", ""))
+        digest = sha256_text(f"{path}:{token}:{chunk_start}:{chunk_end}")
+        return {
+            "schema": "context_chunk_metadata.v1",
+            "path": path,
+            "file_digest": f"sha256:{fingerprint.get('sha256', '')}"
+            if fingerprint.get("sha256")
+            else "",
+            "chunk_id": f"chk_{digest[:16]}",
+            "start_line": chunk_start,
+            "end_line": chunk_end,
+            "content_digest": f"sha256:{digest}",
+            "extractor_version": CHUNK_EXTRACTOR_VERSION,
+            "redaction_version": CHUNK_REDACTION_VERSION,
+        }
 
     def _cached_file_summary(
         self,
@@ -1211,41 +1396,46 @@ class ContextService:
     ) -> tuple[dict[str, Any], bool, dict[str, Any]]:
         fingerprint = self._file_fingerprint(path)
         anchor = max(0, int(line_anchor))
+        chunk = self._chunk_metadata(fingerprint, anchor)
         key = self._file_summary_cache_key(fingerprint, anchor)
         miss_detail = {
             "schema": "cache_miss_detail.v1",
             "namespace": "retrieval.file_summary",
             "path": fingerprint["path"],
             "line_anchor": anchor,
+            "chunk_id": chunk["chunk_id"],
             "reason": "signature_unavailable"
             if not refresh_signature_available
             else "no_compatible_entry",
         }
-        if refresh_signature_available:
-            lookup = self._cache_lookup(key)
-            cached = lookup.get("value") if lookup["hit"] else None
-            if isinstance(cached, dict) and cached.get("schema") == RETRIEVAL_FILE_SUMMARY_SCHEMA:
-                row = self.store.get_json(f"cache:{key}", {})
-                row_metadata = row.get("metadata", {}) if isinstance(row, dict) else {}
-                row_metadata = row_metadata if isinstance(row_metadata, dict) else {}
-                if str(row_metadata.get("refresh_signature", "")) == refresh_signature:
-                    summary = cached.get("summary")
-                    if isinstance(summary, dict):
-                        return summary, True, {}
-            lookup_reason = str(lookup.get("reason") or "")
-            miss_detail["reason"] = (
-                lookup_reason
-                if lookup_reason not in {"", "miss", "hit"}
-                else self._cache_miss_reason(
-                    namespace="retrieval.file_summary",
-                    metadata={
-                        "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
-                        "path": fingerprint["path"],
-                        "refresh_signature": refresh_signature,
-                        "line_anchor": anchor,
-                    },
-                )
+        if not refresh_signature_available:
+            summary = self.index.file_summary(
+                fingerprint["path"],
+                max_chars=RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
+                matched_line=anchor or None,
             )
+            return summary, False, miss_detail
+        lookup = self._cache_lookup(key)
+        cached = lookup.get("value") if lookup["hit"] else None
+        if isinstance(cached, dict) and cached.get("schema") == RETRIEVAL_FILE_SUMMARY_SCHEMA:
+            summary = cached.get("summary")
+            if isinstance(summary, dict):
+                return summary, True, {}
+        lookup_reason = str(lookup.get("reason") or "")
+        miss_detail["reason"] = (
+            lookup_reason
+            if lookup_reason not in {"", "miss", "hit"}
+            else self._cache_miss_reason(
+                namespace="retrieval.file_summary",
+                metadata={
+                    "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                    "path": fingerprint["path"],
+                    "file_fingerprint": fingerprint,
+                    "line_anchor": anchor,
+                    "chunk_id": chunk["chunk_id"],
+                },
+            )
+        )
         summary = self.index.file_summary(
             fingerprint["path"],
             max_chars=RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
@@ -1259,6 +1449,7 @@ class ContextService:
                     "path": fingerprint["path"],
                     "file_fingerprint": fingerprint,
                     "line_anchor": anchor,
+                    "chunk": chunk,
                     "max_chars": RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
                     "summary": summary,
                 },
@@ -1268,11 +1459,206 @@ class ContextService:
                     "path": fingerprint["path"],
                     "file_fingerprint": fingerprint,
                     "line_anchor": anchor,
+                    "chunk_id": chunk["chunk_id"],
+                    "content_digest": chunk["content_digest"],
+                    "extractor_version": CHUNK_EXTRACTOR_VERSION,
+                    "redaction_version": CHUNK_REDACTION_VERSION,
                     "refresh_signature": refresh_signature,
                     "max_chars": RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
                 },
             )
         return summary, False, miss_detail
+
+    def _effective_output_profile(
+        self, output_profile: str | None, client_profile: str
+    ) -> str:
+        profile = output_profile or (
+            "minimal" if client_profile == "codex" else self._budget()["default_output_profile"]
+        )
+        if profile not in OUTPUT_PROFILES:
+            raise ValueError("output_profile must be minimal, compact, normal, or verbose")
+        return profile
+
+    def _normalize_client_profile(self, client_profile: str) -> str:
+        profile = (client_profile or "generic").strip().lower()
+        if profile not in CLIENT_PROFILES:
+            raise ValueError("client_profile must be codex, claude, copilot, or generic")
+        return profile
+
+    def _normalize_model_profile(self, model_profile: str) -> str:
+        profile = (model_profile or "unknown").strip().lower()
+        if profile not in MODEL_PROFILES:
+            raise ValueError("model_profile must be openai, anthropic, github, or unknown")
+        return profile
+
+    def _normalize_diagnostics(self, diagnostics: str) -> str:
+        level = (diagnostics or "summary").strip().lower()
+        if level not in DIAGNOSTIC_LEVELS:
+            raise ValueError("diagnostics must be none, summary, or full")
+        return level
+
+    def _normalize_cache_strategy(self, cache_strategy: str) -> str:
+        strategy = (cache_strategy or "stable").strip().lower()
+        if strategy not in CACHE_STRATEGIES:
+            raise ValueError("cache_strategy must be stable, fresh, or cold")
+        return strategy
+
+    def _planned_content_budget(
+        self, budget: int, profile: str, max_source_tokens: int
+    ) -> int:
+        if profile == "minimal":
+            return max(500, min(budget - 500, max(1, int(max_source_tokens)) * 4))
+        return max(1000, budget - 2400)
+
+    def _diagnostics_reference(
+        self,
+        request: dict[str, Any],
+        repo: dict[str, Any],
+        indexing: dict[str, Any],
+        cache: dict[str, Any],
+        safety: dict[str, Any],
+        metrics: dict[str, Any],
+        max_diagnostic_tokens: int,
+    ) -> dict[str, Any]:
+        payload = {
+            "schema": "context_pack.diagnostics.v1",
+            "request": request,
+            "repo": repo,
+            "indexing": indexing,
+            "cache": cache,
+            "safety": safety,
+            "metrics": metrics,
+            "max_diagnostic_tokens": max(0, int(max_diagnostic_tokens)),
+        }
+        return self.references.create(
+            producer="context_pack.diagnostics",
+            payload=payload,
+            summary={
+                "route": request.get("route", ""),
+                "cache_hit": bool(cache.get("hit")),
+                "diagnostic_tokens_est": self._count_tokens(payload),
+            },
+            ttl_hours=24,
+        )
+
+    def _minimal_context_pack(
+        self,
+        route: str,
+        selected: list[dict[str, Any]],
+        omitted: list[dict[str, Any]],
+        full_reference: dict[str, Any],
+        diagnostics_reference: dict[str, Any],
+        request: dict[str, Any],
+        memory_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "schema": "context_pack.minimal.v1",
+            "route": route,
+            "summary": self._minimal_summary(route, selected, omitted, memory_context),
+            "items": [self._minimal_item(item) for item in selected],
+            "omitted_ref": full_reference["reference_id"],
+            "diagnostics_ref": diagnostics_reference["reference_id"],
+            "request": {
+                "prompt_sha256": request.get("prompt_sha256", ""),
+                "terms": request.get("terms", []),
+                "changed_files": request.get("changed_files", []),
+                "focus_paths": request.get("focus_paths", []),
+                "client_profile": request.get("client_profile", "generic"),
+                "model_profile": request.get("model_profile", "unknown"),
+            },
+        }
+
+    def _minimal_summary(
+        self,
+        route: str,
+        selected: list[dict[str, Any]],
+        omitted: list[dict[str, Any]],
+        memory_context: dict[str, Any],
+    ) -> str:
+        paths = [str(item.get("path", "")) for item in selected[:3] if item.get("path")]
+        if not paths:
+            return f"{route} context: no matching repository evidence selected."
+        suffix = ""
+        if omitted:
+            suffix = f" {len(omitted)} lower-ranked items deferred."
+        if int(memory_context.get("summary_count", 0) or 0):
+            suffix += " Memory summaries available in diagnostics."
+        return f"{route} context: top evidence in {', '.join(paths)}.{suffix}"
+
+    def _minimal_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "path": item.get("path", ""),
+            "lines": [
+                int(item.get("start_line", 1) or 1),
+                int(item.get("end_line", item.get("start_line", 1)) or 1),
+            ],
+            "reason": list(item.get("reason_codes", [])),
+            "confidence": self._confidence_bucket(item),
+            "content": item.get("content", ""),
+            "detail_lookup": item.get("detail_lookup", {}),
+        }
+
+    def _confidence_bucket(self, item: dict[str, Any]) -> str:
+        score = float(item.get("score", 0.0) or 0.0)
+        confidence = float(item.get("confidence", 0.0) or 0.0)
+        value = max(score / 14.0, confidence)
+        if value >= 0.8:
+            return "high"
+        if value >= 0.45:
+            return "medium"
+        return "low"
+
+    def _cache_summary(self, cache: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "hit": bool(cache.get("hit")),
+            "key": cache.get("key", ""),
+            "namespace": cache.get("namespace", ""),
+            "reason": cache.get("reason", ""),
+            "status": cache.get("status", ""),
+            "expires_at": cache.get("expires_at", ""),
+            "warnings": cache.get("warnings", []),
+            "fragment_hits": int(cache.get("fragment_hits", 0) or 0),
+            "fragment_misses": int(cache.get("fragment_misses", 0) or 0),
+            "fragment_hit_ratio": float(cache.get("fragment_hit_ratio", 0.0) or 0.0),
+            "chunk_hits": int(cache.get("chunk_hits", 0) or 0),
+            "chunk_misses": int(cache.get("chunk_misses", 0) or 0),
+            "chunk_hit_ratio": float(cache.get("chunk_hit_ratio", 0.0) or 0.0),
+            "miss_details": cache.get("miss_details", []),
+        }
+
+    def _metrics_summary(self, metrics: dict[str, Any], diagnostics: str) -> dict[str, Any]:
+        if diagnostics == "full":
+            return metrics
+        summary = {
+            "elapsed_ms": metrics.get("elapsed_ms", 0.0),
+            "stage_timings_ms": metrics.get("stage_timings_ms", {}),
+            "candidate_count": metrics.get("candidate_count", 0),
+            "selected_count": metrics.get("selected_count", 0),
+            "baseline_input_tokens_est": metrics.get("baseline_input_tokens_est", 0),
+            "output_tokens_est": metrics.get("output_tokens_est", 0),
+            "estimated_input_tokens_saved": metrics.get("estimated_input_tokens_saved", 0),
+            "tokens_spared_by_mcp_est": metrics.get("tokens_spared_by_mcp_est", 0),
+            "compression_ratio": metrics.get("compression_ratio", 0.0),
+            "external_tool_calls_saved_est": metrics.get("external_tool_calls_saved_est", 0),
+            "references_bytes_deferred_est": metrics.get("references_bytes_deferred_est", 0),
+            "token_counting": metrics.get("token_counting", {}),
+            "token_savings_formula": metrics.get("token_savings_formula", ""),
+            "tokens_spared_by_mcp_formula": metrics.get("tokens_spared_by_mcp_formula", ""),
+            "tokens_spared_by_mcp_reason": metrics.get("tokens_spared_by_mcp_reason", ""),
+        }
+        retrieval_plan = metrics.get("retrieval_plan")
+        if isinstance(retrieval_plan, dict):
+            summary["retrieval_plan"] = {
+                "schema": retrieval_plan.get("schema", "context_pack.retrieval_plan.v1"),
+                "profile": retrieval_plan.get("profile", ""),
+                "detail_mode": retrieval_plan.get("detail_mode", ""),
+                "snippet_request_count": retrieval_plan.get("snippet_request_count", 0),
+                "symbol_lookup_skipped": retrieval_plan.get("symbol_lookup_skipped", False),
+                "chunk_hits": retrieval_plan.get("chunk_hits", 0),
+                "chunk_misses": retrieval_plan.get("chunk_misses", 0),
+                "chunk_hit_ratio": retrieval_plan.get("chunk_hit_ratio", 0.0),
+            }
+        return summary
 
     def _profile_candidates(
         self, candidates: list[dict[str, Any]], profile: str
@@ -1282,7 +1668,9 @@ class ContextService:
             copied = dict(item)
             source_chars = int(copied.get("source_chars", 0) or 0)
             is_explicit = "explicit_path" in set(copied.get("reason_codes", []))
-            if profile == "compact":
+            if profile == "minimal":
+                max_chars = 220 if is_explicit else 180
+            elif profile == "compact":
                 max_chars = 360 if is_explicit else 260
             elif profile == "verbose":
                 max_chars = 900
@@ -1307,6 +1695,7 @@ class ContextService:
         terms: list[str],
         explicit_paths: list[str],
         profile: str,
+        route: str,
         max_items: int,
         refresh_signature: str,
         refresh_signature_available: bool,
@@ -1334,6 +1723,9 @@ class ContextService:
             "fragment_misses": 0,
             "fragment_hit_ratio": 0.0,
             "fragment_miss_details": [],
+            "chunk_hits": 0,
+            "chunk_misses": 0,
+            "chunk_hit_ratio": 0.0,
         }
 
         def count_source(source: str) -> None:
@@ -1352,6 +1744,10 @@ class ContextService:
             if detail:
                 retrieval_stats.setdefault("fragment_miss_details", []).append(detail)
 
+        def count_chunk(hit: bool) -> None:
+            key = "chunk_hits" if hit else "chunk_misses"
+            retrieval_stats[key] = int(retrieval_stats.get(key, 0) or 0) + 1
+
         for rel in explicit_paths:
             try:
                 summary, summary_hit, miss_detail = self._cached_file_summary(
@@ -1361,6 +1757,7 @@ class ContextService:
                     refresh_signature_available=refresh_signature_available,
                 )
                 count_fragment(summary_hit, miss_detail)
+                count_chunk(summary_hit)
             except Exception as exc:
                 omitted.append(
                     {
@@ -1419,6 +1816,7 @@ class ContextService:
                         refresh_signature_available=refresh_signature_available,
                     )
                     count_fragment(summary_hit, miss_detail)
+                    count_chunk(summary_hit)
                     candidates.append(
                         self._candidate_from_summary(
                             summary,
@@ -1439,7 +1837,7 @@ class ContextService:
             retrieval_stats["symbol_limit"] = symbol_limit
             queued_path_count = len({str(item.get("path", "")) for item in candidates})
             if (
-                profile == "compact"
+                profile in {"minimal", "compact"}
                 and len(candidates) >= max_items * 2
                 and queued_path_count >= max_items
             ):
@@ -1462,6 +1860,7 @@ class ContextService:
                         refresh_signature_available=refresh_signature_available,
                     )
                     count_fragment(summary_hit, miss_detail)
+                    count_chunk(summary_hit)
                     candidates.append(
                         self._candidate_from_summary(
                             summary,
@@ -1485,10 +1884,293 @@ class ContextService:
             int(retrieval_stats.get("fragment_hits", 0) or 0),
             int(retrieval_stats.get("fragment_misses", 0) or 0),
         )
+        retrieval_stats["chunk_hit_ratio"] = self._hit_ratio(
+            int(retrieval_stats.get("chunk_hits", 0) or 0),
+            int(retrieval_stats.get("chunk_misses", 0) or 0),
+        )
         retrieval_stats["fragment_miss_details"] = retrieval_stats.get(
             "fragment_miss_details", []
         )[:20]
+        self._add_test_owner_candidates(
+            candidates=candidates,
+            explicit_paths=explicit_paths,
+            refresh_signature=refresh_signature,
+            refresh_signature_available=refresh_signature_available,
+            count_fragment=count_fragment,
+            count_chunk=count_chunk,
+            retrieval_stats=retrieval_stats,
+        )
+        self._apply_route_ranking(
+            candidates=candidates,
+            route=route,
+            explicit_paths=explicit_paths,
+            terms=terms,
+        )
+        retrieval_stats["fragment_miss_details"] = retrieval_stats.get(
+            "fragment_miss_details", []
+        )[:20]
+        retrieval_stats["fragment_hit_ratio"] = self._hit_ratio(
+            int(retrieval_stats.get("fragment_hits", 0) or 0),
+            int(retrieval_stats.get("fragment_misses", 0) or 0),
+        )
+        retrieval_stats["chunk_hit_ratio"] = self._hit_ratio(
+            int(retrieval_stats.get("chunk_hits", 0) or 0),
+            int(retrieval_stats.get("chunk_misses", 0) or 0),
+        )
         return candidates, omitted, retrieval_stats
+
+    def _add_test_owner_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        explicit_paths: list[str],
+        refresh_signature: str,
+        refresh_signature_available: bool,
+        count_fragment: Any,
+        count_chunk: Any,
+        retrieval_stats: dict[str, Any],
+    ) -> None:
+        seen = {str(item.get("path", "")) for item in candidates}
+        added = 0
+        for owner in self._test_owner_paths(explicit_paths, max_results=8):
+            path = str(owner.get("path", ""))
+            if not path or path in seen:
+                continue
+            try:
+                summary, summary_hit, miss_detail = self._cached_file_summary(
+                    path,
+                    line_anchor=1,
+                    refresh_signature=refresh_signature,
+                    refresh_signature_available=refresh_signature_available,
+                )
+            except Exception:
+                continue
+            count_fragment(summary_hit, miss_detail)
+            count_chunk(summary_hit)
+            candidates.append(
+                self._candidate_from_summary(
+                    summary,
+                    score=10.0,
+                    reason_codes=["test_owner"],
+                    source="test_impact",
+                )
+            )
+            seen.add(path)
+            added += 1
+        retrieval_stats["test_owner_summary_count"] = added
+
+    def _apply_route_ranking(
+        self,
+        candidates: list[dict[str, Any]],
+        route: str,
+        explicit_paths: list[str],
+        terms: list[str],
+    ) -> None:
+        explicit = set(self._canonical_cache_paths(explicit_paths))
+        term_set = set(terms)
+        for item in candidates:
+            path = str(item.get("path", ""))
+            reasons = set(item.get("reason_codes", []))
+            score = float(item.get("score", 0.0) or 0.0)
+            if path in explicit:
+                score += 6.0
+            if "test_owner" in reasons:
+                score += 4.0 if route in {"coding", "review", "debug", "test"} else 1.0
+            if path.startswith(("tests/", "test/")):
+                score += 2.0 if route in {"coding", "review", "debug", "test"} else 0.0
+            if route == "docs" and path.lower().startswith(("readme", "docs/")):
+                score += 5.0
+            if route == "security" and any(
+                marker in path.lower()
+                for marker in ("auth", "security", "secret", "token", "config", "path")
+            ):
+                score += 3.0
+            if term_set and any(term in path.lower() for term in term_set):
+                score += 1.0
+            item["score"] = round(score, 4)
+            item["confidence"] = round(min(0.99, max(0.1, score / 18.0)), 3)
+
+    def _chunk_lookup(
+        self, path: str, start_line: int = 1, end_line: int | None = None
+    ) -> dict[str, Any]:
+        fingerprint = self._file_fingerprint(path)
+        chunk = self._chunk_metadata(fingerprint, start_line, end_line)
+        snippet = self.index.snippet(
+            path=fingerprint["path"],
+            start_line=chunk["start_line"],
+            end_line=chunk["end_line"],
+            max_chars=RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
+        )
+        return {
+            "schema": "context_lookup.chunk.v1",
+            "chunk": chunk,
+            "path": fingerprint["path"],
+            "content": snippet["content"],
+            "detail_lookup": {
+                "tool": "context_lookup",
+                "mode": "snippet",
+                "path": fingerprint["path"],
+                "start_line": chunk["start_line"],
+                "end_line": chunk["end_line"],
+            },
+        }
+
+    def _impact_lookup(self, path: str, max_results: int) -> dict[str, Any]:
+        related = []
+        related.extend(self._test_owner_rows(path=path, max_results=max_results))
+        for symbol in self._related_symbol_rows(path=path, query="", max_results=max_results):
+            related.append(symbol)
+            if len(related) >= max_results:
+                break
+        return {
+            "schema": "context_lookup.impact.v1",
+            "source": self._canonical_cache_path(path),
+            "count": len(related[:max_results]),
+            "related": related[:max_results],
+        }
+
+    def _related_symbols_lookup(
+        self, path: str, query: str, max_results: int
+    ) -> dict[str, Any]:
+        rows = self._related_symbol_rows(path=path, query=query, max_results=max_results)
+        return {
+            "schema": "context_lookup.related_symbols.v1",
+            "source": self._canonical_cache_path(path),
+            "count": len(rows),
+            "symbols": rows,
+        }
+
+    def _test_owners_lookup(self, path: str, max_results: int) -> dict[str, Any]:
+        rows = self._test_owner_rows(path=path, max_results=max_results)
+        return {
+            "schema": "context_lookup.test_owners.v1",
+            "source": self._canonical_cache_path(path),
+            "count": len(rows),
+            "related": rows,
+        }
+
+    def _related_symbol_rows(
+        self, path: str, query: str, max_results: int
+    ) -> list[dict[str, Any]]:
+        rel = self._canonical_cache_path(path)
+        terms = normalize_query_terms(query or rel.replace("/", " "), max_terms=8)
+        symbols = self.index.symbols(query=" ".join(terms), limit=max(max_results * 4, 20))
+        rows: list[dict[str, Any]] = []
+        for row in symbols.get("symbols", []):
+            if not isinstance(row, dict):
+                continue
+            symbol_path = str(row.get("path", ""))
+            if symbol_path != rel and Path(symbol_path).stem != Path(rel).stem:
+                continue
+            rows.append(
+                {
+                    "path": symbol_path,
+                    "symbol": row.get("name", ""),
+                    "kind": row.get("kind", ""),
+                    "relationship": "same_file" if symbol_path == rel else "name_match",
+                    "confidence": "high" if symbol_path == rel else "medium",
+                    "detail_lookup": {
+                        "tool": "context_lookup",
+                        "mode": "snippet",
+                        "path": symbol_path,
+                        "start_line": int(row.get("line_start", 1) or 1),
+                        "end_line": int(row.get("line_end", row.get("line_start", 1)) or 1),
+                    },
+                }
+            )
+            if len(rows) >= max_results:
+                break
+        return rows
+
+    def _test_owner_rows(self, path: str, max_results: int) -> list[dict[str, Any]]:
+        return [
+            {
+                "path": row["path"],
+                "relationship": "test_owner",
+                "confidence": row["confidence"],
+                "detail_lookup": {
+                    "tool": "context_lookup",
+                    "mode": "snippet",
+                    "path": row["path"],
+                    "start_line": 1,
+                },
+            }
+            for row in self._test_owner_paths([path], max_results=max_results)
+        ]
+
+    def _test_owner_paths(
+        self, paths: list[str], max_results: int = 10
+    ) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for raw_path in paths:
+            rel = self._canonical_cache_path(raw_path)
+            if not rel or rel.startswith(("tests/", "test/")):
+                continue
+            stem = Path(rel).stem
+            direct = [
+                f"tests/test_{stem}.py",
+                f"test/test_{stem}.py",
+                f"tests/{stem}_test.py",
+                f"test/{stem}_test.py",
+            ]
+            for candidate in direct:
+                try:
+                    resolved = self.config.resolve_repo_path(candidate)
+                except ValueError:
+                    continue
+                if resolved.is_file() and candidate not in seen:
+                    rows.append({"path": candidate, "confidence": "high"})
+                    seen.add(candidate)
+            if len(rows) >= max_results:
+                break
+            try:
+                search = self.index.search(
+                    query=stem,
+                    path=".",
+                    max_results=max_results,
+                    include_globs=["tests/**", "test/**"],
+                )
+            except Exception:
+                continue
+            for result in search.get("results", []):
+                path = str(result.get("path", ""))
+                if path and path not in seen:
+                    rows.append({"path": path, "confidence": "medium"})
+                    seen.add(path)
+                if len(rows) >= max_results:
+                    break
+        return rows[:max_results]
+
+    def _explain_cache(self, path: str, max_results: int) -> dict[str, Any]:
+        rel = self._canonical_cache_path(path)
+        rows = []
+        for key, row in self.store.iter_json("cache:"):
+            if not isinstance(row, dict):
+                continue
+            metadata = row.get("metadata", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            if rel not in {".", "", str(metadata.get("path", ""))}:
+                continue
+            status = self._cache_row_status(row)
+            rows.append(
+                {
+                    "key": key.removeprefix("cache:"),
+                    "namespace": row.get("namespace", ""),
+                    "status": status["status"],
+                    "reason": status["reason"],
+                    "path": metadata.get("path", ""),
+                    "chunk_id": metadata.get("chunk_id", ""),
+                    "updated_at": row.get("updated_at", ""),
+                }
+            )
+            if len(rows) >= max_results:
+                break
+        return {
+            "schema": "context_lookup.explain_cache.v1",
+            "path": rel,
+            "count": len(rows),
+            "rows": rows,
+        }
 
     def _candidate_from_summary(
         self,
@@ -1626,6 +2308,173 @@ class ContextService:
         if omitted:
             baseline_calls += 1
         return max(0, baseline_calls - 1)
+
+    def _quality_eval(self, max_entries: int = 100) -> dict[str, Any]:
+        fixtures = self._gold_anchor_fixtures(max_entries=max_entries)
+        total_required = 0
+        hits_at_3 = 0
+        hits_at_5 = 0
+        first_ranks: list[int] = []
+        noise_rows = 0
+        item_rows = 0
+        required_omitted = 0
+        stale_hits = 0
+        detail_lookup_count = 0
+        regressions = []
+        for fixture in fixtures:
+            task = str(fixture.get("task") or fixture.get("prompt") or "")
+            if not task:
+                continue
+            pack = self.context_pack(
+                prompt=task,
+                changed_files=fixture.get("changed_files") or [],
+                focus_paths=fixture.get("focus_paths") or [],
+                max_items=5,
+                output_profile="minimal",
+                diagnostics="none",
+            )
+            items = [item for item in pack.get("items", []) if isinstance(item, dict)]
+            paths = [str(item.get("path", "")) for item in items]
+            item_rows += len(items)
+            anchors = [
+                row
+                for row in fixture.get("expected_anchors", [])
+                if isinstance(row, dict) and row.get("path")
+            ]
+            expected_paths = {str(row.get("path", "")) for row in anchors}
+            for item in items:
+                if item.get("detail_lookup"):
+                    detail_lookup_count += 1
+                if str(item.get("path", "")) not in expected_paths:
+                    noise_rows += 1
+            for anchor in anchors:
+                path = str(anchor.get("path", ""))
+                required = bool(anchor.get("required", True))
+                if required:
+                    total_required += 1
+                rank = paths.index(path) + 1 if path in paths else 0
+                if rank:
+                    first_ranks.append(rank)
+                    if required and rank <= 3:
+                        hits_at_3 += 1
+                    if required and rank <= 5:
+                        hits_at_5 += 1
+                elif required:
+                    required_omitted += 1
+                    regressions.append(
+                        {
+                            "task": task,
+                            "path": path,
+                            "reason": "required_anchor_omitted",
+                        }
+                    )
+            for stale in fixture.get("must_not_include", []):
+                if isinstance(stale, dict) and str(stale.get("path", "")) in paths:
+                    stale_hits += 1
+                    regressions.append(
+                        {
+                            "task": task,
+                            "path": stale.get("path", ""),
+                            "reason": stale.get("reason", "must_not_include"),
+                        }
+                    )
+        recall_base = max(1, total_required)
+        detail_base = max(1, item_rows)
+        return {
+            "schema": "context_quality_eval.v1",
+            "fixtures": len(fixtures),
+            "metrics": {
+                "anchor_recall_at_3": round(hits_at_3 / recall_base, 4),
+                "anchor_recall_at_5": round(hits_at_5 / recall_base, 4),
+                "first_anchor_rank_avg": round(sum(first_ranks) / len(first_ranks), 4)
+                if first_ranks
+                else 0.0,
+                "noise_ratio": round(noise_rows / detail_base, 4),
+                "required_anchor_omitted_count": required_omitted,
+                "detail_lookup_resolution_rate": round(detail_lookup_count / detail_base, 4),
+                "stale_context_rate": round(stale_hits / max(1, len(fixtures)), 4),
+            },
+            "regressions": regressions,
+        }
+
+    def _gold_anchor_fixtures(self, max_entries: int) -> list[dict[str, Any]]:
+        fixture_dir = self.config.repo_path / "benchmarks" / "gold_anchors"
+        if not fixture_dir.is_dir():
+            return []
+        fixtures = []
+        for path in sorted(fixture_dir.glob("*.json"))[: max(0, int(max_entries))]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            rows = payload if isinstance(payload, list) else [payload]
+            fixtures.extend(row for row in rows if isinstance(row, dict))
+        return fixtures[: max(0, int(max_entries))]
+
+    def _cache_plan(self, max_output_chars: int | None = None) -> dict[str, Any]:
+        budget = int(max_output_chars or self._budget()["max_output_chars"])
+        return {
+            "schema": "context_budget_plan.v1",
+            "max_output_tokens": max(1, budget // 4),
+            "reserved": {"envelope": 120, "references": 80, "diagnostics": 80},
+            "items": {
+                "max_count": 6,
+                "max_tokens_each": 180,
+                "mode": "summary_first",
+            },
+            "defer": {
+                "raw_snippets": True,
+                "metrics": True,
+                "stage_timings": True,
+                "cache_details": True,
+            },
+        }
+
+    def _profile_calibrate(self) -> dict[str, Any]:
+        return {
+            "schema": "context_profile_calibration.v1",
+            "defaults": {
+                "client_profile": "generic",
+                "model_profile": "unknown",
+                "evidence_policy": "summary_first",
+                "diagnostics": "summary",
+                "include_request_prompt": False,
+                "include_runtime_metadata": False,
+                "cache_strategy": "stable",
+            },
+            "profiles": {
+                "codex": {"output_profile": "minimal", "diagnostics": "summary"},
+                "claude": {"output_profile": "compact", "diagnostics": "summary"},
+                "copilot": {"output_profile": "compact", "tools_only": True},
+                "generic": {"output_profile": self._budget()["default_output_profile"]},
+            },
+        }
+
+    def _resource_proxy(
+        self, path: str = ".", max_output_chars: int | None = None
+    ) -> dict[str, Any]:
+        resource = (path or "repo://summary").strip()
+        if resource in {".", "repo://summary"}:
+            payload: Any = self.index.workspace_facts()
+        elif resource == "repo://metrics":
+            payload = self.metrics.snapshot()
+        elif resource == "repo://instructions/codex-context-pack-first":
+            payload = json.loads(self.codex_guidance_resource())
+        elif resource.startswith("repo://tree"):
+            tree_path = resource.removeprefix("repo://tree").strip("/") or "."
+            payload = self.index.tree(path=tree_path, max_entries=100)
+        else:
+            payload = self.index.snippet(
+                path=resource.removeprefix("repo://file/"),
+                start_line=1,
+                max_chars=max_output_chars or self.config.max_output_chars,
+            )
+        return {
+            "schema": "context_resource_proxy.v1",
+            "resource": resource,
+            "payload": payload,
+            "tools_only": True,
+        }
 
     def _context_pack_benchmark(self, max_files: int = 5000) -> dict[str, Any]:
         started = time.perf_counter()
@@ -2075,8 +2924,8 @@ class ContextService:
         if max_output_chars is not None:
             payload["max_output_chars"] = max(256, int(max_output_chars))
         if default_output_profile is not None:
-            if default_output_profile not in {"compact", "normal", "verbose"}:
-                raise ValueError("default_output_profile must be compact, normal, or verbose")
+            if default_output_profile not in OUTPUT_PROFILES:
+                raise ValueError("default_output_profile must be minimal, compact, normal, or verbose")
             payload["default_output_profile"] = default_output_profile
         payload["schema"] = "context_budget.v1"
         if max_output_chars is not None or default_output_profile is not None:
@@ -2325,6 +3174,22 @@ class ContextService:
             str(row.get("path", "")) == expected_path for row in signature_rows
         ):
             return "path_changed"
+        expected_fingerprint = metadata.get("file_fingerprint")
+        if isinstance(expected_fingerprint, dict):
+            expected_token = str(expected_fingerprint.get("cache_token", ""))
+            if expected_token and not any(
+                str(
+                    (row.get("file_fingerprint", {}) or {}).get("cache_token", "")
+                )
+                == expected_token
+                for row in signature_rows
+            ):
+                return "changed_chunk_digest"
+        expected_chunk_id = str(metadata.get("chunk_id", ""))
+        if expected_chunk_id and not any(
+            str(row.get("chunk_id", "")) == expected_chunk_id for row in signature_rows
+        ):
+            return "changed_chunk_digest"
         expected_globs = metadata.get("include_globs")
         if expected_globs is not None and not any(
             row.get("include_globs") == expected_globs for row in signature_rows

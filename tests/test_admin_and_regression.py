@@ -84,7 +84,7 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
         mode="contracts", tool_name="context_pack", contract_profile="compact"
     )
     assert compact_pack_contract["schema"] == "tool_output_contract.compact.v1"
-    assert compact_pack_contract["output_schema_names"] == ["context_pack.v1"]
+    assert "context_pack.minimal.v1" in compact_pack_contract["output_schema_names"]
 
     service.context_admin(mode="index_refresh")
     first = service.context_lookup(mode="search", query="auth token")
@@ -507,6 +507,40 @@ def test_context_pack_changed_signature_invalidates_fragments(
     )
 
 
+def test_unrelated_edit_reuses_unchanged_chunk_summaries(
+    service: ContextService, sample_repo: Path
+) -> None:
+    first = service.context_pack("review auth token behavior", max_items=2)
+    unrelated = sample_repo / "config" / "other.toml"
+    unrelated.write_text("other = true\n", encoding="utf-8")
+
+    second = service.context_pack("review auth token behavior", max_items=2)
+
+    assert first["items"]
+    assert second["items"]
+    assert second["cache"]["hit"] is False
+    assert second["cache"]["chunk_hits"] >= 1
+    assert second["cache"]["chunk_hit_ratio"] > 0
+
+
+def test_context_lookup_impact_chunk_and_cache_modes(service: ContextService) -> None:
+    impact = service.context_lookup(mode="impact", path="src/auth.py")
+    owners = service.context_lookup(mode="test_owners", path="src/auth.py")
+    symbols = service.context_lookup(mode="related_symbols", path="src/auth.py")
+    chunk = service.context_lookup(mode="chunk", path="src/auth.py", start_line=1)
+
+    assert impact["schema"] == "context_lookup.impact.v1"
+    assert any(row["path"] == "tests/test_auth.py" for row in impact["related"])
+    assert owners["related"][0]["path"] == "tests/test_auth.py"
+    assert symbols["symbols"]
+    assert chunk["chunk"]["chunk_id"].startswith("chk_")
+
+    service.context_pack("review auth token behavior", max_items=2)
+    cache = service.context_lookup(mode="explain_cache", path="src/auth.py")
+    assert cache["schema"] == "context_lookup.explain_cache.v1"
+    assert "count" in cache
+
+
 def test_context_pack_missing_refresh_signature_skips_fragment_writes(
     service: ContextService, monkeypatch
 ) -> None:
@@ -523,6 +557,40 @@ def test_context_pack_missing_refresh_signature_skips_fragment_writes(
     )
     assert "retrieval.search_term" not in stats["namespaces"]
     assert "retrieval.file_summary" not in stats["namespaces"]
+
+
+def test_quality_eval_and_tool_only_admin_modes(
+    service: ContextService, sample_repo: Path
+) -> None:
+    fixture_dir = sample_repo / "benchmarks" / "gold_anchors"
+    fixture_dir.mkdir(parents=True)
+    (fixture_dir / "sample.json").write_text(
+        json.dumps(
+            {
+                "task": "Review token handling and update tests",
+                "changed_files": ["src/auth.py"],
+                "expected_anchors": [
+                    {"path": "src/auth.py", "required": True},
+                    {"path": "tests/test_auth.py", "required": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    quality = service.context_admin(mode="quality_eval")
+    instructions = service.context_admin(mode="instructions")
+    proxied = service.context_admin(mode="resource_proxy", path="repo://summary")
+    profile = service.context_admin(mode="profile_calibrate")
+    plan = service.context_admin(mode="cache_plan")
+
+    assert quality["schema"] == "context_quality_eval.v1"
+    assert quality["fixtures"] == 1
+    assert quality["metrics"]["anchor_recall_at_5"] == 1.0
+    assert instructions["schema"] == "codex_context_pack_first.instructions.v1"
+    assert proxied["schema"] == "context_resource_proxy.v1"
+    assert profile["profiles"]["codex"]["output_profile"] == "minimal"
+    assert plan["schema"] == "context_budget_plan.v1"
 
 
 def test_legacy_retrieval_cache_rows_are_stale_and_pruned(

@@ -7,12 +7,22 @@ from .util import estimate_tokens
 
 CONTEXT_PACK_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "required": ["schema", "summary", "items", "omitted", "metrics"],
+    "required": ["schema", "summary", "items"],
     "properties": {
-        "schema": {"const": "context_pack.v1"},
-        "summary": {"type": "object"},
+        "schema": {
+            "enum": [
+                "context_pack.v1",
+                "context_pack.minimal.v1",
+                "context_pack.compact.v2",
+                "context_pack.normal.v2",
+                "context_pack.verbose.v2",
+            ]
+        },
+        "summary": {"type": ["object", "string"]},
         "items": {"type": "array"},
         "omitted": {"type": "array"},
+        "omitted_ref": {"type": "string"},
+        "diagnostics_ref": {"type": "string"},
         "metrics": {"type": "object"},
     },
 }
@@ -98,14 +108,23 @@ TOOL_INPUT_PARAMS: dict[str, dict[str, str]] = {
         "focus_paths": "Paths to prioritize.",
         "memory_session": "Memory session key.",
         "max_output_chars": "Hard output budget.",
-        "output_profile": "compact, normal, verbose.",
+        "output_profile": "minimal, compact, normal, verbose.",
         "max_items": "Max context items.",
         "refresh_index": "Force index refresh.",
+        "client_profile": "codex, claude, copilot, generic.",
+        "model_profile": "openai, anthropic, github, unknown.",
+        "evidence_policy": "summary_first, snippet_first, reference_first.",
+        "diagnostics": "none, summary, full.",
+        "include_request_prompt": "Echo raw prompt.",
+        "include_runtime_metadata": "Inline volatile runtime metadata.",
+        "max_source_tokens": "Source token budget.",
+        "max_diagnostic_tokens": "Diagnostic token budget.",
+        "cache_strategy": "stable, fresh, cold.",
         "project_id": "Project selector.",
         "root_uri": "Repo file URI.",
     },
     "context_lookup": {
-        "mode": "search, snippet, tree, symbols, references.",
+        "mode": "search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, explain_cache.",
         "query": "Search or symbol terms.",
         "path": "Repo-relative path.",
         "start_line": "Snippet start line.",
@@ -138,7 +157,7 @@ TOOL_INPUT_PARAMS: dict[str, dict[str, str]] = {
         "root_uri": "Repo file URI.",
     },
     "context_admin": {
-        "mode": "health, projects, index, cache, warmup, budget, contracts, metrics, state_browser.",
+        "mode": "health, projects, index, cache, warmup, budget, contracts, metrics, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
         "path": "Repo-relative path.",
         "max_files": "Index file cap.",
         "max_entries": "Max rows.",
@@ -162,13 +181,24 @@ TOOL_INPUT_PARAMS: dict[str, dict[str, str]] = {
 }
 
 TOOL_OUTPUT_SCHEMA_NAMES: dict[str, list[str]] = {
-    "context_pack": ["context_pack.v1"],
+    "context_pack": [
+        "context_pack.v1",
+        "context_pack.minimal.v1",
+        "context_pack.compact.v2",
+        "context_pack.normal.v2",
+        "context_pack.verbose.v2",
+    ],
     "context_lookup": [
         "context_search.v1",
         "context_snippet.v1",
         "context_tree.v1",
         "context_symbols.v1",
         "context_references.list.v1",
+        "context_lookup.impact.v1",
+        "context_lookup.related_symbols.v1",
+        "context_lookup.test_owners.v1",
+        "context_lookup.chunk.v1",
+        "context_lookup.explain_cache.v1",
     ],
     "context_memory": [
         "context_memory.get.v1",
@@ -191,6 +221,10 @@ TOOL_OUTPUT_SCHEMA_NAMES: dict[str, list[str]] = {
         "context_measurement_matrix.v1",
         "context_benchmark.v1",
         "context_state_browser.v1",
+        "context_quality_eval.v1",
+        "context_budget_plan.v1",
+        "context_profile_calibration.v1",
+        "context_resource_proxy.v1",
     ],
     "result_reference_resolve": ["mcp_result_reference.resolve.v1"],
 }

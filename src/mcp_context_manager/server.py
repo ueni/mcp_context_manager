@@ -41,6 +41,15 @@ CONTEXT_PACK_HTTP_FIELDS = {
     "output_profile",
     "max_items",
     "refresh_index",
+    "client_profile",
+    "model_profile",
+    "evidence_policy",
+    "diagnostics",
+    "include_request_prompt",
+    "include_runtime_metadata",
+    "max_source_tokens",
+    "max_diagnostic_tokens",
+    "cache_strategy",
     "project_id",
     "root_uri",
 }
@@ -134,11 +143,47 @@ MaxOutputCharsParam = Annotated[
     ),
 ]
 OutputProfileParam = Annotated[
-    Literal["compact", "normal", "verbose"] | None,
+    Literal["minimal", "compact", "normal", "verbose"] | None,
     _tool_param(
-        "Output detail level. Use compact by default; choose normal or verbose only "
-        "when the user asks for more evidence."
+        "Output detail level. Use minimal or compact by default; choose normal or "
+        "verbose only when the user asks for more evidence."
     ),
+]
+ClientProfileParam = Annotated[
+    Literal["codex", "claude", "copilot", "generic"],
+    _tool_param("Client profile for output defaults and tools-only fallbacks."),
+]
+ModelProfileParam = Annotated[
+    Literal["openai", "anthropic", "github", "unknown"],
+    _tool_param("Provider family hint for cache-stable output choices."),
+]
+EvidencePolicyParam = Annotated[
+    Literal["summary_first", "snippet_first", "reference_first"],
+    _tool_param("Evidence shape preference for selected context."),
+]
+DiagnosticsParam = Annotated[
+    Literal["none", "summary", "full"],
+    _tool_param("Inline diagnostics detail; full raw diagnostics remain resolvable."),
+]
+IncludeRequestPromptParam = Annotated[
+    bool,
+    _tool_param("Echo the raw request prompt in tool output. Disabled by default."),
+]
+IncludeRuntimeMetadataParam = Annotated[
+    bool,
+    _tool_param("Inline volatile runtime metadata such as timestamps."),
+]
+MaxSourceTokensParam = Annotated[
+    int,
+    _tool_param("Approximate source-evidence token budget before deferring content."),
+]
+MaxDiagnosticTokensParam = Annotated[
+    int,
+    _tool_param("Approximate inline diagnostic token budget before referencing details."),
+]
+CacheStrategyParam = Annotated[
+    Literal["stable", "fresh", "cold"],
+    _tool_param("Cache preference: stable reuse, fresh refresh, or cold diagnostics."),
 ]
 MaxItemsParam = Annotated[
     int,
@@ -151,7 +196,18 @@ RefreshIndexParam = Annotated[
     ),
 ]
 LookupModeParam = Annotated[
-    Literal["search", "snippet", "tree", "symbols", "references"],
+    Literal[
+        "search",
+        "snippet",
+        "tree",
+        "symbols",
+        "references",
+        "impact",
+        "related_symbols",
+        "test_owners",
+        "chunk",
+        "explain_cache",
+    ],
     _tool_param(
         "Lookup operation: search text, read a bounded snippet, list a tree, query "
         "symbols, or list stored result references."
@@ -292,6 +348,12 @@ AdminModeParam = Annotated[
         "measurement_matrix",
         "benchmark",
         "state_browser",
+        "quality_eval",
+        "cache_plan",
+        "profile_calibrate",
+        "instructions",
+        "resource_proxy",
+        "schema_minify",
     ],
     _tool_param(
         "Administrative operation: health, projects, index refresh/status, cache "
@@ -318,7 +380,7 @@ MaxAgeMinutesParam = Annotated[
     ),
 ]
 DefaultOutputProfileParam = Annotated[
-    Literal["compact", "normal", "verbose"] | None,
+    Literal["minimal", "compact", "normal", "verbose"] | None,
     _tool_param("Default output profile to inspect with mode=budget."),
 ]
 ToolNameParam = Annotated[
@@ -442,6 +504,15 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         output_profile: OutputProfileParam = None,
         max_items: MaxItemsParam = 8,
         refresh_index: RefreshIndexParam = False,
+        client_profile: ClientProfileParam = "generic",
+        model_profile: ModelProfileParam = "unknown",
+        evidence_policy: EvidencePolicyParam = "summary_first",
+        diagnostics: DiagnosticsParam = "summary",
+        include_request_prompt: IncludeRequestPromptParam = False,
+        include_runtime_metadata: IncludeRuntimeMetadataParam = False,
+        max_source_tokens: MaxSourceTokensParam = 1200,
+        max_diagnostic_tokens: MaxDiagnosticTokensParam = 300,
+        cache_strategy: CacheStrategyParam = "stable",
         project_id: ProjectIdParam = None,
         root_uri: RootUriParam = None,
     ) -> dict[str, Any]:
@@ -455,6 +526,15 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
             output_profile=output_profile,
             max_items=max_items,
             refresh_index=refresh_index,
+            client_profile=client_profile,
+            model_profile=model_profile,
+            evidence_policy=evidence_policy,
+            diagnostics=diagnostics,
+            include_request_prompt=include_request_prompt,
+            include_runtime_metadata=include_runtime_metadata,
+            max_source_tokens=max_source_tokens,
+            max_diagnostic_tokens=max_diagnostic_tokens,
+            cache_strategy=cache_strategy,
             project_id=project_id,
             root_uri=root_uri,
             mcp_roots=await _mcp_roots(ctx),

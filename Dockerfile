@@ -25,7 +25,7 @@ RUN python -m venv /opt/venv \
     && mkdir -p /workspace-roots /state \
     && chown -R mcp:mcp /workspace-roots /state
 
-COPY pyproject.toml AGENTS.md ./
+COPY pyproject.toml AGENTS.md README.md ./
 COPY src ./src
 
 FROM base AS test

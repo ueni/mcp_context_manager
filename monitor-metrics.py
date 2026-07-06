@@ -885,6 +885,10 @@ def _project_column_widths(width: int) -> dict[str, int]:
         widths["project_id"] -= 1
     while overhead + sum(widths.values()) > target_width and widths["project"] > 16:
         widths["project"] -= 1
+    if widths["project"] < 26 and widths["project_id"] > 12:
+        shift = min(26 - widths["project"], widths["project_id"] - 12)
+        widths["project"] += shift
+        widths["project_id"] -= shift
     extra = target_width - (overhead + sum(widths.values()))
     if extra > 0:
         widths["project"] += extra
