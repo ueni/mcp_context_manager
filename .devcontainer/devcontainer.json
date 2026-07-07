@@ -1,0 +1,41 @@
+{
+  "name": "mcp-context-manager",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "containerUser": "vscode",
+  "remoteUser": "vscode",
+  "mounts": [
+    "source=/etc/ssl/certs,target=/etc/ssl/certs,type=bind,readonly",
+    "source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,readonly",
+    "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,readonly"
+  ],  
+  "containerEnv": {
+      "MCP_CONTEXT_AUTO_UPDATE": "0",
+      "MCP_CONTEXT_ALLOWED_ROOTS": "/workspaces",
+      "MCP_CONTEXT_ROOT_MAPPINGS": "/workspaces=/workspaces",
+      "MCP_CONTEXT_STATE_DIR": "/tmp/mcp-context-manager-state",
+      "MCP_TRANSPORT": "streamable-http",
+      "PORT": "8000",
+      "REPO_PATH": "/workspaces/mcp-context-manager",
+      "CURL_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
+      "GIT_SSL_CAINFO": "/etc/ssl/certs/ca-certificates.crt",
+      "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
+      "SSL_CERT_DIR": "/etc/ssl/certs",
+      "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt"
+  },
+  "remoteEnv": {
+      "PATH": "${containerEnv:PATH}:/home/vscode/.local/bin"
+  },  
+  "postCreateCommand": "python -m pip install --user --no-compile -e '.[dev]'",
+  "forwardPorts": [8000],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "mhutchie.git-graph",
+                "ms-python.python"
+            ],
+            "settings": {
+                "cmake.configureOnOpen": false
+            }
+        }
+    }  
+}
