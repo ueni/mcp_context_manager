@@ -471,7 +471,7 @@ Build the image locally:
 
 ```bash
 docker build \
-  --build-arg SERVER_BINARY=dist/mcp-context-manager \
+  --build-arg SERVER_BINARY=dist/mcp-context-manager-linux-x86_64-musl \
   -t mcp-context-manager:local .
 ```
 
@@ -479,8 +479,9 @@ GitHub Actions owns release artifacts:
 
 - `Build standalone server` builds and smoke-tests a bundled Linux executable.
 - `Release` is manually dispatched with a version such as `0.2.0`. It creates
-  tag `v0.2.0`, builds a Docker image archive, builds the standalone executable,
-  writes `SHA256SUMS`, signs the checksums with Sigstore, and publishes all
+  tag `v0.2.0`, builds the glibc and musl standalone executables, builds a
+  musl-based Docker image archive, writes `SHA256SUMS`, signs the checksums
+  with Sigstore, and publishes all
   artifacts on the GitHub release.
 
 Verify downloaded release artifacts:
@@ -492,7 +493,7 @@ sha256sum -c SHA256SUMS
 Use the Docker image archive:
 
 ```bash
-gzip -dc mcp-context-manager-0.2.0-image.tar.gz | docker load
+gzip -dc mcp-context-manager-0.2.0-linux-x86_64-musl-image.tar.gz | docker load
 docker run --rm \
   -p 127.0.0.1:8000:8000 \
   -e MCP_CONTEXT_ALLOWED_ROOTS=/workspace-roots \
@@ -503,23 +504,35 @@ docker run --rm \
   mcp-context-manager:0.2.0
 ```
 
-Use the standalone server executable:
+Use the glibc standalone server executable:
 
 ```bash
-chmod +x mcp-context-manager-0.2.0-linux-x86_64
+chmod +x mcp-context-manager-0.2.0-linux-x86_64-glibc
 MCP_TRANSPORT=streamable-http \
 HOST=127.0.0.1 \
 PORT=8000 \
 MCP_CONTEXT_ALLOWED_ROOTS="$PWD" \
 MCP_CONTEXT_STATE_DIR="$HOME/.local/state/mcp-context-manager" \
-./mcp-context-manager-0.2.0-linux-x86_64
+./mcp-context-manager-0.2.0-linux-x86_64-glibc
 ```
 
 Run a self-update from the standalone executable (auto-updates and relaunches):
 
 ```bash
-./mcp-context-manager-0.2.0-linux-x86_64 --update
+./mcp-context-manager-0.2.0-linux-x86_64-glibc --update
 ```
+
+Use the musl standalone server executable on Alpine-compatible hosts:
+
+```bash
+chmod +x mcp-context-manager-0.2.0-linux-x86_64-musl
+MCP_TRANSPORT=streamable-http \
+HOST=127.0.0.1 \
+PORT=8000 \
+MCP_CONTEXT_ALLOWED_ROOTS="$PWD" \
+MCP_CONTEXT_STATE_DIR="$HOME/.local/state/mcp-context-manager" \
+./mcp-context-manager-0.2.0-linux-x86_64-musl --update
+``` 
 
 The updater defaults to `ueni/mcp_context_manager` when `--update-repo` or
 `MCP_CONTEXT_UPDATE_REPO` is not provided and uses `--update` without extra

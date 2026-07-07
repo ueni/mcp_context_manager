@@ -48,8 +48,22 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Build standalone executable
+      - name: Build glibc and musl executables
         run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            python:3.12-slim sh -c '
+              apt-get update \
+              && apt-get install -y --no-install-recommends binutils build-essential libffi-dev libssl-dev \
+              && python -m pip install --upgrade pip \
+              && python -m pip install pyinstaller . \
+              && pyinstaller \
+                --onefile \
+                --name mcp-context-manager-linux-x86_64-glibc \
+                --collect-all mcp_context_manager \
+                src/mcp_context_manager/__main__.py
+            '
           docker run --rm \
             -v "$PWD":/workspace \
             -w /workspace \
@@ -59,14 +73,15 @@ jobs:
               && python -m pip install pyinstaller . \
               && pyinstaller \
                 --onefile \
-                --name mcp-context-manager \
+                --name mcp-context-manager-linux-x86_64-musl \
                 --collect-all mcp_context_manager \
                 src/mcp_context_manager/__main__.py
             '
           mkdir -p release
-          cp dist/mcp-context-manager "release/mcp-context-manager-${VERSION}-linux-x86_64"
+          cp dist/mcp-context-manager-linux-x86_64-glibc "release/mcp-context-manager-${VERSION}-linux-x86_64-glibc"
+          cp dist/mcp-context-manager-linux-x86_64-musl "release/mcp-context-manager-${VERSION}-linux-x86_64-musl"
 
-      - name: Smoke test executable
+      - name: Smoke test glibc executable
         run: |
           state_dir="$(mktemp -d)"
           MCP_TRANSPORT=streamable-http \
@@ -74,9 +89,35 @@ jobs:
           PORT=18080 \
           REPO_PATH="$PWD" \
           MCP_CONTEXT_STATE_DIR="$state_dir" \
-          "release/mcp-context-manager-${VERSION}-linux-x86_64" &
+          "release/mcp-context-manager-${VERSION}-linux-x86_64-glibc" &
           pid="$!"
           trap 'kill "$pid" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
+          for _ in $(seq 1 30); do
+            if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/mcp/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
+            then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Smoke test musl executable
+        run: |
+          state_dir="$(mktemp -d)"
+          container="mcp-context-manager-musl-smoke"
+          docker run --rm -d \
+            --name "$container" \
+            -p 18080:18080 \
+            -e MCP_TRANSPORT=streamable-http \
+            -e HOST=0.0.0.0 \
+            -e PORT=18080 \
+            -e REPO_PATH=/workspace-roots \
+            -e MCP_CONTEXT_STATE_DIR=/state \
+            -v "$PWD:/workspace-roots" \
+            -v "$state_dir:/state" \
+            python:3.12-alpine \
+            "/workspace-roots/release/mcp-context-manager-${VERSION}-linux-x86_64-musl"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
           for _ in $(seq 1 30); do
             if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/mcp/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
             then
@@ -89,11 +130,11 @@ jobs:
       - name: Build Docker image archive
         run: |
           docker build \
-            --build-arg SERVER_BINARY="release/mcp-context-manager-${VERSION}-linux-x86_64" \
+            --build-arg SERVER_BINARY="release/mcp-context-manager-${VERSION}-linux-x86_64-musl" \
             -t "${IMAGE_NAME}:${VERSION}" \
             -t "${IMAGE_NAME}:latest" \
             .
-          docker save "${IMAGE_NAME}:${VERSION}" | gzip -9 > "release/${IMAGE_NAME}-${VERSION}-image.tar.gz"
+          docker save "${IMAGE_NAME}:${VERSION}" | gzip -9 > "release/${IMAGE_NAME}-${VERSION}-linux-x86_64-musl-image.tar.gz"
 
       - name: Create checksums
         working-directory: release
@@ -119,4 +160,4 @@ jobs:
         run: |
           gh release create "$TAG" release/* \
             --title "$TAG" \
-            --notes "Release $TAG. Artifacts include the Alpine Docker image archive, standalone Linux server executable, checksums, and Sigstore signature bundle."
+            --notes "Release $TAG. Artifacts include the Alpine Docker image archive, glibc and musl standalone Linux server executables, checksums, and Sigstore signature bundle."

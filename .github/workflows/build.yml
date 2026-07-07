@@ -24,8 +24,22 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Build executable
+      - name: Build glibc and musl executables
         run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            python:3.12-slim sh -c '
+              apt-get update \
+              && apt-get install -y --no-install-recommends binutils build-essential libffi-dev libssl-dev \
+              && python -m pip install --upgrade pip \
+              && python -m pip install pyinstaller . \
+              && pyinstaller \
+                --onefile \
+                --name mcp-context-manager-linux-x86_64-glibc \
+                --collect-all mcp_context_manager \
+                src/mcp_context_manager/__main__.py
+            '
           docker run --rm \
             -v "$PWD":/workspace \
             -w /workspace \
@@ -35,13 +49,12 @@ jobs:
               && python -m pip install pyinstaller . \
               && pyinstaller \
                 --onefile \
-                --name mcp-context-manager \
+                --name mcp-context-manager-linux-x86_64-musl \
                 --collect-all mcp_context_manager \
                 src/mcp_context_manager/__main__.py
             '
-          cp dist/mcp-context-manager mcp-context-manager-linux-x86_64
 
-      - name: Smoke test executable
+      - name: Smoke test glibc executable
         run: |
           state_dir="$(mktemp -d)"
           MCP_TRANSPORT=streamable-http \
@@ -49,9 +62,35 @@ jobs:
           PORT=18080 \
           REPO_PATH="$PWD" \
           MCP_CONTEXT_STATE_DIR="$state_dir" \
-          ./mcp-context-manager-linux-x86_64 &
+          ./mcp-context-manager-linux-x86_64-glibc &
           pid="$!"
           trap 'kill "$pid" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
+          for _ in $(seq 1 30); do
+            if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
+            then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Smoke test musl executable
+        run: |
+          state_dir="$(mktemp -d)"
+          container="mcp-context-manager-musl-smoke"
+          docker run --rm -d \
+            --name "$container" \
+            -p 18080:18080 \
+            -e MCP_TRANSPORT=streamable-http \
+            -e HOST=0.0.0.0 \
+            -e PORT=18080 \
+            -e REPO_PATH=/workspace-roots \
+            -e MCP_CONTEXT_STATE_DIR=/state \
+            -v "$PWD:/workspace-roots" \
+            -v "$state_dir:/state" \
+            python:3.12-alpine \
+            /workspace-roots/mcp-context-manager-linux-x86_64-musl
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
           for _ in $(seq 1 30); do
             if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
             then
@@ -64,22 +103,29 @@ jobs:
       - name: Build docker image archive
         run: |
           docker build \
-            --build-arg SERVER_BINARY=mcp-context-manager-linux-x86_64 \
+            --build-arg SERVER_BINARY=mcp-context-manager-linux-x86_64-musl \
             -t mcp-context-manager:linux-x86_64 \
             .
           docker save mcp-context-manager:linux-x86_64 \
-            | gzip -9 > mcp-context-manager-linux-x86_64-image.tar.gz
+            | gzip -9 > mcp-context-manager-linux-x86_64-musl-image.tar.gz
 
-      - name: Upload executable
+      - name: Upload glibc executable
         uses: actions/upload-artifact@v4
         with:
-          name: mcp-context-manager-linux-x86_64
-          path: mcp-context-manager-linux-x86_64
+          name: mcp-context-manager-linux-x86_64-glibc
+          path: mcp-context-manager-linux-x86_64-glibc
+          if-no-files-found: error
+
+      - name: Upload musl executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-context-manager-linux-x86_64-musl
+          path: mcp-context-manager-linux-x86_64-musl
           if-no-files-found: error
 
       - name: Upload image archive
         uses: actions/upload-artifact@v4
         with:
-          name: mcp-context-manager-linux-x86_64-image
-          path: mcp-context-manager-linux-x86_64-image.tar.gz
+          name: mcp-context-manager-linux-x86_64-musl-image
+          path: mcp-context-manager-linux-x86_64-musl-image.tar.gz
           if-no-files-found: error
