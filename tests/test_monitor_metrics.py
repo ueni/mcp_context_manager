@@ -376,6 +376,12 @@ def test_active_refresh_project_ids_targets_selected_project() -> None:
         refresh_interval=5.0,
         state_target=monitor.ProjectTarget(project_id="alpha-123"),
     )
+    state_state_no_target = monitor.MonitorState(
+        selected_index=1,
+        view="state",
+        refresh_interval=5.0,
+        state_target=None,
+    )
 
     assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", table_state, snapshots) == [
         "alpha-123",
@@ -389,6 +395,9 @@ def test_active_refresh_project_ids_targets_selected_project() -> None:
     ]
     assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", state_state, snapshots) == [
         "alpha-123",
+    ]
+    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", state_state_no_target, snapshots) == [
+        "beta-456",
     ]
 
 

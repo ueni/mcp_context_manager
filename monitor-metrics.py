@@ -400,12 +400,10 @@ def _active_refresh_project_ids(
         return project_ids
     if not snapshots:
         return []
-    if state.view == "state" and state.state_target:
-        project_id = state.state_target.project_id
-        if project_id:
-            return [project_id]
     selected = _clamped_index(state.selected_index, len(snapshots))
     project_id = snapshots[selected].target.project_id
+    if state.view == "state" and state.state_target:
+        project_id = state.state_target.project_id or project_id
     return [project_id] if project_id else []
 
 
