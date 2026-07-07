@@ -1,5 +1,23 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.12-slim AS base
+FROM python:3.12-alpine AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_NO_COMPILE=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+RUN apk add --no-cache build-base git libffi-dev openssl-dev \
+    && python -m venv /opt/venv
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+RUN /opt/venv/bin/python -m pip install --upgrade pip \
+    && /opt/venv/bin/python -m pip install .
+
+FROM python:3.12-alpine AS runtime
 
 ARG MCP_CONTEXT_UID=1000
 ARG MCP_CONTEXT_GID=1000
@@ -9,9 +27,6 @@ ENV HOME=/tmp \
     MCP_CONTEXT_STATE_DIR=/state \
     MCP_TRANSPORT=streamable-http \
     PATH=/opt/venv/bin:$PATH \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_COMPILE=1 \
-    PIP_NO_CACHE_DIR=1 \
     PORT=8000 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -19,31 +34,20 @@ ENV HOME=/tmp \
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl git tar \
-    && rm -rf /var/lib/apt/lists/* \
-    && python -m venv /opt/venv \
-    && groupadd --gid "${MCP_CONTEXT_GID}" mcp \
-    && useradd --uid "${MCP_CONTEXT_UID}" --gid mcp --home-dir /tmp --shell /usr/sbin/nologin --no-create-home mcp \
+RUN apk add --no-cache ca-certificates git \
+    && addgroup -S -g "${MCP_CONTEXT_GID}" mcp \
+    && adduser -S -D -H -h /tmp -s /sbin/nologin -u "${MCP_CONTEXT_UID}" -G mcp mcp \
     && mkdir -p /workspace-roots /state \
     && chown -R mcp:mcp /workspace-roots /state
 
-COPY pyproject.toml README.md ./
-COPY scripts ./scripts
-COPY src ./src
-RUN chmod +x scripts/*.sh
-
-FROM base AS runtime
-
-RUN pip install --no-compile . \
-    && chown -R mcp:mcp /app /opt/venv
+COPY --from=builder /opt/venv /opt/venv
 
 USER mcp
 
 EXPOSE 8000
 VOLUME ["/workspace-roots", "/state"]
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.getenv('PORT', '8000'), timeout=3).read()" || exit 1
 
-CMD ["scripts/update-from-release.sh", "serve"]
+CMD ["mcp-context-manager"]
