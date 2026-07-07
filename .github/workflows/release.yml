@@ -48,20 +48,21 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install standalone build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends binutils
-          python -m pip install --upgrade pip
-          python -m pip install pyinstaller .
-
       - name: Build standalone executable
         run: |
-          pyinstaller \
-            --onefile \
-            --name mcp-context-manager \
-            --collect-all mcp_context_manager \
-            src/mcp_context_manager/__main__.py
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            python:3.12-alpine sh -c '
+              apk add --no-cache binutils build-base musl-dev libffi-dev openssl-dev \
+              && python -m pip install --upgrade pip \
+              && python -m pip install pyinstaller . \
+              && pyinstaller \
+                --onefile \
+                --name mcp-context-manager \
+                --collect-all mcp_context_manager \
+                src/mcp_context_manager/__main__.py
+            '
           mkdir -p release
           cp dist/mcp-context-manager "release/mcp-context-manager-${VERSION}-linux-x86_64"
 
@@ -87,7 +88,11 @@ jobs:
 
       - name: Build Docker image archive
         run: |
-          docker build -t "${IMAGE_NAME}:${VERSION}" -t "${IMAGE_NAME}:latest" .
+          docker build \
+            --build-arg SERVER_BINARY="release/mcp-context-manager-${VERSION}-linux-x86_64" \
+            -t "${IMAGE_NAME}:${VERSION}" \
+            -t "${IMAGE_NAME}:latest" \
+            .
           docker save "${IMAGE_NAME}:${VERSION}" | gzip -9 > "release/${IMAGE_NAME}-${VERSION}-image.tar.gz"
 
       - name: Create checksums

@@ -1,0 +1,85 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build executable
+        run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            python:3.12-alpine sh -c '
+              apk add --no-cache binutils build-base musl-dev libffi-dev openssl-dev \
+              && python -m pip install --upgrade pip \
+              && python -m pip install pyinstaller . \
+              && pyinstaller \
+                --onefile \
+                --name mcp-context-manager \
+                --collect-all mcp_context_manager \
+                src/mcp_context_manager/__main__.py
+            '
+          cp dist/mcp-context-manager mcp-context-manager-linux-x86_64
+
+      - name: Smoke test executable
+        run: |
+          state_dir="$(mktemp -d)"
+          MCP_TRANSPORT=streamable-http \
+          HOST=127.0.0.1 \
+          PORT=18080 \
+          REPO_PATH="$PWD" \
+          MCP_CONTEXT_STATE_DIR="$state_dir" \
+          ./mcp-context-manager-linux-x86_64 &
+          pid="$!"
+          trap 'kill "$pid" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
+          for _ in $(seq 1 30); do
+            if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
+            then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Build docker image archive
+        run: |
+          docker build \
+            --build-arg SERVER_BINARY=mcp-context-manager-linux-x86_64 \
+            -t mcp-context-manager:linux-x86_64 \
+            .
+          docker save mcp-context-manager:linux-x86_64 \
+            | gzip -9 > mcp-context-manager-linux-x86_64-image.tar.gz
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-context-manager-linux-x86_64
+          path: mcp-context-manager-linux-x86_64
+          if-no-files-found: error
+
+      - name: Upload image archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-context-manager-linux-x86_64-image
+          path: mcp-context-manager-linux-x86_64-image.tar.gz
+          if-no-files-found: error
