@@ -22,6 +22,89 @@ class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
+    def _metric_payload(self, project_id: str) -> dict[str, Any]:
+        return {
+            "schema": "context_metrics.v1",
+            "project_id": project_id,
+            "requests": {
+                "total": 10,
+                "by_operation": {
+                    "context_pack": {"count": 3, "avg_elapsed_ms": 42.5}
+                },
+            },
+            "cache": {
+                "hits": 6,
+                "misses": 2,
+                "hit_ratio": 0.75,
+                "context_pack_fragment_hits": 8,
+                "context_pack_fragment_misses": 2,
+                "context_pack_fragment_hit_ratio": 0.8,
+                "by_namespace": {
+                    "context_pack.retrieval": {
+                        "hits": 2,
+                        "misses": 1,
+                        "hit_ratio": 0.667,
+                    }
+                },
+            },
+            "tokens": {
+                "estimated_input_tokens_saved": 12345,
+                "tokens_spared_by_mcp_est": 12000,
+            },
+            "references": {"bytes_deferred_est": 4096},
+            "index_freshness": {
+                "state": "last_good",
+                "refresh_reason": "last_good_index",
+                "background_refresh_pending": True,
+            },
+            "background": {
+                "queue_depth": 1,
+                "index_refresh": {
+                    "kind": "index_refresh",
+                    "status": "running",
+                    "pending": True,
+                    "last_error": "",
+                },
+                "cache_prune": {
+                    "kind": "cache_prune",
+                    "status": "complete",
+                    "pending": False,
+                    "last_completed_at": "2026-07-01T12:00:00+00:00",
+                    "last_error": "",
+                },
+            },
+            "benchmarks": {
+                "stage_latency_ms_by_operation": {
+                    "context_pack": {
+                        "total_ms": {
+                            "avg_elapsed_ms": 42.5,
+                            "min_elapsed_ms": 20.0,
+                            "max_elapsed_ms": 80.0,
+                        },
+                        "index_refresh_ms": {
+                            "avg_elapsed_ms": 3.0,
+                            "min_elapsed_ms": 0.5,
+                            "max_elapsed_ms": 12.0,
+                        },
+                        "candidate_retrieval_ms": {
+                            "avg_elapsed_ms": 15.0,
+                            "min_elapsed_ms": 0.0,
+                            "max_elapsed_ms": 60.0,
+                        },
+                    }
+                },
+            },
+        }
+
+    def _matrix_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "context_measurement_matrix.v1",
+            "checks": [
+                {"key": "a", "status": "pass"},
+                {"key": "b", "status": "pass"},
+            ],
+        }
+
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((name, arguments))
         mode = arguments.get("mode")
@@ -35,85 +118,14 @@ class FakeClient:
                 ],
             }
         if mode == "metrics":
-            return {
-                "schema": "context_metrics.v1",
-                "project_id": project_id,
-                "requests": {
-                    "total": 10,
-                    "by_operation": {
-                        "context_pack": {"count": 3, "avg_elapsed_ms": 42.5}
-                    },
-                },
-                "cache": {
-                    "hits": 6,
-                    "misses": 2,
-                    "hit_ratio": 0.75,
-                    "context_pack_fragment_hits": 8,
-                    "context_pack_fragment_misses": 2,
-                    "context_pack_fragment_hit_ratio": 0.8,
-                    "by_namespace": {
-                        "context_pack.retrieval": {
-                            "hits": 2,
-                            "misses": 1,
-                            "hit_ratio": 0.667,
-                        }
-                    },
-                },
-                "tokens": {
-                    "estimated_input_tokens_saved": 12345,
-                    "tokens_spared_by_mcp_est": 12000,
-                },
-                "references": {"bytes_deferred_est": 4096},
-                "index_freshness": {
-                    "state": "last_good",
-                    "refresh_reason": "last_good_index",
-                    "background_refresh_pending": True,
-                },
-                "background": {
-                    "queue_depth": 1,
-                    "index_refresh": {
-                        "kind": "index_refresh",
-                        "status": "running",
-                        "pending": True,
-                        "last_error": "",
-                    },
-                    "cache_prune": {
-                        "kind": "cache_prune",
-                        "status": "complete",
-                        "pending": False,
-                        "last_completed_at": "2026-07-01T12:00:00+00:00",
-                        "last_error": "",
-                    },
-                },
-                "benchmarks": {
-                    "stage_latency_ms_by_operation": {
-                        "context_pack": {
-                            "total_ms": {
-                                "avg_elapsed_ms": 42.5,
-                                "min_elapsed_ms": 20.0,
-                                "max_elapsed_ms": 80.0,
-                            },
-                            "index_refresh_ms": {
-                                "avg_elapsed_ms": 3.0,
-                                "min_elapsed_ms": 0.5,
-                                "max_elapsed_ms": 12.0,
-                            },
-                            "candidate_retrieval_ms": {
-                                "avg_elapsed_ms": 15.0,
-                                "min_elapsed_ms": 0.0,
-                                "max_elapsed_ms": 60.0,
-                            },
-                        }
-                    }
-                },
-            }
+            return self._metric_payload(str(project_id))
         if mode == "measurement_matrix":
+            return self._matrix_payload()
+        if mode == "metrics_and_matrix":
             return {
-                "schema": "context_measurement_matrix.v1",
-                "checks": [
-                    {"key": "a", "status": "pass"},
-                    {"key": "b", "status": "pass"},
-                ],
+                "schema": "context_metrics_and_matrix.v1",
+                "metrics": self._metric_payload(str(project_id)),
+                "matrix": self._matrix_payload(),
             }
         if mode == "warmup":
             return {
@@ -319,11 +331,11 @@ def test_collect_snapshots_enumerates_projects_and_calls_metrics() -> None:
     assert ("context_admin", {"mode": "projects"}) in client.calls
     assert (
         "context_admin",
-        {"mode": "metrics", "project_id": "alpha-123"},
+        {"mode": "metrics_and_matrix", "project_id": "alpha-123"},
     ) in client.calls
     assert (
         "context_admin",
-        {"mode": "measurement_matrix", "project_id": "beta-456"},
+        {"mode": "metrics_and_matrix", "project_id": "beta-456"},
     ) in client.calls
 
 
@@ -341,6 +353,43 @@ def test_collect_snapshots_fetches_project_metrics_in_parallel() -> None:
 
     assert [row.target.project_id for row in snapshots] == ["alpha-123", "beta-456"]
     assert client.max_active_metrics == 2
+
+
+def test_active_refresh_project_ids_targets_selected_project() -> None:
+    monitor = load_monitor_module()
+    snapshots = [
+        monitor.ProjectSnapshot(target=monitor.ProjectTarget(project_id="alpha-123")),
+        monitor.ProjectSnapshot(target=monitor.ProjectTarget(project_id="beta-456")),
+    ]
+    table_state = monitor.MonitorState(
+        selected_index=1, view="table", refresh_interval=5.0
+    )
+    detail_state = monitor.MonitorState(
+        selected_index=1, view="detail", refresh_interval=5.0
+    )
+    performance_state = monitor.MonitorState(
+        selected_index=0, view="performance", refresh_interval=5.0
+    )
+    state_state = monitor.MonitorState(
+        selected_index=0,
+        view="state",
+        refresh_interval=5.0,
+        state_target=monitor.ProjectTarget(project_id="alpha-123"),
+    )
+
+    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", table_state, snapshots) == [
+        "alpha-123",
+        "beta-456",
+    ]
+    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", detail_state, snapshots) == [
+        "beta-456",
+    ]
+    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", performance_state, snapshots) == [
+        "alpha-123",
+    ]
+    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", state_state, snapshots) == [
+        "alpha-123",
+    ]
 
 
 def test_collect_snapshots_project_id_survives_project_discovery_error() -> None:

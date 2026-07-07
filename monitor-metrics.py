@@ -7,6 +7,7 @@ The tool talks to the Streamable HTTP MCP endpoint and calls:
 - context_admin(mode="projects")
 - context_admin(mode="metrics", project_id=...)
 - context_admin(mode="measurement_matrix", project_id=...)
+- context_admin(mode="metrics_and_matrix", project_id=...)
 
 It renders an interactive terminal dashboard for one project or every known project.
 No third-party dependencies are required.
@@ -387,6 +388,27 @@ def _collect_targets(
         return [future.result() for future in futures]
 
 
+def _active_refresh_project_ids(
+    project_ids: list[str],
+    root_uri: str,
+    state: MonitorState,
+    snapshots: list[ProjectSnapshot],
+) -> list[str]:
+    if root_uri:
+        return []
+    if state.view not in {"state", "detail", "performance"}:
+        return project_ids
+    if not snapshots:
+        return []
+    if state.view == "state" and state.state_target:
+        project_id = state.state_target.project_id
+        if project_id:
+            return [project_id]
+    selected = _clamped_index(state.selected_index, len(snapshots))
+    project_id = snapshots[selected].target.project_id
+    return [project_id] if project_id else []
+
+
 def fetch_state_browser(
     client: Any,
     target: ProjectTarget,
@@ -464,12 +486,27 @@ def _collect_one(
     selector = _selector_args(target, root_uri)
     snapshot = ProjectSnapshot(target=target)
     try:
-        snapshot.metrics = client.call_tool(
-            "context_admin", {"mode": "metrics", **selector}
-        )
         if include_matrix:
-            snapshot.matrix = client.call_tool(
-                "context_admin", {"mode": "measurement_matrix", **selector}
+            payload = client.call_tool(
+                "context_admin", {"mode": "metrics_and_matrix", **selector}
+            )
+            if (
+                isinstance(payload, dict)
+                and isinstance(payload.get("metrics"), dict)
+                and isinstance(payload.get("matrix"), dict)
+            ):
+                snapshot.metrics = payload["metrics"]
+                snapshot.matrix = payload["matrix"]
+            else:
+                snapshot.metrics = client.call_tool(
+                    "context_admin", {"mode": "metrics", **selector}
+                )
+                snapshot.matrix = client.call_tool(
+                    "context_admin", {"mode": "measurement_matrix", **selector}
+                )
+        else:
+            snapshot.metrics = client.call_tool(
+                "context_admin", {"mode": "metrics", **selector}
             )
     except Exception as exc:
         snapshot.error = str(exc)
@@ -1477,7 +1514,8 @@ def _bar(ratio: float, width: int, color: bool) -> str:
 def _legend(color: bool) -> str:
     return (
         f"{_style('checks', color, Ansi.BOLD)} come from "
-        "context_admin(mode='measurement_matrix'); cache bars show request and "
+        "context_admin(mode='metrics_and_matrix') checks; cache bars show request "
+        "and "
         "fragment hit ratios."
     )
 
@@ -2129,7 +2167,12 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                     "refresh",
                     lambda: collect_snapshots(
                         client,
-                        project_ids=args.project_id,
+                        project_ids=_active_refresh_project_ids(
+                            args.project_id,
+                            args.root_uri,
+                            state,
+                            snapshots,
+                        ),
                         root_uri=args.root_uri,
                         include_matrix=not args.no_matrix,
                     ),
