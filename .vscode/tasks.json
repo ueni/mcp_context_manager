@@ -4,7 +4,7 @@
     {
       "label": "build: docker image",
       "type": "shell",
-      "command": "if [ ! -x dist/mcp-context-manager ]; then echo \"dist/mcp-context-manager is missing; run the standalone build task first.\" >&2; exit 1; fi; docker build --build-arg SERVER_BINARY=dist/mcp-context-manager -t mcp-context-manager:local .",
+      "command": "if [ ! -x dist/mcp-context-manager ]; then mkdir -p dist; echo \"dist/mcp-context-manager missing; building standalone binary...\" >&2; docker run --rm -v \"${workspaceFolder}:/workspace\" -w /tmp/build python:3.12-bullseye sh -lc 'tar -C /workspace --exclude=.git --exclude=.mcp-context-manager --exclude=.pytest_cache --exclude=.ruff_cache --exclude=__pycache__ --exclude=build --exclude=dist --exclude=wheelhouse -cf - . | tar -C /tmp/build -xf - && apt-get update >/tmp/apt.log && apt-get install -y --no-install-recommends binutils >>/tmp/apt.log && python -m pip install --upgrade pip >/tmp/pip.log && python -m pip install pyinstaller . >>/tmp/pip.log && pyinstaller --onefile --name mcp-context-manager --distpath /workspace/dist --workpath /tmp/pyinstaller-build --specpath /tmp --collect-all mcp_context_manager src/mcp_context_manager/__main__.py && chown -R \"$(stat -c \"%u:%g\" /workspace)\" /workspace/dist'; fi; docker build --build-arg SERVER_BINARY=dist/mcp-context-manager -t mcp-context-manager:local .",
       "group": {
         "kind": "build",
         "isDefault": true
@@ -21,7 +21,7 @@
     {
       "label": "build: docker image tar.gz",
       "type": "shell",
-      "command": "set -euo pipefail; mkdir -p dist; if [ ! -x dist/mcp-context-manager ]; then echo \"dist/mcp-context-manager is missing; run the standalone build task first.\" >&2; exit 1; fi; docker build --build-arg SERVER_BINARY=dist/mcp-context-manager -t mcp-context-manager:local .; docker save mcp-context-manager:local | gzip -9 > dist/mcp-context-manager-local-image.tar.gz",
+      "command": "set -euo pipefail; mkdir -p dist; if [ ! -x dist/mcp-context-manager ]; then echo \"dist/mcp-context-manager is missing; building standalone binary...\" >&2; docker run --rm -v \"${workspaceFolder}:/workspace\" -w /tmp/build python:3.12-bullseye sh -lc 'tar -C /workspace --exclude=.git --exclude=.mcp-context-manager --exclude=.pytest_cache --exclude=.ruff_cache --exclude=__pycache__ --exclude=build --exclude=dist --exclude=wheelhouse -cf - . | tar -C /tmp/build -xf - && apt-get update >/tmp/apt.log && apt-get install -y --no-install-recommends binutils >>/tmp/apt.log && python -m pip install --upgrade pip >/tmp/pip.log && python -m pip install pyinstaller . >>/tmp/pip.log && pyinstaller --onefile --name mcp-context-manager --distpath /workspace/dist --workpath /tmp/pyinstaller-build --specpath /tmp --collect-all mcp_context_manager src/mcp_context_manager/__main__.py && chown -R \"$(stat -c \"%u:%g\" /workspace)\" /workspace/dist'; fi; docker build --build-arg SERVER_BINARY=dist/mcp-context-manager -t mcp-context-manager:local .; docker save mcp-context-manager:local | gzip -9 > dist/mcp-context-manager-local-image.tar.gz",
       "group": "build",
       "problemMatcher": []
     },
