@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,20 @@ from .util import (
     save_json_file,
     sha256_text,
 )
+
+
+_PROJECT_METADATA_LOCKS_GUARD = threading.Lock()
+_PROJECT_METADATA_LOCKS: dict[Path, threading.Lock] = {}
+
+
+def _project_metadata_lock(path: Path) -> threading.Lock:
+    key = path.resolve()
+    with _PROJECT_METADATA_LOCKS_GUARD:
+        lock = _PROJECT_METADATA_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PROJECT_METADATA_LOCKS[key] = lock
+        return lock
 
 
 @dataclass(frozen=True)
@@ -317,23 +332,24 @@ class ProjectRegistry:
         if root_locator is None:
             raise ValueError("project root cannot be represented by a safe locator")
         metadata_path = project.state_dir / "project.json"
-        current = load_json_file(metadata_path, {})
-        created_at = current.get("created_at") or now_iso()
-        root_uri_redacted, _redactions = redact_text(project.root_uri)
-        save_json_file(
-            metadata_path,
-            {
-                "schema": "context_project.metadata.v1",
-                "project_id": project.project_id,
-                "root_uri_hash": project.root_hash,
-                "root_uri_redacted": root_uri_redacted,
-                "root_locator": root_locator,
-                "name": project.name,
-                "source": project.source,
-                "created_at": created_at,
-                "updated_at": now_iso(),
-            },
-        )
+        with _project_metadata_lock(metadata_path):
+            current = load_json_file(metadata_path, {})
+            created_at = current.get("created_at") or now_iso()
+            root_uri_redacted, _redactions = redact_text(project.root_uri)
+            save_json_file(
+                metadata_path,
+                {
+                    "schema": "context_project.metadata.v1",
+                    "project_id": project.project_id,
+                    "root_uri_hash": project.root_hash,
+                    "root_uri_redacted": root_uri_redacted,
+                    "root_locator": root_locator,
+                    "name": project.name,
+                    "source": project.source,
+                    "created_at": created_at,
+                    "updated_at": now_iso(),
+                },
+            )
 
     def _project_from_metadata(
         self, metadata: Any

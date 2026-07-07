@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from types import SimpleNamespace
 from typing import Annotated, Literal, get_args, get_origin, get_type_hints
 
@@ -14,6 +15,7 @@ from mcp_context_manager.server import (
     _mcp_roots,
     _mcp_tools_http_payload,
     _normalize_context_pack_http_payload,
+    _run_service_call,
 )
 
 
@@ -143,6 +145,20 @@ def test_create_mcp_tool_parameters_have_llm_descriptions(
         registered_tools["context_lookup"], include_extras=True
     )
     assert "search text" in _annotation_description(lookup_hints["mode"])
+
+
+def test_run_service_call_does_not_block_event_loop() -> None:
+    def slow_service_call() -> dict[str, str]:
+        time.sleep(0.2)
+        return {"schema": "slow.ok"}
+
+    async def run_tool() -> None:
+        task = asyncio.create_task(_run_service_call(slow_service_call))
+        await asyncio.sleep(0.02)
+        assert not task.done()
+        assert await asyncio.wait_for(task, timeout=1) == {"schema": "slow.ok"}
+
+    asyncio.run(run_tool())
 
 
 def test_context_admin_mcp_tool_accepts_warmup_and_cache_stats(

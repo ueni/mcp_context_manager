@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+from mcp_context_manager import projects as projects_module
 from mcp_context_manager.config import ContextConfig
 from mcp_context_manager.context import ContextService
 from mcp_context_manager.manager import ProjectContextService
@@ -345,6 +349,55 @@ def test_known_projects_rewrites_legacy_raw_root_uri_metadata(tmp_path: Path) ->
     assert rewritten["root_locator"]["relative_path"] == "alpha"
     assert repo.as_uri() not in rewritten_text
     assert str(repo) not in rewritten_text
+
+
+def test_remember_project_serializes_metadata_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path / "alpha", "alpha")
+    config = ContextConfig(
+        repo_path=repo.resolve(),
+        state_dir=(tmp_path / "state").resolve(),
+        allowed_roots=(str(tmp_path),),
+    )
+    registry = ProjectRegistry(config)
+    project = registry.project_from_uri(repo.as_uri(), name="Alpha")
+    original_save_json_file = projects_module.save_json_file
+    active_lock = threading.Lock()
+    start = threading.Barrier(8)
+    active = False
+    overlapped = False
+
+    def slow_save_json_file(path: Path, value: object) -> None:
+        nonlocal active, overlapped
+        with active_lock:
+            if active:
+                overlapped = True
+            active = True
+        try:
+            time.sleep(0.01)
+            original_save_json_file(path, value)
+        finally:
+            with active_lock:
+                active = False
+
+    def remember_once() -> None:
+        start.wait(timeout=2)
+        registry.remember_project(project)
+
+    monkeypatch.setattr(projects_module, "save_json_file", slow_save_json_file)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(remember_once) for _ in range(8)]
+        for future in futures:
+            future.result(timeout=3)
+
+    metadata_path = project.state_dir / "project.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    assert overlapped is False
+    assert metadata["project_id"] == project.project_id
+    assert not list(metadata_path.parent.glob(".project.json.*.tmp"))
 
 
 def test_workspace_roots_without_mapping_requires_explicit_project_selection(

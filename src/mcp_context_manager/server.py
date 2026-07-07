@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import threading
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal, TypeVar
 
 from .config import ContextConfig
 from .context import DEFAULT_CACHE_MAX_AGE_MINUTES, ContextService
@@ -31,6 +32,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 SERVICE = ProjectContextService.from_env()
+T = TypeVar("T")
+_SERVICE_CALL_LIMIT = threading.Semaphore(8)
 
 CONTEXT_PACK_HTTP_FIELDS = {
     "prompt",
@@ -527,7 +530,8 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         root_uri: RootUriParam = None,
     ) -> dict[str, Any]:
         """Build a compact, cited repository context pack for a coding task."""
-        return svc.context_pack(
+        return await _run_service_call(
+            svc.context_pack,
             prompt=prompt,
             changed_files=changed_files,
             focus_paths=focus_paths,
@@ -566,7 +570,8 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         root_uri: RootUriParam = None,
     ) -> dict[str, Any]:
         """Search, read snippets, list trees, query symbols, or list references."""
-        return svc.context_lookup(
+        return await _run_service_call(
+            svc.context_lookup,
             mode=mode,
             query=query,
             path=path,
@@ -604,7 +609,8 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         root_uri: RootUriParam = None,
     ) -> dict[str, Any]:
         """Manage compact repository-local context memory."""
-        return svc.context_memory(
+        return await _run_service_call(
+            svc.context_memory,
             mode=mode,
             namespace=namespace,
             key=key,
@@ -644,7 +650,8 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         root_uri: RootUriParam = None,
     ) -> dict[str, Any]:
         """Read health, index, cache, budget, contracts, metrics, and benchmarks."""
-        return svc.context_admin(
+        return await _run_service_call(
+            svc.context_admin,
             mode=mode,
             path=path,
             max_files=max_files,
@@ -671,7 +678,8 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
         root_uri: RootUriParam = None,
     ) -> dict[str, Any]:
         """Resolve a local result reference after boundary, expiry, and hash checks."""
-        return svc.result_reference_resolve(
+        return await _run_service_call(
+            svc.result_reference_resolve,
             reference_id=reference_id,
             reference=reference,
             expected_hash=expected_hash,
@@ -773,7 +781,7 @@ def create_http_app(service: ProjectContextService | ContextService | None = Non
         return PlainTextResponse("mcp-context-manager")
 
     async def healthz(_request: Any) -> JSONResponse:
-        return JSONResponse(svc.context_admin(mode="health"))
+        return JSONResponse(await _run_service_call(svc.context_admin, mode="health"))
 
     async def mcp_tools_http(_request: Any) -> JSONResponse:
         tools = await mcp.list_tools()
@@ -782,7 +790,7 @@ def create_http_app(service: ProjectContextService | ContextService | None = Non
     async def context_pack_http(request: Any) -> JSONResponse:
         try:
             payload = _normalize_context_pack_http_payload(await request.json())
-            return JSONResponse(svc.context_pack(**payload))
+            return JSONResponse(await _run_service_call(svc.context_pack, **payload))
         except (TypeError, ValueError) as exc:
             return JSONResponse(
                 {
@@ -796,7 +804,8 @@ def create_http_app(service: ProjectContextService | ContextService | None = Non
     async def reference_http(_request: Any) -> JSONResponse:
         reference_id = _request.path_params["reference_id"]
         return JSONResponse(
-            svc.result_reference_resolve(
+            await _run_service_call(
+                svc.result_reference_resolve,
                 reference_id=reference_id,
                 project_id=_request.query_params.get("project_id"),
                 root_uri=_request.query_params.get("root_uri"),
@@ -830,6 +839,38 @@ def _project_service(
     if isinstance(service, ProjectContextService):
         return service
     return ProjectContextService(service.config)
+
+
+async def _run_service_call(
+    fn: Callable[..., T],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> T:
+    done = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def worker() -> None:
+        _SERVICE_CALL_LIMIT.acquire()
+        try:
+            outcome["result"] = fn(*args, **kwargs)
+        except BaseException as exc:
+            outcome["exception"] = exc
+        finally:
+            _SERVICE_CALL_LIMIT.release()
+            done.set()
+
+    threading.Thread(
+        target=worker,
+        name="mcp-context-service",
+        daemon=True,
+    ).start()
+    # Polling avoids relying on cross-thread event-loop wakeups after LMDB reads.
+    while not done.is_set():
+        await asyncio.sleep(0.01)
+    if "exception" in outcome:
+        raise outcome["exception"]
+    return outcome["result"]
 
 
 def _normalize_context_pack_http_payload(payload: Any) -> dict[str, Any]:
