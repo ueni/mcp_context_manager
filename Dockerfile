@@ -16,7 +16,7 @@ ENV HOME=/tmp \
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates curl gcompat \
+RUN apk add --no-cache ca-certificates curl zlib \
     && addgroup -S -g "${MCP_CONTEXT_GID}" mcp \
     && adduser -S -D -H -h /tmp -s /sbin/nologin -u "${MCP_CONTEXT_UID}" -G mcp mcp \
     && mkdir -p /workspace-roots /state \
@@ -25,6 +25,8 @@ RUN apk add --no-cache ca-certificates curl gcompat \
 COPY ${SERVER_BINARY} /usr/local/bin/mcp-context-manager
 RUN chmod +x /usr/local/bin/mcp-context-manager \
     && chown mcp:mcp /usr/local/bin/mcp-context-manager
+RUN strings /usr/local/bin/mcp-context-manager | grep -q '/lib/ld-musl-x86_64.so.1' \
+    || { echo "Dockerfile requires a musl-linked server binary for alpine runtime" >&2; exit 1; }
 
 USER mcp
 
