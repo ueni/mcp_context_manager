@@ -19,14 +19,19 @@ ENV HOME=/tmp \
 
 WORKDIR /app
 
-RUN python -m venv /opt/venv \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl git tar \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m venv /opt/venv \
     && groupadd --gid "${MCP_CONTEXT_GID}" mcp \
     && useradd --uid "${MCP_CONTEXT_UID}" --gid mcp --home-dir /tmp --shell /usr/sbin/nologin --no-create-home mcp \
     && mkdir -p /workspace-roots /state \
     && chown -R mcp:mcp /workspace-roots /state
 
-COPY pyproject.toml AGENTS.md README.md ./
+COPY pyproject.toml README.md ./
+COPY scripts ./scripts
 COPY src ./src
+RUN chmod +x scripts/*.sh
 
 FROM base AS test
 
@@ -45,7 +50,8 @@ CMD ["python", "-m", "pytest"]
 
 FROM base AS runtime
 
-RUN pip install --no-compile .
+RUN pip install --no-compile . \
+    && chown -R mcp:mcp /app /opt/venv
 
 USER mcp
 
@@ -55,4 +61,4 @@ VOLUME ["/workspace-roots", "/state"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.getenv('PORT', '8000'), timeout=3).read()" || exit 1
 
-CMD ["mcp-context-manager"]
+CMD ["scripts/update-from-release.sh", "serve"]

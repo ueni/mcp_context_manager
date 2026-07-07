@@ -287,6 +287,22 @@ Allowed:   /home/user/source
 An MCP root URI such as `file:///home/user/source/my-repo` is resolved inside
 the container as `/workspace-roots/my-repo`.
 
+The service image copies only the server runtime files into `/app`. Its startup
+script also watches GitHub releases: when the latest source tarball changes, it
+replaces the runtime files under `/app`, reinstalls package dependencies, and
+exits so Docker restarts the server.
+
+## Update From A GitHub Release
+
+Automatic updates are enabled by default. Set the polling interval with
+`MCP_CONTEXT_UPDATE_INTERVAL_SECONDS`:
+
+```bash
+MCP_CONTEXT_UPDATE_INTERVAL_SECONDS=900 docker compose up -d --build
+```
+
+Set `MCP_CONTEXT_AUTO_UPDATE=0` to disable the in-container watcher.
+
 ## Non-Docker Run
 
 Install the package in your Python environment, then run:
@@ -366,7 +382,11 @@ whole directory as one project. For per-repo isolation, expose or pass roots lik
 | `MCP_CONTEXT_STATE_DIR` | Generated state directory. |
 | `MCP_CONTEXT_ALLOWED_ROOTS` | Host paths allowed for MCP root URIs. Required for global roots outside `REPO_PATH`. |
 | `MCP_CONTEXT_ROOT_MAPPINGS` | Host-to-container path mappings, such as `/home/user/source=/workspace-roots`. |
+| `MCP_CONTEXT_AUTO_UPDATE` | Enables the in-container release updater, defaulting to `1`. |
 | `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host parent mounted at `/workspace-roots`. |
+| `MCP_CONTEXT_UPDATE_INTERVAL_SECONDS` | Automatic release-update polling interval, defaulting to `3600`. |
+| `MCP_CONTEXT_UPDATE_PATHS` | Release archive paths updated by the in-container updater, defaulting to `pyproject.toml README.md scripts src`. |
+| `MCP_CONTEXT_UPDATE_REPO` | GitHub owner/repo used by the updater, defaulting to `ueni/mcp_context_manager`. |
 | `MCP_CONTEXT_UID` / `MCP_CONTEXT_GID` | Compose build args for the non-root container user. Defaults to `1000:1000`. |
 | `MCP_TRANSPORT` | `stdio` by default, or `streamable-http`. |
 | `HOST` / `PORT` | HTTP bind settings. Compose binds the published port to localhost. |
