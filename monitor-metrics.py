@@ -416,6 +416,13 @@ def warmup_project(client: Any, target: ProjectTarget) -> dict[str, Any]:
 
 def friendly_mcp_error(exc: Exception) -> str:
     message = str(exc)
+    if "write transaction is already active" in message:
+        return (
+            "The running MCP server hit concurrent LMDB writes during warmup. "
+            "Rebuild and restart it with the current checkout so store writes are "
+            "serialized, for example: "
+            "MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up -d --build"
+        )
     if (
         "context_adminArguments" in message
         and "state_browser" in message

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Barrier
 
 from mcp_context_manager.config import ContextConfig
 from mcp_context_manager.context import (
@@ -223,6 +225,32 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
 
     assert explicit["index"]["max_files"] == 7
     assert explicit["index"]["default_limited"] is False
+
+
+def test_context_admin_warmup_serializes_concurrent_project_writes(
+    sample_repo: Path,
+) -> None:
+    config = ContextConfig(
+        repo_path=sample_repo.resolve(),
+        state_dir=(sample_repo / ".mcp-context-manager").resolve(),
+        max_output_chars=6000,
+    )
+    services = [ContextService(config), ContextService(config)]
+    start = Barrier(2)
+
+    def warmup(service: ContextService) -> dict:
+        start.wait(timeout=2)
+        return service.context_admin(mode="warmup", path="src", max_entries=3)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(warmup, service) for service in services]
+        results = [future.result(timeout=5) for future in futures]
+
+    assert [result["schema"] for result in results] == [
+        "context_cache.warmup.v1",
+        "context_cache.warmup.v1",
+    ]
+    assert all(result["search_cache"]["query_count"] == 3 for result in results)
 
 
 def test_cache_stats_tolerates_legacy_cache_rows_without_namespace(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Protocol
@@ -36,6 +37,8 @@ class StoreAdapter(Protocol):
 
 class LmdbStoreAdapter:
     _envs: dict[Path, Any] = {}
+    _env_locks: dict[Path, threading.Lock] = {}
+    _guard = threading.Lock()
 
     def __init__(self, config: ContextConfig):
         self.config = config
@@ -49,8 +52,9 @@ class LmdbStoreAdapter:
 
     @contextmanager
     def write_txn(self) -> Iterator[Any]:
-        with self._env().begin(write=True) as txn:
-            yield txn
+        with self._env_lock():
+            with self._env().begin(write=True) as txn:
+                yield txn
 
     def get_bytes(self, key: bytes, txn: Any = None) -> bytes | None:
         if txn is not None:
@@ -81,22 +85,33 @@ class LmdbStoreAdapter:
 
     def _env(self) -> Any:
         path = self.path.resolve()
-        env = self._envs.get(path)
-        if env is not None:
+        with self._guard:
+            env = self._envs.get(path)
+            if env is not None:
+                return env
+            self.config.ensure_state_dirs()
+            env = lmdb.open(
+                str(path),
+                subdir=True,
+                create=True,
+                map_size=self.config.lmdb_map_size,
+                max_dbs=1,
+                max_readers=126,
+                readahead=False,
+                meminit=False,
+            )
+            self._envs[path] = env
+            self._env_locks.setdefault(path, threading.Lock())
             return env
-        self.config.ensure_state_dirs()
-        env = lmdb.open(
-            str(path),
-            subdir=True,
-            create=True,
-            map_size=self.config.lmdb_map_size,
-            max_dbs=1,
-            max_readers=126,
-            readahead=False,
-            meminit=False,
-        )
-        self._envs[path] = env
-        return env
+
+    def _env_lock(self) -> threading.Lock:
+        path = self.path.resolve()
+        with self._guard:
+            lock = self._env_locks.get(path)
+            if lock is None:
+                lock = threading.Lock()
+                self._env_locks[path] = lock
+            return lock
 
     def _iter_raw_txn(self, prefix: bytes, txn: Any) -> Iterator[tuple[bytes, bytes]]:
         cursor = txn.cursor()

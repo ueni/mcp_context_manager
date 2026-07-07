@@ -33,21 +33,6 @@ COPY scripts ./scripts
 COPY src ./src
 RUN chmod +x scripts/*.sh
 
-FROM base AS test
-
-COPY benchmarks ./benchmarks
-COPY monitor-metrics.py ./
-COPY tests ./tests
-
-RUN pip install --no-compile ".[dev]"
-
-ENV PYTEST_ADDOPTS="-p no:cacheprovider" \
-    RUFF_CACHE_DIR=/tmp/ruff-cache
-
-USER mcp
-
-CMD ["python", "-m", "pytest"]
-
 FROM base AS runtime
 
 RUN pip install --no-compile . \

@@ -832,3 +832,18 @@ def test_state_browser_old_server_error_is_actionable() -> None:
         state=state,
     )
     assert "Rebuild and restart" in rendered
+
+
+def test_lmdb_write_transaction_error_is_actionable() -> None:
+    monitor = load_monitor_module()
+
+    message = monitor.friendly_mcp_error(
+        RuntimeError(
+            "MCP tool returned an error: Error executing tool context_admin: "
+            "A write transaction is already active on this environment. "
+            "Only one top-level write transaction is allowed at a time."
+        )
+    )
+
+    assert "concurrent LMDB writes" in message
+    assert "docker compose up -d --build" in message
