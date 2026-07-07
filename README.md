@@ -511,6 +511,18 @@ PORT=8000 \
 MCP_CONTEXT_ALLOWED_ROOTS="$PWD" \
 MCP_CONTEXT_STATE_DIR="$HOME/.local/state/mcp-context-manager" \
 ./mcp-context-manager-0.2.0-linux-x86_64
+
+Run a self-update from the standalone executable:
+
+```bash
+./mcp-context-manager-0.2.0-linux-x86_64 --update \
+  --update-repo <OWNER>/<REPO> \
+  --update-version 0.2.1
+```
+
+Use `--update` without `--update-version` to install the latest release.  
+You can also set `MCP_CONTEXT_UPDATE_REPO` and `MCP_CONTEXT_UPDATE_TARGET`
+environment variables instead of flags.
 ```
 
 ## Development

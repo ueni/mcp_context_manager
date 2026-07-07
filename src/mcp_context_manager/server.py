@@ -2,9 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import inspect
+import os
+import platform
+import shutil
+import sys
+import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Annotated, Any, Callable, Literal, TypeVar
+
+from importlib import metadata
 
 from .config import ContextConfig
 from .context import DEFAULT_CACHE_MAX_AGE_MINUTES, ContextService
@@ -888,7 +901,245 @@ def _mcp_tools_http_payload(tool_names: list[str]) -> dict[str, Any]:
     }
 
 
+_SELF_UPDATE_TIMEOUT_SECONDS = 20.0
+_SELF_UPDATE_CHECKSUM_NAME = "SHA256SUMS"
+_SELF_UPDATE_DEFAULT_ASSET_PREFIX = "mcp-context-manager"
+_SELF_UPDATE_REPO_ENV = "MCP_CONTEXT_UPDATE_REPO"
+_SELF_UPDATE_TARGET_ENV = "MCP_CONTEXT_UPDATE_TARGET"
+
+
+def _normalize_version(version: str) -> str:
+    clean = version.strip()
+    return clean[1:] if clean.startswith("v") else clean
+
+
+def _parse_checksummed_asset_list(contents: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for line in contents.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        parsed[parts[1]] = parts[0]
+    return parsed
+
+
+def _self_update_platform_suffix() -> str:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "linux" and machine in {"x86_64", "amd64"}:
+        return "linux-x86_64"
+    if system == "darwin" and machine in {"x86_64", "amd64"}:
+        return "darwin-x86_64"
+    if system == "darwin" and machine in {"arm64", "aarch64"}:
+        return "darwin-arm64"
+    raise RuntimeError(
+        f"self-update does not support this platform: {system}/{machine}"
+    )
+
+
+def _self_update_asset_name(version: str) -> str:
+    return f"{_SELF_UPDATE_DEFAULT_ASSET_PREFIX}-{version}-{_self_update_platform_suffix()}"
+
+
+def _self_update_release_api_url(repo: str, version: str | None = None) -> str:
+    if version:
+        normalized = _normalize_version(version)
+        tag = f"v{normalized}"
+        return f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+    return f"https://api.github.com/repos/{repo}/releases/latest"
+
+
+def _self_update_fetch_release(repo: str, version: str | None = None) -> dict[str, Any]:
+    url = _self_update_release_api_url(repo, version)
+    request = urllib.request.Request(
+        url, headers={"Accept": "application/vnd.github+json", "User-Agent": "mcp-context-manager"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_SELF_UPDATE_TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"failed to fetch release metadata from {url}") from exc
+
+
+def _self_update_extract_asset_url(
+    release: dict[str, Any], name: str
+) -> str | None:
+    for asset in release.get("assets", []):
+        if not isinstance(asset, dict):
+            continue
+        if asset.get("name") == name:
+            location = asset.get("browser_download_url")
+            if isinstance(location, str) and urlsplit(location).scheme:
+                return location
+    return None
+
+
+def _self_update_find_checksum(release: dict[str, Any], executable_name: str) -> tuple[str, str] | None:
+    checksum_url = _self_update_extract_asset_url(release, _SELF_UPDATE_CHECKSUM_NAME)
+    if not checksum_url:
+        return None
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(
+                checksum_url,
+                headers={"User-Agent": "mcp-context-manager"},
+            ),
+            timeout=_SELF_UPDATE_TIMEOUT_SECONDS,
+        ) as response:
+            checksums = response.read().decode("utf-8")
+    except urllib.error.URLError as exc:
+        raise RuntimeError("failed to download SHA256SUMS") from exc
+
+    parsed = _parse_checksummed_asset_list(checksums)
+    checksum = parsed.get(executable_name)
+    if not checksum:
+        return None
+    return checksum, checksum_url
+
+
+def _self_update_download_file(url: str, target: Path) -> None:
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": "mcp-context-manager"}),
+            timeout=_SELF_UPDATE_TIMEOUT_SECONDS,
+        ) as response:
+            with target.open("wb") as out:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"failed to download {url}") from exc
+
+
+def _self_update_verify_checksum(path: Path, expected: str) -> None:
+    hasher = hashlib.sha256()
+    with path.open("rb") as input_file:
+        while True:
+            chunk = input_file.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    if hasher.hexdigest() != expected:
+        raise RuntimeError("downloaded binary checksum mismatch")
+
+
+def _self_update_target_path(explicit: str | None = None) -> Path:
+    configured = explicit or os.getenv(_SELF_UPDATE_TARGET_ENV, "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser().resolve()
+        if not configured_path.is_file():
+            raise RuntimeError(f"update target does not exist: {configured_path}")
+        return configured_path
+    if not getattr(sys, "frozen", False):
+        candidate = Path(sys.argv[0]).resolve()
+        if candidate.suffix == ".py":
+            raise RuntimeError(
+                "update mode requires a standalone executable; running from source is not supported"
+            )
+        if not os.access(candidate, os.X_OK):
+            raise RuntimeError("update target is not executable")
+        return candidate
+    return Path(sys.executable).resolve()
+
+
+def _self_update_target_version() -> str | None:
+    try:
+        version = metadata.version("mcp-context-manager")
+    except metadata.PackageNotFoundError:
+        return None
+    return version
+
+
+def _self_update_execute(target_version: str | None, update_repo: str, explicit_target: str | None = None) -> None:
+    if not update_repo:
+        raise RuntimeError("update repository is required")
+    target_path = _self_update_target_path(explicit_target)
+    if not target_path.is_file():
+        raise RuntimeError(f"update target is not a file: {target_path}")
+    target_path = target_path.resolve()
+
+    current_version = _self_update_target_version()
+    desired = target_version.strip() if target_version else None
+    desired_normalized = _normalize_version(desired) if desired else None
+
+    release = _self_update_fetch_release(update_repo, target_version)
+    release_tag = str(release.get("tag_name", "")).strip()
+    if not release_tag:
+        raise RuntimeError("release tag is missing from GitHub API response")
+    normalized = _normalize_version(release_tag)
+    asset_name = _self_update_asset_name(normalized)
+    download_url = _self_update_extract_asset_url(release, asset_name)
+    if not download_url:
+        raise RuntimeError(f"release asset not found: {asset_name}")
+
+    checksum_value = _self_update_find_checksum(release, asset_name)
+    if not checksum_value:
+        raise RuntimeError(f"SHA256SUMS missing checksum for {asset_name}")
+    expected_checksum, _ = checksum_value
+
+    if current_version and desired_normalized and desired_normalized == current_version:
+        print(f"Already up to date: {current_version}")
+        return
+    if not desired_normalized and current_version and normalized == current_version:
+        print(f"Already up to date: {current_version}")
+        return
+
+    backup = target_path.with_name(f".{target_path.name}.backup")
+    temp = target_path.with_name(f".{target_path.name}.tmp")
+    try:
+        _self_update_download_file(download_url, temp)
+        _self_update_verify_checksum(temp, expected_checksum)
+        if backup.exists():
+            backup.unlink()
+        shutil.copy2(target_path, backup)
+        shutil.copystat(target_path, temp)
+        os.replace(temp, target_path)
+        print(f"Updated {target_path.name} to {normalized}")
+    except Exception:
+        if temp.exists():
+            temp.unlink()
+        raise
+    finally:
+        if backup.exists():
+            backup.unlink()
+
+
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="mcp-context-manager launcher")
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="download and replace the running executable from GitHub releases",
+    )
+    parser.add_argument(
+        "--update-version",
+        default=None,
+        help="target release tag or version to install (default: latest)",
+    )
+    parser.add_argument(
+        "--update-repo",
+        default=os.getenv(_SELF_UPDATE_REPO_ENV, ""),
+        help="GitHub repository (owner/name) for release lookup",
+    )
+    parser.add_argument(
+        "--update-target",
+        default=os.getenv(_SELF_UPDATE_TARGET_ENV, ""),
+        help="path of executable to replace",
+    )
+    args = parser.parse_args()
+
+    if args.update:
+        try:
+            _self_update_execute(args.update_version, args.update_repo, args.update_target)
+        except RuntimeError as exc:
+            print(f"update failed: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        return
+
     config = ContextConfig.from_env()
     service = ProjectContextService(config)
     if config.transport in {"stdio", "direct"}:
