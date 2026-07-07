@@ -527,6 +527,15 @@ def render_monitor_screen(
 ) -> str:
     if state.view == "state":
         return render_state_browser(url=url, color=color, width=width, state=state)
+    if state.view == "performance" and snapshots:
+        selected = _clamped_index(state.selected_index, len(snapshots))
+        return render_performance_view(
+            snapshots[selected],
+            url=url,
+            color=color,
+            width=width,
+            state=state,
+        )
     if state.view == "detail" and snapshots:
         selected = _clamped_index(state.selected_index, len(snapshots))
         return render_project_detail(
@@ -629,6 +638,51 @@ def render_project_detail(
                 ),
             ]
         )
+    return "\n".join(lines)
+
+
+def render_performance_view(
+    snapshot: ProjectSnapshot,
+    url: str,
+    color: bool,
+    width: int | None,
+    state: MonitorState,
+) -> str:
+    width = width or shutil.get_terminal_size(
+        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+    ).columns
+    metrics = snapshot.metrics or {}
+    freshness = metrics.get("index_freshness", {})
+    freshness = freshness if isinstance(freshness, dict) else {}
+    background = metrics.get("background", {})
+    background = background if isinstance(background, dict) else {}
+    stage_rows = _performance_stage_rows(metrics)
+    cache_rows = _performance_cache_rows(metrics, background, freshness)
+    lines = [
+        _style("mcp-context-manager performance", color, Ansi.BOLD + Ansi.CYAN),
+        _controls(
+            state.refresh_interval,
+            color,
+            status_line=_mcp_status_line(state, color),
+        ),
+        f"endpoint: {url}",
+        f"project:  {_project_name(snapshot.target)}",
+        "",
+        *_render_table(
+            ("stage", "avg ms", "p/min", "max"),
+            stage_rows,
+            widths=(max(24, min(48, width - 36)), 10, 10, 10),
+            aligns=("left", "right", "right", "right"),
+        ),
+        "",
+        *_render_table(
+            ("signal", "value"),
+            cache_rows,
+            aligns=("left", "left"),
+        ),
+    ]
+    if snapshot.error:
+        lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
     return "\n".join(lines)
 
 
@@ -992,7 +1046,7 @@ def _controls(
     status_line: str = "",
 ) -> str:
     keys = (
-        "keys: Up/Down select  Enter details  b state  Esc table  "
+        "keys: Up/Down select  Enter details  p performance  b state  Esc table  "
         "+/- refresh  r reload  w warmup  q quit"
     )
     controls = (
@@ -1053,6 +1107,101 @@ def _measurement_check_rows(
             )
         )
     return rows
+
+
+def _performance_stage_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    stages = metrics.get("benchmarks", {}).get("stage_latency_ms_by_operation", {})
+    pack_stages = stages.get("context_pack", {}) if isinstance(stages, dict) else {}
+    rows: list[tuple[str, str, str, str]] = []
+    for name in (
+        "total_ms",
+        "index_refresh_ms",
+        "explicit_path_refresh_ms",
+        "candidate_retrieval_ms",
+        "search_ranking_ms",
+        "snippet_batch_ms",
+        "cache_lookup_ms",
+        "reference_write_ms",
+        "response_assembly_ms",
+    ):
+        stats = pack_stages.get(name, {}) if isinstance(pack_stages, dict) else {}
+        if not isinstance(stats, dict):
+            stats = {}
+        rows.append(
+            (
+                name,
+                fmt_ms(stats.get("avg_elapsed_ms", 0.0)),
+                fmt_ms(stats.get("min_elapsed_ms", 0.0)),
+                fmt_ms(stats.get("max_elapsed_ms", 0.0)),
+            )
+        )
+    return rows
+
+
+def _performance_cache_rows(
+    metrics: dict[str, Any],
+    background: dict[str, Any],
+    freshness: dict[str, Any],
+) -> list[tuple[str, str]]:
+    cache = metrics.get("cache", {}) if isinstance(metrics.get("cache"), dict) else {}
+    index_job = (
+        background.get("index_refresh", {})
+        if isinstance(background.get("index_refresh"), dict)
+        else {}
+    )
+    cache_job = (
+        background.get("cache_prune", {})
+        if isinstance(background.get("cache_prune"), dict)
+        else {}
+    )
+    return [
+        ("freshness", str(freshness.get("state") or "-")),
+        ("refresh reason", str(freshness.get("refresh_reason") or "-")),
+        (
+            "background refresh",
+            _background_job_summary(index_job),
+        ),
+        ("cache maintenance", _background_job_summary(cache_job)),
+        ("background queue", fmt_int(background.get("queue_depth", 0))),
+        (
+            "cache hit ratio",
+            f"{float(cache.get('hit_ratio', 0.0) or 0.0) * 100:5.1f}%",
+        ),
+        (
+            "fragment hit ratio",
+            f"{_fragment_cache_ratio(metrics) * 100:5.1f}%",
+        ),
+        (
+            "retrieval cache",
+            _namespace_cache_summary(metrics, "context_pack.retrieval"),
+        ),
+    ]
+
+
+def _background_job_summary(job: dict[str, Any]) -> str:
+    status = str(job.get("status") or "idle")
+    pending = "pending" if job.get("pending") else "idle"
+    last_error = str(job.get("last_error") or "")
+    if last_error:
+        return f"{status} ({last_error})"
+    completed = str(job.get("last_completed_at") or "")
+    suffix = f", completed {completed[:19]}" if completed else ""
+    return f"{status}/{pending}{suffix}"
+
+
+def _namespace_cache_summary(metrics: dict[str, Any], namespace: str) -> str:
+    cache = metrics.get("cache", {})
+    cache = cache if isinstance(cache, dict) else {}
+    by_namespace = cache.get("by_namespace", {})
+    by_namespace = by_namespace if isinstance(by_namespace, dict) else {}
+    row = by_namespace.get(namespace, {})
+    if not isinstance(row, dict):
+        return "-"
+    return (
+        f"{fmt_int(row.get('hits', 0))}/"
+        f"{fmt_int(row.get('misses', 0))} h/m  "
+        f"{float(row.get('hit_ratio', 0.0) or 0.0) * 100:5.1f}%"
+    )
 
 
 def _state_rows(state: MonitorState) -> list[dict[str, Any]]:
@@ -1479,6 +1628,8 @@ def decode_key(sequence: str) -> str | None:
         return "refresh"
     if sequence in {"b", "B"}:
         return "browser"
+    if sequence in {"p", "P"}:
+        return "performance"
     if sequence in {"w", "W"}:
         return "warmup"
     if sequence == "\x03":
@@ -1528,6 +1679,7 @@ def _search_text_for_key(key: str) -> str:
         "minus": "-",
         "refresh": "r",
         "browser": "b",
+        "performance": "p",
         "warmup": "w",
         "quit": "q",
         "search": "/",
@@ -1611,6 +1763,9 @@ def handle_key(
         state.state_scroll_offset = 0
         state.state_entry_scroll_offset = 0
         return "browser"
+    if key == "performance" and row_count and state.view != "state":
+        state.view = "performance"
+        return "redraw"
     if key == "up":
         if state.view == "state":
             if state.state_entry:

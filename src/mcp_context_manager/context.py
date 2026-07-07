@@ -12,6 +12,7 @@ from .index import ContextIndex
 from .memory import ContextMemory
 from .metrics import ContextMetrics
 from .references import ResultReferences
+from .runtime import background_jobs, io_executor
 from .schemas import output_contracts
 from .store import ContextStore
 from .token_counter import TokenCount, TokenCounter
@@ -32,6 +33,7 @@ DEFAULT_CACHE_PRUNE_INTERVAL_SECONDS = 5 * 60 * 60
 CACHE_LAST_PRUNED_KEY = "cache:__meta__:last_pruned_at"
 DEFAULT_INDEX_MAX_FILES = 5000
 DEFAULT_WARMUP_MAX_FILES = 100
+DEFAULT_BACKGROUND_REFRESH_INTERVAL_SECONDS = 5.0
 CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR = 6
 RETRIEVAL_SEARCH_TERM_SCHEMA = "retrieval.search_term.v1"
 RETRIEVAL_FILE_SUMMARY_SCHEMA = "retrieval.file_summary.v1"
@@ -346,7 +348,7 @@ class ContextService:
             profile = contract_profile or "verbose"
             return output_contracts(tool_name=tool_name, profile=profile)
         if mode == "metrics":
-            return self.metrics.snapshot()
+            return self._metrics_snapshot()
         if mode == "measurement_matrix":
             return self.metrics.measurement_matrix()
         if mode == "benchmark":
@@ -408,8 +410,9 @@ class ContextService:
         cache_strategy = self._normalize_cache_strategy(cache_strategy)
         refresh_index = refresh_index or cache_strategy in {"fresh", "cold"}
         stage_started = time.perf_counter()
-        index_refresh = self._ensure_index_fresh(
-            max_files=index_max_files, force=refresh_index
+        index_refresh = self._ensure_context_pack_index(
+            max_files=index_max_files,
+            strict=refresh_index,
         )
         stage_timings["index_refresh_ms"] = self._elapsed_ms(stage_started)
         profile = self._effective_output_profile(output_profile, client_profile)
@@ -648,6 +651,9 @@ class ContextService:
             },
             "request": request_metadata,
             "indexing": {
+                "index_refresh": index_refresh,
+                "index_freshness": self._index_freshness(index_refresh),
+                "background": self._background_status(),
                 "explicit_path_refresh": explicit_refresh,
             },
             "budget": {
@@ -691,6 +697,10 @@ class ContextService:
                     "skipped": bool(index_refresh.get("skipped", False)),
                     "reason": index_refresh.get("reason", ""),
                 },
+                "index_freshness": self._index_freshness(index_refresh),
+                "background_refresh_pending": bool(
+                    self._background_status().get("index_refresh", {}).get("pending")
+                ),
             },
             "safety": {
                 "repository_boundary_enforced": True,
@@ -922,6 +932,120 @@ class ContextService:
     ) -> dict[str, Any]:
         return self.index.refresh_if_needed(path=path, max_files=max_files, force=force)
 
+    def _ensure_context_pack_index(
+        self,
+        max_files: int,
+        strict: bool,
+    ) -> dict[str, Any]:
+        if strict:
+            result = self._ensure_index_fresh(max_files=max_files, force=True)
+            result["freshness"] = "fresh"
+            result["background_refresh_pending"] = False
+            return result
+        status = self.index.status()
+        if not int(status.get("file_count", 0) or 0):
+            result = self._ensure_index_fresh(max_files=max_files, force=True)
+            result["freshness"] = "fresh"
+            result["background_refresh_pending"] = False
+            return result
+        background = self._enqueue_background_index_refresh(max_files=max_files)
+        return {
+            "schema": "context_index.refresh.v1",
+            "generated_at": status.get("generated_at", ""),
+            "index_available": True,
+            "file_count": int(status.get("file_count", 0) or 0),
+            "symbol_count": int(status.get("symbol_count", 0) or 0),
+            "import_count": int(status.get("import_count", 0) or 0),
+            "files_considered": 0,
+            "updated_count": 0,
+            "unchanged_count": 0,
+            "removed_count": 0,
+            "fts_enabled": bool(status.get("fts_enabled", False)),
+            "search_mode": str(status.get("search_mode", "term_index")),
+            "skipped": True,
+            "reason": "last_good_index",
+            "freshness": "last_good",
+            "background_refresh_pending": bool(background.get("pending")),
+            "background_refresh_status": background.get("status", ""),
+        }
+
+    def _enqueue_background_index_refresh(self, max_files: int) -> dict[str, Any]:
+        return background_jobs.submit(
+            self._background_project_id(),
+            "index_refresh",
+            lambda: self.index.refresh_if_needed(max_files=max_files, force=False),
+            executor=io_executor(),
+            min_interval_seconds=DEFAULT_BACKGROUND_REFRESH_INTERVAL_SECONDS,
+        )
+
+    def _enqueue_background_cache_prune(self) -> dict[str, Any]:
+        return background_jobs.submit(
+            self._background_project_id(),
+            "cache_prune",
+            lambda: self._cache_prune_if_due(),
+            executor=io_executor(),
+            min_interval_seconds=DEFAULT_CACHE_PRUNE_INTERVAL_SECONDS,
+        )
+
+    def _background_status(self) -> dict[str, Any]:
+        status = background_jobs.status(self._background_project_id())
+        by_kind = {
+            str(row.get("kind")): row
+            for row in status.get("jobs", [])
+            if isinstance(row, dict)
+        }
+        return {
+            **status,
+            "index_refresh": by_kind.get(
+                "index_refresh",
+                {
+                    "kind": "index_refresh",
+                    "status": "idle",
+                    "pending": False,
+                    "last_error": "",
+                },
+            ),
+            "cache_prune": by_kind.get(
+                "cache_prune",
+                {
+                    "kind": "cache_prune",
+                    "status": "idle",
+                    "pending": False,
+                    "last_error": "",
+                },
+            ),
+        }
+
+    def _index_freshness(self, refresh: dict[str, Any] | None = None) -> dict[str, Any]:
+        refresh = refresh or {}
+        status = self.index.status()
+        freshness = str(refresh.get("freshness") or "")
+        if not freshness:
+            freshness = "fresh" if not refresh.get("skipped") else "fresh"
+        if str(refresh.get("reason", "")) == "last_good_index":
+            freshness = "last_good"
+        background = self._background_status().get("index_refresh", {})
+        return {
+            "schema": "context_index.freshness.v1",
+            "state": freshness,
+            "generated_at": status.get("generated_at", ""),
+            "refresh_reason": refresh.get("reason", ""),
+            "background_refresh_pending": bool(background.get("pending")),
+            "background_refresh_status": background.get("status", "idle"),
+            "background_refresh_last_error": background.get("last_error", ""),
+        }
+
+    def _metrics_snapshot(self) -> dict[str, Any]:
+        snapshot = self.metrics.snapshot()
+        snapshot["index_freshness"] = self._index_freshness()
+        snapshot["background"] = self._background_status()
+        return snapshot
+
+    def _background_project_id(self) -> str:
+        return self.config.project_id or sha256_text(
+            str(self.config.repo_path.resolve())
+        )[:24]
+
     def _record_metric(
         self,
         operation: str,
@@ -1033,9 +1157,8 @@ class ContextService:
         )
 
     def _current_refresh_signature(self) -> tuple[str, bool]:
-        status = self.index.status()
-        status_signature = str(status.get("refresh_signature", ""))
-        if status_signature and bool(status.get("refresh_signature_available", False)):
+        status_signature, status_available = self.index.stored_refresh_signature()
+        if status_signature and status_available:
             return status_signature, True
         signature = self.index.refresh_signature(max_files=DEFAULT_INDEX_MAX_FILES)
         if bool(signature.get("available", False)) and signature.get("signature"):
@@ -1079,6 +1202,7 @@ class ContextService:
         public_namespace: str,
         reusable_terms: list[str] | None = None,
         allow_fallback: bool = True,
+        include_index: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         terms = normalize_query_terms(query, max_terms=8)
         if not terms:
@@ -1118,8 +1242,9 @@ class ContextService:
             "terms": terms,
             "count": len(rows),
             "results": rows,
-            "index": self.index.status(),
         }
+        if include_index:
+            result["index"] = self.index.status()
         public_key = self._cache_key(
             public_namespace,
             {
@@ -1670,6 +1795,10 @@ class ContextService:
             "chunk_misses": int(cache.get("chunk_misses", 0) or 0),
             "chunk_hit_ratio": float(cache.get("chunk_hit_ratio", 0.0) or 0.0),
             "miss_details": cache.get("miss_details", []),
+            "index_freshness": cache.get("index_freshness", {}),
+            "background_refresh_pending": bool(
+                cache.get("background_refresh_pending", False)
+            ),
         }
 
     def _metrics_summary(self, metrics: dict[str, Any], diagnostics: str) -> dict[str, Any]:
@@ -1839,6 +1968,8 @@ class ContextService:
                     include_globs=None,
                     public_namespace="context_pack.search",
                     reusable_terms=reusable_terms,
+                    allow_fallback=False,
+                    include_index=False,
                 )
                 retrieval_stats["fragment_hits"] = int(
                     retrieval_stats.get("fragment_hits", 0)
@@ -3075,24 +3206,6 @@ class ContextService:
                 "sensitivity": sensitivity,
             },
         )
-        entries = [
-            entry
-            for entry in self.store.iter_json("cache:")
-            if entry[0] != CACHE_LAST_PRUNED_KEY
-        ]
-        if len(entries) > 200:
-            ordered = sorted(
-                entries,
-                key=lambda item: item[1].get("updated_at", "")
-                if isinstance(item[1], dict)
-                else "",
-                reverse=True,
-            )
-            keep = {key for key, _row in ordered[:200]}
-            with self.store.write_txn() as txn:
-                for cache_key, _row in ordered[200:]:
-                    if cache_key not in keep:
-                        self.store.delete(cache_key, txn=txn)
 
     def _cache_prune_if_due(
         self,
@@ -3131,7 +3244,7 @@ class ContextService:
 
     def _cache_prune_if_due_best_effort(self) -> None:
         try:
-            self._cache_prune_if_due()
+            self._enqueue_background_cache_prune()
         except Exception:
             return
 

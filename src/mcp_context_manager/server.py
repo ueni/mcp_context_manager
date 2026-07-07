@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import threading
 from dataclasses import dataclass
 from typing import Annotated, Any, Callable, Literal, TypeVar
 
 from .config import ContextConfig
 from .context import DEFAULT_CACHE_MAX_AGE_MINUTES, ContextService
 from .manager import ProjectContextService
+from .runtime import service_executor
 
 try:  # pragma: no cover - optional transport dependency is integration-tested.
     from mcp.server.fastmcp import Context as MCPContext
@@ -33,7 +33,6 @@ except ModuleNotFoundError:  # pragma: no cover
 
 SERVICE = ProjectContextService.from_env()
 T = TypeVar("T")
-_SERVICE_CALL_LIMIT = threading.Semaphore(8)
 
 CONTEXT_PACK_HTTP_FIELDS = {
     "prompt",
@@ -847,30 +846,11 @@ async def _run_service_call(
     *args: Any,
     **kwargs: Any,
 ) -> T:
-    done = threading.Event()
-    outcome: dict[str, Any] = {}
-
-    def worker() -> None:
-        _SERVICE_CALL_LIMIT.acquire()
-        try:
-            outcome["result"] = fn(*args, **kwargs)
-        except BaseException as exc:
-            outcome["exception"] = exc
-        finally:
-            _SERVICE_CALL_LIMIT.release()
-            done.set()
-
-    threading.Thread(
-        target=worker,
-        name="mcp-context-service",
-        daemon=True,
-    ).start()
+    future = service_executor().submit(fn, *args, **kwargs)
     # Polling avoids relying on cross-thread event-loop wakeups after LMDB reads.
-    while not done.is_set():
+    while not future.done():
         await asyncio.sleep(0.01)
-    if "exception" in outcome:
-        raise outcome["exception"]
-    return outcome["result"]
+    return future.result()
 
 
 def _normalize_context_pack_http_payload(payload: Any) -> dict[str, Any]:

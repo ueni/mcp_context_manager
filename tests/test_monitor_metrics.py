@@ -51,12 +51,61 @@ class FakeClient:
                     "context_pack_fragment_hits": 8,
                     "context_pack_fragment_misses": 2,
                     "context_pack_fragment_hit_ratio": 0.8,
+                    "by_namespace": {
+                        "context_pack.retrieval": {
+                            "hits": 2,
+                            "misses": 1,
+                            "hit_ratio": 0.667,
+                        }
+                    },
                 },
                 "tokens": {
                     "estimated_input_tokens_saved": 12345,
                     "tokens_spared_by_mcp_est": 12000,
                 },
                 "references": {"bytes_deferred_est": 4096},
+                "index_freshness": {
+                    "state": "last_good",
+                    "refresh_reason": "last_good_index",
+                    "background_refresh_pending": True,
+                },
+                "background": {
+                    "queue_depth": 1,
+                    "index_refresh": {
+                        "kind": "index_refresh",
+                        "status": "running",
+                        "pending": True,
+                        "last_error": "",
+                    },
+                    "cache_prune": {
+                        "kind": "cache_prune",
+                        "status": "complete",
+                        "pending": False,
+                        "last_completed_at": "2026-07-01T12:00:00+00:00",
+                        "last_error": "",
+                    },
+                },
+                "benchmarks": {
+                    "stage_latency_ms_by_operation": {
+                        "context_pack": {
+                            "total_ms": {
+                                "avg_elapsed_ms": 42.5,
+                                "min_elapsed_ms": 20.0,
+                                "max_elapsed_ms": 80.0,
+                            },
+                            "index_refresh_ms": {
+                                "avg_elapsed_ms": 3.0,
+                                "min_elapsed_ms": 0.5,
+                                "max_elapsed_ms": 12.0,
+                            },
+                            "candidate_retrieval_ms": {
+                                "avg_elapsed_ms": 15.0,
+                                "min_elapsed_ms": 0.0,
+                                "max_elapsed_ms": 60.0,
+                            },
+                        }
+                    }
+                },
             }
         if mode == "measurement_matrix":
             return {
@@ -403,6 +452,7 @@ def test_interactive_key_bindings_update_state() -> None:
     assert monitor.decode_key("+") == "plus"
     assert monitor.decode_key("-") == "minus"
     assert monitor.decode_key("b") == "browser"
+    assert monitor.decode_key("p") == "performance"
     assert monitor.decode_key("w") == "warmup"
 
     assert monitor.handle_key("down", state, row_count=3) == "redraw"
@@ -427,6 +477,10 @@ def test_interactive_key_bindings_update_state() -> None:
     state.state_search_active = True
     assert monitor.handle_key("warmup", state, row_count=3, state_row_count=2) == "redraw"
     assert state.state_search == "w"
+
+    state.view = "table"
+    assert monitor.handle_key("performance", state, row_count=3) == "redraw"
+    assert state.view == "performance"
 
 
 def test_default_refresh_interval_is_60_seconds() -> None:
@@ -462,6 +516,7 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
 
     assert "| > | Alpha" in table
     assert "Enter details" in table
+    assert "p performance" in table
     assert "w warmup" in table
     assert "refresh=5.0s" in table
 
@@ -480,6 +535,23 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "| fragment cache     | 8/2 h/m   80.0%" in detail
     assert "token spared/saved" in detail
     assert "| a                        |         pass" in detail
+
+    state.view = "performance"
+    performance = monitor.render_monitor_screen(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=120,
+        state=state,
+    )
+
+    assert "mcp-context-manager performance" in performance
+    assert "| total_ms" in performance
+    assert "| index_refresh_ms" in performance
+    assert "freshness" in performance
+    assert "last_good" in performance
+    assert "background queue" in performance
+    assert "2/1 h/m" in performance
 
 
 def test_mcp_loading_status_renders_in_controls() -> None:

@@ -18,7 +18,6 @@ from .util import (
     sha256_text,
 )
 
-
 _PROJECT_METADATA_LOCKS_GUARD = threading.Lock()
 _PROJECT_METADATA_LOCKS: dict[Path, threading.Lock] = {}
 

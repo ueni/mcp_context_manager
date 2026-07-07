@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import fnmatch
 import re
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -39,6 +41,9 @@ class ContextIndex:
     def __init__(self, config: ContextConfig):
         self.config = config
         self.store = ContextStore(config)
+        self._status_cache: dict[str, Any] | None = None
+        self._status_cache_at = 0.0
+        self._status_lock = threading.Lock()
 
     def _iter_candidate_files(self, root: Path, max_files: int) -> list[CandidateFile]:
         files: list[CandidateFile] = []
@@ -106,64 +111,77 @@ class ContextIndex:
         updated_count = 0
         unchanged_count = 0
         previous_generated = self._get_meta("generated_at")
+        prepared_updates: list[dict[str, Any]] = []
+        prepared_deletes: list[tuple[str, dict[str, Any] | None]] = []
+
+        for rel in sorted(set(existing_rows) - current_rels):
+            prepared_deletes.append((rel, existing_rows.get(rel)))
+            removed_count += 1
+        for candidate in files:
+            file_path = candidate.path
+            rel = str(file_path.relative_to(self.config.repo_path)).replace("\\", "/")
+            existing = existing_rows.get(rel)
+            if (
+                existing
+                and int(existing.get("size", -1)) == candidate.size
+                and int(existing.get("mtime_ns", -1)) == candidate.mtime_ns
+                and isinstance(existing.get("summary"), dict)
+            ):
+                unchanged_count += 1
+                continue
+            if is_likely_binary(file_path):
+                if existing:
+                    prepared_deletes.append((rel, existing))
+                    removed_count += 1
+                continue
+            raw = file_path.read_bytes()
+            text = raw.decode("utf-8", errors="replace")
+            digest = sha256_bytes(raw)
+            symbols, imports = self.extract_file_intel(rel, text)
+            term_rows = self._term_rows(rel, text)
+            prepared_updates.append(
+                {
+                    "rel": rel,
+                    "existing": existing,
+                    "symbols": symbols,
+                    "imports": imports,
+                    "term_rows": term_rows,
+                    "record": {
+                        "path": rel,
+                        "size": candidate.size,
+                        "mtime_ns": candidate.mtime_ns,
+                        "sha256": digest,
+                        "extension": file_path.suffix.lower(),
+                        "language": language_for_path(rel),
+                        "line_count": len(text.splitlines()),
+                        "indexed_at": indexed_at,
+                        "summary": self._file_summary_payload(
+                            rel=rel,
+                            text=text,
+                            symbols=symbols,
+                            size=candidate.size,
+                            source="index",
+                        ),
+                        "content": text,
+                        "terms": sorted(term_rows),
+                    },
+                }
+            )
+            updated_count += 1
 
         with self.store.write_txn() as txn:
-            for rel in sorted(set(existing_rows) - current_rels):
-                self._delete_file_rows(rel, existing_rows.get(rel), txn)
-                removed_count += 1
-            for candidate in files:
-                file_path = candidate.path
-                rel = str(file_path.relative_to(self.config.repo_path)).replace(
-                    "\\", "/"
-                )
-                existing = existing_rows.get(rel)
-                if (
-                    existing
-                    and int(existing.get("size", -1)) == candidate.size
-                    and int(existing.get("mtime_ns", -1)) == candidate.mtime_ns
-                    and isinstance(existing.get("summary"), dict)
-                ):
-                    unchanged_count += 1
-                    continue
-                if is_likely_binary(file_path):
-                    if existing:
-                        self._delete_file_rows(rel, existing, txn)
-                        removed_count += 1
-                    continue
-                raw = file_path.read_bytes()
-                text = raw.decode("utf-8", errors="replace")
-                digest = sha256_bytes(raw)
-                symbols, imports = self.extract_file_intel(rel, text)
-                term_rows = self._term_rows(rel, text)
-                record = {
-                    "path": rel,
-                    "size": candidate.size,
-                    "mtime_ns": candidate.mtime_ns,
-                    "sha256": digest,
-                    "extension": file_path.suffix.lower(),
-                    "language": language_for_path(rel),
-                    "line_count": len(text.splitlines()),
-                    "indexed_at": indexed_at,
-                    "summary": self._file_summary_payload(
-                        rel=rel,
-                        text=text,
-                        symbols=symbols,
-                        size=candidate.size,
-                        source="index",
-                    ),
-                    "content": text,
-                    "terms": sorted(term_rows),
-                }
+            for rel, existing in prepared_deletes:
                 self._delete_file_rows(rel, existing, txn)
-                self.store.put_json(_file_key(rel), record, txn=txn)
-                for row in symbols:
+            for update in prepared_updates:
+                rel = str(update["rel"])
+                self._delete_file_rows(rel, update.get("existing"), txn)
+                self.store.put_json(_file_key(rel), update["record"], txn=txn)
+                for row in update["symbols"]:
                     self.store.put_json(_symbol_key(row), row, txn=txn)
-                for row in imports:
+                for row in update["imports"]:
                     self.store.put_json(_import_key(row), row, txn=txn)
-                for term, row in term_rows.items():
+                for term, row in update["term_rows"].items():
                     self.store.put_json(_term_key(term, rel), row, txn=txn)
-                updated_count += 1
-
             generated_at = (
                 indexed_at
                 if updated_count or removed_count or not previous_generated
@@ -188,7 +206,8 @@ class ContextIndex:
                     txn,
                 )
 
-        status = self.status()
+        self._invalidate_status_cache()
+        status = self.status(use_cache=False)
         return {
             "schema": "context_index.refresh.v1",
             "generated_at": generated_at,
@@ -325,12 +344,21 @@ class ContextIndex:
             return rel == root_rel
         return rel == root_rel or rel.startswith(root_rel.rstrip("/") + "/")
 
-    def status(self) -> dict[str, Any]:
+    def stored_refresh_signature(self) -> tuple[str, bool]:
+        signature = self._get_meta("refresh_signature")
+        available = self._get_meta("refresh_signature_available") == "true"
+        return signature, bool(signature and available)
+
+    def status(self, use_cache: bool = True) -> dict[str, Any]:
+        if use_cache:
+            with self._status_lock:
+                if self._status_cache is not None and time.time() - self._status_cache_at < 1.0:
+                    return dict(self._status_cache)
         meta = self._meta()
         file_count = self.store.count("index:file:")
         symbol_count = self.store.count("index:symbol:")
         import_count = self.store.count("index:import:")
-        return {
+        status = {
             "schema": "context_index.status.v1",
             "index_available": self.store.exists(),
             "exists": self.store.exists(),
@@ -350,6 +378,15 @@ class ContextIndex:
             )
             == "true",
         }
+        with self._status_lock:
+            self._status_cache = dict(status)
+            self._status_cache_at = time.time()
+        return status
+
+    def _invalidate_status_cache(self) -> None:
+        with self._status_lock:
+            self._status_cache = None
+            self._status_cache_at = 0.0
 
     def files(self, limit: int = 1000) -> list[dict[str, Any]]:
         rows = []

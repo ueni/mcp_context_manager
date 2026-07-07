@@ -4,7 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 
 from mcp_context_manager.config import ContextConfig
 from mcp_context_manager.context import (
@@ -319,6 +319,11 @@ def test_expired_search_cache_is_recomputed_and_pruned(
     service: ContextService,
 ) -> None:
     first = service.context_lookup(mode="search", query="auth token")
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=2)
+    while datetime.now(timezone.utc) < deadline:
+        if not service._background_status()["cache_prune"]["pending"]:
+            break
+        Event().wait(0.01)
     cache_key, row = _search_fragment_cache_row(service, term="auth")
     row["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
     service.store.put_json(cache_key, row)
@@ -394,6 +399,11 @@ def test_cache_prune_runs_opportunistically_when_due(
 
     service.context_lookup(mode="search", query="auth token")
 
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=2)
+    while datetime.now(timezone.utc) < deadline:
+        if service.store.get_json(expired_key) is None:
+            break
+        Event().wait(0.01)
     assert service.store.get_json(expired_key) is None
     last_pruned = service.store.get_json(CACHE_LAST_PRUNED_KEY)
     assert isinstance(last_pruned, dict)
@@ -404,6 +414,11 @@ def test_invalidated_context_pack_cache_reports_stale(
     service: ContextService,
 ) -> None:
     first = service.context_pack("review auth token behavior", max_items=2)
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=2)
+    while datetime.now(timezone.utc) < deadline:
+        if not service._background_status()["cache_prune"]["pending"]:
+            break
+        Event().wait(0.01)
     cache_key = first["cache"]["key"]
     row = service.store.get_json(f"cache:{cache_key}")
     row["status"] = "invalidated"
@@ -573,7 +588,7 @@ def test_context_pack_changed_signature_invalidates_fragments(
 
     assert changed["cache"]["fragment_misses"] > 0
     assert any(
-        detail["reason"] == "index_changed"
+        detail["reason"] in {"changed_chunk_digest", "index_changed"}
         for detail in changed["cache"]["miss_details"]
     )
 
@@ -589,9 +604,8 @@ def test_unrelated_edit_reuses_unchanged_chunk_summaries(
 
     assert first["items"]
     assert second["items"]
-    assert second["cache"]["hit"] is False
-    assert second["cache"]["chunk_hits"] >= 1
-    assert second["cache"]["chunk_hit_ratio"] > 0
+    assert second["cache"]["hit"] is True
+    assert second["cache"]["index_freshness"]["state"] == "last_good"
 
 
 def test_context_lookup_impact_chunk_and_cache_modes(service: ContextService) -> None:
@@ -714,6 +728,80 @@ def test_warm_context_pack_reuses_retrieval_for_response_assembly(
     assert warm["metrics"]["stage_timings_ms"]["candidate_retrieval_ms"] == 0.0
     assert warm["metrics"]["stage_timings_ms"]["snippet_batch_ms"] == 0.0
     assert warm["references"][0]["reference_id"] != first["references"][0]["reference_id"]
+
+
+def test_stable_context_pack_uses_last_good_index_and_queues_refresh(
+    service: ContextService,
+    monkeypatch,
+) -> None:
+    service.context_pack("review auth token behavior", max_items=2)
+
+    def fail_synchronous_signature(*_args, **_kwargs):
+        raise AssertionError("stable pack should not scan repo freshness synchronously")
+
+    monkeypatch.setattr(service.index, "refresh_signature", fail_synchronous_signature)
+
+    pack = service.context_pack("review auth token behavior", max_items=2)
+    metrics = service.context_admin(mode="metrics")
+
+    assert pack["cache"]["hit"] is True
+    assert pack["cache"]["index_freshness"]["state"] == "last_good"
+    assert pack["metrics"]["stage_timings_ms"]["index_refresh_ms"] < 50
+    assert metrics["background"]["index_refresh"]["status"] in {
+        "running",
+        "failed",
+        "throttled",
+        "complete",
+    }
+
+
+def test_explicit_paths_refresh_before_context_pack_returns(
+    service: ContextService,
+    sample_repo: Path,
+) -> None:
+    service.context_pack("review auth token behavior", max_items=2)
+    auth_file = sample_repo / "src" / "auth.py"
+    auth_file.write_text(
+        auth_file.read_text(encoding="utf-8") + "\ndef explicit_refresh_marker():\n    return True\n",
+        encoding="utf-8",
+    )
+
+    pack = service.context_pack(
+        "review src/auth.py explicit_refresh_marker",
+        changed_files=["src/auth.py"],
+        max_items=2,
+        output_profile="normal",
+    )
+
+    assert pack["indexing"]["explicit_path_refresh"]["refreshed_count"] == 1
+    assert pack["items"][0]["path"] == "src/auth.py"
+    indexed = service.store.get_json("index:file:src/auth.py")
+    assert "explicit_refresh_marker" in indexed["content"]
+
+
+def test_background_index_refresh_deduplicates_concurrent_stable_packs(
+    service: ContextService,
+    monkeypatch,
+) -> None:
+    service.context_pack("review auth token behavior", max_items=2)
+    started = Event()
+    release = Event()
+    original_refresh_if_needed = service.index.refresh_if_needed
+
+    def slow_refresh_if_needed(*args, **kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return original_refresh_if_needed(*args, **kwargs)
+
+    monkeypatch.setattr(service.index, "refresh_if_needed", slow_refresh_if_needed)
+
+    first = service.context_pack("review auth token behavior", max_items=2)
+    assert started.wait(timeout=1)
+    second = service.context_pack("inspect auth token flow", max_items=2)
+    release.set()
+
+    assert first["cache"]["background_refresh_pending"] is True
+    assert second["indexing"]["background"]["index_refresh"]["deduplicated_count"] >= 1
 
 
 def test_context_pack_retrieval_cache_normalizes_paths_and_item_floor(
