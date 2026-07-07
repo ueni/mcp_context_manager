@@ -906,6 +906,7 @@ _SELF_UPDATE_CHECKSUM_NAME = "SHA256SUMS"
 _SELF_UPDATE_DEFAULT_ASSET_PREFIX = "mcp-context-manager"
 _SELF_UPDATE_REPO_ENV = "MCP_CONTEXT_UPDATE_REPO"
 _SELF_UPDATE_TARGET_ENV = "MCP_CONTEXT_UPDATE_TARGET"
+_SELF_UPDATE_DEFAULT_REPO = "ueni/mcp_context_manager"
 
 
 def _normalize_version(version: str) -> str:
@@ -1052,6 +1053,31 @@ def _self_update_target_version() -> str | None:
     return version
 
 
+def _self_update_restart_args(argv: list[str]) -> list[str]:
+    ignored = {
+        "--update",
+        "--update-version",
+        "--update-repo",
+        "--update-target",
+    }
+    out: list[str] = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ignored:
+            if arg in {"--update-version", "--update-repo", "--update-target"}:
+                skip_next = True
+            continue
+        if arg.startswith("--update-version=") or arg.startswith(
+            "--update-repo="
+        ) or arg.startswith("--update-target="):
+            continue
+        out.append(arg)
+    return out
+
+
 def _self_update_execute(target_version: str | None, update_repo: str, explicit_target: str | None = None) -> None:
     if not update_repo:
         raise RuntimeError("update repository is required")
@@ -1122,7 +1148,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--update-repo",
-        default=os.getenv(_SELF_UPDATE_REPO_ENV, ""),
+        default=os.getenv(_SELF_UPDATE_REPO_ENV, _SELF_UPDATE_DEFAULT_REPO),
         help="GitHub repository (owner/name) for release lookup",
     )
     parser.add_argument(
@@ -1130,14 +1156,19 @@ def main() -> None:
         default=os.getenv(_SELF_UPDATE_TARGET_ENV, ""),
         help="path of executable to replace",
     )
-    args = parser.parse_args()
+    args, passthrough_args = parser.parse_known_args(sys.argv[1:])
 
     if args.update:
         try:
+            target_path = _self_update_target_path(args.update_target)
             _self_update_execute(args.update_version, args.update_repo, args.update_target)
         except RuntimeError as exc:
             print(f"update failed: {exc}", file=sys.stderr)
             raise SystemExit(1)
+        os.execv(
+            str(target_path),
+            [str(target_path)] + _self_update_restart_args(passthrough_args),
+        )
         return
 
     config = ContextConfig.from_env()

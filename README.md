@@ -511,19 +511,23 @@ PORT=8000 \
 MCP_CONTEXT_ALLOWED_ROOTS="$PWD" \
 MCP_CONTEXT_STATE_DIR="$HOME/.local/state/mcp-context-manager" \
 ./mcp-context-manager-0.2.0-linux-x86_64
+```
 
-Run a self-update from the standalone executable:
+Run a self-update from the standalone executable (auto-updates and relaunches):
 
 ```bash
-./mcp-context-manager-0.2.0-linux-x86_64 --update \
-  --update-repo <OWNER>/<REPO> \
-  --update-version 0.2.1
+./mcp-context-manager-0.2.0-linux-x86_64 --update
 ```
 
-Use `--update` without `--update-version` to install the latest release.  
-You can also set `MCP_CONTEXT_UPDATE_REPO` and `MCP_CONTEXT_UPDATE_TARGET`
-environment variables instead of flags.
-```
+The updater defaults to `ueni/mcp_context_manager` when `--update-repo` or
+`MCP_CONTEXT_UPDATE_REPO` is not provided and uses `--update` without extra
+input to fetch the latest release.
+It replaces the running executable and restarts it using the same non-update
+arguments so it continues as the same invocation.
+You can still override with `--update-repo`/`MCP_CONTEXT_UPDATE_REPO` and
+`--update-target`/`MCP_CONTEXT_UPDATE_TARGET`.
+
+Use `--update-version` only when you want to install a specific version.
 
 ## Development
 

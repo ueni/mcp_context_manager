@@ -45,7 +45,87 @@ def test_self_update_target_path_rejects_python_file(monkeypatch, tmp_path) -> N
     script.write_text("#!/usr/bin/env python\n", encoding="utf-8")
     monkeypatch.setattr(server_module.sys, "argv", [str(script)])
     monkeypatch.setattr(server_module.os, "access", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(server_module.sys, "frozen", False)
+    monkeypatch.setattr(server_module.sys, "frozen", False, raising=False)
 
     with pytest.raises(RuntimeError, match="standalone executable"):
         server_module._self_update_target_path()
+
+
+def test_self_update_restart_args_preserves_runtime_arguments() -> None:
+    raw_args = [
+        "--update",
+        "--update-version=0.1.0",
+        "--update-repo",
+        "owner/repo",
+        "--update-target",
+        "/tmp/current",
+        "--existing",
+        "value",
+    ]
+    assert server_module._self_update_restart_args(raw_args) == ["--existing", "value"]
+
+
+def test_main_update_preserves_runtime_arguments_for_restart(monkeypatch, tmp_path) -> None:
+    executable = tmp_path / "mcp-context-manager"
+    executable.write_text("old", encoding="utf-8")
+    executable.chmod(0o755)
+
+    calls: dict[str, object] = {}
+
+    def fake_execute(*args, **kwargs) -> None:
+        calls["executed"] = (args, kwargs)
+
+    def fake_execv(path: str, argv: list[str]) -> None:
+        calls["exec"] = (path, argv)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(server_module.sys, "argv", [
+        "mcp-context-manager",
+        "--update",
+        "--update-version",
+        "0.1.0",
+        "--existing",
+        "value",
+        "--update-target",
+        str(executable),
+        "--update-repo",
+        "owner/repo",
+        "--extra",
+        "arg",
+    ])
+    monkeypatch.setattr(server_module, "_self_update_execute", fake_execute)
+    monkeypatch.setattr(server_module.os, "execv", fake_execv)
+
+    with pytest.raises(SystemExit):
+        server_module.main()
+
+    assert "exec" in calls
+    assert calls["exec"] == (str(executable), [str(executable), "--existing", "value", "--extra", "arg"])
+
+
+def test_main_update_target_error_is_reported(monkeypatch, tmp_path, capsys) -> None:
+    def should_not_be_called(*_args, **_kwargs) -> None:
+        raise AssertionError("should not be called")
+
+    monkeypatch.setattr(
+        server_module.sys,
+        "argv",
+        ["mcp-context-manager", "--update", "--update-target", str(tmp_path / "missing-target")],
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_self_update_execute",
+        should_not_be_called,
+    )
+    monkeypatch.setattr(
+        server_module.os,
+        "execv",
+        should_not_be_called,
+    )
+
+    with pytest.raises(SystemExit):
+        server_module.main()
+
+    captured = capsys.readouterr()
+    assert "update failed:" in captured.err
+    assert "Traceback" not in captured.err
