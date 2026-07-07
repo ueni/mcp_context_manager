@@ -1,0 +1,67 @@
+name: Build standalone server
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  standalone:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller .
+
+      - name: Build executable
+        run: |
+          pyinstaller \
+            --onefile \
+            --name mcp-context-manager \
+            --collect-all mcp_context_manager \
+            src/mcp_context_manager/__main__.py
+
+      - name: Smoke test executable
+        run: |
+          state_dir="$(mktemp -d)"
+          MCP_TRANSPORT=streamable-http \
+          HOST=127.0.0.1 \
+          PORT=18080 \
+          REPO_PATH="$PWD" \
+          MCP_CONTEXT_STATE_DIR="$state_dir" \
+          ./dist/mcp-context-manager &
+          pid="$!"
+          trap 'kill "$pid" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
+          for _ in $(seq 1 30); do
+            if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
+            then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-context-manager-linux-x86_64
+          path: dist/mcp-context-manager
+          if-no-files-found: error

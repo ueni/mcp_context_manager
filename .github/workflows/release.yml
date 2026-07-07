@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the leading v, for example 0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+
+    env:
+      IMAGE_NAME: mcp-context-manager
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version
+        run: |
+          version="${{ inputs.version }}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+[.][0-9]+[.][0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "Version must look like 1.2.3, without a leading v." >&2
+            exit 1
+          fi
+          tag="v${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists." >&2
+            exit 1
+          fi
+          {
+            echo "VERSION=${version}"
+            echo "TAG=${tag}"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install standalone build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller .
+
+      - name: Build standalone executable
+        run: |
+          pyinstaller \
+            --onefile \
+            --name mcp-context-manager \
+            --collect-all mcp_context_manager \
+            src/mcp_context_manager/__main__.py
+          mkdir -p release
+          cp dist/mcp-context-manager "release/mcp-context-manager-${VERSION}-linux-x86_64"
+
+      - name: Smoke test executable
+        run: |
+          state_dir="$(mktemp -d)"
+          MCP_TRANSPORT=streamable-http \
+          HOST=127.0.0.1 \
+          PORT=18080 \
+          REPO_PATH="$PWD" \
+          MCP_CONTEXT_STATE_DIR="$state_dir" \
+          "release/mcp-context-manager-${VERSION}-linux-x86_64" &
+          pid="$!"
+          trap 'kill "$pid" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
+          for _ in $(seq 1 30); do
+            if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/mcp/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
+            then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Build Docker image archive
+        run: |
+          docker build -t "${IMAGE_NAME}:${VERSION}" -t "${IMAGE_NAME}:latest" .
+          docker save "${IMAGE_NAME}:${VERSION}" | gzip -9 > "release/${IMAGE_NAME}-${VERSION}-image.tar.gz"
+
+      - name: Create checksums
+        working-directory: release
+        run: sha256sum * > SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums
+        working-directory: release
+        run: cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" release/* \
+            --title "$TAG" \
+            --notes "Release $TAG. Artifacts include the Alpine Docker image archive, standalone Linux server executable, checksums, and Sigstore signature bundle."
