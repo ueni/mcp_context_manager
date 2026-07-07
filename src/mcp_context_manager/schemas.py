@@ -51,6 +51,16 @@ MEASUREMENT_MATRIX_SCHEMA: dict[str, Any] = {
     },
 }
 
+CONTEXT_METRICS_AND_MATRIX_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["schema", "metrics", "matrix"],
+    "properties": {
+        "schema": {"const": "context_metrics_and_matrix.v1"},
+        "metrics": {"type": "object"},
+        "matrix": {"type": "object"},
+    },
+}
+
 CONTEXT_BENCHMARK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["schema", "runs", "measurement_matrix"],
@@ -80,6 +90,7 @@ TOOL_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "context_admin": {
         "oneOf": [
             CONTEXT_METRICS_SCHEMA,
+            CONTEXT_METRICS_AND_MATRIX_SCHEMA,
             MEASUREMENT_MATRIX_SCHEMA,
             CONTEXT_BENCHMARK_SCHEMA,
             CONTEXT_CACHE_WARMUP_SCHEMA,
@@ -218,6 +229,7 @@ TOOL_OUTPUT_SCHEMA_NAMES: dict[str, list[str]] = {
         "context_budget.v1",
         "tool_output_contracts.v1",
         "context_metrics.v1",
+        "context_metrics_and_matrix.v1",
         "context_measurement_matrix.v1",
         "context_benchmark.v1",
         "context_state_browser.v1",

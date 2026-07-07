@@ -371,6 +371,7 @@ AdminModeParam = Annotated[
         "contracts",
         "metrics",
         "measurement_matrix",
+        "metrics_and_matrix",
         "benchmark",
         "state_browser",
         "quality_eval",

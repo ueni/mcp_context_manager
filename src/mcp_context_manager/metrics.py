@@ -485,14 +485,18 @@ class ContextMetrics:
             },
         }
 
-    def measurement_matrix(self) -> dict[str, Any]:
-        snapshot = self.snapshot(recent_limit=50)
+    def measurement_matrix(
+        self, snapshot: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        payload = (
+            snapshot if isinstance(snapshot, dict) else self.snapshot(recent_limit=50)
+        )
         return {
             "schema": "context_measurement_matrix.v1",
             "generated_at": now_iso(),
             "project_id": self.config.project_id,
             "checks": [
-                self._measurement_check(target, snapshot)
+                self._measurement_check(target, payload)
                 for target in MEASUREMENT_TARGETS
             ],
             "metric_sources": {

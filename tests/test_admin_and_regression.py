@@ -178,6 +178,11 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
         check["status"] for check in matrix["checks"]
     }.issubset({"pass", "fail", "insufficient"})
 
+    matrix_bundle = service.context_admin(mode="metrics_and_matrix")
+    assert matrix_bundle["schema"] == "context_metrics_and_matrix.v1"
+    assert matrix_bundle["metrics"]["schema"] == "context_metrics.v1"
+    assert matrix_bundle["matrix"]["schema"] == "context_measurement_matrix.v1"
+
 
 def test_context_admin_warmup_preinitializes_index_and_search_cache(
     service: ContextService,

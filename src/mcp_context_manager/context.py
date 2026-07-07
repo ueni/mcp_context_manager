@@ -305,6 +305,7 @@ class ContextService:
             "contracts",
             "metrics",
             "measurement_matrix",
+            "metrics_and_matrix",
             "benchmark",
             "state_browser",
             "quality_eval",
@@ -351,6 +352,13 @@ class ContextService:
             return self._metrics_snapshot()
         if mode == "measurement_matrix":
             return self.metrics.measurement_matrix()
+        if mode == "metrics_and_matrix":
+            metrics = self._metrics_snapshot()
+            return {
+                "schema": "context_metrics_and_matrix.v1",
+                "metrics": metrics,
+                "matrix": self.metrics.measurement_matrix(snapshot=metrics),
+            }
         if mode == "benchmark":
             return self._context_pack_benchmark(
                 max_files=max_files
