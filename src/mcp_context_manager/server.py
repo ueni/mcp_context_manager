@@ -3,21 +3,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import json
 import inspect
+import json
 import os
 import platform
 import shutil
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
-from urllib.parse import urlsplit
-from typing import Annotated, Any, Callable, Literal, TypeVar
-
 from importlib import metadata
+from pathlib import Path
+from typing import Annotated, Any, Callable, Literal, TypeVar
+from urllib.parse import urlsplit
 
 from .config import ContextConfig
 from .context import DEFAULT_CACHE_MAX_AGE_MINUTES, ContextService
@@ -1079,7 +1077,9 @@ def _self_update_restart_args(argv: list[str]) -> list[str]:
     return out
 
 
-def _self_update_execute(target_version: str | None, update_repo: str, explicit_target: str | None = None) -> None:
+def _self_update_execute(
+    target_version: str | None, update_repo: str, explicit_target: str | None = None
+) -> Path:
     if not update_repo:
         raise RuntimeError("update repository is required")
     target_path = _self_update_target_path(explicit_target)
@@ -1108,10 +1108,10 @@ def _self_update_execute(target_version: str | None, update_repo: str, explicit_
 
     if current_version and desired_normalized and desired_normalized == current_version:
         print(f"Already up to date: {current_version}")
-        return
+        return target_path
     if not desired_normalized and current_version and normalized == current_version:
         print(f"Already up to date: {current_version}")
-        return
+        return target_path
 
     backup = target_path.with_name(f".{target_path.name}.backup")
     temp = target_path.with_name(f".{target_path.name}.tmp")
@@ -1131,6 +1131,7 @@ def _self_update_execute(target_version: str | None, update_repo: str, explicit_
     finally:
         if backup.exists():
             backup.unlink()
+    return target_path
 
 
 def main() -> None:
@@ -1161,8 +1162,9 @@ def main() -> None:
 
     if args.update:
         try:
-            target_path = _self_update_target_path(args.update_target)
-            _self_update_execute(args.update_version, args.update_repo, args.update_target)
+            target_path = _self_update_execute(
+                args.update_version, args.update_repo, args.update_target
+            )
         except RuntimeError as exc:
             print(f"update failed: {exc}", file=sys.stderr)
             raise SystemExit(1)

@@ -72,8 +72,9 @@ def test_main_update_preserves_runtime_arguments_for_restart(monkeypatch, tmp_pa
 
     calls: dict[str, object] = {}
 
-    def fake_execute(*args, **kwargs) -> None:
-        calls["executed"] = (args, kwargs)
+    def fake_execute(*_args, **_kwargs):
+        calls["executed"] = (_args, _kwargs)
+        return executable
 
     def fake_execv(path: str, argv: list[str]) -> None:
         calls["exec"] = (path, argv)
@@ -104,28 +105,30 @@ def test_main_update_preserves_runtime_arguments_for_restart(monkeypatch, tmp_pa
 
 
 def test_main_update_target_error_is_reported(monkeypatch, tmp_path, capsys) -> None:
-    def should_not_be_called(*_args, **_kwargs) -> None:
-        raise AssertionError("should not be called")
+    calls: dict[str, object] = {}
+
+    def fake_execute(*_args, **_kwargs):
+        calls["called"] = True
+        raise RuntimeError("update target is not a file")
 
     monkeypatch.setattr(
         server_module.sys,
         "argv",
         ["mcp-context-manager", "--update", "--update-target", str(tmp_path / "missing-target")],
     )
-    monkeypatch.setattr(
-        server_module,
-        "_self_update_execute",
-        should_not_be_called,
-    )
+    monkeypatch.setattr(server_module, "_self_update_execute", fake_execute)
     monkeypatch.setattr(
         server_module.os,
         "execv",
-        should_not_be_called,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("execv should not be called")
+        ),
     )
 
     with pytest.raises(SystemExit):
         server_module.main()
 
+    assert calls["called"]
     captured = capsys.readouterr()
-    assert "update failed:" in captured.err
+    assert "update failed: update target is not a file" in captured.err
     assert "Traceback" not in captured.err
