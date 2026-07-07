@@ -1,4 +1,4 @@
-from .server import main
+from mcp_context_manager.server import main
 
 if __name__ == "__main__":
     main()

@@ -820,6 +820,7 @@ def create_http_app(service: ProjectContextService | ContextService | None = Non
         routes=[
             Route("/", root, methods=["GET"]),
             Route("/healthz", healthz, methods=["GET"]),
+            Route("/mcp/healthz", healthz, methods=["GET"]),
             Route("/v1/mcp/tools", mcp_tools_http, methods=["GET"]),
             Route("/v1/context/pack", context_pack_http, methods=["POST"]),
             Route("/v1/context/references/{reference_id}", reference_http, methods=["GET"]),

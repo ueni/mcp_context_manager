@@ -65,6 +65,69 @@ def test_mcp_tools_http_payload_lists_transport_endpoints() -> None:
     }
 
 
+def test_create_http_app_registers_healthz_before_root_mcp_mount(
+    monkeypatch, service
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRoute:
+        def __init__(self, path: str, _endpoint: object, methods: list[str]):
+            self.path = path
+            self.methods = methods
+
+    class FakeMount:
+        def __init__(self, path: str, **_kwargs: object):
+            self.path = path
+
+    class FakeStarlette:
+        def __init__(self, *, routes: list[object], lifespan: object):
+            captured["routes"] = routes
+            captured["lifespan"] = lifespan
+
+    class FakeFastMCP:
+        def __init__(self, _name: str, **_kwargs: object):
+            pass
+
+        def tool(self):
+            return lambda fn: fn
+
+        def resource(self, *_args: object, **_kwargs: object):
+            return lambda fn: fn
+
+        def prompt(self, *_args: object, **_kwargs: object):
+            return lambda fn: fn
+
+        def sse_app(self):
+            return object()
+
+        def streamable_http_app(self):
+            return object()
+
+    monkeypatch.setattr(server_module, "FastMCP", FakeFastMCP)
+    monkeypatch.setattr(server_module, "Route", FakeRoute)
+    monkeypatch.setattr(server_module, "Mount", FakeMount)
+    monkeypatch.setattr(server_module, "Starlette", FakeStarlette)
+
+    server_module.create_http_app(service)
+
+    routes = captured["routes"]
+    route_paths = [route.path for route in routes if isinstance(route, FakeRoute)]
+    root_mount_index = next(
+        idx
+        for idx, route in enumerate(routes)
+        if isinstance(route, FakeMount) and route.path == "/"
+    )
+    mcp_health_index = next(
+        idx
+        for idx, route in enumerate(routes)
+        if isinstance(route, FakeRoute) and route.path == "/mcp/healthz"
+    )
+
+    assert "/healthz" in route_paths
+    assert "/mcp/healthz" in route_paths
+    assert mcp_health_index < root_mount_index
+
+
 def test_create_mcp_advertises_server_instructions(monkeypatch, service) -> None:
     captured: dict[str, object] = {}
 
