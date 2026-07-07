@@ -62,7 +62,7 @@ jobs:
           PORT=18080 \
           REPO_PATH="$PWD" \
           MCP_CONTEXT_STATE_DIR="$state_dir" \
-          ./mcp-context-manager-linux-x86_64-glibc &
+          ./dist/mcp-context-manager-linux-x86_64-glibc &
           pid="$!"
           trap 'kill "$pid" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
           for _ in $(seq 1 30); do
@@ -89,7 +89,7 @@ jobs:
             -v "$PWD:/workspace-roots" \
             -v "$state_dir:/state" \
             python:3.12-alpine \
-            /workspace-roots/mcp-context-manager-linux-x86_64-musl
+            /workspace-roots/dist/mcp-context-manager-linux-x86_64-musl
           trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
           for _ in $(seq 1 30); do
             if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
@@ -103,7 +103,7 @@ jobs:
       - name: Build docker image archive
         run: |
           docker build \
-            --build-arg SERVER_BINARY=mcp-context-manager-linux-x86_64-musl \
+            --build-arg SERVER_BINARY=dist/mcp-context-manager-linux-x86_64-musl \
             -t mcp-context-manager:linux-x86_64 \
             .
           docker save mcp-context-manager:linux-x86_64 \
@@ -113,14 +113,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mcp-context-manager-linux-x86_64-glibc
-          path: mcp-context-manager-linux-x86_64-glibc
+          path: dist/mcp-context-manager-linux-x86_64-glibc
           if-no-files-found: error
 
       - name: Upload musl executable
         uses: actions/upload-artifact@v4
         with:
           name: mcp-context-manager-linux-x86_64-musl
-          path: mcp-context-manager-linux-x86_64-musl
+          path: dist/mcp-context-manager-linux-x86_64-musl
           if-no-files-found: error
 
       - name: Upload image archive
