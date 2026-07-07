@@ -767,6 +767,8 @@ def test_state_browser_lists_and_inspects_generated_state(
         "debug:sample",
         {
             "schema": "debug.sample.v1",
+            "created_at": "2026-07-01T10:00:00+00:00",
+            "updated_at": "2026-07-01T10:00:00+00:00",
             "path": str(sample_repo.resolve() / "src" / "auth.py"),
             "value": {"nested": True},
         },
@@ -785,6 +787,8 @@ def test_state_browser_lists_and_inspects_generated_state(
     assert listing["generated_state_only"] is True
     assert listing["rows"][0]["key"] == "debug:sample"
     assert listing["rows"][0]["schema"] == "debug.sample.v1"
+    assert listing["rows"][0]["created_at"] == "2026-07-01T10:00:00+00:00"
+    assert listing["rows"][0]["updated_at"] == "2026-07-01T10:00:00+00:00"
     assert str(sample_repo.resolve()) not in json.dumps(listing, sort_keys=True)
 
     entry = service.context_admin(
@@ -796,6 +800,7 @@ def test_state_browser_lists_and_inspects_generated_state(
     assert entry["mode"] == "entry"
     assert entry["entry"]["key"] == "debug:sample"
     assert entry["entry"]["schema"] == "debug.sample.v1"
+    assert entry["entry"]["created_at"] == "2026-07-01T10:00:00+00:00"
     assert "[REDACTED_HOST_PATH]" in entry["entry"]["preview"]
     assert str(sample_repo.resolve()) not in json.dumps(entry, sort_keys=True)
 

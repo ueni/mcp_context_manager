@@ -66,6 +66,13 @@ class FakeClient:
                     {"key": "b", "status": "pass"},
                 ],
             }
+        if mode == "warmup":
+            return {
+                "schema": "context_cache.warmup.v1",
+                "project_id": project_id,
+                "index": {"file_count": 12},
+                "search_cache": {"query_count": 3},
+            }
         if mode == "state_browser":
             state_key = str(arguments.get("state_key") or "")
             if state_key:
@@ -78,7 +85,10 @@ class FakeClient:
                         "size_chars": 42,
                         "schema": "debug.sample.v1",
                         "status": "active",
+                        "created_at": "2026-07-01T12:00:00+00:00",
+                        "updated_at": "2026-07-01T12:00:00+00:00",
                         "expires_at": "",
+                        "namespace": "debug.sample",
                         "preview": "\n".join(
                             [
                                 "{",
@@ -107,7 +117,10 @@ class FakeClient:
                         "size_chars": 42,
                         "schema": "debug.sample.v1",
                         "status": "active",
+                        "created_at": "2026-07-01T10:00:00+00:00",
+                        "updated_at": "2026-07-01T10:00:00+00:00",
                         "expires_at": "",
+                        "namespace": "debug.sample",
                         "preview": "cache preview",
                     },
                     {
@@ -116,6 +129,8 @@ class FakeClient:
                         "size_chars": 64,
                         "schema": "memory.sample.v1",
                         "status": "active",
+                        "created_at": "2026-07-01T12:00:00+00:00",
+                        "updated_at": "2026-07-01T12:00:00+00:00",
                         "expires_at": "",
                         "preview": "memory preview",
                     },
@@ -125,6 +140,8 @@ class FakeClient:
                         "size_chars": 96,
                         "schema": "reference.sample.v1",
                         "status": "active",
+                        "created_at": "2026-07-01T13:00:00+00:00",
+                        "updated_at": "2026-07-01T13:00:00+00:00",
                         "expires_at": "",
                         "preview": "reference preview",
                     },
@@ -134,7 +151,10 @@ class FakeClient:
                         "size_chars": 12,
                         "schema": "debug.sample.v1",
                         "status": "active",
+                        "created_at": "2026-07-01T11:00:00+00:00",
+                        "updated_at": "2026-07-01T11:00:00+00:00",
                         "expires_at": "",
+                        "namespace": "debug.sample",
                         "preview": "second cache preview",
                     },
                 ],
@@ -383,6 +403,7 @@ def test_interactive_key_bindings_update_state() -> None:
     assert monitor.decode_key("+") == "plus"
     assert monitor.decode_key("-") == "minus"
     assert monitor.decode_key("b") == "browser"
+    assert monitor.decode_key("w") == "warmup"
 
     assert monitor.handle_key("down", state, row_count=3) == "redraw"
     assert state.selected_index == 1
@@ -394,13 +415,18 @@ def test_interactive_key_bindings_update_state() -> None:
     assert state.refresh_interval == 6.0
     assert monitor.handle_key("minus", state, row_count=3) == "redraw"
     assert state.refresh_interval == 5.0
+    assert monitor.handle_key("warmup", state, row_count=3) == "warmup"
     assert monitor.handle_key("browser", state, row_count=3) == "browser"
     assert state.view == "state"
     assert monitor.handle_key("down", state, row_count=3, state_row_count=2) == "redraw"
     assert state.state_selected_index == 1
     assert monitor.handle_key("enter", state, row_count=3, state_row_count=2) == "state_entry"
     assert monitor.handle_key("refresh", state, row_count=3, state_row_count=2) == "ignore"
+    assert monitor.handle_key("warmup", state, row_count=3, state_row_count=2) == "ignore"
     assert monitor.handle_key("plus", state, row_count=3, state_row_count=2) == "ignore"
+    state.state_search_active = True
+    assert monitor.handle_key("warmup", state, row_count=3, state_row_count=2) == "redraw"
+    assert state.state_search == "w"
 
 
 def test_default_refresh_interval_is_60_seconds() -> None:
@@ -436,6 +462,7 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
 
     assert "| > | Alpha" in table
     assert "Enter details" in table
+    assert "w warmup" in table
     assert "refresh=5.0s" in table
 
     state.view = "detail"
@@ -561,8 +588,11 @@ def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
     )
 
     assert "mcp-context-manager state browser" in rendered
+    assert "| class        |" in rendered
+    assert "created" in rendered
+    assert rendered.index("cache:xyz") < rendered.index("cache:abc")
     assert "cache:abc" in rendered
-    assert "| > | cache:abc" in rendered
+    assert "| > | cache:xyz" in rendered
 
     monitor._load_state_entry(client, state)
     assert state.view == "state"
@@ -576,7 +606,7 @@ def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
     )
 
     assert "mcp-context-manager state entry" in detail
-    assert "cache:abc" in detail
+    assert "cache:xyz" in detail
     assert '"hello": "world"' in detail
 
     assert (
@@ -678,6 +708,35 @@ def test_background_mcp_operation_result_updates_state() -> None:
     assert state.state_payload["schema"] == "context_state_browser.v1"
 
 
+def test_warmup_selected_project_calls_admin_and_sets_status() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=False,
+    )
+    state = monitor.MonitorState(selected_index=0, refresh_interval=5.0)
+
+    with monitor.ThreadPoolExecutor(max_workers=1) as executor:
+        pending = monitor._submit_mcp_operation(
+            executor,
+            "warmup",
+            lambda: monitor._fetch_warmup_result(client, snapshots, 0),
+        )
+        pending.future.result(timeout=2)
+        updated = monitor._apply_mcp_operation_result(state, snapshots, pending)
+
+    assert updated == snapshots
+    assert state.mcp_error == ""
+    assert state.mcp_status == "warmed Alpha: 3 queries, 12 files"
+    assert (
+        "context_admin",
+        {"mode": "warmup", "project_id": "alpha-123"},
+    ) in client.calls
+
+
 def test_state_browser_filters_rows_with_search_input() -> None:
     monitor = load_monitor_module()
     client = FakeClient()
@@ -742,10 +801,11 @@ def test_state_browser_scrolls_visible_window() -> None:
 
     assert "rows:     4 / 4" in rendered
     assert "window: 2-4" in rendered
+    assert "cache:abc" in rendered
     assert "memory:def" in rendered
     assert "reference:ghi" in rendered
-    assert "| > | cache:xyz" in rendered
-    assert "cache:abc" not in rendered
+    assert "| > | reference:ghi" in rendered
+    assert "cache:xyz" not in rendered
 
 
 def test_state_browser_old_server_error_is_actionable() -> None:

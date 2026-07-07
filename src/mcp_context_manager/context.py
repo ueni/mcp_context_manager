@@ -2856,10 +2856,19 @@ class ContextService:
                     "preview": preview,
                     "truncated": exists and len(preview) >= entry_budget,
                     "schema": value.get("schema", "") if isinstance(value, dict) else "",
+                    "created_at": value.get("created_at", "")
+                    if isinstance(value, dict)
+                    else "",
+                    "updated_at": value.get("updated_at", "")
+                    if isinstance(value, dict)
+                    else "",
                     "expires_at": value.get("expires_at", "")
                     if isinstance(value, dict)
                     else "",
                     "status": value.get("status", "") if isinstance(value, dict) else "",
+                    "namespace": value.get("namespace", "")
+                    if isinstance(value, dict)
+                    else "",
                 },
                 "repo_boundary_enforced": True,
                 "generated_state_only": True,
@@ -2911,9 +2920,12 @@ class ContextService:
             ),
             "schema": value.get("schema", "") if isinstance(value, dict) else "",
             "status": value.get("status", "") if isinstance(value, dict) else "",
+            "created_at": value.get("created_at", "") if isinstance(value, dict) else "",
+            "updated_at": value.get("updated_at", "") if isinstance(value, dict) else "",
             "expires_at": value.get("expires_at", "")
             if isinstance(value, dict)
             else "",
+            "namespace": value.get("namespace", "") if isinstance(value, dict) else "",
             "preview": self._state_value_preview(value, max_chars),
         }
 

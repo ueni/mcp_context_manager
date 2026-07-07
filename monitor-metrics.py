@@ -118,6 +118,13 @@ class StateEntryResult:
 
 
 @dataclass
+class WarmupResult:
+    target: ProjectTarget | None
+    payload: dict[str, Any] | None = None
+    error: str = ""
+
+
+@dataclass
 class PendingMcpOperation:
     kind: str
     future: Future[Any]
@@ -399,6 +406,14 @@ def fetch_state_browser(
     return client.call_tool("context_admin", args)
 
 
+def warmup_project(client: Any, target: ProjectTarget) -> dict[str, Any]:
+    root_uri = target.name if target.source == "root_uri" else ""
+    return client.call_tool(
+        "context_admin",
+        {"mode": "warmup", **_selector_args(target, root_uri)},
+    )
+
+
 def friendly_mcp_error(exc: Exception) -> str:
     message = str(exc)
     if (
@@ -409,6 +424,17 @@ def friendly_mcp_error(exc: Exception) -> str:
         return (
             "The running MCP server does not support "
             "context_admin(mode='state_browser') yet. Rebuild and restart it with "
+            "the current checkout, for example: "
+            "MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up -d --build"
+        )
+    if (
+        "context_adminArguments" in message
+        and "warmup" in message
+        and "literal_error" in message
+    ):
+        return (
+            "The running MCP server does not support "
+            "context_admin(mode='warmup') yet. Rebuild and restart it with "
             "the current checkout, for example: "
             "MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up -d --build"
         )
@@ -673,10 +699,10 @@ def render_state_browser(
     ]
     lines.extend(
         _render_table(
-            ("", "key", "type", "size", "schema", "status", "expires"),
+            ("", "key", "class", "type", "size", "created", "schema", "status"),
             table_rows,
             widths=_state_table_widths(width),
-            aligns=("left", "left", "left", "right", "left", "left", "left"),
+            aligns=("left", "left", "left", "left", "right", "left", "left", "left"),
         )
     )
     if not table_rows:
@@ -960,7 +986,7 @@ def _controls(
 ) -> str:
     keys = (
         "keys: Up/Down select  Enter details  b state  Esc table  "
-        "+/- refresh  r reload  q quit"
+        "+/- refresh  r reload  w warmup  q quit"
     )
     controls = (
         f"{keys}   refresh={fmt_seconds(refresh_interval)}"
@@ -1026,7 +1052,10 @@ def _state_rows(state: MonitorState) -> list[dict[str, Any]]:
     rows = (state.state_payload or {}).get("rows")
     if not isinstance(rows, list):
         return []
-    return [row for row in rows if isinstance(row, dict)]
+    return sorted(
+        (row for row in rows if isinstance(row, dict)),
+        key=_state_row_sort_key,
+    )
 
 
 def _filtered_state_rows(state: MonitorState) -> list[dict[str, Any]]:
@@ -1045,11 +1074,51 @@ def _state_row_matches(row: dict[str, Any], query: str) -> bool:
             "value_type",
             "schema",
             "status",
+            "namespace",
+            "created_at",
+            "updated_at",
             "expires_at",
             "preview",
+            "state_class",
         )
     ).lower()
     return query in haystack
+
+
+def _state_row_sort_key(row: dict[str, Any]) -> tuple[str, float, str]:
+    return (
+        _state_row_class(row).lower(),
+        -_state_row_timestamp(row),
+        str(row.get("key") or ""),
+    )
+
+
+def _state_row_class(row: dict[str, Any]) -> str:
+    namespace = str(row.get("namespace") or "").strip()
+    if namespace:
+        return namespace
+    key = str(row.get("key") or "")
+    if key.startswith("cache:"):
+        cache_key = key.removeprefix("cache:")
+        if ":" in cache_key:
+            return cache_key.split(":", 1)[0]
+        return "cache"
+    if ":" in key:
+        return key.split(":", 1)[0]
+    schema = str(row.get("schema") or "").strip()
+    return schema.split(".", 1)[0] if schema else "-"
+
+
+def _state_row_timestamp(row: dict[str, Any]) -> float:
+    for field in ("created_at", "updated_at", "expires_at"):
+        value = str(row.get(field) or "").strip()
+        if not value:
+            continue
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return 0.0
 
 
 def _state_visible_count(height: int, entry_open: bool) -> int:
@@ -1093,17 +1162,19 @@ def _state_row_cells(row: dict[str, Any], selected: bool = False) -> tuple[str, 
     return (
         ">" if selected else " ",
         _trim(str(row.get("key") or "-"), 42),
+        _trim(_state_row_class(row), 22),
         _trim(str(row.get("value_type") or "-"), 8),
         fmt_int(row.get("size_chars", 0)),
+        _trim(str(row.get("created_at") or "-"), 20),
         _trim(str(row.get("schema") or "-"), 22),
         _trim(str(row.get("status") or "-"), 10),
-        _trim(str(row.get("expires_at") or "-"), 20),
     )
 
 
 def _state_table_widths(width: int) -> tuple[int, ...]:
-    key_width = max(24, min(42, width - 70))
-    return (1, key_width, 8, 8, 22, 10, 20)
+    key_width = max(24, min(42, width - 94))
+    class_width = max(12, min(22, width - 114))
+    return (1, key_width, class_width, 8, 8, 20, 22, 10)
 
 
 def _wrap_block(text: str, width: int) -> list[str]:
@@ -1401,6 +1472,8 @@ def decode_key(sequence: str) -> str | None:
         return "refresh"
     if sequence in {"b", "B"}:
         return "browser"
+    if sequence in {"w", "W"}:
+        return "warmup"
     if sequence == "\x03":
         return "interrupt"
     if sequence in {"q", "Q"}:
@@ -1448,6 +1521,7 @@ def _search_text_for_key(key: str) -> str:
         "minus": "-",
         "refresh": "r",
         "browser": "b",
+        "warmup": "w",
         "quit": "q",
         "search": "/",
     }.get(key, "")
@@ -1521,6 +1595,8 @@ def handle_key(
         return "quit"
     if key == "refresh" and state.view != "state":
         return "refresh"
+    if key == "warmup" and state.view != "state" and row_count:
+        return "warmup"
     if key == "browser" and row_count:
         state.view = "state"
         state.state_entry = None
@@ -1750,6 +1826,34 @@ def _apply_state_entry_result(state: MonitorState, result: StateEntryResult) -> 
     state.view = "state"
 
 
+def _fetch_warmup_result(
+    client: Any,
+    snapshots: list[ProjectSnapshot],
+    selected_index: int,
+) -> WarmupResult:
+    if not snapshots:
+        return WarmupResult(target=None, error="no project selected")
+    selected = _clamped_index(selected_index, len(snapshots))
+    target = snapshots[selected].target
+    try:
+        return WarmupResult(target=target, payload=warmup_project(client, target))
+    except Exception as exc:
+        return WarmupResult(target=target, error=friendly_mcp_error(exc))
+
+
+def _apply_warmup_result(state: MonitorState, result: WarmupResult) -> None:
+    if result.error:
+        state.mcp_status = ""
+        state.mcp_error = result.error
+        return
+    payload = result.payload or {}
+    project = _project_name(result.target) if result.target else "-"
+    query_count = _int_at(payload, ("search_cache", "query_count"))
+    file_count = _int_at(payload, ("index", "file_count"))
+    state.mcp_status = f"warmed {project}: {query_count} queries, {file_count} files"
+    state.mcp_error = ""
+
+
 def _apply_mcp_operation_result(
     state: MonitorState,
     snapshots: list[ProjectSnapshot],
@@ -1769,6 +1873,10 @@ def _apply_mcp_operation_result(
     if pending.kind == "state_entry":
         if isinstance(result, StateEntryResult):
             _apply_state_entry_result(state, result)
+        return snapshots
+    if pending.kind == "warmup":
+        if isinstance(result, WarmupResult):
+            _apply_warmup_result(state, result)
         return snapshots
     return snapshots
 
@@ -1799,6 +1907,7 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
     pending: PendingMcpOperation | None = None
     queued_browser_load = False
     queued_refresh = False
+    queued_warmup = False
     fd = sys.stdin.fileno()
 
     with ThreadPoolExecutor(
@@ -1807,10 +1916,12 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
         while True:
             now = time.monotonic()
             if pending and pending.future.done():
+                completed_kind = pending.kind
                 try:
                     snapshots = _apply_mcp_operation_result(state, snapshots, pending)
                 except Exception as exc:
                     _set_mcp_error(state, exc)
+                    completed_kind = ""
                 pending = None
                 next_refresh = time.monotonic() + state.refresh_interval
                 if queued_browser_load and state.view == "state":
@@ -1827,8 +1938,20 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                             client, snapshots, state.selected_index
                         ),
                     )
+                elif queued_warmup:
+                    queued_warmup = False
+                    _set_mcp_loading(state, "warming selected project...")
+                    pending = _submit_mcp_operation(
+                        executor,
+                        "warmup",
+                        lambda: _fetch_warmup_result(
+                            client, snapshots, state.selected_index
+                        ),
+                    )
                 elif queued_refresh:
                     queued_refresh = False
+                    force_refresh = True
+                elif completed_kind == "warmup" and not state.mcp_error:
                     force_refresh = True
                 else:
                     force_refresh = False
@@ -1925,6 +2048,20 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                     queued_refresh = True
                     _set_mcp_loading(state, "waiting for current MCP request...")
                     dirty = True
+            if action == "warmup":
+                if pending is None:
+                    _set_mcp_loading(state, "warming selected project...")
+                    pending = _submit_mcp_operation(
+                        executor,
+                        "warmup",
+                        lambda: _fetch_warmup_result(
+                            client, snapshots, state.selected_index
+                        ),
+                    )
+                else:
+                    queued_warmup = True
+                    _set_mcp_loading(state, "waiting for current MCP request...")
+                dirty = True
             if action in {"redraw", "refresh"}:
                 next_refresh = time.monotonic() + state.refresh_interval
                 dirty = True
