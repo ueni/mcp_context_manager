@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -782,6 +783,41 @@ def test_explicit_paths_refresh_before_context_pack_returns(
     assert pack["items"][0]["path"] == "src/auth.py"
     indexed = service.store.get_json("index:file:src/auth.py")
     assert "explicit_refresh_marker" in indexed["content"]
+
+
+def test_health_status_reuses_cached_counts_and_refreshes_in_background(
+    service: ContextService,
+    monkeypatch,
+) -> None:
+    service.context_admin(mode="health")
+    original_count = service.index.store.count
+    cached = service.context_admin(mode="health")
+    assert "index" in cached
+
+    started = Event()
+    release = Event()
+    original = original_count
+
+    def slow_count(_prefix: str) -> int:
+        started.set()
+        release.wait(1.0)
+        return original(_prefix)
+
+    service.index._status_cache_at = 0.0
+    service.index._status_refresh_future = None
+    monkeypatch.setattr(service.index.store, "count", slow_count)
+
+    started_at = time.perf_counter()
+    health = service.context_admin(mode="health")
+    elapsed = time.perf_counter() - started_at
+
+    assert elapsed < 0.5
+    assert started.wait(0.5)
+    assert health["index"]["file_count"] == cached["index"]["file_count"]
+
+    release.set()
+    if service.index._status_refresh_future is not None:
+        service.index._status_refresh_future.result(timeout=2.0)
 
 
 def test_background_index_refresh_deduplicates_concurrent_stable_packs(

@@ -44,6 +44,7 @@ class ContextIndex:
         self._status_cache: dict[str, Any] | None = None
         self._status_cache_at = 0.0
         self._status_lock = threading.Lock()
+        self._status_refresh_future = None
 
     def _iter_candidate_files(self, root: Path, max_files: int) -> list[CandidateFile]:
         files: list[CandidateFile] = []
@@ -349,11 +350,36 @@ class ContextIndex:
         available = self._get_meta("refresh_signature_available") == "true"
         return signature, bool(signature and available)
 
-    def status(self, use_cache: bool = True) -> dict[str, Any]:
+    def status(self, use_cache: bool = True, allow_stale: bool = True) -> dict[str, Any]:
+        now = time.time()
+        stale_status: dict[str, Any] | None = None
         if use_cache:
             with self._status_lock:
-                if self._status_cache is not None and time.time() - self._status_cache_at < 1.0:
+                if (
+                    self._status_cache is not None
+                    and now - self._status_cache_at < 1.0
+                ):
                     return dict(self._status_cache)
+                if self._status_cache is not None:
+                    stale_status = dict(self._status_cache)
+        if use_cache and stale_status is not None and allow_stale:
+            self._refresh_status_in_background()
+            return stale_status
+        status = self._compute_status()
+        return status
+
+    def _refresh_status_in_background(self) -> None:
+        try:
+            from .runtime import io_executor
+        except Exception:
+            return
+        with self._status_lock:
+            future = self._status_refresh_future
+            if future is not None and not future.done():
+                return
+            self._status_refresh_future = io_executor().submit(self._compute_status)
+
+    def _compute_status(self) -> dict[str, Any]:
         meta = self._meta()
         file_count = self.store.count("index:file:")
         symbol_count = self.store.count("index:symbol:")
@@ -381,6 +407,9 @@ class ContextIndex:
         with self._status_lock:
             self._status_cache = dict(status)
             self._status_cache_at = time.time()
+            future = self._status_refresh_future
+            if future is not None and future.done():
+                self._status_refresh_future = None
         return status
 
     def _invalidate_status_cache(self) -> None:

@@ -9,6 +9,4 @@
 .venv
 venv
 build
-dist
-!dist/mcp-context-manager
 wheelhouse
