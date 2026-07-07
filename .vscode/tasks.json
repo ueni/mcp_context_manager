@@ -4,7 +4,7 @@
     {
       "label": "build: docker image",
       "type": "shell",
-      "command": "docker build -t mcp-context-manager:local .",
+      "command": "if [ ! -x dist/mcp-context-manager ]; then echo \"dist/mcp-context-manager is missing; run the standalone build task first.\" >&2; exit 1; fi; docker build --build-arg SERVER_BINARY=dist/mcp-context-manager -t mcp-context-manager:local .",
       "group": {
         "kind": "build",
         "isDefault": true
@@ -21,7 +21,7 @@
     {
       "label": "build: docker image tar.gz",
       "type": "shell",
-      "command": "set -euo pipefail; mkdir -p dist; docker build -t mcp-context-manager:local .; docker save mcp-context-manager:local | gzip -9 > dist/mcp-context-manager-local-image.tar.gz",
+      "command": "set -euo pipefail; mkdir -p dist; if [ ! -x dist/mcp-context-manager ]; then echo \"dist/mcp-context-manager is missing; run the standalone build task first.\" >&2; exit 1; fi; docker build --build-arg SERVER_BINARY=dist/mcp-context-manager -t mcp-context-manager:local .; docker save mcp-context-manager:local | gzip -9 > dist/mcp-context-manager-local-image.tar.gz",
       "group": "build",
       "problemMatcher": []
     },

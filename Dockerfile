@@ -3,7 +3,7 @@ FROM alpine:3.21
 
 ARG MCP_CONTEXT_UID=1000
 ARG MCP_CONTEXT_GID=1000
-ARG SERVER_BINARY=mcp-context-manager
+ARG SERVER_BINARY=dist/mcp-context-manager
 
 ENV HOME=/tmp \
     HOST=0.0.0.0 \

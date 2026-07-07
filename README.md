@@ -470,7 +470,9 @@ source. It does not require a committed `wheelhouse/` directory.
 Build the image locally:
 
 ```bash
-docker build -t mcp-context-manager:local .
+docker build \
+  --build-arg SERVER_BINARY=dist/mcp-context-manager \
+  -t mcp-context-manager:local .
 ```
 
 GitHub Actions owns release artifacts:
