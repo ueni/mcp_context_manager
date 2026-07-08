@@ -259,3 +259,24 @@ def test_context_pack_budget_omits_extra_candidates(service: ContextService) -> 
     assert len(pack["items"]) == 1
     assert pack["omitted"]
     assert {row["reason_code"] for row in pack["omitted"]}.intersection({"item_limit", "budget_exhausted", "duplicate"})
+
+
+def test_context_pack_rejects_prompt_path_noise(service: ContextService) -> None:
+    pack = service.context_pack(
+        prompt="Review 0.2 and e.g and i.e. in this module, then open src/auth.py and tests/test_auth.py",
+        max_items=2,
+        refresh_index=True,
+    )
+
+    explicit = pack["indexing"]["explicit_path_refresh"]
+    refreshed_paths = [row["path"] for row in explicit["refreshed_paths"]]
+    skipped_paths = [row["path"] for row in explicit["skipped_paths"]]
+    omitted_paths = [row["path"] for row in explicit["omitted"]]
+    explicit_paths = set(refreshed_paths + skipped_paths)
+
+    assert explicit["path_count"] == 2
+    assert explicit_paths == {"src/auth.py", "tests/test_auth.py"}
+    assert not any(path in {"0.2", "e.g", "i.e"} for path in explicit_paths)
+    assert not any(path in {"0.2", "e.g", "i.e"} for path in omitted_paths)
+    assert pack["request"]["changed_files"] == []
+    assert pack["request"]["focus_paths"] == []

@@ -1077,21 +1077,30 @@ class ContextService:
         return round((time.perf_counter() - started) * 1000, 3)
 
     def _collect_paths(self, prompt: str, changed: list[str], focus: list[str]) -> list[str]:
-        found: list[str] = []
-        for item in [*changed, *focus]:
-            if item and item not in found:
-                found.append(item)
-        for match in re.findall(r"(?<![\w/.-])[\w./-]+\.[A-Za-z0-9]{1,8}(?=\b|:)", prompt):
-            if match not in found:
-                found.append(match)
         safe: list[str] = []
-        for rel in found:
+        for item in [*changed, *focus]:
+            if not item or item in safe:
+                continue
             try:
-                self.config.resolve_repo_path(rel)
+                self.config.resolve_repo_path(item)
             except ValueError:
                 continue
-            safe.append(rel)
+            safe.append(item)
+        for match in re.findall(r"(?<![\w/.-])[\w./-]+\.[A-Za-z0-9]{1,8}(?=\b|:)", prompt):
+            if match in safe:
+                continue
+            if self._is_prompt_path_candidate_current_or_existing(match):
+                safe.append(match)
         return safe[:12]
+
+    def _is_prompt_path_candidate_current_or_existing(self, rel: str) -> bool:
+        try:
+            repo_path = self.config.resolve_repo_path(rel)
+        except ValueError:
+            return False
+        if repo_path.exists():
+            return True
+        return self.index.indexed_path_current(rel)
 
     def _refresh_explicit_paths(
         self,

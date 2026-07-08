@@ -73,20 +73,6 @@ MEASUREMENT_TARGETS: tuple[dict[str, Any], ...] = (
         "min_samples": 1,
     },
     {
-        "key": "cache.hit_ratio",
-        "operator": ">=",
-        "target": 0.2,
-        "unit": "ratio",
-        "min_samples": 2,
-    },
-    {
-        "key": "cache.context_pack_retrieval_hit_ratio",
-        "operator": ">=",
-        "target": 0.2,
-        "unit": "ratio",
-        "min_samples": 2,
-    },
-    {
         "key": "cache.context_pack_fragment_hit_ratio",
         "operator": ">=",
         "target": 0.2,

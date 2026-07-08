@@ -110,8 +110,17 @@ class FakeClient:
         return {
             "schema": "context_measurement_matrix.v1",
             "checks": [
-                {"key": "a", "status": "pass"},
-                {"key": "b", "status": "pass"},
+                {
+                    "key": "a",
+                    "status": "pass",
+                    "description": "Context matrix check a",
+                    "operator": "<=",
+                },
+                {
+                    "key": "latency.context_pack.avg_elapsed_ms",
+                    "status": "pass",
+                    "operator": "<=",
+                },
             ],
         }
 
@@ -568,7 +577,15 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "| project id         | alpha-123" in detail
     assert "| fragment cache     | 8/2 h/m   80.0%" in detail
     assert "token spared/saved" in detail
-    assert "| a                        |         pass" in detail
+    assert any("| a" in line and "pass" in line for line in detail.splitlines())
+    assert "Context matrix check a" in detail
+    assert "Context matrix check a (lower is better)" in detail
+    assert "Average context-pack request latency (lower is better)" in detail
+    latency_row = next(
+        line for line in detail.splitlines() if "latency.context_pack.avg_elapsed_ms" in line
+    )
+    latency_description = latency_row.split("|")[-2].strip()
+    assert "latency.context_pack.avg_elapsed_ms" not in latency_description
     detail_footer = next(
         line
         for line in reversed(detail.splitlines())

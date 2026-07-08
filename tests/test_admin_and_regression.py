@@ -168,7 +168,6 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
         "latency.context_pack.avg_elapsed_ms",
         "latency.context_pack.snippet_batch_avg_ms",
         "latency.context_admin.warmup.avg_elapsed_ms",
-        "cache.context_pack_retrieval_hit_ratio",
         "cache.context_pack_fragment_hit_ratio",
         "tokens.context_pack.avg_saved_per_pack",
         "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack",

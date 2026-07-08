@@ -637,15 +637,16 @@ def render_project_detail(
         lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
     check_rows = _measurement_check_rows(snapshot.matrix or {}, color)
     if check_rows:
-        key_width = max(24, min(max(_visible_len(row[0]) for row in check_rows), width - 44))
+        key_width = max(24, min(max(_visible_len(row[0]) for row in check_rows), width - 64))
+        description_width = max(14, max(_visible_len(row[4]) for row in check_rows))
         lines.extend(
             [
                 "",
                 *_render_table(
-                    ("check", "status", "current", "target"),
+                    ("check", "status", "current", "target", "description"),
                     check_rows,
-                    widths=(key_width, 12, 10, 10),
-                    aligns=("left", "right", "right", "right"),
+                    widths=(key_width, 12, 10, 10, description_width),
+                    aligns=("left", "right", "right", "right", "left"),
                 ),
             ]
         )
@@ -1107,21 +1108,85 @@ def _browser_controls(
 def _measurement_check_rows(
     matrix: dict[str, Any],
     color: bool,
-) -> list[tuple[str, str, str, str]]:
+) -> list[tuple[str, str, str, str, str]]:
+
+    fallback_descriptions = {
+        "latency.context_pack.avg_elapsed_ms": "Average context-pack request latency",
+        "latency.context_pack.p95_recent_ms": "Recent p95 context-pack request latency",
+        "latency.context_pack.index_refresh_avg_ms": "Average index refresh time during context pack",
+        "latency.context_pack.snippet_batch_avg_ms": "Average snippet batch time during context pack",
+        "latency.context_pack.p95_elapsed_ms": "P95 context-pack request latency",
+        "latency.context_pack.min_elapsed_ms": "Minimum context-pack request latency",
+        "latency.context_pack.max_elapsed_ms": "Maximum context-pack request latency",
+        "warmup.avg_elapsed_ms": "warmup latency",
+        "latency.context_admin.warmup.avg_elapsed_ms": "Average warmup request latency",
+        "warmup_latency_ms": "warmup latency",
+        "token_savings": "Token savings",
+        "tokens_saved": "Token savings",
+        "compression_ratio": "Compression ratio",
+        "candidates_per_selected": "Candidates per selected",
+        "retrieval.context_pack.candidates_per_selected": "Ranked candidates per selected item",
+        "cache_hit_ratio": "Cache hit ratio",
+        "cache.context_pack_retrieval_hit_ratio": "Context-pack retrieval cache hit ratio",
+        "cache.context_pack_fragment_hit_ratio": "Context-pack fragment cache hit ratio",
+        "cache.hit_ratio": "Overall cache hit ratio",
+        "external_calls_saved": "External calls saved",
+        "tooling.external_calls_saved_per_pack": "Estimated external tool calls avoided per pack",
+        "contract_tokens_saved": "Contract tokens saved",
+        "tooling.contract_tokens_saved_est": "Estimated contract tokens saved",
+        "references_bytes_deferred": "Deferred references bytes",
+        "references.bytes_deferred_est": "Bytes deferred behind local references",
+        "tokens.context_pack.avg_saved_per_pack": "Average tokens saved per context pack",
+        "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack": "Average tokens spared by MCP per context pack",
+        "tokens.context_pack.compression_ratio": "Output tokens as a share of baseline tokens",
+    }
+
     checks = matrix.get("checks") if isinstance(matrix, dict) else None
     if not isinstance(checks, list):
         return []
-    rows: list[tuple[str, str, str, str]] = []
+
+    def _fallback_description(key: str) -> str:
+        key_clean = key.strip().lower()
+        if key_clean in fallback_descriptions:
+            return fallback_descriptions[key_clean]
+        humanized = re.sub(r"[._-]+", " ", key_clean)
+        humanized = humanized.replace(" avg ", " average ").replace(" p95 ", " p95 ")
+        humanized = humanized.replace(" est", " estimate")
+        humanized = " ".join(humanized.split())
+        if not humanized:
+            return ""
+        return humanized
+
+    rows: list[tuple[str, str, str, str, str]] = []
     for check in checks:
         if not isinstance(check, dict):
             continue
         status = str(check.get("status") or "-")
+        check_key = str(check.get("key") or "-")
+        description = check.get("description")
+        if description is None:
+            description = check.get("desc")
+            if description is None:
+                description = _fallback_description(check_key)
+        if not isinstance(description, str):
+            description = str(description)
+        operator = check.get("operator")
+        hint = None
+        if operator == "<=" or operator == "<":
+            hint = "lower is better"
+        elif operator == ">=" or operator == ">":
+            hint = "higher is better"
+        elif operator == "==" or operator == "=":
+            hint = "target match expected"
+        if hint and hint not in description.lower():
+            description = f"{description} ({hint})"
         rows.append(
             (
-                _trim(str(check.get("key") or "-"), 72),
+                _trim(check_key, 72),
                 _status_text(status, color),
                 _metric_value(check.get("current")),
                 _metric_value(check.get("target")),
+                _trim(description.strip(), 72),
             )
         )
     return rows
