@@ -53,6 +53,42 @@ def test_index_refresh_search_symbols_and_snippet(service: ContextService) -> No
     assert "class AuthService" in snippet["content"]
 
 
+def test_delete_file_rows_derives_legacy_terms_from_content(
+    service: ContextService,
+) -> None:
+    rel = "legacy.py"
+    existing = {"path": rel, "content": "def legacy_token():\n    return 1\n"}
+    service.index.store.put_json(f"index:file:{rel}", existing)
+    service.index.store.put_json(
+        f"index:term:legacy_token:{rel}",
+        {"path": rel, "term": "legacy_token"},
+    )
+
+    with service.index.store.write_txn() as txn:
+        service.index._delete_file_rows(rel, existing, txn)
+
+    assert service.index.store.get_json(f"index:file:{rel}") is None
+    assert service.index.store.get_json(f"index:term:legacy_token:{rel}") is None
+
+
+def test_delete_file_rows_does_not_scan_all_terms_for_legacy_rows_without_content(
+    service: ContextService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rel = "legacy.py"
+    existing = {"path": rel}
+    original_iter_json = service.index.store.iter_json
+
+    def fail_term_scan(prefix: str, *args, **kwargs):
+        if prefix == "index:term:":
+            raise AssertionError("must not scan the full term index")
+        return original_iter_json(prefix, *args, **kwargs)
+
+    monkeypatch.setattr(service.index.store, "iter_json", fail_term_scan)
+
+    with service.index.store.write_txn() as txn:
+        service.index._delete_file_rows(rel, existing, txn)
+
+
 def test_index_refresh_falls_back_when_git_metadata_is_unavailable(
     tmp_path: Path,
 ) -> None:

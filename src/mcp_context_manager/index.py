@@ -323,9 +323,8 @@ class ContextIndex:
     def _delete_file_rows(
         self, rel: str, existing: dict[str, Any] | None, txn: Any
     ) -> None:
-        terms = []
-        if isinstance(existing, dict):
-            terms = [str(term) for term in existing.get("terms", [])]
+        terms = self._existing_terms(rel, existing)
+        legacy_terms_unknown = isinstance(existing, dict) and not terms
         self.store.delete(_file_key(rel), txn=txn)
         self.store.delete_prefix(_symbol_prefix(rel), txn=txn)
         self.store.delete_prefix(_import_prefix(rel), txn=txn)
@@ -333,9 +332,19 @@ class ContextIndex:
             for term in terms:
                 self.store.delete(_term_key(term, rel), txn=txn)
             return
-        for key, row in self.store.iter_json("index:term:", txn=txn):
-            if isinstance(row, dict) and row.get("path") == rel:
-                self.store.delete(key, txn=txn)
+        if legacy_terms_unknown:
+            return
+
+    def _existing_terms(self, rel: str, existing: dict[str, Any] | None) -> list[str]:
+        if not isinstance(existing, dict):
+            return []
+        terms = existing.get("terms")
+        if isinstance(terms, list):
+            return [str(term) for term in terms]
+        content = existing.get("content")
+        if isinstance(content, str) and content:
+            return sorted(self._term_rows(rel, content))
+        return []
 
     def _rel_in_refresh_scope(self, rel: str, root: Path) -> bool:
         if root == self.config.repo_path:
