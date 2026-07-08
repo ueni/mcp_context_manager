@@ -1,5 +1,7 @@
 # mcp-context-manager
 
+[![Build](https://github.com/ueni/mcp_context_manager/actions/workflows/build.yml/badge.svg)](https://github.com/ueni/mcp_context_manager/actions/workflows/build.yml)
+
 `mcp-context-manager` is a focused Model Context Protocol server for coding
 agents. It builds small, task-specific repository context packs so an agent can
 start from the most relevant files, symbols, snippets, memory, and references
