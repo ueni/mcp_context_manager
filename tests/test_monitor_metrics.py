@@ -365,52 +365,6 @@ def test_collect_snapshots_fetches_project_metrics_in_parallel() -> None:
     assert client.max_active_metrics == 2
 
 
-def test_active_refresh_project_ids_targets_selected_project() -> None:
-    monitor = load_monitor_module()
-    snapshots = [
-        monitor.ProjectSnapshot(target=monitor.ProjectTarget(project_id="alpha-123")),
-        monitor.ProjectSnapshot(target=monitor.ProjectTarget(project_id="beta-456")),
-    ]
-    table_state = monitor.MonitorState(
-        selected_index=1, view="table", refresh_interval=5.0
-    )
-    detail_state = monitor.MonitorState(
-        selected_index=1, view="detail", refresh_interval=5.0
-    )
-    performance_state = monitor.MonitorState(
-        selected_index=0, view="performance", refresh_interval=5.0
-    )
-    state_state = monitor.MonitorState(
-        selected_index=0,
-        view="state",
-        refresh_interval=5.0,
-        state_target=monitor.ProjectTarget(project_id="alpha-123"),
-    )
-    state_state_no_target = monitor.MonitorState(
-        selected_index=1,
-        view="state",
-        refresh_interval=5.0,
-        state_target=None,
-    )
-
-    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", table_state, snapshots) == [
-        "alpha-123",
-        "beta-456",
-    ]
-    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", detail_state, snapshots) == [
-        "beta-456",
-    ]
-    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", performance_state, snapshots) == [
-        "alpha-123",
-    ]
-    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", state_state, snapshots) == [
-        "alpha-123",
-    ]
-    assert monitor._active_refresh_project_ids(["alpha-123", "beta-456"], "", state_state_no_target, snapshots) == [
-        "beta-456",
-    ]
-
-
 def test_collect_snapshots_project_id_survives_project_discovery_error() -> None:
     monitor = load_monitor_module()
     client = FailingProjectsClient()
@@ -529,6 +483,18 @@ def test_interactive_key_bindings_update_state() -> None:
     assert state.view == "detail"
     assert monitor.handle_key("escape", state, row_count=3) == "redraw"
     assert state.view == "table"
+    state = monitor.MonitorState(
+        selected_index=1,
+        view="state",
+        refresh_interval=5.0,
+        state_selected_index=0,
+        state_search_active=False,
+    )
+    assert monitor.handle_key("escape", state, row_count=3, state_row_count=2) == "redraw"
+    assert state.view == "table"
+    state.view = "performance"
+    assert monitor.handle_key("escape", state, row_count=3) == "redraw"
+    assert state.view == "table"
     assert monitor.handle_key("plus", state, row_count=3) == "redraw"
     assert state.refresh_interval == 6.0
     assert monitor.handle_key("minus", state, row_count=3) == "redraw"
@@ -603,6 +569,13 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "| fragment cache     | 8/2 h/m   80.0%" in detail
     assert "token spared/saved" in detail
     assert "| a                        |         pass" in detail
+    detail_footer = next(
+        line
+        for line in reversed(detail.splitlines())
+        if line and line.strip().startswith("keys:")
+    )
+    assert detail_footer.startswith("keys: Up/Down select")
+    assert "refresh=5.0s" in detail_footer
 
     state.view = "performance"
     performance = monitor.render_monitor_screen(
@@ -622,6 +595,13 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "2/1 h/m" in performance
     assert "warmup" in performance
     assert "2 runs, avg 18.5, last 12.0, 3 queries" in performance
+    performance_footer = next(
+        line
+        for line in reversed(performance.splitlines())
+        if line and line.strip().startswith("keys:")
+    )
+    assert performance_footer.startswith("keys: Up/Down select")
+    assert "refresh=5.0s" in performance_footer
 
 
 def test_mcp_loading_status_renders_in_controls() -> None:
@@ -735,6 +715,14 @@ def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
     assert rendered.index("cache:xyz") < rendered.index("cache:abc")
     assert "cache:abc" in rendered
     assert "| > | cache:xyz" in rendered
+    assert "keys: Up/Down select" in rendered
+    assert "keys: Up/Down select  Enter details" in rendered
+    rendered_footer = next(
+        line
+        for line in reversed(rendered.splitlines())
+        if line and line.strip().startswith("keys:")
+    )
+    assert "refresh=5.0s" in rendered_footer
 
     monitor._load_state_entry(client, state)
     assert state.view == "state"
@@ -750,6 +738,13 @@ def test_state_browser_fetches_selected_project_and_renders_entry() -> None:
     assert "mcp-context-manager state entry" in detail
     assert "cache:xyz" in detail
     assert '"hello": "world"' in detail
+    assert "keys: Up/Down select  Enter details" in detail
+    state_entry_footer = next(
+        line
+        for line in reversed(detail.splitlines())
+        if line and line.strip().startswith("keys:")
+    )
+    assert "refresh=5.0s" in state_entry_footer
 
     assert (
         monitor.handle_key(
@@ -789,6 +784,13 @@ def test_state_entry_view_scrolls_content() -> None:
     assert '"hello": "world"' in first_page
     assert "line 08" in first_page
     assert "line 09" not in first_page
+    assert "keys: Up/Down select  Enter details" in first_page
+    state_entry_footer = next(
+        line
+        for line in reversed(first_page.splitlines())
+        if line and line.strip().startswith("keys:")
+    )
+    assert "refresh=5.0s" in state_entry_footer
 
     assert (
         monitor.handle_key(
@@ -877,6 +879,39 @@ def test_warmup_selected_project_calls_admin_and_sets_status() -> None:
         "context_admin",
         {"mode": "warmup", "project_id": "alpha-123"},
     ) in client.calls
+
+
+def test_refresh_result_replaces_current_table_snapshot() -> None:
+    monitor = load_monitor_module()
+    stale_snapshot = monitor.ProjectSnapshot(
+        target=monitor.ProjectTarget(project_id="alpha-123", name="Alpha", source="known"),
+        metrics={
+            "schema": "context_metrics.v1",
+            "requests": {"total": 1, "by_operation": {"context_pack": {"count": 1}}},
+        },
+    )
+    full_refresh_snapshot = [
+        stale_snapshot,
+        monitor.ProjectSnapshot(
+            target=monitor.ProjectTarget(project_id="beta-456", name="Beta", source="known"),
+            metrics={"schema": "context_metrics.v1", "requests": {"total": 2}},
+            matrix={"checks": [{"key": "a", "status": "pass"}]},
+        ),
+    ]
+    state = monitor.MonitorState(view="detail", selected_index=0, refresh_interval=5.0)
+    snapshots = [stale_snapshot]
+
+    with monitor.ThreadPoolExecutor(max_workers=1) as executor:
+        pending = monitor._submit_mcp_operation(
+            executor,
+            "refresh",
+            lambda: full_refresh_snapshot,
+        )
+        pending.future.result(timeout=2)
+        updated = monitor._apply_mcp_operation_result(state, snapshots, pending)
+
+    assert [row.target.project_id for row in updated] == ["alpha-123", "beta-456"]
+    assert updated[1].matrix is not None
 
 
 def test_state_browser_filters_rows_with_search_input() -> None:
