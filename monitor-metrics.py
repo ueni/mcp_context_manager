@@ -50,7 +50,7 @@ DEFAULT_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
 DEFAULT_TIMEOUT = 15.0
 DEFAULT_INTERVAL = 60.0
 DEFAULT_FETCH_WORKERS = 8
-MIN_INTERVAL = 0.5
+MIN_INTERVAL = 5.0
 MAX_INTERVAL = 3600.0
 INTERVAL_STEP = 1.0
 DEFAULT_TERMINAL_COLUMNS = 160
@@ -388,25 +388,6 @@ def _collect_targets(
         return [future.result() for future in futures]
 
 
-def _active_refresh_project_ids(
-    project_ids: list[str],
-    root_uri: str,
-    state: MonitorState,
-    snapshots: list[ProjectSnapshot],
-) -> list[str]:
-    if root_uri:
-        return []
-    if state.view not in {"state", "detail", "performance"}:
-        return project_ids
-    if not snapshots:
-        return []
-    selected = _clamped_index(state.selected_index, len(snapshots))
-    project_id = snapshots[selected].target.project_id
-    if state.view == "state" and state.state_target:
-        project_id = state.state_target.project_id or project_id
-    return [project_id] if project_id else []
-
-
 def fetch_state_browser(
     client: Any,
     target: ProjectTarget,
@@ -649,11 +630,6 @@ def render_project_detail(
     ]
     lines = [
         _style("mcp-context-manager project details", color, Ansi.BOLD + Ansi.CYAN),
-        _controls(
-            state.refresh_interval,
-            color,
-            status_line=_mcp_status_line(state, color),
-        ),
         "",
     ]
     lines.extend(_render_table(("field", "value"), details, aligns=("left", "left")))
@@ -673,6 +649,13 @@ def render_project_detail(
                 ),
             ]
         )
+    lines.append(
+        _controls(
+            state.refresh_interval,
+            color,
+            status_line=_mcp_status_line(state, color),
+        )
+    )
     return "\n".join(lines)
 
 
@@ -695,11 +678,6 @@ def render_performance_view(
     cache_rows = _performance_cache_rows(metrics, background, freshness)
     lines = [
         _style("mcp-context-manager performance", color, Ansi.BOLD + Ansi.CYAN),
-        _controls(
-            state.refresh_interval,
-            color,
-            status_line=_mcp_status_line(state, color),
-        ),
         f"endpoint: {url}",
         f"project:  {_project_name(snapshot.target)}",
         "",
@@ -718,6 +696,13 @@ def render_performance_view(
     ]
     if snapshot.error:
         lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
+    lines.append(
+        _controls(
+            state.refresh_interval,
+            color,
+            status_line=_mcp_status_line(state, color),
+        )
+    )
     return "\n".join(lines)
 
 
@@ -755,11 +740,15 @@ def render_state_browser(
         _style("mcp-context-manager state browser", color, Ansi.BOLD + Ansi.CYAN),
         f"endpoint: {url}",
         f"project:  {project}",
-        _browser_controls(state, color, status_line=_mcp_status_line(state, color)),
         "",
     ]
     if state.state_error:
         lines.append(_style(f"ERROR: {state.state_error}", color, Ansi.RED))
+        lines.append(
+            _browser_controls(
+                state, color, status_line=_mcp_status_line(state, color)
+            )
+        )
         return "\n".join(lines)
     prefix_counts = payload.get("prefix_counts") if isinstance(payload, dict) else []
     if isinstance(prefix_counts, list) and prefix_counts:
@@ -803,6 +792,11 @@ def render_state_browser(
     )
     if not table_rows:
         lines.append("No generated-state rows for this project.")
+    lines.append(
+        _browser_controls(
+            state, color, status_line=_mcp_status_line(state, color)
+        )
+    )
     return "\n".join(lines)
 
 
@@ -853,7 +847,6 @@ def render_state_entry_view(
         _style("mcp-context-manager state entry", color, Ansi.BOLD + Ansi.CYAN),
         f"endpoint: {url}",
         f"project:  {project}",
-        _browser_controls(state, color, status_line=_mcp_status_line(state, color)),
         "",
         *lines,
         "",
@@ -866,6 +859,9 @@ def render_state_entry_view(
     ]
     if state.state_error:
         body.extend(["", _style(f"ERROR: {state.state_error}", color, Ansi.RED)])
+    body.append(
+        _browser_controls(state, color, status_line=_mcp_status_line(state, color))
+    )
     return "\n".join(body)
 
 
@@ -1105,20 +1101,7 @@ def _browser_controls(
     color: bool,
     status_line: str = "",
 ) -> str:
-    if state.state_entry:
-        keys = (
-            "keys: Up/Down content  PgUp/PgDn jump  Home/End  "
-            "Esc state list  q quit"
-        )
-    elif state.state_search_active:
-        keys = "keys: type search  Backspace edit  Enter apply  Esc cancel"
-    else:
-        keys = (
-            "keys: Up/Down scroll  PgUp/PgDn jump  / search  "
-            "Enter inspect  Esc table  q quit"
-        )
-    controls = _style(keys, color, Ansi.DIM) if color else keys
-    return f"{controls}   {status_line}" if status_line else controls
+    return _controls(state.refresh_interval, color, status_line=status_line)
 
 
 def _measurement_check_rows(
@@ -1319,8 +1302,8 @@ def _state_row_class(row: dict[str, Any]) -> str:
 
 
 def _state_row_timestamp(row: dict[str, Any]) -> float:
-    for field in ("created_at", "updated_at", "expires_at"):
-        value = str(row.get(field) or "").strip()
+    for timestamp_field in ("created_at", "updated_at", "expires_at"):
+        value = str(row.get(timestamp_field) or "").strip()
         if not value:
             continue
         try:
@@ -2183,12 +2166,7 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                     "refresh",
                     lambda: collect_snapshots(
                         client,
-                        project_ids=_active_refresh_project_ids(
-                            args.project_id,
-                            args.root_uri,
-                            state,
-                            snapshots,
-                        ),
+                        project_ids=args.project_id,
                         root_uri=args.root_uri,
                         include_matrix=not args.no_matrix,
                     ),
@@ -2361,6 +2339,8 @@ def main() -> int:
         if args.interval is not None
         else (DEFAULT_INTERVAL if terminal_attached else 0.0)
     )
+    if args.interval > 0:
+        args.interval = max(MIN_INTERVAL, args.interval)
 
     try:
         if args.once or args.interval <= 0:
