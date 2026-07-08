@@ -18,7 +18,7 @@ services:
       - "127.0.0.1:8000:8000"
     restart: always
     tmpfs:
-      - /tmp
+      - /tmp:rw,exec
     volumes:
       - ${MCP_CONTEXT_HOST_ROOT:-${PWD}}:/workspace-roots:ro
       - mcp-context-state:/state
