@@ -9,7 +9,7 @@ description = "Focused MCP server for compact repository context packs."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "lmdb>=1.5,<2",
+  "lmdb>=1.5,<3",
   "mcp>=1.26,<3",
   "uvicorn>=0.30,<1",
 ]
