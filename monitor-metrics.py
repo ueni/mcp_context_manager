@@ -704,7 +704,7 @@ def render_performance_view(
         f"project:  {_project_name(snapshot.target)}",
         "",
         *_render_table(
-            ("stage", "avg ms", "p/min", "max"),
+            ("stage", "avg ms", "min ms", "max ms"),
             stage_rows,
             widths=(max(24, min(48, width - 36)), 10, 10, 10),
             aligns=("left", "right", "right", "right"),
