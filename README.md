@@ -1,11 +1,14 @@
-# mcp-context-manager
+# AgentTonic
 
 [![Build](https://github.com/ueni/mcp_context_manager/actions/workflows/build.yml/badge.svg)](https://github.com/ueni/mcp_context_manager/actions/workflows/build.yml)
 
-`mcp-context-manager` is a focused Model Context Protocol server for coding
-agents. It builds small, task-specific repository context packs so an agent can
-start from the most relevant files, symbols, snippets, memory, and references
-instead of spending tokens on broad `rg`, tree, and whole-file reads.
+Give AI agents the right context.
+
+`AgentTonic` (mcp-context-manager) is a focused Model Context Protocol (MCP)
+server for context management. It builds small, task-specific context packets
+from the sources you expose, such as files, symbols, snippets, memory, metrics,
+and references, so an agent can start from relevant signal instead of spending
+tokens on broad discovery and repeated reads.
 
 The server is read-only for source files. It writes only generated state such as
 indexes, cache entries, metrics, memory, and result references under the
@@ -13,13 +16,14 @@ configured state directory.
 
 ## What It Is
 
-The project is a compact context authority for one or more repositories exposed
-through MCP roots or explicit `root_uri` / `project_id` selection.
+The project is a compact context authority for one or more workspaces,
+repositories, or project scopes exposed through MCP roots or explicit `root_uri`
+/ `project_id` selection.
 
 It provides:
 
 - Bounded context packs for coding, review, debug, test, docs, security, and
-  general repository tasks.
+  general context-heavy tasks.
 - Targeted lookup for search hits, snippets, trees, symbols, references,
   related symbols, test owners, chunks, and cache explanation.
 - Project-scoped generated state for indexes, caches, memory, references, and
@@ -32,20 +36,20 @@ The implementation details are described in
 
 ## Why Use It
 
-Modern coding agents are powerful, but repository discovery is still expensive.
+Modern coding agents are powerful, but context discovery is still expensive.
 Without a context layer, every turn can become another round of broad search,
-tree walking, whole-file reads, and repeated explanations of the same project
-facts. `mcp-context-manager` turns that scattered discovery work into one fast,
+tree walking, repeated reads, and repeated explanations of the same project
+facts. `AgentTonic` turns that scattered discovery work into one fast,
 bounded, evidence-backed context packet.
 
 Use it when you want agents to:
 
 - Start with signal, not noise. The first tool call returns the files, symbols,
   snippets, tests, memory, and references most likely to matter for the task.
-- Spend tokens on reasoning instead of repository archaeology. Compact packs
+- Spend tokens on reasoning instead of context archaeology. Compact packs
   summarize and rank evidence while keeping full details available on demand.
 - Stay fast across follow-up turns. Incremental indexing, retrieval cache,
-  fragment cache, and chunk reuse keep unchanged repository work from being
+  fragment cache, and chunk reuse keep unchanged context work from being
   repeated.
 - Review and debug with traceable evidence. Every selected item carries path,
   line hints, reasons, confidence, provenance, and a `detail_lookup` route back
@@ -53,9 +57,9 @@ Use it when you want agents to:
 - Keep large evidence out of the prompt until it is actually needed. Omitted
   candidates and diagnostics stay behind local references that can be resolved
   later.
-- Work cleanly across many repositories. MCP roots, explicit `root_uri`, and
-  `project_id` keep indexes, cache, memory, metrics, and references isolated per
-  project.
+- Work cleanly across many workspaces or repositories. MCP roots, explicit
+  `root_uri`, and `project_id` keep indexes, cache, memory, metrics, and
+  references isolated per project.
 - Optimize without guessing. Metrics, benchmark runs, and gold-anchor fixtures
   show whether token savings, latency, cache reuse, and retrieval recall are
   actually improving.
