@@ -142,7 +142,7 @@ The public tool surface is intentionally small:
 | `context_pack` | Build a task-focused context pack with ranked evidence and references. |
 | `context_lookup` | Search, snippet, tree, symbols, references, impact, related symbols, test owners, chunk, or cache explanation. |
 | `context_memory` | Store, retrieve, validate, and compact structured repository-local memory. |
-| `context_admin` | Health, projects, index, cache, budget, contracts, metrics, benchmark, quality evaluation, instructions, and resource proxy. |
+| `context_admin` | Health, projects, index, cache/warmup, budget, contracts, metrics, measurement matrix, benchmark, generated-state browsing, quality evaluation, cache planning, profile calibration, instructions, resource proxy, and schema minification. |
 | `result_reference_resolve` | Resolve local result references after boundary, expiry, and hash checks. |
 
 Project-aware tools accept optional `project_id` or `root_uri`. If omitted, the
@@ -384,6 +384,7 @@ whole directory as one project. For per-repo isolation, expose or pass roots lik
 | `MAX_READ_BYTES` | Maximum file bytes read for snippets/indexing. |
 | `MAX_OUTPUT_CHARS` | Default output budget. |
 | `MCP_CONTEXT_OUTPUT_PROFILE` | Default profile: `minimal`, `compact`, `normal`, or `verbose`. |
+| `MCP_CONTEXT_LMDB_MAP_SIZE` | LMDB map size in bytes. Defaults to `1073741824` and is clamped to at least `16777216`. |
 | `MCP_CONTEXT_TOKEN_COUNTER` | `estimate` by default, or `target` to try an optional target tokenizer. |
 | `MCP_CONTEXT_TARGET_TOKENIZER` | Target tokenizer name for `target` mode, defaulting to `cl100k_base`. |
 
@@ -423,12 +424,11 @@ reuse, prompt-variation fragment reuse, and compact focused retrieval.
 
 ## Live Metrics Monitor
 
-`monitor-metrics.py` is a terminal dashboard that reads metrics through MCP tool
-calls. It calls `context_admin(mode="projects")`, then
-`context_admin(mode="metrics")` and `context_admin(mode="measurement_matrix")`
-for each project.
+`monitor-metrics.py` is a terminal dashboard that queries `context_admin(mode="projects")`,
+then fetches `context_admin(mode="metrics")` and
+`context_admin(mode="measurement_matrix")` for each selected project.
 
-Run it interactively:
+Run it interactively against a local server:
 
 ```bash
 python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp
@@ -437,14 +437,20 @@ python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp
 Render one snapshot and exit:
 
 ```bash
-python3 monitor-metrics.py --once
+python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp --once
 ```
 
-Monitor one known project or root:
+Monitor one known project or root URI:
 
 ```bash
 python3 monitor-metrics.py --project-id my-repo-123abc
 python3 monitor-metrics.py --root-uri file:///home/user/source/my-repo
+```
+
+Run a pinned remote version in one line:
+
+```bash
+VER=1.1.1; curl -fsSL "https://raw.githubusercontent.com/ueni/mcp_context_manager/v${VER}/monitor-metrics.py" | python3 - --url http://127.0.0.1:8000/mcp --once
 ```
 
 The dashboard shows request volume, `context_pack` latency, cache hit bars,
@@ -470,10 +476,11 @@ documented sample.
 
 ## Release Packaging
 
-The production `Dockerfile` builds an Alpine-based image from the checked-out
-source. It does not require a committed `wheelhouse/` directory.
+The production `Dockerfile` builds an Alpine-based runtime image around a
+prebuilt standalone server executable. It does not build the Python package from
+source inside the runtime image.
 
-Build the image locally:
+Build the image locally after producing a musl-linked standalone executable:
 
 ```bash
 docker build \
@@ -481,9 +488,14 @@ docker build \
   -t mcp-context-manager:local .
 ```
 
+The Dockerfile checks that `SERVER_BINARY` is musl-linked because the runtime
+base image is Alpine.
+
 GitHub Actions owns release artifacts:
 
-- `Build standalone server` builds and smoke-tests a bundled Linux executable.
+- `Build glibc and musl executables` builds the bundled Linux executables.
+- `Smoke test glibc executable` and `Smoke test musl executable` verify the
+  standalone servers before packaging.
 - `Release` is manually dispatched with a version such as `0.2.0`. It creates
   tag `v0.2.0`, builds the glibc and musl standalone executables, builds a
   musl-based Docker image archive, writes `SHA256SUMS`, signs the checksums
