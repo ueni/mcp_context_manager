@@ -34,6 +34,9 @@ class StoreAdapter(Protocol):
     def iter_raw(self, prefix: bytes, txn: Any = None) -> Iterator[tuple[bytes, bytes]]:
         ...
 
+    def count_raw(self, prefix: bytes, txn: Any = None) -> int:
+        ...
+
 
 class LmdbStoreAdapter:
     _envs: dict[Path, Any] = {}
@@ -83,6 +86,12 @@ class LmdbStoreAdapter:
         with self._env().begin() as read_txn:
             yield from self._iter_raw_txn(prefix, read_txn)
 
+    def count_raw(self, prefix: bytes, txn: Any = None) -> int:
+        if txn is not None:
+            return self._count_raw_txn(prefix, txn)
+        with self._env().begin() as read_txn:
+            return self._count_raw_txn(prefix, read_txn)
+
     def _env(self) -> Any:
         path = self.path.resolve()
         with self._guard:
@@ -121,6 +130,17 @@ class LmdbStoreAdapter:
             if not raw_key.startswith(prefix):
                 break
             yield raw_key, raw_value
+
+    def _count_raw_txn(self, prefix: bytes, txn: Any) -> int:
+        cursor = txn.cursor()
+        if not cursor.set_range(prefix):
+            return 0
+        count = 0
+        for raw_key, _raw_value in cursor:
+            if not raw_key.startswith(prefix):
+                break
+            count += 1
+        return count
 
 
 class ContextStore:
@@ -167,7 +187,7 @@ class ContextStore:
         return rows
 
     def count(self, prefix: str, txn: Any = None) -> int:
-        return len(self.iter_json(prefix, txn=txn))
+        return self.adapter.count_raw(self._key(prefix), txn=txn)
 
     def delete_prefix(self, prefix: str, txn: Any = None) -> int:
         if txn is not None:

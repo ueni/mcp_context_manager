@@ -89,6 +89,40 @@ def test_delete_file_rows_does_not_scan_all_terms_for_legacy_rows_without_conten
         service.index._delete_file_rows(rel, existing, txn)
 
 
+def test_scoped_index_refresh_reads_only_matching_file_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "target"
+    target.mkdir()
+    other = repo / "other"
+    other.mkdir()
+    (target / "hit.py").write_text("needle = 'target'\n", encoding="utf-8")
+    (other / "skip.py").write_text("needle = 'other'\n", encoding="utf-8")
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+    service.context_admin(mode="index_refresh")
+    original_iter_json = service.index.store.iter_json
+
+    def fail_full_file_scan(prefix: str, *args, **kwargs):
+        if prefix == "index:file:":
+            raise AssertionError("scoped refresh must not scan all indexed files")
+        return original_iter_json(prefix, *args, **kwargs)
+
+    monkeypatch.setattr(service.index.store, "iter_json", fail_full_file_scan)
+    (target / "hit.py").write_text("needle = 'target changed'\n", encoding="utf-8")
+
+    refresh = service.context_admin(mode="index_refresh", path="target")
+
+    assert refresh["updated_count"] == 1
+    assert refresh["removed_count"] == 0
+
+
 def test_index_refresh_falls_back_when_git_metadata_is_unavailable(
     tmp_path: Path,
 ) -> None:

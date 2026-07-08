@@ -31,10 +31,17 @@ def test_context_store_adapter_preserves_json_operations(tmp_path: Path) -> None
         "demo:b",
     ]
 
+    store.adapter.put_bytes(b"demo:raw", b"not-json")
+    assert store.count("demo:") == 3
+    assert [key for key, _value in store.iter_json("demo:")] == [
+        "demo:a",
+        "demo:b",
+    ]
+
     with store.write_txn() as txn:
         removed = store.delete_prefix("demo:", txn=txn)
 
-    assert removed == 2
+    assert removed == 3
     assert store.get_json("demo:a") is None
     assert store.get_json("other:c") == {"value": 3}
 

@@ -98,12 +98,7 @@ class ContextIndex:
         whole_repo_refresh = root == self.config.repo_path
         indexed_at = now_iso()
         files = self._iter_candidate_files(root, max_files=max_files)
-        existing_rows = {
-            str(row.get("path")): row
-            for _key, row in self.store.iter_json("index:file:")
-            if isinstance(row, dict)
-            and self._rel_in_refresh_scope(str(row.get("path")), root)
-        }
+        existing_rows = self._existing_file_rows(root)
         current_rels = {
             str(candidate.path.relative_to(self.config.repo_path)).replace("\\", "/")
             for candidate in files
@@ -114,6 +109,12 @@ class ContextIndex:
         previous_generated = self._get_meta("generated_at")
         prepared_updates: list[dict[str, Any]] = []
         prepared_deletes: list[tuple[str, dict[str, Any] | None]] = []
+        git = git_snapshot(self.config.repo_path)
+        refresh_signature = (
+            self._refresh_signature_from_git_or_files(git, files)
+            if whole_repo_refresh
+            else None
+        )
 
         for rel in sorted(set(existing_rows) - current_rels):
             prepared_deletes.append((rel, existing_rows.get(rel)))
@@ -189,7 +190,6 @@ class ContextIndex:
                 else previous_generated
             )
             self._set_meta("generated_at", generated_at, txn)
-            git = git_snapshot(self.config.repo_path)
             self._set_meta("git_head", str(git.get("git_head", "")), txn)
             self._set_meta("git_branch", str(git.get("git_branch", "")), txn)
             self._set_meta(
@@ -199,8 +199,11 @@ class ContextIndex:
                 "git_changes_hash", str(git.get("git_changes_hash", "")), txn
             )
             if whole_repo_refresh:
-                signature = self.refresh_signature(max_files=max_files)
-                self._set_meta("refresh_signature", signature["signature"], txn)
+                signature = refresh_signature or {
+                    "available": False,
+                    "signature": "",
+                }
+                self._set_meta("refresh_signature", str(signature["signature"]), txn)
                 self._set_meta(
                     "refresh_signature_available",
                     "true" if signature["available"] else "false",
@@ -273,19 +276,7 @@ class ContextIndex:
     def refresh_signature(self, max_files: int = 5000) -> dict[str, Any]:
         git = git_snapshot(self.config.repo_path)
         if git.get("available") and git.get("worktree_matches_path"):
-            git_head = str(git.get("git_head", ""))
-            status_hash = str(git.get("git_status_hash", ""))
-            changes_hash = str(git.get("git_changes_hash", "")) or status_hash
-            return {
-                "schema": "context_index.refresh_signature.v1",
-                "available": True,
-                "signature": f"git:{git_head}:{changes_hash}",
-                "source": "git",
-                "git_head": git_head,
-                "git_branch": str(git.get("git_branch", "")),
-                "git_status_hash": status_hash,
-                "git_changes_hash": changes_hash,
-            }
+            return self._git_refresh_signature(git)
         files_signature = self._file_metadata_refresh_signature(max_files=max_files)
         if files_signature["available"]:
             files_signature["git_available"] = bool(git.get("available"))
@@ -294,11 +285,44 @@ class ContextIndex:
             )
         return files_signature
 
+    def _refresh_signature_from_git_or_files(
+        self, git: dict[str, Any], files: list[CandidateFile]
+    ) -> dict[str, Any]:
+        if git.get("available") and git.get("worktree_matches_path"):
+            return self._git_refresh_signature(git)
+        files_signature = self._file_metadata_refresh_signature_for_candidates(files)
+        if files_signature["available"]:
+            files_signature["git_available"] = bool(git.get("available"))
+            files_signature["git_worktree_matches_path"] = bool(
+                git.get("worktree_matches_path")
+            )
+        return files_signature
+
+    def _git_refresh_signature(self, git: dict[str, Any]) -> dict[str, Any]:
+        git_head = str(git.get("git_head", ""))
+        status_hash = str(git.get("git_status_hash", ""))
+        changes_hash = str(git.get("git_changes_hash", "")) or status_hash
+        return {
+            "schema": "context_index.refresh_signature.v1",
+            "available": True,
+            "signature": f"git:{git_head}:{changes_hash}",
+            "source": "git",
+            "git_head": git_head,
+            "git_branch": str(git.get("git_branch", "")),
+            "git_status_hash": status_hash,
+            "git_changes_hash": changes_hash,
+        }
+
     def _file_metadata_refresh_signature(self, max_files: int = 5000) -> dict[str, Any]:
         try:
             files = self._iter_candidate_files(self.config.repo_path, max_files=max_files)
         except OSError:
             files = []
+        return self._file_metadata_refresh_signature_for_candidates(files)
+
+    def _file_metadata_refresh_signature_for_candidates(
+        self, files: list[CandidateFile]
+    ) -> dict[str, Any]:
         if not files:
             return {
                 "schema": "context_index.refresh_signature.v1",
@@ -318,6 +342,22 @@ class ContextIndex:
             "signature": "files:" + sha256_text("\n".join(sorted(rows))),
             "source": "file_metadata",
             "file_count": len(rows),
+        }
+
+    def _existing_file_rows(self, root: Path) -> dict[str, dict[str, Any]]:
+        if root == self.config.repo_path:
+            prefix = "index:file:"
+        else:
+            root_rel = str(root.relative_to(self.config.repo_path)).replace("\\", "/")
+            if root.is_file():
+                row = self.store.get_json(_file_key(root_rel))
+                return {root_rel: row} if isinstance(row, dict) else {}
+            prefix = f"index:file:{root_rel.rstrip('/')}/"
+        return {
+            str(row.get("path")): row
+            for _key, row in self.store.iter_json(prefix)
+            if isinstance(row, dict)
+            and self._rel_in_refresh_scope(str(row.get("path")), root)
         }
 
     def _delete_file_rows(
