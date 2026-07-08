@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Event
+from typing import Any
 
 from mcp_context_manager.config import ContextConfig
 from mcp_context_manager.context import (
@@ -208,7 +209,16 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert warmup["workspace"]["file_count"] >= 1
     assert warmup["search_cache"]["namespace"] == "context_lookup.search"
     assert warmup["search_cache"]["path"] == "src"
+    assert warmup["stage_timings_ms"]["search_ms"] >= 0
+    assert warmup["stage_timings_ms"]["file_summary_ms"] >= 0
     assert warmup["search_cache"]["query_count"] == 3
+    assert warmup["file_summary_cache"]["summary_count"] > 0
+    assert warmup["file_summary_cache"]["summary_count"] <= (min(3 * 4, 80) + min(3 * 2, 40))
+    assert warmup["file_summary_cache"]["hits"] + warmup["file_summary_cache"]["misses"] == warmup["file_summary_cache"]["summary_count"]
+    assert (
+        warmup["file_summary_cache"]["summary_count"]
+        == int(sum(warmup["file_summary_cache"]["source_counts"].values()))
+    )
     assert all(row["path"] == "src" for row in warmup["search_cache"]["queries"])
     assert fallback_flags == [False, False, False]
     assert warmup["cache"]["entry_count_after"] >= warmup["search_cache"]["query_count"]
@@ -245,6 +255,52 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
 
     assert explicit["index"]["max_files"] == 7
     assert explicit["index"]["default_limited"] is False
+    assert explicit["search_cache"]["query_count"] == 0
+    assert explicit["file_summary_cache"]["summary_count"] == 0
+    assert explicit["stage_timings_ms"]["search_ms"] >= 0
+    assert explicit["stage_timings_ms"]["file_summary_ms"] >= 0
+
+
+def test_context_admin_warmup_scopes_symbol_summary_targets(service: ContextService, monkeypatch) -> None:
+    scoped_summary_paths: list[str] = []
+
+    original_cached_file_summary = service._cached_file_summary
+
+    def tracked_file_summary(
+        path: str,
+        line_anchor: int,
+        refresh_signature: str,
+        refresh_signature_available: bool,
+    ) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+        scoped_summary_paths.append(path)
+        return original_cached_file_summary(
+            path=path,
+            line_anchor=line_anchor,
+            refresh_signature=refresh_signature,
+            refresh_signature_available=refresh_signature_available,
+        )
+
+    def staged_symbols(*, query: str = "", limit: int = 50) -> dict[str, Any]:
+        symbols = [
+            {"path": "src/test_helpers.py", "line_start": 1},
+            {"path": "scripts/tools.py", "line_start": 1},
+            {"path": "tests/test_auth.py", "line_start": 1},
+        ]
+        return {
+            "schema": "context_symbols.v1",
+            "count": len(symbols),
+            "symbols": symbols[:limit],
+        }
+
+    monkeypatch.setattr(service, "_cached_file_summary", tracked_file_summary)
+    monkeypatch.setattr(service.index, "symbols", staged_symbols)
+    monkeypatch.setattr(service, "_warm_search_caches", lambda *args, **kwargs: ([], []))
+
+    warmup = service.context_admin(mode="warmup", path="tests", max_entries=1)
+
+    assert warmup["file_summary_cache"]["source_counts"]["symbol"] == 1
+    assert warmup["file_summary_cache"]["summary_count"] == 1
+    assert all(path == "tests" or path.startswith("tests/") for path in scoped_summary_paths)
 
 
 def test_context_admin_warmup_serializes_concurrent_project_writes(

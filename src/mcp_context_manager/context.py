@@ -1657,6 +1657,33 @@ class ContextService:
             )
         return summary, False, miss_detail
 
+    def _dedupe_file_summary_targets(
+        self,
+        targets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for target in targets:
+            path = str(target.get("path", ""))
+            if not path:
+                continue
+            try:
+                line_anchor = max(0, int(target.get("line_anchor", 0) or 0))
+            except (TypeError, ValueError):
+                line_anchor = 0
+            key = (path, line_anchor)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(
+                {
+                    "path": path,
+                    "line_anchor": line_anchor,
+                    "source": str(target.get("source", "")) or "search",
+                }
+            )
+        return deduped
+
     def _effective_output_profile(
         self, output_profile: str | None, client_profile: str
     ) -> str:
@@ -2761,10 +2788,12 @@ class ContextService:
         self.store.get_json("budget:default")
         cache_before = self._cache_stats()
         omitted: list[dict[str, Any]] = []
+        stage_timings: dict[str, float] = {}
         effective_max_files = (
             max_files if max_files is not None else DEFAULT_WARMUP_MAX_FILES
         )
 
+        index_started = time.perf_counter()
         try:
             index_refresh = self._ensure_index_fresh(
                 path=path,
@@ -2783,7 +2812,10 @@ class ContextService:
                     "detail": type(exc).__name__,
                 }
             )
+        stage_timings["index_refresh_ms"] = self._elapsed_ms(index_started)
+        refresh_signature, refresh_signature_available = self._current_refresh_signature()
 
+        facts_started = time.perf_counter()
         facts: dict[str, Any] = {}
         try:
             facts = self.index.workspace_facts()
@@ -2794,13 +2826,48 @@ class ContextService:
                     "detail": type(exc).__name__,
                 }
             )
+        stage_timings["workspace_facts_ms"] = self._elapsed_ms(facts_started)
 
         symbol_count = 0
+        symbol_summary_targets: list[dict[str, Any]] = []
+        symbol_summary_limit = max(0, min(int(max_entries) * 2, 40))
+        symbol_scope = None
+        try:
+            symbol_scope = self.config.repo_relative(path)
+        except ValueError:
+            symbol_scope = None
+        symbol_scope = (str(symbol_scope).replace("\\", "/").rstrip("/")) if symbol_scope else ""
+        symbols_started = time.perf_counter()
         try:
             symbol_limit = max(0, min(int(max_entries), 100))
-            symbol_count = int(
-                self.index.symbols(query="", limit=symbol_limit).get("count", 0)
-            )
+            if max_entries > 0 and symbol_scope and symbol_scope != ".":
+                symbol_limit = max(
+                    symbol_limit,
+                    min(max(symbol_summary_limit * 10, 100), 1000),
+                )
+            symbols_payload = self.index.symbols(query="", limit=symbol_limit)
+            symbol_count = int(symbols_payload.get("count", 0))
+            for row in symbols_payload.get("symbols", []):
+                if len(symbol_summary_targets) >= symbol_summary_limit:
+                    break
+                symbol_path = str(row.get("path", ""))
+                if not symbol_path:
+                    continue
+                if symbol_scope and symbol_scope != "." and not (
+                    symbol_path == symbol_scope or symbol_path.startswith(symbol_scope + "/")
+                ):
+                    continue
+                try:
+                    line_anchor = max(0, int(row.get("line_start", 1) or 1))
+                except (TypeError, ValueError):
+                    line_anchor = 0
+                symbol_summary_targets.append(
+                    {
+                        "path": symbol_path,
+                        "line_anchor": line_anchor,
+                        "source": "symbol",
+                    }
+                )
         except Exception as exc:
             omitted.append(
                 {
@@ -2808,8 +2875,58 @@ class ContextService:
                     "detail": type(exc).__name__,
                 }
             )
+        stage_timings["symbols_ms"] = self._elapsed_ms(symbols_started)
 
-        search_rows = self._warm_search_caches(path=path, max_entries=max_entries)
+        search_rows: list[dict[str, Any]] = []
+        file_summary_targets: list[dict[str, Any]] = []
+        search_started = time.perf_counter()
+        if max_entries > 0:
+            search_rows, file_summary_targets = self._warm_search_caches(
+                path=path,
+                max_entries=max_entries,
+            )
+        stage_timings["search_ms"] = self._elapsed_ms(search_started)
+
+        file_summary_targets.extend(symbol_summary_targets)
+        file_summary_targets = self._dedupe_file_summary_targets(file_summary_targets)
+        file_summary_stats: dict[str, int | dict[str, int]] = {
+            "summary_count": 0,
+            "hits": 0,
+            "misses": 0,
+            "source_counts": {},
+        }
+        file_summary_started = time.perf_counter()
+        if max_entries > 0:
+            for target in file_summary_targets:
+                source = str(target.get("source", "search"))
+                try:
+                    _, summary_hit, _ = self._cached_file_summary(
+                        path=str(target.get("path", "")),
+                        line_anchor=max(0, int(target.get("line_anchor", 0) or 0)),
+                        refresh_signature=refresh_signature,
+                        refresh_signature_available=refresh_signature_available,
+                    )
+                except Exception as exc:
+                    omitted.append(
+                        {
+                            "path": str(target.get("path", "")),
+                            "line_anchor": int(target.get("line_anchor", 0) or 0),
+                            "source": source,
+                            "reason_code": "file_summary_warmup_failed",
+                            "detail": type(exc).__name__,
+                        }
+                    )
+                    continue
+                if summary_hit:
+                    file_summary_stats["hits"] = int(file_summary_stats["hits"]) + 1
+                else:
+                    file_summary_stats["misses"] = int(file_summary_stats["misses"]) + 1
+                file_summary_stats["summary_count"] = int(
+                    file_summary_stats["summary_count"]
+                ) + 1
+                source_counts = file_summary_stats.setdefault("source_counts", {})
+                source_counts[source] = int(source_counts.get(source, 0)) + 1
+        stage_timings["file_summary_ms"] = self._elapsed_ms(file_summary_started)
         omitted.extend(
             row for row in search_rows if row.get("reason_code") == "search_warmup_failed"
         )
@@ -2822,6 +2939,7 @@ class ContextService:
             "context_admin.warmup",
             elapsed_ms=elapsed_ms,
             result_count=len(warmed_searches),
+            stage_timings_ms=stage_timings,
         )
         return {
             "schema": "context_cache.warmup.v1",
@@ -2869,6 +2987,20 @@ class ContextService:
                 "query_count": len(warmed_searches),
                 "queries": warmed_searches,
             },
+            "file_summary_cache": {
+                "namespace": "retrieval.file_summary",
+                "summary_count": int(file_summary_stats["summary_count"]),
+                "hits": int(file_summary_stats["hits"]),
+                "misses": int(file_summary_stats["misses"]),
+                "source_counts": dict(
+                    sorted(
+                        file_summary_stats["source_counts"].items()
+                        if isinstance(file_summary_stats["source_counts"], dict)
+                        else []
+                    )
+                ),
+            },
+            "stage_timings_ms": stage_timings,
             "cache": {
                 "entry_count_before": int(cache_before.get("entry_count", 0) or 0),
                 "entry_count_after": int(cache_after.get("entry_count", 0) or 0),
@@ -2882,7 +3014,7 @@ class ContextService:
 
     def _warm_search_caches(
         self, path: str = ".", max_entries: int = 100
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         seed_queries = (
             "test",
             "debug",
@@ -2893,21 +3025,46 @@ class ContextService:
             "cache",
             "index",
             "context",
+            "schema",
+            "metrics",
+            "symbols",
+            "memory",
+            "server",
             "error",
         )
         query_limit = max(0, min(int(max_entries), len(seed_queries)))
-        max_results = 20
+        search_result_limit = max(0, min(int(max_entries) * 4, 80))
         rows: list[dict[str, Any]] = []
+        file_summary_targets: list[dict[str, Any]] = []
+        search_summary_budget = search_result_limit
         for query in seed_queries[:query_limit]:
             try:
                 result, cache = self._cached_search(
                     query=query,
                     path=path,
-                    max_results=max_results,
+                    max_results=search_result_limit,
                     include_globs=None,
                     public_namespace="context_lookup.search",
                     allow_fallback=False,
                 )
+                for row in result.get("results", [])[:search_summary_budget]:
+                    if search_summary_budget <= 0:
+                        break
+                    row_path = str(row.get("path", ""))
+                    if not row_path:
+                        continue
+                    try:
+                        line_anchor = max(0, int(row.get("line", 1) or 1))
+                    except (TypeError, ValueError):
+                        line_anchor = 0
+                    search_summary_budget -= 1
+                    file_summary_targets.append(
+                        {
+                            "path": row_path,
+                            "line_anchor": line_anchor,
+                            "source": "search",
+                        }
+                    )
             except Exception as exc:
                 rows.append(
                     {
@@ -2929,7 +3086,7 @@ class ContextService:
                     "key": str(cache.get("key", "")),
                 }
             )
-        return rows
+        return rows, file_summary_targets
 
     def _benchmark_focus_paths(self) -> list[str]:
         files = self.index.files(limit=80)
