@@ -211,13 +211,15 @@ Fragment cache entries support reuse across prompt variations:
 
 Chunk metadata splits files into fixed line windows. Each chunk records:
 
-- chunk id;
+- schema;
 - path;
-- start and end lines;
-- content digest;
-- extractor version;
-- redaction version;
-- symbols and normalized terms.
+- file_digest;
+- chunk_id;
+- start_line;
+- end_line;
+- content_digest;
+- extractor_version;
+- redaction_version;
 
 This lets unchanged chunks keep their cached summaries even when unrelated files
 or query terms change. Cache diagnostics expose hit ratios and miss reasons
@@ -269,21 +271,27 @@ Entries include namespace, source, confidence, created/updated timestamps, TTL,
 tags, and provenance. Decision records include `decided_by`, with human
 decisions treated as higher authority than model decisions.
 
-Memory retrieval ranks by namespace specificity, freshness, confidence, and task
-relevance. Prompt-facing context prefers compact summaries and effective
-decisions over raw rows. Validation reports expired rows, stale paths,
-duplicates, missing metadata, and untrusted-content contamination.
+Memory retrieval is constrained to namespace scope plus optional slices for
+compact summaries and effective decisions. Prompt-facing context prioritizes
+summaries and effective decisions over raw rows. Decision ordering in
+`effective_decisions` favors human-vs-LLM source, then confidence, then most
+recent update. Validation checks expired rows, stale/unsafe paths, and missing
+metadata.
 
 ## Safety And Redaction
 
 The safety boundary is repository-relative:
 
-- path traversal and absolute host paths are rejected at request boundaries;
+- path traversal and repository-escape paths are rejected at request boundaries;
 - generated state is excluded from repository indexing;
 - binary and oversized files are skipped;
-- repository text is treated as untrusted;
+- repository text is treated as untrusted and may be stored internally for
+  retrieval;
 - prompt-injection patterns are surfaced as metadata;
-- secrets and host paths are redacted before storage or public output.
+- secrets and host paths are redacted before model-facing summaries and
+  snippets, and before memory/reference payloads are persisted. Internal index
+  records may still contain raw repository text. Absolute host paths may be
+  accepted when they resolve to in-repo files.
 
 The model-facing context pack is useful for triage, but raw referenced evidence
 must be inspected before destructive edits, release claims, or security
