@@ -1,8 +1,6 @@
-# AgentTonic
+# <img align="left" src="doc/assets/agenttonic-banner.svg" alt="AgentTonic" width="100%" hspace="0" vspace="10">
 
 [![Build](https://github.com/ueni/mcp_context_manager/actions/workflows/build.yml/badge.svg)](https://github.com/ueni/mcp_context_manager/actions/workflows/build.yml)
-
-Give AI agents the right context.
 
 `AgentTonic` (mcp-context-manager) is a focused Model Context Protocol (MCP)
 server for context management. It builds small, task-specific context packets

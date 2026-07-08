@@ -1,0 +1,63 @@
+<svg width="1600" height="900" viewBox="0 0 1600 900" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">AgentTonic logo</title>
+  <desc id="desc">AgentTonic logo with a custom context-compression symbol and wordmark.</desc>
+  <defs>
+    <linearGradient id="iconBlue" x1="145" y1="449" x2="650" y2="449" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#04143A"/>
+      <stop offset="0.54" stop-color="#0C72D8"/>
+      <stop offset="1" stop-color="#20D4E8"/>
+    </linearGradient>
+    <linearGradient id="iconCyan" x1="430" y1="372" x2="648" y2="526" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0E7EF0"/>
+      <stop offset="1" stop-color="#21DDE8"/>
+    </linearGradient>
+    <linearGradient id="wordmarkT" x1="1085" y1="332" x2="1180" y2="454" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1DBEEE"/>
+      <stop offset="1" stop-color="#1977F3"/>
+    </linearGradient>
+    <linearGradient id="nodeGrad" x1="590" y1="405" x2="668" y2="515" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0FBFE6"/>
+      <stop offset="1" stop-color="#2498F5"/>
+    </linearGradient>
+    <filter id="softShadow" x="100" y="240" width="620" height="390" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#00153E" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="900" fill="white"/>
+
+  <g id="agenttonic-symbol" filter="url(#softShadow)">
+    <path d="M145 350L276 434V466L145 550V350Z" fill="#061744"/>
+    <path d="M205 310L358 419V481L205 590V310Z" fill="#08265F"/>
+    <path d="M270 270L438 405V495L270 630V270Z" fill="#061744"/>
+    <path d="M358 356L493 428V472L358 544V356Z" fill="url(#iconBlue)"/>
+
+    <path d="M150 390C251 429 337 452 489 452" stroke="white" stroke-width="16" stroke-linecap="round"/>
+    <path d="M206 359C291 421 365 444 491 448" stroke="white" stroke-width="16" stroke-linecap="round"/>
+    <path d="M272 320C342 401 391 431 493 443" stroke="white" stroke-width="16" stroke-linecap="round"/>
+    <path d="M150 510C251 471 337 448 489 448" stroke="white" stroke-width="16" stroke-linecap="round"/>
+    <path d="M206 541C291 479 365 456 491 452" stroke="white" stroke-width="16" stroke-linecap="round"/>
+    <path d="M272 580C342 499 391 469 493 457" stroke="white" stroke-width="16" stroke-linecap="round"/>
+
+    <path d="M468 391C507 391 529 414 546 438C562 460 584 472 618 472V428C584 428 562 440 546 462C529 486 507 509 468 509C500 478 500 422 468 391Z" fill="url(#iconCyan)"/>
+    <circle cx="522" cy="450" r="29" fill="white"/>
+    <circle cx="522" cy="450" r="17" fill="#14BFE8"/>
+    <circle cx="522" cy="450" r="42" stroke="#0B79DB" stroke-width="10"/>
+
+    <path d="M565 395H610" stroke="#13C8E7" stroke-width="8" stroke-linecap="round"/>
+    <rect x="610" y="379" width="54" height="32" rx="8" fill="url(#nodeGrad)"/>
+    <path d="M565 450H632" stroke="#13C8E7" stroke-width="8" stroke-linecap="round"/>
+    <rect x="632" y="434" width="54" height="32" rx="8" fill="url(#nodeGrad)"/>
+    <path d="M565 505H610" stroke="#13C8E7" stroke-width="8" stroke-linecap="round"/>
+    <rect x="610" y="489" width="54" height="32" rx="8" fill="url(#nodeGrad)"/>
+  </g>
+
+  <g id="agenttonic-wordmark">
+    <text x="710" y="454" font-family="Inter, Avenir Next, Segoe UI, Arial, sans-serif" font-size="136" font-weight="800" letter-spacing="-5" fill="#061744">Agent</text>
+    <text x="1106" y="454" font-family="Inter, Avenir Next, Segoe UI, Arial, sans-serif" font-size="136" font-weight="800" letter-spacing="-5" fill="url(#wordmarkT)">T</text>
+    <text x="1185" y="454" font-family="Inter, Avenir Next, Segoe UI, Arial, sans-serif" font-size="136" font-weight="800" letter-spacing="-5" fill="#061744">onic</text>
+
+    <text x="715" y="543" font-family="Inter, Avenir Next, Segoe UI, Arial, sans-serif" font-size="54" font-weight="500" letter-spacing="0" fill="#061744">Give AI agents the right context.</text>
+    <text x="715" y="617" font-family="SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace" font-size="42" font-weight="500" letter-spacing="4" fill="#6C7C95">mcp-context-manager</text>
+  </g>
+</svg>
