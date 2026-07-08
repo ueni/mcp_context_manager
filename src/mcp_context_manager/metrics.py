@@ -38,6 +38,13 @@ MEASUREMENT_TARGETS: tuple[dict[str, Any], ...] = (
         "min_samples": 1,
     },
     {
+        "key": "latency.context_admin.warmup.avg_elapsed_ms",
+        "operator": "<=",
+        "target": 1000.0,
+        "unit": "ms",
+        "min_samples": 1,
+    },
+    {
         "key": "tokens.context_pack.avg_saved_per_pack",
         "operator": ">=",
         "target": 500.0,
@@ -352,6 +359,7 @@ class ContextMetrics:
             name: self._public_stats(stats)
             for name, stats in sorted(payload.get("operations", {}).items())
         }
+        warmup = self._warmup_metrics(operations, payload.get("recent", []))
         routes = {
             name: self._public_stats(stats)
             for name, stats in sorted(payload.get("routes", {}).items())
@@ -410,6 +418,7 @@ class ContextMetrics:
                 if result_count
                 else 0.0,
             },
+            "warmup": warmup,
             "tokens": {
                 "estimated_input_tokens_saved": tokens_saved,
                 "tokens_spared_by_mcp_est": tokens_saved,
@@ -641,6 +650,39 @@ class ContextMetrics:
         )
         return public
 
+    def _warmup_metrics(
+        self, operations: dict[str, dict[str, Any]], recent: Any
+    ) -> dict[str, Any]:
+        stats = operations.get("context_admin.warmup", {})
+        if not isinstance(stats, dict):
+            stats = {}
+        count = int(stats.get("count", 0) or 0)
+        query_count = int(stats.get("result_count", 0) or 0)
+        recent_rows = recent if isinstance(recent, list) else []
+        last = next(
+            (
+                row
+                for row in reversed(recent_rows)
+                if isinstance(row, dict)
+                and row.get("operation") == "context_admin.warmup"
+            ),
+            {},
+        )
+        last = last if isinstance(last, dict) else {}
+        return {
+            "schema": "context_warmup.metrics.v1",
+            "operation": "context_admin.warmup",
+            "count": count,
+            "avg_elapsed_ms": float(stats.get("avg_elapsed_ms", 0.0) or 0.0),
+            "min_elapsed_ms": float(stats.get("min_elapsed_ms", 0.0) or 0.0),
+            "max_elapsed_ms": float(stats.get("max_elapsed_ms", 0.0) or 0.0),
+            "query_count": query_count,
+            "avg_query_count": round(query_count / count, 3) if count else 0.0,
+            "last_elapsed_ms": float(last.get("elapsed_ms", 0.0) or 0.0),
+            "last_query_count": int(last.get("result_count", 0) or 0),
+            "last_recorded_at": str(last.get("recorded_at", "")),
+        }
+
     def _public_cache_namespace(self, stats: dict[str, Any]) -> dict[str, Any]:
         hits = int(stats.get("hits", 0) or 0)
         misses = int(stats.get("misses", 0) or 0)
@@ -724,6 +766,11 @@ class ContextMetrics:
             )
             return float(stage.get("avg_elapsed_ms", 0.0)), int(
                 stage.get("count", 0) or 0
+            )
+        if key == "latency.context_admin.warmup.avg_elapsed_ms":
+            warmup = snapshot.get("warmup", {})
+            return float(warmup.get("avg_elapsed_ms", 0.0)), int(
+                warmup.get("count", 0) or 0
             )
         if key == "tokens.context_pack.avg_saved_per_pack":
             return (

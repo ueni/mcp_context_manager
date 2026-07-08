@@ -167,6 +167,7 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     assert {
         "latency.context_pack.avg_elapsed_ms",
         "latency.context_pack.snippet_batch_avg_ms",
+        "latency.context_admin.warmup.avg_elapsed_ms",
         "cache.context_pack_retrieval_hit_ratio",
         "cache.context_pack_fragment_hit_ratio",
         "tokens.context_pack.avg_saved_per_pack",
@@ -214,6 +215,12 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert warmup["cache"]["entry_count_after"] >= warmup["search_cache"]["query_count"]
     assert "retrieval.search_term" in warmup["cache"]["namespaces_after"]
     assert "context_pack.retrieval" not in warmup["cache"]["namespaces_after"]
+    metrics = service.context_admin(mode="metrics")
+    assert metrics["warmup"]["schema"] == "context_warmup.metrics.v1"
+    assert metrics["warmup"]["count"] == 1
+    assert metrics["warmup"]["query_count"] == warmup["search_cache"]["query_count"]
+    assert metrics["warmup"]["last_query_count"] == warmup["search_cache"]["query_count"]
+    assert metrics["warmup"]["last_elapsed_ms"] >= 0
 
     lookup = service.context_lookup(mode="search", query="test", path="src")
 

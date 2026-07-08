@@ -1210,6 +1210,7 @@ def _performance_cache_rows(
             "retrieval cache",
             _namespace_cache_summary(metrics, "context_pack.retrieval"),
         ),
+        ("warmup", _warmup_summary(metrics)),
     ]
 
 
@@ -1236,6 +1237,23 @@ def _namespace_cache_summary(metrics: dict[str, Any], namespace: str) -> str:
         f"{fmt_int(row.get('hits', 0))}/"
         f"{fmt_int(row.get('misses', 0))} h/m  "
         f"{float(row.get('hit_ratio', 0.0) or 0.0) * 100:5.1f}%"
+    )
+
+
+def _warmup_summary(metrics: dict[str, Any]) -> str:
+    warmup = metrics.get("warmup", {})
+    if not isinstance(warmup, dict):
+        return "-"
+    count = int(warmup.get("count", 0) or 0)
+    if not count:
+        return "not run"
+    last_at = str(warmup.get("last_recorded_at") or "")
+    last_suffix = f", last {last_at[:19]}" if last_at else ""
+    return (
+        f"{fmt_int(count)} runs, avg {fmt_ms(warmup.get('avg_elapsed_ms', 0.0))}, "
+        f"last {fmt_ms(warmup.get('last_elapsed_ms', 0.0))}, "
+        f"{fmt_int(warmup.get('last_query_count', 0))} queries"
+        f"{last_suffix}"
     )
 
 

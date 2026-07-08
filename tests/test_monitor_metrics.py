@@ -52,6 +52,16 @@ class FakeClient:
                 "tokens_spared_by_mcp_est": 12000,
             },
             "references": {"bytes_deferred_est": 4096},
+            "warmup": {
+                "schema": "context_warmup.metrics.v1",
+                "count": 2,
+                "avg_elapsed_ms": 18.5,
+                "query_count": 6,
+                "avg_query_count": 3.0,
+                "last_elapsed_ms": 12.0,
+                "last_query_count": 3,
+                "last_recorded_at": "2026-07-01T12:00:00+00:00",
+            },
             "index_freshness": {
                 "state": "last_good",
                 "refresh_reason": "last_good_index",
@@ -610,6 +620,8 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "last_good" in performance
     assert "background queue" in performance
     assert "2/1 h/m" in performance
+    assert "warmup" in performance
+    assert "2 runs, avg 18.5, last 12.0, 3 queries" in performance
 
 
 def test_mcp_loading_status_renders_in_controls() -> None:
