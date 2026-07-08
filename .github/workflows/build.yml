@@ -24,35 +24,18 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Cache build downloads
+        uses: actions/cache@v4
+        with:
+          path: .downloads
+          key: ${{ runner.os }}-build-downloads-${{ hashFiles('pyproject.toml', 'CMakeLists.txt', 'CMakePresets.json', 'cmake/**/*.cmake') }}
+          restore-keys: |
+            ${{ runner.os }}-build-downloads-
+
       - name: Build glibc and musl executables
         run: |
-          docker run --rm \
-            -v "$PWD":/workspace \
-            -w /workspace \
-            ubuntu:22.04 sh -c '
-              apt-get update \
-              && apt-get install -y --no-install-recommends python3 python3-pip python3.10-dev libpython3.10 libffi-dev libssl-dev binutils build-essential \
-              && python3 -m pip install --upgrade pip \
-              && python3 -m pip install pyinstaller . \
-              && pyinstaller \
-                --onefile \
-                --name mcp-context-manager-linux-x86_64-glibc \
-                --collect-all mcp_context_manager \
-                src/mcp_context_manager/__main__.py
-            '
-          docker run --rm \
-            -v "$PWD":/workspace \
-            -w /workspace \
-            python:3.12-alpine sh -c '
-              apk add --no-cache binutils build-base musl-dev libffi-dev openssl-dev \
-              && python -m pip install --upgrade pip \
-              && python -m pip install pyinstaller . \
-              && pyinstaller \
-                --onefile \
-                --name mcp-context-manager-linux-x86_64-musl \
-                --collect-all mcp_context_manager \
-                src/mcp_context_manager/__main__.py
-            '
+          cmake --preset ci
+          cmake --build --preset standalone-ci
 
       - name: Smoke test glibc executable
         run: |
@@ -102,12 +85,8 @@ jobs:
 
       - name: Build docker image archive
         run: |
-          docker build \
-            --build-arg SERVER_BINARY=dist/mcp-context-manager-linux-x86_64-musl \
-            -t mcp-context-manager:linux-x86_64 \
-            .
-          docker save mcp-context-manager:linux-x86_64 \
-            | gzip -9 > mcp-context-manager-linux-x86_64-musl-image.tar.gz
+          cmake --preset ci
+          cmake --build --preset docker-image-archive-ci
 
       - name: Upload glibc executable
         uses: actions/upload-artifact@v4

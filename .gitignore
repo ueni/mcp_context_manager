@@ -1,4 +1,6 @@
 .mcp-context-manager/
+.downloads/
+.cmake-build/
 .continue/
 .pytest_cache/
 __pycache__/

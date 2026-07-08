@@ -498,27 +498,41 @@ The production `Dockerfile` builds an Alpine-based runtime image around a
 prebuilt standalone server executable. It does not build the Python package from
 source inside the runtime image.
 
-Build the image locally after producing a musl-linked standalone executable:
+Local build tasks are orchestrated through CMake presets. Container package
+manager and pip downloads are cached under `.downloads/`, so repeated builds do
+not fetch the same apt, apk, and pip artifacts every time.
+When running inside the devcontainer, the presets use `HOST_WORKSPACE_FOLDER`
+as the host-visible Docker bind mount path.
 
 ```bash
-docker build \
-  --build-arg SERVER_BINARY=dist/mcp-context-manager-linux-x86_64-musl \
-  -t mcp-context-manager:local .
+cmake --preset local
+cmake --build --preset standalone
+cmake --build --preset docker-image
+cmake --build --preset docker-image-archive
 ```
 
-The Dockerfile checks that `SERVER_BINARY` is musl-linked because the runtime
-base image is Alpine.
+If Docker requires sudo on the host, use the matching presets:
+
+```bash
+cmake --preset local-sudo-docker
+cmake --build --preset standalone-sudo-docker
+```
+
+The Docker image target uses `dist/mcp-context-manager-linux-x86_64-musl` as
+`SERVER_BINARY`. The Dockerfile checks that the binary is musl-linked because
+the runtime base image is Alpine.
 
 GitHub Actions owns release artifacts:
 
-- `Build glibc and musl executables` builds the bundled Linux executables.
+- `Build glibc and musl executables` runs the CMake `standalone-ci` preset and
+  caches `.downloads/` between runs.
+- `Build docker image archive` runs the CMake `docker-image-archive-ci` preset.
 - `Smoke test glibc executable` and `Smoke test musl executable` verify the
   standalone servers before packaging.
 - `Release` is manually dispatched with a version such as `0.2.0`. It creates
-  tag `v0.2.0`, builds the glibc and musl standalone executables, builds a
-  musl-based Docker image archive, writes `SHA256SUMS`, signs the checksums
-  with Sigstore, and publishes all
-  artifacts on the GitHub release.
+  tag `v0.2.0`, builds with the CMake `release-ci` preset, writes
+  `SHA256SUMS`, signs the checksums with Sigstore, and publishes all artifacts
+  on the GitHub release.
 
 Verify downloaded release artifacts:
 

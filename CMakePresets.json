@@ -1,0 +1,138 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "local",
+      "displayName": "Local build orchestration",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/.cmake-build/local",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MCP_DOWNLOAD_CACHE_DIR": "${sourceDir}/.downloads",
+        "MCP_USE_SUDO_DOCKER": "OFF"
+      }
+    },
+    {
+      "name": "local-sudo-docker",
+      "displayName": "Local build orchestration with sudo docker",
+      "inherits": "local",
+      "binaryDir": "${sourceDir}/.cmake-build/local-sudo-docker",
+      "cacheVariables": {
+        "MCP_USE_SUDO_DOCKER": "ON"
+      }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI build orchestration",
+      "inherits": "local",
+      "binaryDir": "${sourceDir}/.cmake-build/ci",
+      "cacheVariables": {
+        "MCP_DOCKER_IMAGE": "mcp-context-manager:linux-x86_64",
+        "MCP_IMAGE_ARCHIVE": "${sourceDir}/mcp-context-manager-linux-x86_64-musl-image.tar.gz"
+      }
+    },
+    {
+      "name": "release-ci",
+      "displayName": "Release build orchestration",
+      "inherits": "ci",
+      "binaryDir": "${sourceDir}/.cmake-build/release-ci",
+      "cacheVariables": {
+        "MCP_DOCKER_IMAGE": "$env{IMAGE_NAME}:$env{VERSION}",
+        "MCP_DOCKER_EXTRA_IMAGE_TAGS": "$env{IMAGE_NAME}:latest",
+        "MCP_SERVER_BINARY": "release/mcp-context-manager-$env{VERSION}-linux-x86_64-musl",
+        "MCP_IMAGE_ARCHIVE": "${sourceDir}/release/$env{IMAGE_NAME}-$env{VERSION}-linux-x86_64-musl-image.tar.gz"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "standalone",
+      "configurePreset": "local",
+      "targets": [
+        "standalone-executable"
+      ]
+    },
+    {
+      "name": "standalone-sudo-docker",
+      "configurePreset": "local-sudo-docker",
+      "targets": [
+        "standalone-executable"
+      ]
+    },
+    {
+      "name": "standalone-ci",
+      "configurePreset": "ci",
+      "targets": [
+        "standalone-executable"
+      ]
+    },
+    {
+      "name": "standalone-release-ci",
+      "configurePreset": "release-ci",
+      "targets": [
+        "standalone-executable"
+      ]
+    },
+    {
+      "name": "docker-image",
+      "configurePreset": "local",
+      "targets": [
+        "docker-image"
+      ]
+    },
+    {
+      "name": "docker-image-sudo-docker",
+      "configurePreset": "local-sudo-docker",
+      "targets": [
+        "docker-image"
+      ]
+    },
+    {
+      "name": "docker-image-archive",
+      "configurePreset": "local",
+      "targets": [
+        "docker-image-archive"
+      ]
+    },
+    {
+      "name": "docker-image-archive-sudo-docker",
+      "configurePreset": "local-sudo-docker",
+      "targets": [
+        "docker-image-archive"
+      ]
+    },
+    {
+      "name": "docker-image-archive-ci",
+      "configurePreset": "ci",
+      "targets": [
+        "docker-image-archive"
+      ]
+    },
+    {
+      "name": "docker-image-archive-release-ci",
+      "configurePreset": "release-ci",
+      "targets": [
+        "docker-image-archive"
+      ]
+    },
+    {
+      "name": "local-release-artifacts",
+      "configurePreset": "local",
+      "targets": [
+        "local-release-artifacts"
+      ]
+    },
+    {
+      "name": "local-release-artifacts-sudo-docker",
+      "configurePreset": "local-sudo-docker",
+      "targets": [
+        "local-release-artifacts"
+      ]
+    }
+  ]
+}
