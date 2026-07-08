@@ -15,7 +15,6 @@
       "command": "if [ ! -x dist/mcp-context-manager-linux-x86_64-glibc ] || [ ! -x dist/mcp-context-manager-linux-x86_64-musl ]; then mkdir -p dist; echo \"mcp-context-manager executables are missing; building glibc and musl binaries...\" >&2; sudo env \"PATH=$PATH\" docker run --rm -v \"${env:HOST_WORKSPACE_FOLDER}:/workspace\" -w /workspace ubuntu:22.04 sh -ec 'apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3.10-dev libpython3.10 libffi-dev libssl-dev binutils build-essential && python3 -m pip install --upgrade pip && python3 -m pip install pyinstaller . && pyinstaller --onefile --name mcp-context-manager-linux-x86_64-glibc --distpath /workspace/dist --collect-all mcp_context_manager src/mcp_context_manager/__main__.py; chown -R \"$(stat -c \"%u:%g\" /workspace)\" /workspace/dist'; sudo env \"PATH=$PATH\" docker run --rm -v \"${env:HOST_WORKSPACE_FOLDER}:/workspace\" -w /workspace python:3.12-alpine sh -ec 'apk add --no-cache binutils build-base musl-dev libffi-dev openssl-dev && python -m pip install --upgrade pip && python -m pip install pyinstaller . && pyinstaller --onefile --name mcp-context-manager-linux-x86_64-musl --distpath /workspace/dist --collect-all mcp_context_manager src/mcp_context_manager/__main__.py; chown -R \"$(stat -c \"%u:%g\" /workspace)\" /workspace/dist'; fi; sudo env \"PATH=$PATH\" docker build --build-arg SERVER_BINARY=dist/mcp-context-manager-linux-x86_64-musl -t mcp-context-manager:local .",
       "group": {
         "kind": "build",
-        "isDefault": true
       },
       "problemMatcher": []
     },
@@ -51,7 +50,10 @@
       "dependsOn": [
         "build: standalone executable"
       ],
-      "group": "build",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
       "problemMatcher": []
     },
     {
