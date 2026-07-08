@@ -5,9 +5,10 @@
   "remoteUser": "vscode",
   "mounts": [
     "source=/etc/ssl/certs,target=/etc/ssl/certs,type=bind,readonly",
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
     "source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,readonly",
     "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,type=bind,readonly"
-  ],  
+  ],
   "containerEnv": {
       "MCP_CONTEXT_AUTO_UPDATE": "0",
       "MCP_CONTEXT_ALLOWED_ROOTS": "/workspaces",
@@ -20,12 +21,15 @@
       "GIT_SSL_CAINFO": "/etc/ssl/certs/ca-certificates.crt",
       "REQUESTS_CA_BUNDLE": "/etc/ssl/certs/ca-certificates.crt",
       "SSL_CERT_DIR": "/etc/ssl/certs",
-      "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt"
+      "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
+      "DOCKER_HOST": "unix:///var/run/docker.sock",
+      "HOST_WORKSPACE_FOLDER": "${localWorkspaceFolder}"
   },
   "remoteEnv": {
       "PATH": "${containerEnv:PATH}:/home/vscode/.local/bin"
-  },  
-  "postCreateCommand": "python -m pip install --user --no-compile -e '.[dev]'",
+  },
+  "onCreateCommand": "bash -lc 'set -euo pipefail\nDOCKER_BIN=\"$HOME/.local/bin/docker\"\ncase \"$(uname -m)\" in\n  x86_64) DOCKER_ARCH=x86_64 ;;\n  aarch64|arm64) DOCKER_ARCH=aarch64 ;;\n  *) echo \"unsupported architecture: $(uname -m)\"; exit 1 ;;\nesac\nif [ ! -x \"$DOCKER_BIN\" ]; then\n  mkdir -p \"$HOME/.local/bin\"\n  DOCKER_VERSION=27.4.0\n  curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 \"https://download.docker.com/linux/static/stable/$DOCKER_ARCH/docker-$DOCKER_VERSION.tgz\" -o /tmp/docker.tgz\n  mkdir -p /tmp/docker_extract\n  tar -xzf /tmp/docker.tgz -C /tmp/docker_extract --strip-components=1\n  mv /tmp/docker_extract/docker \"$DOCKER_BIN\"\n  chmod +x \"$DOCKER_BIN\"\n  rm -rf /tmp/docker.tgz /tmp/docker_extract\nelse\n  echo \"docker already present: $DOCKER_BIN\"\nfi\nCOMPOSE_VERSION=2.40.0\nCOMPOSE_BIN_DIR=\"$HOME/.docker/cli-plugins\"\nCOMPOSE_BIN=\"$COMPOSE_BIN_DIR/docker-compose\"\nif [ ! -x \"$COMPOSE_BIN\" ]; then\n  mkdir -p \"$COMPOSE_BIN_DIR\"\n  curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 \"https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-${DOCKER_ARCH}\" -o \"$COMPOSE_BIN\"\n  chmod +x \"$COMPOSE_BIN\"\nfi\nif [ -S /var/run/docker.sock ]; then\n  DOCKER_SOCK_GID=\"$(stat -c %g /var/run/docker.sock)\"\n  if ! getent group \"$DOCKER_SOCK_GID\" >/dev/null; then\n    sudo groupadd --gid \"$DOCKER_SOCK_GID\" docker-host\n  fi\n  DOCKER_SOCK_GROUP=\"$(getent group \"$DOCKER_SOCK_GID\" | cut -d: -f1)\"\n  sudo usermod -aG \"$DOCKER_SOCK_GROUP\" \"$USER\"\n  export DOCKER_HOST=unix:///var/run/docker.sock\n  sudo \"$DOCKER_BIN\" version >/tmp/docker-version.txt || true\nelse\n  echo \"docker socket not available at /var/run/docker.sock\"\nfi'",
+  "postCreateCommand": "bash -lc 'python -m pip install --user --no-compile -e \".[dev]\" --timeout 120 --retries 5 --progress-bar off'",
   "forwardPorts": [8000],
     "customizations": {
         "vscode": {
@@ -37,5 +41,5 @@
                 "cmake.configureOnOpen": false
             }
         }
-    }  
+    }
 }

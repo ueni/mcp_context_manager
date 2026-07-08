@@ -5,6 +5,7 @@ services:
       args:
         MCP_CONTEXT_UID: ${MCP_CONTEXT_UID:-1000}
         MCP_CONTEXT_GID: ${MCP_CONTEXT_GID:-1000}
+        SERVER_BINARY: ${SERVER_BINARY:-dist/mcp-context-manager-linux-x86_64-musl}
     image: mcp-context-manager:local
     environment:
       HOST: 0.0.0.0

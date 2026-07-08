@@ -221,6 +221,14 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert metrics["warmup"]["query_count"] == warmup["search_cache"]["query_count"]
     assert metrics["warmup"]["last_query_count"] == warmup["search_cache"]["query_count"]
     assert metrics["warmup"]["last_elapsed_ms"] >= 0
+    matrix = service.context_admin(mode="measurement_matrix")
+    warmup_check = next(
+        check
+        for check in matrix["checks"]
+        if check["key"] == "latency.context_admin.warmup.avg_elapsed_ms"
+    )
+    assert warmup_check["samples"] == 1
+    assert warmup_check["current"] == metrics["warmup"]["avg_elapsed_ms"]
 
     lookup = service.context_lookup(mode="search", query="test", path="src")
 
