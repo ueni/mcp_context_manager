@@ -85,6 +85,9 @@ reads, smaller prompts, and better evidence discipline before code changes.
   extractor version, and redaction version.
 - Request-level retrieval cache plus fragment caches for search terms and file
   summaries.
+- Optional skill guidance compiled from non-secret `context_memory` records in
+  `skills/<provider>` namespaces, cached as compact cards and returned by
+  `context_pack` only when relevant.
 - Route-aware candidate ranking using task terms, explicit paths, changed files,
   symbol matches, related symbols, likely tests, and diversity limits.
 - Budget planning before final serialization, with low-value or bulky evidence
@@ -94,6 +97,21 @@ reads, smaller prompts, and better evidence discipline before code changes.
 - Prompt-injection signal detection on returned repository text.
 - Secret and host-path redaction before generated-state storage.
 - Gold-anchor retrieval-quality fixtures and measurement-matrix benchmarks.
+
+## Skill Guidance Convention
+
+Agents can share reusable, non-secret skill material without adding tools or
+parameters. Store raw skill records through `context_memory(mode="upsert")`
+under namespaces such as `skills/codex`, `skills/claude`, `skills/copilot`, or
+`skills/custom`. Use stable keys for skill ids and values with fields such as
+`name`, `description`, `triggers`, `body` or `instructions`, `source`, and
+optional `version`.
+
+Pre-summarized skill records can use `context_memory(mode="summary_upsert")` in
+the same namespaces. The next relevant `context_pack` ranks matching records,
+compiles compact deterministic skill cards, caches them internally under
+`skill.compiled`, and returns an optional `skill_guidance` field. Raw skill
+bodies are not returned.
 
 ## Why LMDB Instead Of SQLite
 

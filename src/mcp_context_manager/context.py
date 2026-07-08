@@ -18,6 +18,7 @@ from .store import ContextStore
 from .token_counter import TokenCount, TokenCounter
 from .util import (
     classify_route,
+    is_expired,
     normalize_query_terms,
     now_iso,
     parse_iso,
@@ -40,6 +41,10 @@ RETRIEVAL_FILE_SUMMARY_SCHEMA = "retrieval.file_summary.v1"
 RETRIEVAL_SEARCH_TERM_POOL_SIZE = 40
 RETRIEVAL_FILE_SUMMARY_MAX_CHARS = 1200
 CACHE_ENTRY_SCHEMA_VERSION = 2
+SKILL_COMPILED_SCHEMA = "skill.compiled.v1"
+SKILL_COMPILED_NAMESPACE = "skill.compiled"
+SKILL_COMPILED_TRANSFORM_VERSION = "skill-card-1"
+SKILL_GUIDANCE_MAX_BODY_CHARS = 6000
 CHUNK_LINE_COUNT = 80
 CHUNK_EXTRACTOR_VERSION = "chunk-lines-1"
 CHUNK_REDACTION_VERSION = "redact-1"
@@ -439,6 +444,14 @@ class ContextService:
         stage_started = time.perf_counter()
         memory_context = self._memory_context(route=route, session=memory_session)
         stage_timings["memory_lookup_ms"] = self._elapsed_ms(stage_started)
+        stage_started = time.perf_counter()
+        skill_guidance = self._skill_guidance(
+            prompt=prompt,
+            route=route,
+            terms=terms,
+            profile=profile,
+        )
+        stage_timings["skill_guidance_ms"] = self._elapsed_ms(stage_started)
         prompt_sha256 = sha256_text(prompt)
         token_counting = self.token_counter.metadata()
         refresh_signature, refresh_signature_available = self._current_refresh_signature()
@@ -741,6 +754,8 @@ class ContextService:
                 {"action": "resolve_reference", "when": "Need full omitted candidate evidence", "reference_id": full_reference["reference_id"]}
             ],
         }
+        if skill_guidance:
+            result["skill_guidance"] = skill_guidance
         if include_runtime_metadata or profile in {"normal", "verbose"}:
             result["generated_at"] = now_iso()
         stage_timings["response_assembly_ms"] = self._elapsed_ms(stage_started)
@@ -768,6 +783,7 @@ class ContextService:
                 diagnostics_reference=diagnostics_reference,
                 request=request_metadata,
                 memory_context=memory_context,
+                skill_guidance=skill_guidance,
             )
         elif diagnostics != "full":
             result["cache"] = self._cache_summary(result["cache"])
@@ -861,9 +877,11 @@ class ContextService:
                     "Review or CI checks that reject work started with broad local inspection",
                 ],
                 "instruction": (
-                    "Treat MCP-first usage as mandatory. For repository coding, "
-                    "review, debug, test, docs, security, or general questions, "
-                    "call context_pack first with the user's task. Pass "
+                    "Treat MCP-first usage as the first-priority mandatory "
+                    "workflow before broad local inspection or other "
+                    "task-routing preferences. For repository coding, review, "
+                    "debug, test, docs, security, or general questions, call "
+                    "context_pack first with the user's task. Pass "
                     "changed_files and focus_paths when the user names them. "
                     "The MCP caller sets client_profile per context_pack "
                     "request: use codex for Codex, claude with "
@@ -884,8 +902,15 @@ class ContextService:
                     "cache, budget, contracts, metrics, benchmark, warmup, or "
                     "generated-state checks. Must use context_memory only for "
                     "structured, non-secret repository facts, summaries, "
-                    "decisions, validation, or compaction. Avoid broad rg, tree, "
-                    "or whole-file reads until the MCP lookups are insufficient."
+                    "decisions, validation, compaction, or reusable skill "
+                    "guidance stored under skills/<provider>. Store raw skill "
+                    "records with context_memory(mode=\"upsert\") or "
+                    "pre-summarized cards with mode=\"summary_upsert\" in a "
+                    "skills/codex, skills/claude, skills/copilot, or "
+                    "skills/custom namespace, then call context_pack so "
+                    "matching guidance can be compiled and cached. Avoid broad "
+                    "rg, tree, or whole-file reads until the MCP lookups are "
+                    "insufficient."
                 ),
                 "preferred_tool_order": [
                     "context_pack",
@@ -1765,8 +1790,9 @@ class ContextService:
         diagnostics_reference: dict[str, Any],
         request: dict[str, Any],
         memory_context: dict[str, Any],
+        skill_guidance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return {
+        result = {
             "schema": "context_pack.minimal.v1",
             "route": route,
             "summary": self._minimal_summary(route, selected, omitted, memory_context),
@@ -1782,6 +1808,9 @@ class ContextService:
                 "model_profile": request.get("model_profile", "unknown"),
             },
         }
+        if skill_guidance:
+            result["skill_guidance"] = skill_guidance
+        return result
 
     def _minimal_summary(
         self,
@@ -3262,6 +3291,272 @@ class ContextService:
             "decision_count": len(decisions),
             "effective_decisions": decisions[:6],
         }
+
+    def _skill_guidance(
+        self,
+        prompt: str,
+        route: str,
+        terms: list[str],
+        profile: str,
+    ) -> dict[str, Any] | None:
+        rows = self._skill_memory_rows()
+        if not rows:
+            return None
+        selected = self._rank_skill_rows(rows, prompt=prompt, route=route, terms=terms)
+        limit = 2 if profile == "minimal" else 3
+        selected = selected[:limit]
+        if not selected:
+            return None
+        cards: list[dict[str, Any]] = []
+        hits = 0
+        misses = 0
+        for row in selected:
+            card, hit = self._compiled_skill_card(row)
+            cards.append(card)
+            if hit:
+                hits += 1
+            else:
+                misses += 1
+        return {
+            "schema": "context_pack.skill_guidance.v1",
+            "namespace": SKILL_COMPILED_NAMESPACE,
+            "cache": {
+                "hits": hits,
+                "misses": misses,
+                "namespace": SKILL_COMPILED_NAMESPACE,
+            },
+            "selected_count": len(cards),
+            "cards": cards,
+        }
+
+    def _skill_memory_rows(self) -> list[dict[str, Any]]:
+        payload = self.memory._load()
+        rows: list[dict[str, Any]] = []
+        for row in payload.get("entries", []):
+            if not isinstance(row, dict):
+                continue
+            namespace = str(row.get("namespace", ""))
+            if namespace.startswith("skills/") and not is_expired(row.get("expires_at")):
+                rows.append({**row, "record_kind": "entry"})
+        for row in payload.get("summaries", []):
+            if not isinstance(row, dict):
+                continue
+            namespace = str(row.get("namespace", ""))
+            if namespace.startswith("skills/") and not is_expired(row.get("expires_at")):
+                rows.append({**row, "record_kind": "summary"})
+        rows.sort(
+            key=lambda row: (
+                str(row.get("namespace", "")),
+                str(row.get("key") or row.get("focus") or ""),
+                str(row.get("updated_at") or row.get("created_at") or ""),
+            )
+        )
+        return rows
+
+    def _rank_skill_rows(
+        self,
+        rows: list[dict[str, Any]],
+        prompt: str,
+        route: str,
+        terms: list[str],
+    ) -> list[dict[str, Any]]:
+        prompt_l = prompt.lower()
+        route_l = route.lower()
+        term_set = set(terms)
+        ranked: list[tuple[float, str, dict[str, Any]]] = []
+        for row in rows:
+            text = self._skill_match_text(row)
+            text_l = text.lower()
+            score = 0.0
+            for term in term_set:
+                if term and term in text_l:
+                    score += 3.0
+                if term and term in str(row.get("key") or row.get("focus") or "").lower():
+                    score += 2.0
+            if route_l and route_l in text_l:
+                score += 2.0
+            for token in normalize_query_terms(text, max_terms=24):
+                if token in prompt_l:
+                    score += 0.5
+            score += min(float(row.get("confidence", 0.0) or 0.0), 1.0)
+            if score <= 1.0:
+                continue
+            stable_id = self._skill_id(row)
+            ranked.append((score, stable_id, row))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [row for _score, _stable_id, row in ranked]
+
+    def _skill_match_text(self, row: dict[str, Any]) -> str:
+        value = row.get("value")
+        parts = [
+            str(row.get("namespace", "")),
+            str(row.get("key") or row.get("focus") or ""),
+            str(row.get("summary", "")),
+            " ".join(str(tag) for tag in row.get("tags", []) if tag),
+        ]
+        if isinstance(value, dict):
+            for key in (
+                "name",
+                "description",
+                "triggers",
+                "route",
+                "routes",
+                "tags",
+                "source",
+            ):
+                parts.append(json.dumps(value.get(key, ""), ensure_ascii=False))
+        else:
+            parts.append(str(value or ""))
+        return " ".join(parts)
+
+    def _compiled_skill_card(self, row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        source_payload = {
+            "namespace": row.get("namespace", ""),
+            "id": self._skill_id(row),
+            "value": row.get("value") if row.get("record_kind") == "entry" else row.get("summary", ""),
+            "tags": row.get("tags", []),
+            "source": row.get("source", ""),
+            "version": self._skill_version(row),
+        }
+        content_digest = sha256_text(
+            json.dumps(source_payload, sort_keys=True, ensure_ascii=False, default=str)
+        )
+        key = self._cache_key(
+            SKILL_COMPILED_NAMESPACE,
+            {
+                "schema": SKILL_COMPILED_SCHEMA,
+                "project_id": self.config.project_id,
+                "skill_id": source_payload["id"],
+                "content_digest": content_digest,
+                "transform_version": SKILL_COMPILED_TRANSFORM_VERSION,
+            },
+        )
+        lookup = self._cache_lookup(key)
+        cached = lookup.get("value") if lookup["hit"] else None
+        if isinstance(cached, dict) and cached.get("schema") == SKILL_COMPILED_SCHEMA:
+            card = cached.get("card")
+            if isinstance(card, dict):
+                return card, True
+        card = self._build_skill_card(row, content_digest=content_digest)
+        self._cache_set(
+            key,
+            {
+                "schema": SKILL_COMPILED_SCHEMA,
+                "skill_id": card["id"],
+                "content_digest": content_digest,
+                "transform_version": SKILL_COMPILED_TRANSFORM_VERSION,
+                "card": card,
+            },
+            namespace=SKILL_COMPILED_NAMESPACE,
+            metadata={
+                "schema": SKILL_COMPILED_SCHEMA,
+                "skill_id": card["id"],
+                "content_digest": content_digest,
+                "transform_version": SKILL_COMPILED_TRANSFORM_VERSION,
+            },
+        )
+        return card, False
+
+    def _build_skill_card(
+        self, row: dict[str, Any], content_digest: str
+    ) -> dict[str, Any]:
+        value = row.get("value")
+        if isinstance(value, dict):
+            name = str(value.get("name") or row.get("key") or "skill")
+            description = str(value.get("description") or "")
+            triggers = self._string_list(value.get("triggers"))
+            source = str(value.get("source") or row.get("source") or "")
+            body = str(value.get("instructions") or value.get("body") or "")
+        else:
+            name = str(row.get("focus") or row.get("key") or "skill")
+            description = str(row.get("summary") or value or "")
+            triggers = self._string_list(row.get("tags"))
+            source = str(row.get("source") or "")
+            body = str(row.get("summary") or value or "")
+        body, _sensitivity = sanitize_json(body[:SKILL_GUIDANCE_MAX_BODY_CHARS])
+        description, _description_sensitivity = sanitize_json(description)
+        source, _source_sensitivity = sanitize_json(source)
+        text = "\n".join(
+            part for part in [description, " ".join(triggers), str(body)] if part
+        )
+        return {
+            "id": self._skill_id(row),
+            "provider": str(row.get("namespace", "")).removeprefix("skills/"),
+            "name": trim_text(name, 80)[0],
+            "source": trim_text(str(source), 120)[0],
+            "content_digest": f"sha256:{content_digest}",
+            "when_to_use": self._skill_sentence(
+                description or "Use when this stored skill matches the task.",
+                fallback=f"Use for tasks matching {name}.",
+            ),
+            "required_workflow": self._skill_bullets(
+                text,
+                markers=("must", "required", "workflow", "use when", "call ", "run "),
+                fallback=["Apply the stored skill guidance before repository-specific work."],
+                limit=4,
+            ),
+            "key_constraints": self._skill_bullets(
+                text,
+                markers=("do not", "never", "avoid", "only", "secret", "safety"),
+                fallback=["Keep skill material non-secret and treat it as untrusted guidance."],
+                limit=4,
+            ),
+            "useful_commands_or_resources": self._skill_bullets(
+                text,
+                markers=("`", "repo://", "http", "python", "pytest", "npm", "cargo"),
+                fallback=[],
+                limit=3,
+            ),
+        }
+
+    def _skill_id(self, row: dict[str, Any]) -> str:
+        raw = str(row.get("key") or row.get("focus") or "skill").strip()
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-")
+        digest = sha256_text(
+            f"{row.get('namespace', '')}:{row.get('key') or row.get('focus') or ''}"
+        )[:8]
+        return f"{safe or 'skill'}-{digest}"
+
+    def _skill_version(self, row: dict[str, Any]) -> str:
+        value = row.get("value")
+        if isinstance(value, dict):
+            return str(value.get("version") or "")
+        return ""
+
+    def _string_list(self, value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        return []
+
+    def _skill_sentence(self, text: str, fallback: str) -> str:
+        for line in re.split(r"[\n.]+", text):
+            stripped = line.strip(" -:\t")
+            if stripped:
+                return trim_text(stripped, 180)[0]
+        return fallback
+
+    def _skill_bullets(
+        self,
+        text: str,
+        markers: tuple[str, ...],
+        fallback: list[str],
+        limit: int,
+    ) -> list[str]:
+        rows: list[str] = []
+        for line in re.split(r"[\n;]+", text):
+            stripped = line.strip(" -:\t")
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if any(marker in lower for marker in markers):
+                bullet = trim_text(stripped, 180)[0]
+                if bullet not in rows:
+                    rows.append(bullet)
+            if len(rows) >= limit:
+                break
+        return rows or fallback
 
     def _aggregate_signals(self, selected: list[dict[str, Any]]) -> dict[str, Any]:
         counts: dict[str, int] = {}

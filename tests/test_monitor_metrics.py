@@ -44,7 +44,12 @@ class FakeClient:
                         "hits": 2,
                         "misses": 1,
                         "hit_ratio": 0.667,
-                    }
+                    },
+                    "skill.compiled": {
+                        "hits": 4,
+                        "misses": 1,
+                        "hit_ratio": 0.8,
+                    },
                 },
             },
             "tokens": {
@@ -100,6 +105,11 @@ class FakeClient:
                             "avg_elapsed_ms": 15.0,
                             "min_elapsed_ms": 0.0,
                             "max_elapsed_ms": 60.0,
+                        },
+                        "skill_guidance_ms": {
+                            "avg_elapsed_ms": 2.0,
+                            "min_elapsed_ms": 1.0,
+                            "max_elapsed_ms": 5.0,
                         },
                     }
                 },
@@ -606,10 +616,13 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "mcp-context-manager performance" in performance
     assert "| total_ms" in performance
     assert "| index_refresh_ms" in performance
+    assert "| skill_guidance_ms" in performance
     assert "freshness" in performance
     assert "last_good" in performance
     assert "background queue" in performance
     assert "2/1 h/m" in performance
+    assert "4/1 h/m" in performance
+    assert "skill card cache" in performance
     assert "warmup" in performance
     assert "2 runs, avg 18.5, last 12.0, 3 queries" in performance
     performance_footer = next(

@@ -137,6 +137,254 @@ def test_minimal_pack_is_cache_stable_and_reference_backed(
     assert diagnostics["status"] == "resolved"
 
 
+def test_context_pack_without_skill_memory_keeps_minimal_shape(
+    service: ContextService,
+) -> None:
+    pack = service.context_pack(
+        "review auth token behavior",
+        max_items=2,
+        output_profile="minimal",
+        diagnostics="none",
+    )
+
+    assert "skill_guidance" not in pack
+    assert list(pack) == [
+        "schema",
+        "route",
+        "summary",
+        "items",
+        "omitted_ref",
+        "diagnostics_ref",
+        "request",
+    ]
+
+
+def test_context_pack_compiles_matching_skill_guidance_and_reuses_cache(
+    service: ContextService,
+) -> None:
+    service.context_memory(
+        mode="upsert",
+        namespace="skills/codex",
+        key="pytest-debugger",
+        value={
+            "name": "Pytest Debugger",
+            "description": "Use when debugging pytest failures in this repository.",
+            "triggers": ["pytest", "failure", "debug"],
+            "instructions": (
+                "Required workflow: inspect failing test output first. "
+                "Must run `python3 -m pytest tests/test_auth.py -q`. "
+                "Do not add production dependencies."
+            ),
+            "source": "test-skill",
+            "version": "1",
+        },
+        ttl_days=7,
+        source="test",
+        tags=["pytest", "debug"],
+    )
+
+    first = service.context_pack(
+        "debug pytest failure in auth tests",
+        max_items=2,
+        output_profile="compact",
+    )
+    second = service.context_pack(
+        "debug pytest failure in auth tests",
+        max_items=2,
+        output_profile="compact",
+    )
+
+    guidance = first["skill_guidance"]
+    assert guidance["schema"] == "context_pack.skill_guidance.v1"
+    assert guidance["namespace"] == "skill.compiled"
+    assert guidance["cache"]["misses"] == 1
+    assert guidance["cache"]["hits"] == 0
+    assert guidance["cards"][0]["provider"] == "codex"
+    assert guidance["cards"][0]["name"] == "Pytest Debugger"
+    assert "debugging pytest failures" in guidance["cards"][0]["when_to_use"]
+    assert any(
+        "python3 -m pytest tests/test_auth.py -q" in row
+        for row in guidance["cards"][0]["useful_commands_or_resources"]
+    )
+    assert second["skill_guidance"]["cache"]["hits"] == 1
+    assert second["skill_guidance"]["cache"]["misses"] == 0
+    assert any(
+        row[0].startswith("cache:skill.compiled:")
+        for row in service.store.iter_json("cache:skill.compiled:")
+    )
+
+
+def test_context_pack_skill_guidance_ranks_providers_and_limits_minimal(
+    service: ContextService,
+) -> None:
+    for namespace, key, name in [
+        ("skills/copilot", "zeta-review", "Zeta Review"),
+        ("skills/claude", "alpha-review", "Alpha Review"),
+        ("skills/custom", "beta-review", "Beta Review"),
+    ]:
+        service.context_memory(
+            mode="upsert",
+            namespace=namespace,
+            key=key,
+            value={
+                "name": name,
+                "description": "Use when reviewing authentication code.",
+                "triggers": ["review", "auth"],
+                "instructions": "Must inspect tests before suggesting changes.",
+            },
+            ttl_days=7,
+            source="test",
+        )
+
+    pack = service.context_pack(
+        "review auth behavior",
+        output_profile="minimal",
+        diagnostics="none",
+        max_items=2,
+    )
+
+    cards = pack["skill_guidance"]["cards"]
+    assert len(cards) == 2
+    assert [card["provider"] for card in cards] == ["claude", "custom"]
+
+
+def test_context_pack_skill_guidance_scans_all_memory_rows_before_limit(
+    service: ContextService,
+) -> None:
+    payload = service.memory._load()
+    timestamp = "2026-07-01T12:00:00+00:00"
+    payload["entries"] = [
+        {
+            "namespace": "notes/ci",
+            "key": f"noise-entry-{idx}",
+            "value": {
+                "name": f"Noise {idx}",
+                "description": "Unrelated entry noise.",
+            },
+            "confidence": 1.0,
+            "source": "test",
+            "tags": [],
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "expires_at": "",
+            "sensitivity": {},
+        }
+        for idx in range(1100)
+    ]
+    payload["summaries"] = [
+        {
+            "namespace": "notes/summaries",
+            "focus": f"noise-summary-{idx}",
+            "summary": "Unrelated summary noise used to create unrelated rows.",
+            "confidence": 1.0,
+            "source": "test",
+            "tags": [],
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "expires_at": "",
+            "sensitivity": {},
+        }
+        for idx in range(1100)
+    ]
+    payload["entries"].append(
+        {
+            "namespace": "skills/codex",
+            "key": "late-skill-guidance",
+            "value": {
+                "name": "Late Skill",
+                "description": "Use when reviewing late skill guidance.",
+                "triggers": ["review", "skills", "guidance"],
+                "instructions": "Use this skill for late guidance.",
+            },
+            "confidence": 1.0,
+            "source": "test",
+            "tags": [],
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "expires_at": "",
+            "sensitivity": {},
+        }
+    )
+    service.memory._save(payload)
+
+    pack = service.context_pack(
+        "review late skill guidance",
+        output_profile="compact",
+        max_items=2,
+    )
+
+    cards = pack["skill_guidance"]["cards"]
+    assert any(card["name"] == "Late Skill" for card in cards)
+
+
+def test_context_pack_skill_guidance_redacts_and_ignores_expired_or_nonmatching(
+    service: ContextService,
+) -> None:
+    service.context_memory(
+        mode="upsert",
+        namespace="skills/codex",
+        key="secret-skill",
+        value={
+            "name": "Secret Skill",
+            "description": "Use when debugging deployment tokens.",
+            "triggers": ["deployment", "token"],
+            "instructions": (
+                "Must inspect /home/user/private/token.txt and "
+                "API_TOKEN = super-secret-token-value-123456."
+            ),
+        },
+        ttl_days=7,
+        source="test",
+    )
+    service.context_memory(
+        mode="upsert",
+        namespace="skills/codex",
+        key="expired-skill",
+        value={
+            "name": "Expired Skill",
+            "description": "Use when debugging deployment tokens.",
+            "triggers": ["deployment", "token"],
+            "instructions": "Must not appear.",
+        },
+        ttl_days=-1,
+        source="test",
+    )
+    service.context_memory(
+        mode="upsert",
+        namespace="skills/codex",
+        key="docs-only",
+        value={
+            "name": "Docs Only",
+            "description": "Use when writing release notes.",
+            "triggers": ["release", "docs"],
+            "instructions": "Must not match deployment debugging.",
+        },
+        ttl_days=7,
+        source="test",
+    )
+
+    pack = service.context_pack(
+        "debug deployment token handling",
+        output_profile="compact",
+        max_items=2,
+    )
+    text = json.dumps(pack["skill_guidance"], sort_keys=True)
+    cache_text = json.dumps(
+        [row for _key, row in service.store.iter_json("cache:skill.compiled:")],
+        sort_keys=True,
+    )
+
+    assert "Secret Skill" in text
+    assert "Expired Skill" not in text
+    assert "Docs Only" not in text
+    assert "super-secret-token-value-123456" not in text
+    assert "/home/user/private/token.txt" not in text
+    assert "[REDACTED_SECRET_" in text
+    assert "[REDACTED_HOST_PATH]" in text
+    assert "super-secret-token-value-123456" not in cache_text
+    assert "/home/user/private/token.txt" not in cache_text
+
+
 def test_context_pack_prompt_echo_is_opt_in(service: ContextService) -> None:
     prompt = "review auth token behavior opt-in-prompt-echo"
 

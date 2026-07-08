@@ -1203,6 +1203,7 @@ def _performance_stage_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str
         "candidate_retrieval_ms",
         "search_ranking_ms",
         "snippet_batch_ms",
+        "skill_guidance_ms",
         "cache_lookup_ms",
         "reference_write_ms",
         "response_assembly_ms",
@@ -1257,6 +1258,10 @@ def _performance_cache_rows(
         (
             "retrieval cache",
             _namespace_cache_summary(metrics, "context_pack.retrieval"),
+        ),
+        (
+            "skill card cache",
+            _namespace_cache_summary(metrics, "skill.compiled"),
         ),
         ("warmup", _warmup_summary(metrics)),
     ]

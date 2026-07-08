@@ -6,6 +6,9 @@ Product explanation belongs in `README.md`. Implementation details belong in
 
 ## Mandatory MCP-First Workflow
 
+This workflow has first-level priority for repository work. Follow this order
+before any broad local inspection or other task-routing preference.
+
 Use `mcp-context-manager` before broad local inspection for coding, review,
 debug, test, docs, security, and general repository tasks.
 

@@ -24,6 +24,7 @@ CONTEXT_PACK_SCHEMA: dict[str, Any] = {
         "omitted_ref": {"type": "string"},
         "diagnostics_ref": {"type": "string"},
         "metrics": {"type": "object"},
+        "skill_guidance": {"type": "object"},
     },
 }
 

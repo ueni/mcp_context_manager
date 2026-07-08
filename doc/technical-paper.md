@@ -55,6 +55,16 @@ Resources expose bounded project data for clients that support MCP resources.
 Tools-only clients can use `context_admin(mode="instructions")` and
 `context_admin(mode="resource_proxy")` for equivalent access.
 
+Reusable skill guidance uses the existing memory surface rather than a new
+tool. Agents store non-secret skill records in `context_memory` namespaces such
+as `skills/codex`, `skills/claude`, `skills/copilot`, or `skills/custom`. Raw
+records are normal memory entries keyed by stable skill id; pre-summarized
+records are normal memory summaries. During `context_pack`, matching non-expired
+skill rows are compiled into deterministic compact cards and cached under the
+internal `skill.compiled` cache namespace. The response includes optional
+`skill_guidance` only when relevant cards exist, and never returns raw skill
+bodies.
+
 ## Project Resolution
 
 `ProjectContextService` routes every project-aware call to a project-local
