@@ -101,6 +101,20 @@ GENERIC_RETRIEVAL_TERMS = {
     "work",
     "world",
 }
+WARMUP_ROUTES = ("coding", "review", "debug", "test", "docs")
+WARMUP_ROUTE_DEFAULT_SEEDS = {
+    "coding": ("auth", "token", "config", "schema", "context", "server"),
+    "review": ("auth", "token", "schema", "metrics", "server", "context"),
+    "debug": ("error", "failure", "traceback", "timeout", "exception", "log"),
+    "test": ("pytest", "fixture", "coverage", "assert", "mock", "auth"),
+    "docs": ("readme", "docs", "manual", "usage", "example", "schema"),
+}
+WARMUP_MAX_SEEDS_PER_ROUTE = 8
+WARMUP_NEGATIVE_ZERO_RESULT_THRESHOLD = 2
+WARMUP_NEGATIVE_NEVER_SELECTED_THRESHOLD = 3
+WARMUP_MANIFEST_KEY = "warmup:manifest"
+WARMUP_NEGATIVE_TERMS_KEY = "warmup:negative_terms"
+WARMUP_ROUTE_SEEDS_KEY = "warmup:route_seeds"
 
 
 class ContextService:
@@ -541,6 +555,15 @@ class ContextService:
         )
         stage_timings["selection_ms"] = self._elapsed_ms(stage_started)
         omitted.extend(omitted_budget)
+        try:
+            self._warmup_record_context_pack_usage(
+                route=route,
+                terms=terms,
+                selected=selected,
+                retrieval_stats=retrieval_stats,
+            )
+        except Exception:
+            pass
         stage_started = time.perf_counter()
         full_reference = self.references.create(
             producer="context_pack",
@@ -1732,6 +1755,575 @@ class ContextService:
                 }
             )
         return deduped
+
+    def _warmup_path_scope(self, path: str) -> str:
+        scope = self._canonical_cache_path(path).replace("\\", "/").rstrip("/")
+        return scope or "."
+
+    def _warmup_term_stats_key(self, term: str, route: str, path_scope: str) -> str:
+        digest = sha256_text(
+            json.dumps(
+                {
+                    "project_id": self.config.project_id,
+                    "term": term,
+                    "route": route,
+                    "path_scope": path_scope,
+                },
+                sort_keys=True,
+            )
+        )[:24]
+        return f"warmup:term_stats:{digest}"
+
+    def _warmup_update_term_stats(
+        self,
+        term: str,
+        route: str,
+        path_scope: str,
+        result_count: int,
+        selected_count: int = 0,
+        cache_hit: bool | None = None,
+        selection_observed: bool = True,
+    ) -> None:
+        normalized = normalize_query_terms(term, max_terms=1)
+        if not normalized:
+            return
+        term = normalized[0]
+        if term in GENERIC_RETRIEVAL_TERMS:
+            return
+        route = route if route in WARMUP_ROUTES else "coding"
+        path_scope = self._warmup_path_scope(path_scope)
+        key = self._warmup_term_stats_key(term, route, path_scope)
+        now = now_iso()
+        row = self.store.get_json(key)
+        if not isinstance(row, dict):
+            row = {
+                "schema": "warmup.term_stats.v1",
+                "created_at": now,
+                "term": term,
+                "route": route,
+                "path_scope": path_scope,
+                "result_count": 0,
+                "result_count_total": 0,
+                "selected_count": 0,
+                "hit_total": 0,
+                "miss_total": 0,
+                "zero_result_count": 0,
+                "never_selected_count": 0,
+            }
+        result_count = max(0, int(result_count))
+        selected_count = max(0, int(selected_count))
+        row["schema"] = "warmup.term_stats.v1"
+        row["term"] = term
+        row["route"] = route
+        row["path_scope"] = path_scope
+        row["result_count"] = result_count
+        row["result_count_total"] = int(row.get("result_count_total", 0) or 0) + result_count
+        row["selected_count"] = int(row.get("selected_count", 0) or 0) + selected_count
+        if cache_hit is not None:
+            counter = "hit_total" if cache_hit else "miss_total"
+            row[counter] = int(row.get(counter, 0) or 0) + 1
+        if result_count > 0 or selected_count > 0:
+            row["zero_result_count"] = 0
+        elif result_count == 0:
+            row["zero_result_count"] = int(row.get("zero_result_count", 0) or 0) + 1
+        if selection_observed:
+            row["never_selected_count"] = (
+                0
+                if selected_count
+                else int(row.get("never_selected_count", 0) or 0) + 1
+            )
+        row["last_used_at"] = now
+        row["updated_at"] = now
+        self.store.put_json(key, row)
+
+    def _warmup_negative_terms(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for _key, row in self.store.iter_json("warmup:term_stats:"):
+            if not isinstance(row, dict):
+                continue
+            zero_count = int(row.get("zero_result_count", 0) or 0)
+            never_selected = int(row.get("never_selected_count", 0) or 0)
+            reason = ""
+            if zero_count >= WARMUP_NEGATIVE_ZERO_RESULT_THRESHOLD:
+                reason = "repeated_zero_results"
+            elif never_selected >= WARMUP_NEGATIVE_NEVER_SELECTED_THRESHOLD:
+                reason = "never_selected"
+            if not reason:
+                continue
+            rows.append(
+                {
+                    "term": str(row.get("term", "")),
+                    "route": str(row.get("route", "")),
+                    "path_scope": str(row.get("path_scope", ".")),
+                    "reason": reason,
+                    "zero_result_count": zero_count,
+                    "never_selected_count": never_selected,
+                    "last_used_at": str(row.get("last_used_at", "")),
+                }
+            )
+        rows.sort(key=lambda item: (item["term"], item["route"], item["path_scope"]))
+        self.store.put_json(
+            WARMUP_NEGATIVE_TERMS_KEY,
+            {
+                "schema": "warmup.negative_terms.v1",
+                "generated_at": now_iso(),
+                "terms": rows,
+            },
+        )
+        return rows
+
+    def _warmup_rebuild_route_seeds(self, path_scope: str = ".") -> dict[str, Any]:
+        path_scope = self._warmup_path_scope(path_scope)
+        negative_terms = self._warmup_negative_terms()
+        candidates: dict[str, list[dict[str, Any]]] = {route: [] for route in WARMUP_ROUTES}
+        for _key, row in self.store.iter_json("warmup:term_stats:"):
+            if not isinstance(row, dict):
+                continue
+            term = str(row.get("term", ""))
+            route = str(row.get("route", ""))
+            row_path_scope = self._warmup_path_scope(str(row.get("path_scope", ".")))
+            if (
+                route not in candidates
+                or not term
+                or self._warmup_is_negative_term(
+                    term=term,
+                    route=route,
+                    path_scope=row_path_scope,
+                    negative_terms=negative_terms,
+                )
+                or term in GENERIC_RETRIEVAL_TERMS
+                or int(row.get("selected_count", 0) or 0) <= 0
+            ):
+                continue
+            result_count_total = int(
+                row.get("result_count_total", 0) or row.get("result_count", 0) or 0
+            )
+            if result_count_total <= 0:
+                continue
+            row = {
+                **row,
+                "_result_count_total": result_count_total,
+                "_scope_rank": self._warmup_scope_rank(row_path_scope, path_scope),
+                "_last_used_sort": self._warmup_last_used_sort_value(row),
+            }
+            candidates[route].append(row)
+        route_seeds: dict[str, list[str]] = {}
+        route_seed_details: dict[str, list[dict[str, Any]]] = {}
+        for route, rows in candidates.items():
+            rows.sort(
+                key=lambda row: (
+                    -int(row.get("_scope_rank", 0) or 0),
+                    -int(row.get("selected_count", 0) or 0),
+                    -int(row.get("_result_count_total", 0) or 0),
+                    -float(row.get("_last_used_sort", 0.0) or 0.0),
+                    str(row.get("term", "")),
+                )
+            )
+            selected_rows = rows[:WARMUP_MAX_SEEDS_PER_ROUTE]
+            route_seeds[route] = [str(row.get("term", "")) for row in selected_rows if row.get("term")]
+            route_seed_details[route] = [
+                {
+                    "term": str(row.get("term", "")),
+                    "path_scope": str(row.get("path_scope", ".")),
+                    "selected_count": int(row.get("selected_count", 0) or 0),
+                    "result_count_total": int(
+                        row.get("_result_count_total", 0) or 0
+                    ),
+                    "last_used_at": str(row.get("last_used_at", "")),
+                }
+                for row in selected_rows
+                if row.get("term")
+            ]
+        payload = {
+            "schema": "warmup.route_seeds.v1",
+            "generated_at": now_iso(),
+            "path_scope": path_scope,
+            "route_seeds": route_seeds,
+            "route_seed_details": route_seed_details,
+            "negative_terms": self._warmup_negative_term_summary(negative_terms),
+        }
+        self.store.put_json(WARMUP_ROUTE_SEEDS_KEY, payload)
+        return payload
+
+    def _warmup_is_negative_term(
+        self,
+        term: str,
+        route: str,
+        path_scope: str,
+        negative_terms: list[dict[str, Any]],
+    ) -> bool:
+        path_scope = self._warmup_path_scope(path_scope)
+        for row in negative_terms:
+            if str(row.get("term", "")) != term or str(row.get("route", "")) != route:
+                continue
+            negative_scope = self._warmup_path_scope(str(row.get("path_scope", ".")))
+            if negative_scope == "." or path_scope == negative_scope:
+                return True
+            if path_scope.startswith(negative_scope + "/"):
+                return True
+        return False
+
+    def _warmup_negative_term_summary(
+        self, negative_terms: list[dict[str, Any]], max_entries: int = 20
+    ) -> dict[str, Any]:
+        limit = max(0, int(max_entries))
+        return {
+            "schema": "warmup.negative_terms.summary.v1",
+            "count": len(negative_terms),
+            "terms": negative_terms[:limit],
+            "omitted_count": max(0, len(negative_terms) - limit),
+        }
+
+    def _warmup_scope_rank(self, row_path_scope: str, requested_scope: str) -> int:
+        row_path_scope = self._warmup_path_scope(row_path_scope)
+        requested_scope = self._warmup_path_scope(requested_scope)
+        if requested_scope == ".":
+            return 2 if row_path_scope == "." else 1
+        if row_path_scope == requested_scope:
+            return 3
+        if row_path_scope == ".":
+            return 2
+        if row_path_scope.startswith(requested_scope + "/") or requested_scope.startswith(
+            row_path_scope + "/"
+        ):
+            return 1
+        return 0
+
+    def _warmup_last_used_sort_value(self, row: dict[str, Any]) -> float:
+        parsed = parse_iso(str(row.get("last_used_at", "")))
+        return parsed.timestamp() if parsed is not None else 0.0
+
+    def _warmup_seed_queries(
+        self, path_scope: str, max_entries: int
+    ) -> list[dict[str, str]]:
+        limit = max(0, int(max_entries))
+        if limit <= 0:
+            return []
+        path_scope = self._warmup_path_scope(path_scope)
+        route_seed_payload = self._warmup_rebuild_route_seeds(path_scope=path_scope)
+        route_seeds = route_seed_payload.get("route_seeds", {})
+        route_seeds = route_seeds if isinstance(route_seeds, dict) else {}
+        negative_terms = {
+            (
+                str(row.get("term", "")),
+                str(row.get("route", "")),
+                self._warmup_path_scope(str(row.get("path_scope", "."))),
+            )
+            for row in self._warmup_negative_terms()
+            if row.get("term")
+        }
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        def add(term: str, route: str, source: str) -> None:
+            if len(rows) >= limit:
+                return
+            normalized = normalize_query_terms(term, max_terms=1)
+            if not normalized:
+                return
+            normalized_term = normalized[0]
+            if (
+                normalized_term in seen
+                or normalized_term in GENERIC_RETRIEVAL_TERMS
+                or any(
+                    term == normalized_term
+                    and negative_route == route
+                    and (
+                        negative_scope == "."
+                        or path_scope == negative_scope
+                        or path_scope.startswith(negative_scope + "/")
+                    )
+                    for term, negative_route, negative_scope in negative_terms
+                )
+            ):
+                return
+            seen.add(normalized_term)
+            rows.append(
+                {
+                    "term": normalized_term,
+                    "route": route,
+                    "source": source,
+                    "path_scope": path_scope,
+                }
+            )
+
+        for route in WARMUP_ROUTES:
+            for term in route_seeds.get(route, []):
+                add(str(term), route, "route_seed")
+        for route in WARMUP_ROUTES:
+            for term in WARMUP_ROUTE_DEFAULT_SEEDS.get(route, ()):
+                add(term, route, "default_seed")
+        return rows
+
+    def _warmup_hot_chunk_key(self, path: str, line_anchor: int, route: str) -> str:
+        digest = sha256_text(
+            json.dumps(
+                {
+                    "project_id": self.config.project_id,
+                    "path": path,
+                    "line_anchor": max(0, int(line_anchor)),
+                    "route": route,
+                },
+                sort_keys=True,
+            )
+        )[:24]
+        return f"warmup:hot_chunks:{digest}"
+
+    def _warmup_test_owner_key(self, source_path: str) -> str:
+        digest = sha256_text(
+            json.dumps(
+                {"project_id": self.config.project_id, "source_path": source_path},
+                sort_keys=True,
+            )
+        )[:24]
+        return f"warmup:test_owner_targets:{digest}"
+
+    def _warmup_record_context_pack_usage(
+        self,
+        route: str,
+        terms: list[str],
+        selected: list[dict[str, Any]],
+        retrieval_stats: dict[str, Any],
+    ) -> None:
+        path_scope = "."
+        result_count = int(retrieval_stats.get("search_result_count", 0) or 0)
+        for term in self._reusable_retrieval_terms(terms):
+            selected_count = self._warmup_selected_count_for_term(term, selected)
+            self._warmup_update_term_stats(
+                term=term,
+                route=route,
+                path_scope=path_scope,
+                result_count=result_count,
+                selected_count=selected_count,
+                cache_hit=None,
+                selection_observed=True,
+            )
+        self._warmup_record_hot_chunks(route=route, selected=selected)
+        self._warmup_record_test_owner_targets(route=route, selected=selected)
+        self._warmup_rebuild_route_seeds()
+
+    def _warmup_selected_count_for_term(
+        self, term: str, selected: list[dict[str, Any]]
+    ) -> int:
+        term = term.lower()
+        count = 0
+        for item in selected:
+            text = " ".join(
+                [
+                    str(item.get("path", "")),
+                    str(item.get("title_hint", "")),
+                    str(item.get("content", "")),
+                    " ".join(str(row) for row in item.get("reason_codes", [])),
+                ]
+            ).lower()
+            if term in text:
+                count += 1
+        return count
+
+    def _warmup_record_hot_chunks(
+        self, route: str, selected: list[dict[str, Any]]
+    ) -> None:
+        route = route if route in WARMUP_ROUTES else "coding"
+        for item in selected:
+            path = str(item.get("path", ""))
+            if not path:
+                continue
+            try:
+                line_anchor = max(0, int(item.get("start_line", 1) or 1))
+                fingerprint = self._file_fingerprint(path)
+                chunk = self._chunk_metadata(fingerprint, line_anchor)
+            except Exception:
+                continue
+            key = self._warmup_hot_chunk_key(fingerprint["path"], line_anchor, route)
+            row = self.store.get_json(key)
+            if not isinstance(row, dict):
+                row = {
+                    "schema": "warmup.hot_chunks.v1",
+                    "created_at": now_iso(),
+                    "path": fingerprint["path"],
+                    "line_anchor": line_anchor,
+                    "route": route,
+                    "selected_count": 0,
+                }
+            row.update(
+                {
+                    "schema": "warmup.hot_chunks.v1",
+                    "path": fingerprint["path"],
+                    "line_anchor": line_anchor,
+                    "route": route,
+                    "file_fingerprint": fingerprint,
+                    "chunk": chunk,
+                    "selected_count": int(row.get("selected_count", 0) or 0) + 1,
+                    "last_selected_at": now_iso(),
+                    "updated_at": now_iso(),
+                }
+            )
+            self.store.put_json(key, row)
+
+    def _warmup_record_test_owner_targets(
+        self, route: str, selected: list[dict[str, Any]]
+    ) -> None:
+        if not (
+            (self.config.repo_path / "tests").is_dir()
+            or (self.config.repo_path / "test").is_dir()
+        ):
+            return
+        route = route if route in WARMUP_ROUTES else "coding"
+        source_paths: list[str] = []
+        for item in selected:
+            path = str(item.get("path", ""))
+            if (
+                path
+                and path not in source_paths
+                and not path.startswith(("tests/", "test/"))
+            ):
+                source_paths.append(path)
+            if len(source_paths) >= 2:
+                break
+        for source_path in source_paths:
+            try:
+                targets = self._test_owner_paths([source_path], max_results=4)
+            except Exception:
+                continue
+            if not targets:
+                continue
+            key = self._warmup_test_owner_key(source_path)
+            now = now_iso()
+            row = self.store.get_json(key)
+            selected_count = (
+                int(row.get("selected_count", 0) or 0) + 1
+                if isinstance(row, dict)
+                else 1
+            )
+            self.store.put_json(
+                key,
+                {
+                    "schema": "warmup.test_owner_targets.v1",
+                    "created_at": row.get("created_at", now)
+                    if isinstance(row, dict)
+                    else now,
+                    "updated_at": now,
+                    "source_path": source_path,
+                    "route": route,
+                    "targets": targets,
+                    "selected_count": selected_count,
+                },
+            )
+
+    def _warmup_hot_chunk_targets(
+        self, path_scope: str, max_targets: int
+    ) -> list[dict[str, Any]]:
+        path_scope = self._warmup_path_scope(path_scope)
+        rows: list[dict[str, Any]] = []
+        for _key, row in self.store.iter_json("warmup:hot_chunks:"):
+            if not isinstance(row, dict):
+                continue
+            rows.append(row)
+        rows.sort(
+            key=lambda row: (
+                -int(row.get("selected_count", 0) or 0),
+                str(row.get("path", "")),
+                int(row.get("line_anchor", 0) or 0),
+            )
+        )
+        targets: list[dict[str, Any]] = []
+        for row in rows:
+            if len(targets) >= max_targets:
+                break
+            path = str(row.get("path", ""))
+            if not self._warmup_path_in_scope(path, path_scope):
+                continue
+            try:
+                fingerprint = self._file_fingerprint(path)
+            except Exception:
+                continue
+            stored_fingerprint = row.get("file_fingerprint", {})
+            stored_fingerprint = (
+                stored_fingerprint if isinstance(stored_fingerprint, dict) else {}
+            )
+            if str(stored_fingerprint.get("cache_token", "")) != str(
+                fingerprint.get("cache_token", "")
+            ):
+                continue
+            targets.append(
+                {
+                    "path": path,
+                    "line_anchor": max(0, int(row.get("line_anchor", 0) or 0)),
+                    "source": "hot_chunk",
+                    "route": str(row.get("route", "")),
+                }
+            )
+        return targets
+
+    def _warmup_test_owner_summary_targets(
+        self, path_scope: str, max_targets: int
+    ) -> list[dict[str, Any]]:
+        path_scope = self._warmup_path_scope(path_scope)
+        targets: list[dict[str, Any]] = []
+        for _key, row in self.store.iter_json("warmup:test_owner_targets:"):
+            if not isinstance(row, dict):
+                continue
+            source_path = str(row.get("source_path", ""))
+            if not self._warmup_path_in_scope(source_path, path_scope):
+                continue
+            for target in row.get("targets", []):
+                if len(targets) >= max_targets:
+                    return targets
+                if not isinstance(target, dict):
+                    continue
+                path = str(target.get("path", ""))
+                if not path:
+                    continue
+                try:
+                    resolved = self.config.resolve_repo_path(path)
+                except ValueError:
+                    continue
+                if not resolved.is_file():
+                    continue
+                targets.append(
+                    {
+                        "path": path,
+                        "line_anchor": 1,
+                        "source": "test_owner",
+                        "source_path": source_path,
+                    }
+                )
+        return targets
+
+    def _warmup_path_in_scope(self, path: str, path_scope: str) -> bool:
+        if path_scope in {"", "."}:
+            return True
+        return path == path_scope or path.startswith(path_scope + "/")
+
+    def _warmup_write_manifest(
+        self,
+        refresh_signature: str,
+        refresh_signature_available: bool,
+        path_scope: str,
+        warmed_terms: list[dict[str, Any]],
+        warmed_summaries: list[dict[str, Any]],
+        negative_terms: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        manifest = {
+            "schema": "warmup.manifest.v1",
+            "generated_at": now_iso(),
+            "project_id": self.config.project_id,
+            "refresh_signature": refresh_signature,
+            "refresh_signature_available": refresh_signature_available,
+            "path_scope": self._warmup_path_scope(path_scope),
+            "fallback_policy": {
+                "context_pack_search_allow_fallback": False,
+                "context_lookup_search_warmed": False,
+            },
+            "warmed_terms": warmed_terms[:50],
+            "warmed_summaries": warmed_summaries[:80],
+            "negative_terms": self._warmup_negative_term_summary(
+                negative_terms,
+                max_entries=50,
+            ),
+        }
+        self.store.put_json(WARMUP_MANIFEST_KEY, manifest)
+        return manifest
 
     def _effective_output_profile(
         self, output_profile: str | None, client_profile: str
@@ -2926,6 +3518,7 @@ class ContextService:
             )
         stage_timings["index_refresh_ms"] = self._elapsed_ms(index_started)
         refresh_signature, refresh_signature_available = self._current_refresh_signature()
+        path_scope = self._warmup_path_scope(path)
 
         facts_started = time.perf_counter()
         facts: dict[str, Any] = {}
@@ -2999,7 +3592,24 @@ class ContextService:
             )
         stage_timings["search_ms"] = self._elapsed_ms(search_started)
 
-        file_summary_targets.extend(symbol_summary_targets)
+        hot_chunk_targets: list[dict[str, Any]] = []
+        test_owner_targets: list[dict[str, Any]] = []
+        if max_entries > 0:
+            metadata_target_limit = max(0, min(int(max_entries) * 2, 40))
+            hot_chunk_targets = self._warmup_hot_chunk_targets(
+                path_scope=path_scope,
+                max_targets=metadata_target_limit,
+            )
+            test_owner_targets = self._warmup_test_owner_summary_targets(
+                path_scope=path_scope,
+                max_targets=metadata_target_limit,
+            )
+        file_summary_targets = [
+            *hot_chunk_targets,
+            *test_owner_targets,
+            *file_summary_targets,
+            *symbol_summary_targets,
+        ]
         file_summary_targets = self._dedupe_file_summary_targets(file_summary_targets)
         file_summary_stats: dict[str, int | dict[str, int]] = {
             "summary_count": 0,
@@ -3007,6 +3617,7 @@ class ContextService:
             "misses": 0,
             "source_counts": {},
         }
+        warmed_summary_targets: list[dict[str, Any]] = []
         file_summary_started = time.perf_counter()
         if max_entries > 0:
             for target in file_summary_targets:
@@ -3036,6 +3647,16 @@ class ContextService:
                 file_summary_stats["summary_count"] = int(
                     file_summary_stats["summary_count"]
                 ) + 1
+                warmed_summary_targets.append(
+                    {
+                        "path": str(target.get("path", "")),
+                        "line_anchor": max(
+                            0, int(target.get("line_anchor", 0) or 0)
+                        ),
+                        "source": source,
+                        "cache_hit": summary_hit,
+                    }
+                )
                 source_counts = file_summary_stats.setdefault("source_counts", {})
                 source_counts[source] = int(source_counts.get(source, 0)) + 1
         stage_timings["file_summary_ms"] = self._elapsed_ms(file_summary_started)
@@ -3045,6 +3666,20 @@ class ContextService:
         warmed_searches = [
             row for row in search_rows if row.get("reason_code") != "search_warmup_failed"
         ]
+        negative_terms = self._warmup_negative_terms()
+        route_seed_payload = self._warmup_rebuild_route_seeds(path_scope=path_scope)
+        negative_term_summary = self._warmup_negative_term_summary(
+            negative_terms,
+            max_entries=max_entries,
+        )
+        manifest = self._warmup_write_manifest(
+            refresh_signature=refresh_signature,
+            refresh_signature_available=refresh_signature_available,
+            path_scope=path_scope,
+            warmed_terms=warmed_searches,
+            warmed_summaries=warmed_summary_targets,
+            negative_terms=negative_terms,
+        )
         cache_after = self._cache_stats()
         elapsed_ms = self._elapsed_ms(started)
         self.metrics.record_event(
@@ -3094,7 +3729,7 @@ class ContextService:
                 "limit": max(0, min(int(max_entries), 100)),
             },
             "search_cache": {
-                "namespace": "context_lookup.search",
+                "namespace": "context_pack.search",
                 "path": path,
                 "query_count": len(warmed_searches),
                 "queries": warmed_searches,
@@ -3112,6 +3747,25 @@ class ContextService:
                     )
                 ),
             },
+            "term_stats": {
+                "namespace": "warmup.term_stats",
+                "updated_count": len(
+                    self.store.iter_json("warmup:term_stats:")
+                ),
+                "negative_terms": negative_term_summary,
+            },
+            "route_seeds": route_seed_payload,
+            "hot_chunks": {
+                "namespace": "warmup.hot_chunks",
+                "target_count": len(hot_chunk_targets),
+                "targets": hot_chunk_targets,
+            },
+            "test_owner_targets": {
+                "namespace": "warmup.test_owner_targets",
+                "target_count": len(test_owner_targets),
+                "targets": test_owner_targets,
+            },
+            "manifest": manifest,
             "stage_timings_ms": stage_timings,
             "cache": {
                 "entry_count_before": int(cache_before.get("entry_count", 0) or 0),
@@ -3127,37 +3781,36 @@ class ContextService:
     def _warm_search_caches(
         self, path: str = ".", max_entries: int = 100
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        seed_queries = (
-            "test",
-            "debug",
-            "review",
-            "config",
-            "readme",
-            "build",
-            "cache",
-            "index",
-            "context",
-            "schema",
-            "metrics",
-            "symbols",
-            "memory",
-            "server",
-            "error",
+        seed_queries = self._warmup_seed_queries(
+            path_scope=path,
+            max_entries=max_entries,
         )
-        query_limit = max(0, min(int(max_entries), len(seed_queries)))
         search_result_limit = max(0, min(int(max_entries) * 4, 80))
         rows: list[dict[str, Any]] = []
         file_summary_targets: list[dict[str, Any]] = []
         search_summary_budget = search_result_limit
-        for query in seed_queries[:query_limit]:
+        for seed in seed_queries:
+            query = seed["term"]
+            route = seed["route"]
             try:
                 result, cache = self._cached_search(
                     query=query,
                     path=path,
                     max_results=search_result_limit,
                     include_globs=None,
-                    public_namespace="context_lookup.search",
+                    public_namespace="context_pack.search",
+                    reusable_terms=[query],
                     allow_fallback=False,
+                    include_index=False,
+                )
+                self._warmup_update_term_stats(
+                    term=query,
+                    route=route,
+                    path_scope=path,
+                    result_count=int(result.get("count", 0) or 0),
+                    selected_count=0,
+                    cache_hit=bool(cache.get("hit")),
+                    selection_observed=False,
                 )
                 for row in result.get("results", [])[:search_summary_budget]:
                     if search_summary_budget <= 0:
@@ -3181,6 +3834,9 @@ class ContextService:
                 rows.append(
                     {
                         "query": query,
+                        "term": query,
+                        "route": route,
+                        "source": seed["source"],
                         "reason_code": "search_warmup_failed",
                         "detail": type(exc).__name__,
                     }
@@ -3189,6 +3845,9 @@ class ContextService:
             rows.append(
                 {
                     "query": query,
+                    "term": query,
+                    "route": route,
+                    "source": seed["source"],
                     "path": path,
                     "cache_hit": bool(cache.get("hit")),
                     "cache_reason": str(cache.get("reason") or "miss"),
@@ -4030,6 +4689,17 @@ class ContextService:
         namespace = str(row.get("namespace", ""))
         metadata = row.get("metadata", {})
         metadata = metadata if isinstance(metadata, dict) else {}
+        if namespace == "context_pack.retrieval":
+            return {
+                "status": "stale",
+                "reason": "unsupported_generated_state",
+                "warnings": [
+                    {
+                        "code": "cache_unsupported",
+                        "message": "whole context_pack retrieval rows are not reusable",
+                    }
+                ],
+            }
         if namespace in FRAGMENT_CACHE_NAMESPACES:
             schema_version = int(
                 row.get("schema_version")

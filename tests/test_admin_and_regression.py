@@ -13,6 +13,8 @@ from mcp_context_manager.context import (
     CACHE_LAST_PRUNED_KEY,
     DEFAULT_CACHE_TTL_SECONDS,
     DEFAULT_WARMUP_MAX_FILES,
+    GENERIC_RETRIEVAL_TERMS,
+    WARMUP_MANIFEST_KEY,
     ContextService,
 )
 
@@ -220,11 +222,15 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert warmup["index"]["default_limited"] is True
     assert warmup["index"]["file_count"] >= 1
     assert warmup["workspace"]["file_count"] >= 1
-    assert warmup["search_cache"]["namespace"] == "context_lookup.search"
+    assert warmup["search_cache"]["namespace"] == "context_pack.search"
     assert warmup["search_cache"]["path"] == "src"
     assert warmup["stage_timings_ms"]["search_ms"] >= 0
     assert warmup["stage_timings_ms"]["file_summary_ms"] >= 0
     assert warmup["search_cache"]["query_count"] == 3
+    assert {
+        row["term"] for row in warmup["search_cache"]["queries"]
+    }.isdisjoint(GENERIC_RETRIEVAL_TERMS)
+    assert all(row["source"] in {"default_seed", "route_seed"} for row in warmup["search_cache"]["queries"])
     assert warmup["file_summary_cache"]["summary_count"] > 0
     assert warmup["file_summary_cache"]["summary_count"] <= (min(3 * 4, 80) + min(3 * 2, 40))
     assert warmup["file_summary_cache"]["hits"] + warmup["file_summary_cache"]["misses"] == warmup["file_summary_cache"]["summary_count"]
@@ -236,7 +242,39 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert fallback_flags == []
     assert warmup["cache"]["entry_count_after"] >= warmup["search_cache"]["query_count"]
     assert "retrieval.search_term" in warmup["cache"]["namespaces_after"]
+    assert "context_lookup.search" not in warmup["cache"]["namespaces_after"]
     assert "context_pack.retrieval" not in warmup["cache"]["namespaces_after"]
+    assert warmup["term_stats"]["namespace"] == "warmup.term_stats"
+    assert warmup["term_stats"]["updated_count"] >= warmup["search_cache"]["query_count"]
+    assert warmup["route_seeds"]["schema"] == "warmup.route_seeds.v1"
+    assert warmup["hot_chunks"]["namespace"] == "warmup.hot_chunks"
+    assert warmup["test_owner_targets"]["namespace"] == "warmup.test_owner_targets"
+    assert warmup["manifest"]["schema"] == "warmup.manifest.v1"
+    assert warmup["manifest"]["path_scope"] == "src"
+    assert warmup["manifest"]["fallback_policy"] == {
+        "context_pack_search_allow_fallback": False,
+        "context_lookup_search_warmed": False,
+    }
+    assert service.store.get_json(WARMUP_MANIFEST_KEY)["refresh_signature"] == warmup[
+        "manifest"
+    ]["refresh_signature"]
+    state = service.context_admin(
+        mode="state_browser",
+        state_prefix="warmup:",
+        max_entries=20,
+    )
+    assert state["entry_count"] >= 3
+    assert {
+        row["schema"]
+        for row in state["rows"]
+        if row["schema"].startswith("warmup.")
+    }.issuperset(
+        {
+            "warmup.manifest.v1",
+            "warmup.negative_terms.v1",
+            "warmup.route_seeds.v1",
+        }
+    )
     metrics = service.context_admin(mode="metrics")
     assert metrics["warmup"]["schema"] == "context_warmup.metrics.v1"
     assert metrics["warmup"]["count"] == 1
@@ -274,6 +312,315 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert explicit["file_summary_cache"]["summary_count"] == 0
     assert explicit["stage_timings_ms"]["search_ms"] >= 0
     assert explicit["stage_timings_ms"]["file_summary_ms"] >= 0
+
+
+def test_warmup_prefers_learned_route_terms_and_records_hot_chunks(
+    service: ContextService,
+) -> None:
+    service.context_pack(
+        "review auth token behavior",
+        max_items=2,
+        output_profile="compact",
+    )
+
+    warmup = service.context_admin(mode="warmup", max_entries=2)
+    warmed_terms = [row["term"] for row in warmup["search_cache"]["queries"]]
+
+    assert set(warmed_terms) == {"auth", "token"}
+    assert all(row["source"] == "route_seed" for row in warmup["search_cache"]["queries"])
+    assert set(warmup["route_seeds"]["route_seeds"]["review"][:2]) == {
+        "auth",
+        "token",
+    }
+    assert warmup["hot_chunks"]["target_count"] >= 1
+    assert warmup["file_summary_cache"]["source_counts"]["hot_chunk"] >= 1
+    assert {
+        row["term"] for row in warmup["manifest"]["warmed_terms"]
+    }.issuperset({"auth", "token"})
+    assert warmup["manifest"]["warmed_summaries"]
+
+    hot_rows = [
+        row
+        for _key, row in service.store.iter_json("warmup:hot_chunks:")
+        if isinstance(row, dict)
+    ]
+    assert hot_rows
+    assert all(row["file_fingerprint"]["cache_token"] for row in hot_rows)
+
+
+def test_warmup_route_seeds_prefer_matching_path_scope(
+    service: ContextService,
+) -> None:
+    service.store.put_json(
+        "warmup:term_stats:global-auth",
+        {
+            "schema": "warmup.term_stats.v1",
+            "term": "auth",
+            "route": "review",
+            "path_scope": ".",
+            "result_count": 10,
+            "result_count_total": 10,
+            "selected_count": 5,
+            "hit_total": 0,
+            "miss_total": 1,
+            "zero_result_count": 0,
+            "never_selected_count": 0,
+            "last_used_at": "2026-07-09T00:00:00+00:00",
+        },
+    )
+    service.store.put_json(
+        "warmup:term_stats:scoped-token",
+        {
+            "schema": "warmup.term_stats.v1",
+            "term": "token",
+            "route": "review",
+            "path_scope": "src",
+            "result_count": 4,
+            "result_count_total": 4,
+            "selected_count": 1,
+            "hit_total": 0,
+            "miss_total": 1,
+            "zero_result_count": 0,
+            "never_selected_count": 0,
+            "last_used_at": "2026-07-09T01:00:00+00:00",
+        },
+    )
+
+    warmup = service.context_admin(mode="warmup", path="src", max_entries=1)
+
+    assert warmup["search_cache"]["queries"][0]["term"] == "token"
+    assert warmup["route_seeds"]["path_scope"] == "src"
+    assert warmup["route_seeds"]["route_seed_details"]["review"][0] == {
+        "term": "token",
+        "path_scope": "src",
+        "selected_count": 1,
+        "result_count_total": 4,
+        "last_used_at": "2026-07-09T01:00:00+00:00",
+    }
+
+
+def test_warmup_raises_mixed_route_fragment_hit_ratio(
+    service: ContextService,
+) -> None:
+    warmup = service.context_admin(mode="warmup", max_entries=20)
+    assert warmup["search_cache"]["query_count"] >= 10
+    assert warmup["file_summary_cache"]["summary_count"] > 0
+
+    prompts = [
+        ("Implement safer token handling in src/auth.py", ["src/auth.py"]),
+        ("Review auth token behavior and related tests", []),
+        ("Debug missing user login error in auth service", []),
+        ("Update pytest coverage for issue_token auth behavior", []),
+        ("Update README docs for authentication token behavior", []),
+    ]
+    fragment_hits = 0
+    fragment_misses = 0
+    for prompt, focus_paths in prompts:
+        pack = service.context_pack(
+            prompt,
+            focus_paths=focus_paths,
+            max_items=4,
+            output_profile="compact",
+        )
+        assert pack["cache"]["namespace"] == "context_pack.fragments"
+        fragment_hits += int(pack["cache"]["fragment_hits"])
+        fragment_misses += int(pack["cache"]["fragment_misses"])
+
+    assert fragment_hits + fragment_misses > 0
+    assert fragment_hits / (fragment_hits + fragment_misses) >= 0.70
+
+
+def test_warmup_skips_negative_and_generic_terms(
+    service: ContextService,
+    monkeypatch,
+) -> None:
+    service.store.put_json(
+        "warmup:term_stats:generic-review",
+        {
+            "schema": "warmup.term_stats.v1",
+            "term": "review",
+            "route": "review",
+            "path_scope": ".",
+            "result_count": 5,
+            "result_count_total": 5,
+            "selected_count": 3,
+            "hit_total": 0,
+            "miss_total": 1,
+            "zero_result_count": 0,
+            "never_selected_count": 0,
+            "last_used_at": "2026-07-09T00:00:00+00:00",
+        },
+    )
+    service._warmup_update_term_stats(
+        term="auth",
+        route="coding",
+        path_scope=".",
+        result_count=0,
+        cache_hit=False,
+        selection_observed=False,
+    )
+    service._warmup_update_term_stats(
+        term="auth",
+        route="coding",
+        path_scope=".",
+        result_count=0,
+        cache_hit=False,
+        selection_observed=False,
+    )
+
+    original_search_fragment = service.index.search_fragment
+    observed_terms: list[str] = []
+
+    def tracked_search_fragment(*args, **kwargs):
+        observed_terms.append(str(kwargs.get("term", args[0] if args else "")))
+        return original_search_fragment(*args, **kwargs)
+
+    monkeypatch.setattr(service.index, "search_fragment", tracked_search_fragment)
+
+    warmup = service.context_admin(mode="warmup", max_entries=3)
+    warmed_terms = [row["term"] for row in warmup["search_cache"]["queries"]]
+
+    assert "auth" not in warmed_terms
+    assert "review" not in warmed_terms
+    assert set(warmed_terms).isdisjoint(GENERIC_RETRIEVAL_TERMS)
+    assert observed_terms == warmed_terms
+    assert any(
+        row["term"] == "auth" and row["reason"] == "repeated_zero_results"
+        for row in warmup["term_stats"]["negative_terms"]["terms"]
+    )
+    assert "auth" in warmup["manifest"]["negative_terms"]["terms"][0]["term"]
+
+
+def test_warmup_term_stats_clear_zero_results_after_success(
+    service: ContextService,
+) -> None:
+    for _ in range(2):
+        service._warmup_update_term_stats(
+            term="auth",
+            route="coding",
+            path_scope=".",
+            result_count=0,
+            cache_hit=False,
+            selection_observed=False,
+        )
+
+    assert any(row["term"] == "auth" for row in service._warmup_negative_terms())
+
+    service._warmup_update_term_stats(
+        term="auth",
+        route="coding",
+        path_scope=".",
+        result_count=3,
+        selected_count=1,
+        cache_hit=False,
+        selection_observed=True,
+    )
+
+    row = next(
+        row
+        for _key, row in service.store.iter_json("warmup:term_stats:")
+        if isinstance(row, dict) and row.get("term") == "auth"
+    )
+    assert row["zero_result_count"] == 0
+    assert row["never_selected_count"] == 0
+    assert not any(row["term"] == "auth" for row in service._warmup_negative_terms())
+
+
+def test_warmup_negative_terms_are_route_and_scope_specific(
+    service: ContextService,
+) -> None:
+    for _ in range(2):
+        service._warmup_update_term_stats(
+            term="auth",
+            route="docs",
+            path_scope="docs",
+            result_count=0,
+            cache_hit=False,
+            selection_observed=False,
+        )
+    service.store.put_json(
+        "warmup:term_stats:src-auth",
+        {
+            "schema": "warmup.term_stats.v1",
+            "term": "auth",
+            "route": "review",
+            "path_scope": "src",
+            "result_count": 4,
+            "result_count_total": 4,
+            "selected_count": 2,
+            "hit_total": 0,
+            "miss_total": 1,
+            "zero_result_count": 0,
+            "never_selected_count": 0,
+            "last_used_at": "2026-07-09T01:00:00+00:00",
+        },
+    )
+
+    warmup = service.context_admin(mode="warmup", path="src", max_entries=1)
+
+    assert warmup["search_cache"]["queries"][0]["term"] == "auth"
+    assert warmup["search_cache"]["queries"][0]["route"] == "review"
+    assert warmup["term_stats"]["negative_terms"]["terms"][0]["route"] == "docs"
+
+
+def test_warmup_negative_terms_are_capped_in_public_response(
+    service: ContextService,
+) -> None:
+    for index in range(4):
+        term = f"term{index}"
+        for _ in range(2):
+            service._warmup_update_term_stats(
+                term=term,
+                route="coding",
+                path_scope=".",
+                result_count=0,
+                cache_hit=False,
+                selection_observed=False,
+            )
+
+    warmup = service.context_admin(mode="warmup", max_entries=2)
+
+    negative_terms = warmup["term_stats"]["negative_terms"]
+    assert negative_terms["count"] >= 4
+    assert len(negative_terms["terms"]) == 2
+    assert negative_terms["omitted_count"] >= 2
+
+
+def test_warmup_includes_test_owner_summary_targets(
+    service: ContextService,
+    monkeypatch,
+) -> None:
+    service.context_pack(
+        "review src/auth.py auth behavior",
+        focus_paths=["src/auth.py"],
+        max_items=2,
+        output_profile="compact",
+    )
+
+    original_cached_file_summary = service._cached_file_summary
+    warmed_paths: list[str] = []
+
+    def tracked_file_summary(
+        path: str,
+        line_anchor: int,
+        refresh_signature: str,
+        refresh_signature_available: bool,
+    ) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+        warmed_paths.append(path)
+        return original_cached_file_summary(
+            path=path,
+            line_anchor=line_anchor,
+            refresh_signature=refresh_signature,
+            refresh_signature_available=refresh_signature_available,
+        )
+
+    monkeypatch.setattr(service, "_cached_file_summary", tracked_file_summary)
+
+    warmup = service.context_admin(mode="warmup", path="src", max_entries=1)
+
+    assert "tests/test_auth.py" in warmed_paths
+    assert warmup["test_owner_targets"]["target_count"] >= 1
+    assert warmup["file_summary_cache"]["source_counts"]["test_owner"] >= 1
 
 
 def test_context_lookup_search_keeps_public_fallback_search_path(
@@ -542,6 +889,45 @@ def test_context_pack_does_not_write_whole_retrieval_cache(
     assert pack["cache"]["hit"] is False
     assert pack["cache"]["namespace"] == "context_pack.fragments"
     assert pack["cache"]["key"].startswith("context_pack.fragments:")
+    assert whole_pack_rows == []
+
+
+def test_unsupported_context_pack_retrieval_rows_are_stale_and_pruned(
+    service: ContextService,
+) -> None:
+    service.store.put_json(
+        "cache:context_pack.retrieval:legacy",
+        {
+            "schema": "context_cache.entry.v2",
+            "schema_version": 2,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+            "ttl_seconds": DEFAULT_CACHE_TTL_SECONDS,
+            "status": "active",
+            "namespace": "context_pack.retrieval",
+            "key": "context_pack.retrieval:legacy",
+            "metadata": {"schema_version": 2},
+            "value": {"schema": "context_pack.retrieval.v1"},
+        },
+    )
+
+    stats = service.context_admin(mode="cache_stats")
+
+    assert stats["namespaces"]["context_pack.retrieval"]["stale_count"] == 1
+    assert stats["namespaces"]["context_pack.retrieval"]["legacy_count"] == 0
+
+    pruned = service.context_admin(mode="cache_prune")
+    pack = service.context_pack("review auth token behavior", max_items=2)
+    whole_pack_rows = [
+        row
+        for _key, row in service.store.iter_json("cache:")
+        if isinstance(row, dict) and row.get("namespace") == "context_pack.retrieval"
+    ]
+
+    assert pruned["stale_removed"] >= 1
+    assert service.store.get_json("cache:context_pack.retrieval:legacy") is None
+    assert pack["cache"]["namespace"] == "context_pack.fragments"
     assert whole_pack_rows == []
 
 

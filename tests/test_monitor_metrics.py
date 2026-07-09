@@ -187,6 +187,13 @@ class FakeClient:
                 "project_id": project_id,
                 "index": {"file_count": 12},
                 "search_cache": {"query_count": 3},
+                "file_summary_cache": {
+                    "summary_count": 5,
+                    "hits": 2,
+                    "misses": 3,
+                },
+                "hot_chunks": {"target_count": 2},
+                "test_owner_targets": {"target_count": 4},
             }
         if mode == "state_browser":
             state_key = str(arguments.get("state_key") or "")
@@ -948,7 +955,11 @@ def test_warmup_selected_project_calls_admin_and_sets_status() -> None:
 
     assert updated == snapshots
     assert state.mcp_error == ""
-    assert state.mcp_status == "warmed Alpha: 3 queries, 12 files"
+    assert (
+        state.mcp_status
+        == "warmed Alpha: 3 terms, 5 summaries (2 hit/3 miss), "
+        "2 hot chunks, 4 test targets, 12 files"
+    )
     assert (
         "context_admin",
         {"mode": "warmup", "project_id": "alpha-123"},

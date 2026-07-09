@@ -1589,9 +1589,8 @@ def _bar(ratio: float, width: int, color: bool) -> str:
 def _legend(color: bool) -> str:
     return (
         f"{_style('checks', color, Ansi.BOLD)} come from "
-        "context_admin(mode='metrics_and_matrix') checks; cache bars show request "
-        "and "
-        "fragment hit ratios."
+        "context_admin(mode='metrics_and_matrix') checks; cache bars show "
+        "context-pack fragment hit ratios."
     )
 
 
@@ -2123,10 +2122,40 @@ def _apply_warmup_result(state: MonitorState, result: WarmupResult) -> None:
         return
     payload = result.payload or {}
     project = _project_name(result.target) if result.target else "-"
-    query_count = _int_at(payload, ("search_cache", "query_count"))
-    file_count = _int_at(payload, ("index", "file_count"))
-    state.mcp_status = f"warmed {project}: {query_count} queries, {file_count} files"
+    state.mcp_status = f"warmed {project}: {_warmup_result_summary(payload)}"
     state.mcp_error = ""
+
+
+def _warmup_result_summary(payload: dict[str, Any]) -> str:
+    terms = _int_at(payload, ("search_cache", "query_count"))
+    files = _int_at(payload, ("index", "file_count"))
+    parts = [f"{fmt_int(terms)} terms"]
+
+    file_summary_cache = payload.get("file_summary_cache")
+    if isinstance(file_summary_cache, dict):
+        summaries = _int_at(payload, ("file_summary_cache", "summary_count"))
+        hits = _int_at(payload, ("file_summary_cache", "hits"))
+        misses = _int_at(payload, ("file_summary_cache", "misses"))
+        parts.append(
+            f"{fmt_int(summaries)} summaries "
+            f"({fmt_int(hits)} hit/{fmt_int(misses)} miss)"
+        )
+
+    hot_chunks = payload.get("hot_chunks")
+    if isinstance(hot_chunks, dict):
+        parts.append(
+            f"{fmt_int(_int_at(payload, ('hot_chunks', 'target_count')))} hot chunks"
+        )
+
+    test_owner_targets = payload.get("test_owner_targets")
+    if isinstance(test_owner_targets, dict):
+        parts.append(
+            f"{fmt_int(_int_at(payload, ('test_owner_targets', 'target_count')))} "
+            "test targets"
+        )
+
+    parts.append(f"{fmt_int(files)} files")
+    return ", ".join(parts)
 
 
 def _apply_mcp_operation_result(
