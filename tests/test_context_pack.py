@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from mcp_context_manager.context import ContextService
+from mcp_context_manager.context import WARMUP_AUTO_LEARN_KEY, ContextService
 
 
 def test_context_pack_returns_cited_budgeted_items_and_reference(service: ContextService) -> None:
@@ -84,6 +84,52 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     resolved = service.result_reference_resolve(reference=pack["references"][0])
     assert resolved["status"] == "resolved"
     assert resolved["content"]["candidate_count"] >= pack["summary"]["item_count"]
+
+
+def test_context_pack_records_bounded_auto_learn_state(service: ContextService) -> None:
+    service.context_pack(
+        "review auth token behavior",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+
+    state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
+
+    assert state["schema"] == "warmup.auto_learn.v1"
+    assert state["enabled"] is True
+    assert state["observed_context_pack_count"] == 1
+    assert state["last_reason_code"] == "below_min_packs"
+    assert state["last_route"] == "review"
+    assert state["learned_target_counts"]["route_seeds"] >= 1
+    assert "prompt" not in json.dumps(state)
+    assert str(service.config.repo_path) not in json.dumps(state)
+
+
+def test_context_pack_does_not_iter_json_warmup_target_prefixes(
+    service: ContextService, monkeypatch
+) -> None:
+    original_iter_json = service.store.iter_json
+    called_prefixes: list[str] = []
+
+    def tracked_iter_json(prefix: str, *args, **kwargs):
+        called_prefixes.append(prefix)
+        return original_iter_json(prefix, *args, **kwargs)
+
+    monkeypatch.setattr(service.store, "iter_json", tracked_iter_json)
+
+    service.context_pack(
+        "review auth token behavior",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+
+    assert not any(
+        str(prefix).startswith("warmup:hot_chunks:")
+        or str(prefix).startswith("warmup:test_owner_targets:")
+        for prefix in called_prefixes
+    )
 
 
 def test_context_pack_redacts_secret_like_content(service: ContextService, sample_repo) -> None:

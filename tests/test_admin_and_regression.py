@@ -14,6 +14,8 @@ from mcp_context_manager.context import (
     DEFAULT_CACHE_TTL_SECONDS,
     DEFAULT_WARMUP_MAX_FILES,
     GENERIC_RETRIEVAL_TERMS,
+    WARMUP_AUTO_JOB_KIND,
+    WARMUP_AUTO_LEARN_KEY,
     WARMUP_MANIFEST_KEY,
     ContextService,
 )
@@ -78,6 +80,21 @@ def _search_fragment_cache_row(
         if isinstance(row, dict) and row.get("metadata", {}).get("term") == term:
             return key, row
     raise AssertionError(f"missing search fragment cache row for {term}")
+
+
+def _wait_for_auto_warmup(service: ContextService, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = service.store.get_json(WARMUP_AUTO_LEARN_KEY, {})
+        background = service._background_status()[WARMUP_AUTO_JOB_KIND]
+        if (
+            isinstance(state, dict)
+            and state.get("last_auto_status") == "complete"
+            and not background.get("pending")
+        ):
+            return
+        Event().wait(0.01)
+    raise AssertionError("auto warmup did not complete")
 
 
 def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
@@ -217,6 +234,7 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     warmup = service.context_admin(mode="warmup", path="src", max_entries=3)
 
     assert warmup["schema"] == "context_cache.warmup.v1"
+    assert warmup["trigger"] == "manual"
     assert warmup["state"]["store_exists"] is True
     assert warmup["index"]["max_files"] == DEFAULT_WARMUP_MAX_FILES
     assert warmup["index"]["default_limited"] is True
@@ -250,6 +268,7 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert warmup["hot_chunks"]["namespace"] == "warmup.hot_chunks"
     assert warmup["test_owner_targets"]["namespace"] == "warmup.test_owner_targets"
     assert warmup["manifest"]["schema"] == "warmup.manifest.v1"
+    assert warmup["manifest"]["trigger"] == "manual"
     assert warmup["manifest"]["path_scope"] == "src"
     assert warmup["manifest"]["fallback_policy"] == {
         "context_pack_search_allow_fallback": False,
@@ -278,6 +297,8 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     metrics = service.context_admin(mode="metrics")
     assert metrics["warmup"]["schema"] == "context_warmup.metrics.v1"
     assert metrics["warmup"]["count"] == 1
+    assert metrics["warmup"]["manual_count"] == 1
+    assert metrics["warmup"]["auto_count"] == 0
     assert metrics["warmup"]["query_count"] == warmup["search_cache"]["query_count"]
     assert metrics["warmup"]["last_query_count"] == warmup["search_cache"]["query_count"]
     assert metrics["warmup"]["last_elapsed_ms"] >= 0
@@ -346,6 +367,257 @@ def test_warmup_prefers_learned_route_terms_and_records_hot_chunks(
     ]
     assert hot_rows
     assert all(row["file_fingerprint"]["cache_token"] for row in hot_rows)
+
+
+def test_auto_learn_records_usage_without_enqueuing_before_threshold(
+    sample_repo: Path,
+) -> None:
+    service = ContextService(
+        ContextConfig(
+            repo_path=sample_repo.resolve(),
+            state_dir=(sample_repo / ".mcp-context-manager").resolve(),
+            max_output_chars=6000,
+            auto_learn_min_packs=3,
+            auto_learn_min_interval_seconds=60,
+            auto_learn_max_entries=4,
+        )
+    )
+
+    service.context_pack(
+        "review auth token behavior",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+
+    state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
+    background = service._background_status()[WARMUP_AUTO_JOB_KIND]
+    stats = service.context_admin(mode="cache_stats")
+
+    assert state["schema"] == "warmup.auto_learn.v1"
+    assert state["enabled"] is True
+    assert state["observed_context_pack_count"] == 1
+    assert state["last_reason_code"] == "below_min_packs"
+    assert state["learned_target_counts"]["route_seeds"] >= 1
+    assert state["learned_target_counts"]["hot_chunks"] >= 1
+    assert background["status"] == "idle"
+    assert background["pending"] is False
+    assert stats["auto_learn"]["observed_context_pack_count"] == 1
+
+
+def test_cache_stats_and_metrics_summary_do_not_iterate_warmup_target_prefixes(
+    service: ContextService, monkeypatch
+) -> None:
+    original_iter_json = service.store.iter_json
+    called_prefixes: list[str] = []
+
+    def tracked_iter_json(prefix: str, *args, **kwargs):
+        called_prefixes.append(prefix)
+        return original_iter_json(prefix, *args, **kwargs)
+
+    monkeypatch.setattr(service.store, "iter_json", tracked_iter_json)
+
+    service.context_admin(mode="cache_stats")
+    service.context_admin(mode="metrics")
+
+    assert not any(
+        str(prefix).startswith("warmup:hot_chunks:")
+        or str(prefix).startswith("warmup:test_owner_targets:")
+        for prefix in called_prefixes
+    )
+
+
+def test_auto_warmup_runs_and_warms_learned_fragment_layers(
+    sample_repo: Path,
+) -> None:
+    service = ContextService(
+        ContextConfig(
+            repo_path=sample_repo.resolve(),
+            state_dir=(sample_repo / ".mcp-context-manager").resolve(),
+            max_output_chars=6000,
+            auto_learn_min_packs=1,
+            auto_learn_min_interval_seconds=0,
+            auto_learn_max_entries=4,
+        )
+    )
+
+    service.context_pack(
+        "review auth token behavior",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+    _wait_for_auto_warmup(service)
+
+    manifest = service.store.get_json(WARMUP_MANIFEST_KEY)
+    stats = service.context_admin(mode="cache_stats")
+    metrics = service.context_admin(mode="metrics")
+    state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
+    summary_sources = {
+        row.get("source") for row in manifest["warmed_summaries"] if isinstance(row, dict)
+    }
+
+    assert manifest["trigger"] == "auto"
+    assert {row["source"] for row in manifest["warmed_terms"]}.issubset(
+        {"route_seed", "default_seed"}
+    )
+    assert {"hot_chunk", "test_owner"}.issubset(summary_sources)
+    assert "retrieval.search_term" in stats["namespaces"]
+    assert "retrieval.file_summary" in stats["namespaces"]
+    assert "context_lookup.search" not in stats["namespaces"]
+    assert "context_pack.retrieval" not in stats["namespaces"]
+    assert state["last_auto_status"] == "complete"
+    assert state["last_run_at"]
+    assert metrics["warmup"]["auto_count"] >= 1
+    assert metrics["warmup"]["manual_count"] == 0
+    assert metrics["warmup"]["last_auto_status"] == "complete"
+
+
+def test_auto_warmup_deduplicates_pending_jobs_and_respects_min_interval(
+    sample_repo: Path,
+    monkeypatch,
+) -> None:
+    service = ContextService(
+        ContextConfig(
+            repo_path=sample_repo.resolve(),
+            state_dir=(sample_repo / ".mcp-context-manager").resolve(),
+            max_output_chars=6000,
+            auto_learn_min_packs=1,
+            auto_learn_min_interval_seconds=60,
+            auto_learn_max_entries=4,
+        )
+    )
+    started = Event()
+    release = Event()
+
+    def slow_warmup(
+        path: str = ".",
+        max_files: int | None = None,
+        max_entries: int = 100,
+        trigger: str = "manual",
+    ) -> dict[str, Any]:
+        started.set()
+        release.wait(timeout=2)
+        return {
+            "schema": "context_cache.warmup.v1",
+            "trigger": trigger,
+            "search_cache": {"query_count": max_entries},
+            "file_summary_cache": {"summary_count": 0, "hits": 0, "misses": 0},
+        }
+
+    monkeypatch.setattr(service, "_cache_warmup", slow_warmup)
+
+    service.context_pack(
+        "review auth token behavior",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+    assert started.wait(timeout=1)
+
+    service.context_pack(
+        "inspect auth token behavior",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+    state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
+    background = service._background_status()[WARMUP_AUTO_JOB_KIND]
+
+    assert state["last_reason_code"] == "enqueue_deduplicated"
+    assert background["deduplicated_count"] >= 1
+
+    release.set()
+    _wait_for_auto_warmup(service)
+
+    service.context_pack(
+        "debug auth token behavior",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+    state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
+
+    assert state["last_reason_code"] == "enqueue_throttled"
+
+
+def test_auto_learn_cache_can_be_disabled_with_env(
+    sample_repo: Path,
+    monkeypatch,
+) -> None:
+    state_dir = sample_repo / ".mcp-context-manager-disabled"
+    monkeypatch.setenv("REPO_PATH", str(sample_repo))
+    monkeypatch.setenv("MCP_CONTEXT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("MCP_CONTEXT_AUTO_LEARN_CACHE", "0")
+    monkeypatch.setenv("MCP_CONTEXT_AUTO_LEARN_MIN_PACKS", "1")
+    service = ContextService.from_env()
+
+    service.context_pack(
+        "review auth token behavior",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+
+    state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
+    background = service._background_status()[WARMUP_AUTO_JOB_KIND]
+
+    assert service.config.auto_learn_cache is False
+    assert state["enabled"] is False
+    assert state["observed_context_pack_count"] == 1
+    assert state["last_reason_code"] == "disabled"
+    assert background["status"] == "idle"
+
+
+def test_auto_learn_state_and_jobs_are_project_isolated(
+    sample_repo: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    services = [
+        ContextService(
+            ContextConfig(
+                repo_path=sample_repo.resolve(),
+                state_dir=(tmp_path / project_id).resolve(),
+                project_id=project_id,
+                max_output_chars=6000,
+                auto_learn_min_packs=1,
+                auto_learn_min_interval_seconds=60,
+                auto_learn_max_entries=2,
+            )
+        )
+        for project_id in ("project-a", "project-b")
+    ]
+
+    def no_op_warmup(
+        path: str = ".",
+        max_files: int | None = None,
+        max_entries: int = 100,
+        trigger: str = "manual",
+    ) -> dict[str, Any]:
+        return {
+            "schema": "context_cache.warmup.v1",
+            "project_id": "",
+            "trigger": trigger,
+            "search_cache": {"query_count": max_entries},
+        }
+
+    for svc in services:
+        monkeypatch.setattr(svc, "_cache_warmup", no_op_warmup)
+        svc.context_pack(
+            "review auth token behavior",
+            changed_files=["src/auth.py"],
+            max_items=1,
+            output_profile="compact",
+        )
+        _wait_for_auto_warmup(svc)
+
+    states = [svc.store.get_json(WARMUP_AUTO_LEARN_KEY) for svc in services]
+    backgrounds = [svc._background_status()[WARMUP_AUTO_JOB_KIND] for svc in services]
+
+    assert [state["project_id"] for state in states] == ["project-a", "project-b"]
+    assert [state["observed_context_pack_count"] for state in states] == [1, 1]
+    assert [row["project_id"] for row in backgrounds] == ["project-a", "project-b"]
 
 
 def test_warmup_route_seeds_prefer_matching_path_scope(

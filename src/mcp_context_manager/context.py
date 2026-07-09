@@ -115,6 +115,8 @@ WARMUP_NEGATIVE_NEVER_SELECTED_THRESHOLD = 3
 WARMUP_MANIFEST_KEY = "warmup:manifest"
 WARMUP_NEGATIVE_TERMS_KEY = "warmup:negative_terms"
 WARMUP_ROUTE_SEEDS_KEY = "warmup:route_seeds"
+WARMUP_AUTO_LEARN_KEY = "warmup:auto_learn"
+WARMUP_AUTO_JOB_KIND = "cache_auto_warmup"
 
 
 class ContextService:
@@ -373,6 +375,7 @@ class ContextService:
                 path=path,
                 max_files=max_files,
                 max_entries=max_entries,
+                trigger="manual",
             )
         if mode == "contracts":
             profile = contract_profile or "verbose"
@@ -560,6 +563,10 @@ class ContextService:
                 route=route,
                 terms=terms,
                 selected=selected,
+                retrieval_stats=retrieval_stats,
+            )
+            self._maybe_enqueue_auto_warmup(
+                route=route,
                 retrieval_stats=retrieval_stats,
             )
         except Exception:
@@ -1033,6 +1040,15 @@ class ContextService:
                     "last_error": "",
                 },
             ),
+            WARMUP_AUTO_JOB_KIND: by_kind.get(
+                WARMUP_AUTO_JOB_KIND,
+                {
+                    "kind": WARMUP_AUTO_JOB_KIND,
+                    "status": "idle",
+                    "pending": False,
+                    "last_error": "",
+                },
+            ),
         }
 
     def _index_freshness(self, refresh: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1058,6 +1074,9 @@ class ContextService:
         snapshot = self.metrics.snapshot()
         snapshot["index_freshness"] = self._index_freshness()
         snapshot["background"] = self._background_status()
+        warmup = snapshot.setdefault("warmup", {})
+        if isinstance(warmup, dict):
+            warmup["auto_learn"] = self._auto_learn_summary()
         return snapshot
 
     def _background_project_id(self) -> str:
@@ -2102,6 +2121,249 @@ class ContextService:
         self._warmup_record_test_owner_targets(route=route, selected=selected)
         self._warmup_rebuild_route_seeds()
 
+    def _maybe_enqueue_auto_warmup(
+        self,
+        route: str,
+        retrieval_stats: dict[str, Any],
+    ) -> None:
+        now = now_iso()
+        state = self._auto_learn_state()
+        observed_count = int(state.get("observed_context_pack_count", 0) or 0) + 1
+        target_counts = self._auto_learn_target_counts()
+        state.update(
+            {
+                "enabled": bool(self.config.auto_learn_cache),
+                "observed_context_pack_count": observed_count,
+                "min_context_pack_count": int(self.config.auto_learn_min_packs),
+                "min_interval_seconds": int(
+                    self.config.auto_learn_min_interval_seconds
+                ),
+                "max_entries": int(self.config.auto_learn_max_entries),
+                "last_observed_at": now,
+                "last_route": route,
+                "learned_target_counts": target_counts,
+                "last_fragment_hit_ratio": float(
+                    retrieval_stats.get("fragment_hit_ratio", 0.0) or 0.0
+                ),
+            }
+        )
+        reason = ""
+        if not self.config.auto_learn_cache:
+            reason = "disabled"
+        elif observed_count < int(self.config.auto_learn_min_packs):
+            reason = "below_min_packs"
+        elif not self._auto_learn_has_targets(target_counts):
+            reason = "no_learned_targets"
+        if reason:
+            state["last_reason_code"] = reason
+            self._auto_learn_write_state(state)
+            return
+
+        state["last_enqueue_attempt_at"] = now
+        self._auto_learn_write_state({**state, "last_reason_code": "enqueue_attempt"})
+
+        def run_auto_warmup() -> dict[str, Any]:
+            self._auto_learn_mark_run(
+                status="running",
+                reason_code="auto_warmup_running",
+            )
+            try:
+                result = self._cache_warmup(
+                    path=".",
+                    max_entries=int(self.config.auto_learn_max_entries),
+                    trigger="auto",
+                )
+            except Exception as exc:
+                self._auto_learn_mark_run(
+                    status="failed",
+                    reason_code="auto_warmup_failed",
+                    error=type(exc).__name__,
+                )
+                raise
+            self._auto_learn_mark_run(
+                status="complete",
+                reason_code="auto_warmup_completed",
+            )
+            return result
+
+        job = background_jobs.submit(
+            self._background_project_id(),
+            WARMUP_AUTO_JOB_KIND,
+            run_auto_warmup,
+            executor=io_executor(),
+            min_interval_seconds=float(self.config.auto_learn_min_interval_seconds),
+        )
+        if job.get("status") == "throttled":
+            reason = "enqueue_throttled"
+        elif job.get("deduplicated"):
+            reason = "enqueue_deduplicated"
+        elif job.get("pending"):
+            reason = "enqueued"
+            state["last_enqueue_at"] = now
+        else:
+            reason = str(job.get("status") or "enqueue_status_unknown")
+        state.update(
+            {
+                "last_reason_code": reason,
+                "last_background_status": str(job.get("status") or ""),
+                "last_background_pending": bool(job.get("pending", False)),
+                "last_background_deduplicated": bool(
+                    job.get("deduplicated", False)
+                ),
+            }
+        )
+        self._auto_learn_write_state(state)
+
+    def _auto_learn_state(self) -> dict[str, Any]:
+        row = self.store.get_json(WARMUP_AUTO_LEARN_KEY)
+        state = row if isinstance(row, dict) else {}
+        counts = state.get("learned_target_counts", {})
+        counts = counts if isinstance(counts, dict) else {}
+        merged = {
+            "schema": "warmup.auto_learn.v1",
+            "created_at": state.get("created_at") or now_iso(),
+            "updated_at": state.get("updated_at", ""),
+            "project_id": self.config.project_id,
+            "enabled": bool(self.config.auto_learn_cache),
+            "observed_context_pack_count": int(
+                state.get("observed_context_pack_count", 0) or 0
+            ),
+            "min_context_pack_count": int(self.config.auto_learn_min_packs),
+            "min_interval_seconds": int(
+                self.config.auto_learn_min_interval_seconds
+            ),
+            "max_entries": int(self.config.auto_learn_max_entries),
+            "last_observed_at": str(state.get("last_observed_at", "")),
+            "last_enqueue_attempt_at": str(
+                state.get("last_enqueue_attempt_at", "")
+            ),
+            "last_enqueue_at": str(state.get("last_enqueue_at", "")),
+            "last_run_at": str(state.get("last_run_at", "")),
+            "last_reason_code": str(state.get("last_reason_code", "not_observed")),
+            "last_route": str(state.get("last_route", "")),
+            "learned_target_counts": {
+                "route_seeds": int(counts.get("route_seeds", 0) or 0),
+                "hot_chunks": int(counts.get("hot_chunks", 0) or 0),
+                "test_owner_targets": int(
+                    counts.get("test_owner_targets", 0) or 0
+                ),
+            },
+            "last_fragment_hit_ratio": float(
+                state.get("last_fragment_hit_ratio", 0.0) or 0.0
+            ),
+            "last_auto_status": str(state.get("last_auto_status", "")),
+            "last_auto_error": str(state.get("last_auto_error", "")),
+            "last_background_status": str(state.get("last_background_status", "")),
+            "last_background_pending": bool(
+                state.get("last_background_pending", False)
+            ),
+            "last_background_deduplicated": bool(
+                state.get("last_background_deduplicated", False)
+            ),
+        }
+        return merged
+
+    def _auto_learn_write_state(self, state: dict[str, Any]) -> None:
+        now = now_iso()
+        current = self.store.get_json(WARMUP_AUTO_LEARN_KEY)
+        if isinstance(current, dict):
+            for key in (
+                "created_at",
+                "last_run_at",
+                "last_auto_status",
+                "last_auto_error",
+            ):
+                if current.get(key) and not state.get(key):
+                    state[key] = current[key]
+        state.update(
+            {
+                "schema": "warmup.auto_learn.v1",
+                "updated_at": now,
+                "project_id": self.config.project_id,
+                "enabled": bool(self.config.auto_learn_cache),
+                "min_context_pack_count": int(self.config.auto_learn_min_packs),
+                "min_interval_seconds": int(
+                    self.config.auto_learn_min_interval_seconds
+                ),
+                "max_entries": int(self.config.auto_learn_max_entries),
+            }
+        )
+        state.setdefault("created_at", now)
+        self.store.put_json(WARMUP_AUTO_LEARN_KEY, state)
+
+    def _auto_learn_mark_run(
+        self,
+        status: str,
+        reason_code: str,
+        error: str = "",
+    ) -> None:
+        state = self._auto_learn_state()
+        state.update(
+            {
+                "last_run_at": now_iso(),
+                "last_auto_status": status,
+                "last_reason_code": reason_code,
+                "last_auto_error": error,
+            }
+        )
+        self._auto_learn_write_state(state)
+
+    def _auto_learn_target_counts(self) -> dict[str, int]:
+        route_payload = self.store.get_json(WARMUP_ROUTE_SEEDS_KEY)
+        route_seeds = {}
+        if isinstance(route_payload, dict) and isinstance(
+            route_payload.get("route_seeds"), dict
+        ):
+            route_seeds = route_payload["route_seeds"]
+        route_seed_count = sum(
+            len(rows)
+            for rows in route_seeds.values()
+            if isinstance(rows, list)
+        )
+        return {
+            "route_seeds": int(route_seed_count),
+            "hot_chunks": int(self.store.count("warmup:hot_chunks:")),
+            "test_owner_targets": int(self.store.count("warmup:test_owner_targets:")),
+        }
+
+    def _auto_learn_has_targets(self, counts: dict[str, int]) -> bool:
+        return any(int(value or 0) > 0 for value in counts.values())
+
+    def _auto_learn_summary(self) -> dict[str, Any]:
+        state = self._auto_learn_state()
+        state["learned_target_counts"] = self._auto_learn_target_counts()
+        background = self._background_status().get(WARMUP_AUTO_JOB_KIND, {})
+        return {
+            "schema": state["schema"],
+            "project_id": state["project_id"],
+            "enabled": bool(state["enabled"]),
+            "observed_context_pack_count": int(
+                state["observed_context_pack_count"]
+            ),
+            "min_context_pack_count": int(state["min_context_pack_count"]),
+            "min_interval_seconds": int(state["min_interval_seconds"]),
+            "max_entries": int(state["max_entries"]),
+            "last_observed_at": state["last_observed_at"],
+            "last_enqueue_attempt_at": state["last_enqueue_attempt_at"],
+            "last_enqueue_at": state["last_enqueue_at"],
+            "last_run_at": state["last_run_at"],
+            "last_reason_code": state["last_reason_code"],
+            "last_route": state["last_route"],
+            "learned_target_counts": state["learned_target_counts"],
+            "last_fragment_hit_ratio": float(state["last_fragment_hit_ratio"]),
+            "last_auto_status": state["last_auto_status"],
+            "last_auto_error": state["last_auto_error"],
+            "background": {
+                "kind": str(background.get("kind", WARMUP_AUTO_JOB_KIND)),
+                "status": str(background.get("status", "idle")),
+                "pending": bool(background.get("pending", False)),
+                "deduplicated_count": int(
+                    background.get("deduplicated_count", 0) or 0
+                ),
+                "last_error": str(background.get("last_error", "")),
+            },
+        }
+
     def _warmup_selected_count_for_term(
         self, term: str, selected: list[dict[str, Any]]
     ) -> int:
@@ -2303,11 +2565,13 @@ class ContextService:
         warmed_terms: list[dict[str, Any]],
         warmed_summaries: list[dict[str, Any]],
         negative_terms: list[dict[str, Any]],
+        trigger: str = "manual",
     ) -> dict[str, Any]:
         manifest = {
             "schema": "warmup.manifest.v1",
             "generated_at": now_iso(),
             "project_id": self.config.project_id,
+            "trigger": trigger if trigger in {"manual", "auto"} else "manual",
             "refresh_signature": refresh_signature,
             "refresh_signature_available": refresh_signature_available,
             "path_scope": self._warmup_path_scope(path_scope),
@@ -3485,7 +3749,9 @@ class ContextService:
         path: str = ".",
         max_files: int | None = None,
         max_entries: int = 100,
+        trigger: str = "manual",
     ) -> dict[str, Any]:
+        trigger = trigger if trigger in {"manual", "auto"} else "manual"
         started = time.perf_counter()
         self.config.ensure_state_dirs()
         store_existed_before = self.store.exists()
@@ -3679,6 +3945,7 @@ class ContextService:
             warmed_terms=warmed_searches,
             warmed_summaries=warmed_summary_targets,
             negative_terms=negative_terms,
+            trigger=trigger,
         )
         cache_after = self._cache_stats()
         elapsed_ms = self._elapsed_ms(started)
@@ -3687,11 +3954,14 @@ class ContextService:
             elapsed_ms=elapsed_ms,
             result_count=len(warmed_searches),
             stage_timings_ms=stage_timings,
+            warmup_trigger=trigger,
+            warmup_status="complete",
         )
         return {
             "schema": "context_cache.warmup.v1",
             "generated_at": now_iso(),
             "project_id": self.config.project_id,
+            "trigger": trigger,
             "elapsed_ms": elapsed_ms,
             "state": {
                 "state_dir": self.config.display_path(self.config.state_dir),
@@ -4519,6 +4789,7 @@ class ContextService:
             "entry_count": len(entries),
             "keys": sorted(keys)[:20],
             "namespaces": dict(sorted(namespaces.items())),
+            "auto_learn": self._auto_learn_summary(),
         }
 
     def _cache_prune(self, max_age_minutes: int) -> dict[str, Any]:

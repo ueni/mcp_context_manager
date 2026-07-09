@@ -19,6 +19,10 @@ class ContextConfig:
     lmdb_map_size: int = 1_073_741_824
     token_counter_mode: str = "estimate"
     target_tokenizer: str = "cl100k_base"
+    auto_learn_cache: bool = True
+    auto_learn_min_packs: int = 3
+    auto_learn_min_interval_seconds: int = 900
+    auto_learn_max_entries: int = 12
     project_id: str = ""
     root_uri: str = ""
     allowed_roots: tuple[str, ...] = field(default_factory=tuple)
@@ -56,6 +60,24 @@ class ContextConfig:
             target_tokenizer=os.getenv(
                 "MCP_CONTEXT_TARGET_TOKENIZER", "cl100k_base"
             ).strip(),
+            auto_learn_cache=_env_bool(
+                os.getenv("MCP_CONTEXT_AUTO_LEARN_CACHE", "1"),
+                default=True,
+            ),
+            auto_learn_min_packs=max(
+                1, int(os.getenv("MCP_CONTEXT_AUTO_LEARN_MIN_PACKS", "3"))
+            ),
+            auto_learn_min_interval_seconds=max(
+                0,
+                int(
+                    os.getenv(
+                        "MCP_CONTEXT_AUTO_LEARN_MIN_INTERVAL_SECONDS", "900"
+                    )
+                ),
+            ),
+            auto_learn_max_entries=max(
+                1, int(os.getenv("MCP_CONTEXT_AUTO_LEARN_MAX_ENTRIES", "12"))
+            ),
         )
 
     def with_project(
@@ -82,6 +104,10 @@ class ContextConfig:
             lmdb_map_size=self.lmdb_map_size,
             token_counter_mode=self.token_counter_mode,
             target_tokenizer=self.target_tokenizer,
+            auto_learn_cache=self.auto_learn_cache,
+            auto_learn_min_packs=self.auto_learn_min_packs,
+            auto_learn_min_interval_seconds=self.auto_learn_min_interval_seconds,
+            auto_learn_max_entries=self.auto_learn_max_entries,
         )
 
     @property
@@ -149,6 +175,17 @@ def _split_env_list(value: str) -> tuple[str, ...]:
     for chunk in value.split(os.pathsep):
         raw_parts.extend(chunk.split(","))
     return tuple(part.strip() for part in raw_parts if part.strip())
+
+
+def _env_bool(value: str | None, default: bool = False) -> bool:
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _parse_root_mappings(value: str) -> tuple[tuple[str, str], ...]:

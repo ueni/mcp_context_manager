@@ -60,12 +60,33 @@ class FakeClient:
             "warmup": {
                 "schema": "context_warmup.metrics.v1",
                 "count": 2,
+                "manual_count": 1,
+                "auto_count": 1,
                 "avg_elapsed_ms": 18.5,
                 "query_count": 6,
                 "avg_query_count": 3.0,
                 "last_elapsed_ms": 12.0,
                 "last_query_count": 3,
                 "last_recorded_at": "2026-07-01T12:00:00+00:00",
+                "last_auto_status": "complete",
+                "last_auto_recorded_at": "2026-07-01T12:01:00+00:00",
+                "auto_learn": {
+                    "schema": "warmup.auto_learn.v1",
+                    "enabled": True,
+                    "observed_context_pack_count": 4,
+                    "last_reason_code": "auto_warmup_completed",
+                    "last_auto_status": "complete",
+                    "learned_target_counts": {
+                        "route_seeds": 2,
+                        "hot_chunks": 1,
+                        "test_owner_targets": 1,
+                    },
+                    "background": {
+                        "kind": "cache_auto_warmup",
+                        "status": "complete",
+                        "pending": False,
+                    },
+                },
             },
             "index_freshness": {
                 "state": "last_good",
@@ -85,6 +106,13 @@ class FakeClient:
                     "status": "complete",
                     "pending": False,
                     "last_completed_at": "2026-07-01T12:00:00+00:00",
+                    "last_error": "",
+                },
+                "cache_auto_warmup": {
+                    "kind": "cache_auto_warmup",
+                    "status": "complete",
+                    "pending": False,
+                    "last_completed_at": "2026-07-01T12:01:00+00:00",
                     "last_error": "",
                 },
             },
@@ -676,6 +704,8 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "warmup" in performance
     assert "lookup cache" not in performance
     assert "2 runs, avg 18.5, last 12.0, 3 queries" in performance
+    assert "auto warmup" in performance
+    assert "1 auto runs, complete, idle, reason auto_warmup_completed" in performance
     performance_footer = next(
         line
         for line in reversed(performance.splitlines())

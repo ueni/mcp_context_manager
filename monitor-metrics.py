@@ -1251,6 +1251,11 @@ def _performance_cache_rows(
         if isinstance(background.get("cache_prune"), dict)
         else {}
     )
+    auto_warmup_job = (
+        background.get("cache_auto_warmup", {})
+        if isinstance(background.get("cache_auto_warmup"), dict)
+        else {}
+    )
     return [
         ("freshness", str(freshness.get("state") or "-")),
         ("refresh reason", str(freshness.get("refresh_reason") or "-")),
@@ -1270,6 +1275,7 @@ def _performance_cache_rows(
             _namespace_cache_summary(metrics, "skill.compiled"),
         ),
         ("warmup", _warmup_summary(metrics)),
+        ("auto warmup", _auto_warmup_summary(metrics, auto_warmup_job)),
     ]
 
 
@@ -1314,6 +1320,33 @@ def _warmup_summary(metrics: dict[str, Any]) -> str:
         f"{fmt_int(warmup.get('last_query_count', 0))} queries"
         f"{last_suffix}"
     )
+
+
+def _auto_warmup_summary(metrics: dict[str, Any], job: dict[str, Any]) -> str:
+    warmup = metrics.get("warmup", {})
+    if not isinstance(warmup, dict):
+        warmup = {}
+    auto_learn = warmup.get("auto_learn", {})
+    auto_learn = auto_learn if isinstance(auto_learn, dict) else {}
+    auto_count = int(warmup.get("auto_count", 0) or 0)
+    status = str(
+        auto_learn.get("last_auto_status")
+        or warmup.get("last_auto_status")
+        or job.get("status")
+        or ""
+    )
+    reason = str(auto_learn.get("last_reason_code") or "")
+    if not auto_count and not reason and not status:
+        return "not run"
+    pending = "pending" if job.get("pending") else "idle"
+    parts = [f"{fmt_int(auto_count)} auto runs"]
+    if status:
+        parts.append(status)
+    if pending:
+        parts.append(pending)
+    if reason:
+        parts.append(f"reason {reason}")
+    return ", ".join(parts)
 
 
 def _state_rows(state: MonitorState) -> list[dict[str, Any]]:

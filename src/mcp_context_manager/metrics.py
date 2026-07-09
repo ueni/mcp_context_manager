@@ -129,6 +129,8 @@ class ContextMetrics:
         stage_timings_ms: dict[str, float] | None = None,
         fragment_cache_hits: int = 0,
         fragment_cache_misses: int = 0,
+        warmup_trigger: str = "",
+        warmup_status: str = "",
     ) -> None:
         payload = self._load()
         now = now_iso()
@@ -202,6 +204,15 @@ class ContextMetrics:
             totals["context_pack_fragment_cache_misses"] = int(
                 totals.get("context_pack_fragment_cache_misses", 0)
             ) + fragment_misses
+        if operation == "context_admin.warmup":
+            trigger = (warmup_trigger or "manual").strip().lower()
+            if trigger not in {"manual", "auto"}:
+                trigger = "manual"
+            trigger_counts = totals.setdefault("warmup_triggers", {})
+            trigger_counts[trigger] = int(trigger_counts.get(trigger, 0) or 0) + 1
+            if trigger == "auto":
+                totals["warmup_last_auto_status"] = warmup_status or "complete"
+                totals["warmup_last_auto_at"] = now
 
         op_stats = payload.setdefault("operations", {}).setdefault(
             operation,
@@ -316,6 +327,12 @@ class ContextMetrics:
                 ),
                 "fragment_cache_hits": fragment_hits,
                 "fragment_cache_misses": fragment_misses,
+                "warmup_trigger": (warmup_trigger or "manual")
+                if operation == "context_admin.warmup"
+                else "",
+                "warmup_status": warmup_status
+                if operation == "context_admin.warmup"
+                else "",
                 "stage_timings_ms": {
                     key: round(float(value), 3)
                     for key, value in sorted((stage_timings_ms or {}).items())
@@ -345,7 +362,11 @@ class ContextMetrics:
             name: self._public_stats(stats)
             for name, stats in sorted(payload.get("operations", {}).items())
         }
-        warmup = self._warmup_metrics(operations, payload.get("recent", []))
+        warmup = self._warmup_metrics(
+            operations,
+            payload.get("recent", []),
+            totals,
+        )
         routes = {
             name: self._public_stats(stats)
             for name, stats in sorted(payload.get("routes", {}).items())
@@ -637,7 +658,10 @@ class ContextMetrics:
         return public
 
     def _warmup_metrics(
-        self, operations: dict[str, dict[str, Any]], recent: Any
+        self,
+        operations: dict[str, dict[str, Any]],
+        recent: Any,
+        totals: dict[str, Any],
     ) -> dict[str, Any]:
         stats = operations.get("context_admin.warmup", {})
         if not isinstance(stats, dict):
@@ -645,6 +669,12 @@ class ContextMetrics:
         count = int(stats.get("count", 0) or 0)
         query_count = int(stats.get("result_count", 0) or 0)
         recent_rows = recent if isinstance(recent, list) else []
+        trigger_counts = totals.get("warmup_triggers", {})
+        trigger_counts = trigger_counts if isinstance(trigger_counts, dict) else {}
+        manual_count = int(trigger_counts.get("manual", 0) or 0)
+        auto_count = int(trigger_counts.get("auto", 0) or 0)
+        if count and manual_count + auto_count == 0:
+            manual_count = count
         last = next(
             (
                 row
@@ -655,10 +685,23 @@ class ContextMetrics:
             {},
         )
         last = last if isinstance(last, dict) else {}
+        last_auto = next(
+            (
+                row
+                for row in reversed(recent_rows)
+                if isinstance(row, dict)
+                and row.get("operation") == "context_admin.warmup"
+                and row.get("warmup_trigger") == "auto"
+            ),
+            {},
+        )
+        last_auto = last_auto if isinstance(last_auto, dict) else {}
         return {
             "schema": "context_warmup.metrics.v1",
             "operation": "context_admin.warmup",
             "count": count,
+            "manual_count": manual_count,
+            "auto_count": auto_count,
             "avg_elapsed_ms": float(stats.get("avg_elapsed_ms", 0.0) or 0.0),
             "min_elapsed_ms": float(stats.get("min_elapsed_ms", 0.0) or 0.0),
             "max_elapsed_ms": float(stats.get("max_elapsed_ms", 0.0) or 0.0),
@@ -667,6 +710,17 @@ class ContextMetrics:
             "last_elapsed_ms": float(last.get("elapsed_ms", 0.0) or 0.0),
             "last_query_count": int(last.get("result_count", 0) or 0),
             "last_recorded_at": str(last.get("recorded_at", "")),
+            "last_trigger": str(last.get("warmup_trigger", "")),
+            "last_auto_status": str(
+                totals.get("warmup_last_auto_status")
+                or last_auto.get("warmup_status")
+                or ""
+            ),
+            "last_auto_recorded_at": str(
+                totals.get("warmup_last_auto_at")
+                or last_auto.get("recorded_at")
+                or ""
+            ),
         }
 
     def _public_cache_namespace(self, stats: dict[str, Any]) -> dict[str, Any]:
