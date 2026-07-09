@@ -583,10 +583,6 @@ def render_project_detail(
         (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
     ).columns
     metrics = snapshot.metrics or {}
-    cache_hits = _int_at(metrics, ("cache", "hits"))
-    cache_misses = _int_at(metrics, ("cache", "misses"))
-    cache_total = cache_hits + cache_misses
-    cache_ratio = (cache_hits / cache_total) if cache_total else 0.0
     fragment_hits = _int_at(metrics, ("cache", "context_pack_fragment_hits"))
     fragment_misses = _int_at(metrics, ("cache", "context_pack_fragment_misses"))
     fragment_ratio = _fragment_cache_ratio(metrics)
@@ -614,7 +610,6 @@ def render_project_detail(
                 )
             ),
         ),
-        ("cache", f"{cache_hits}/{cache_misses} h/m  {cache_ratio * 100:5.1f}%"),
         (
             "fragment cache",
             f"{fragment_hits}/{fragment_misses} h/m  {fragment_ratio * 100:5.1f}%",
@@ -904,8 +899,6 @@ def _summary_table(
     ok_rows: list[ProjectSnapshot],
     color: bool,
 ) -> list[str]:
-    cache_total = int(totals["cache_hits"]) + int(totals["cache_misses"])
-    ratio = (int(totals["cache_hits"]) / cache_total) if cache_total else 0.0
     fragment_total = int(totals["fragment_hits"]) + int(totals["fragment_misses"])
     fragment_ratio = (
         int(totals["fragment_hits"]) / fragment_total if fragment_total else 0.0
@@ -914,7 +907,6 @@ def _summary_table(
         ("projects", f"{len(snapshots)} total / {len(ok_rows)} ok"),
         ("requests", fmt_int(totals["requests"])),
         ("context_pack", fmt_int(totals["packs"])),
-        ("cache hit", f"{_bar(ratio, 18, color)} {ratio * 100:5.1f}%"),
         (
             "fragment cache",
             f"{_bar(fragment_ratio, 18, color)} {fragment_ratio * 100:5.1f}%",
@@ -945,7 +937,6 @@ def _project_table(
             "pack",
             "avg ms",
             "cache",
-            "frag",
             "mcp tok",
             "checks",
         ),
@@ -958,7 +949,6 @@ def _project_table(
             widths["pack"],
             widths["avg_ms"],
             widths["cache"],
-            widths["fragment"],
             widths["tokens"],
             widths["checks"],
         ),
@@ -966,7 +956,6 @@ def _project_table(
             "left",
             "left",
             "left",
-            "right",
             "right",
             "right",
             "right",
@@ -994,7 +983,6 @@ def _project_column_widths(width: int) -> dict[str, int]:
         "pack": 4,
         "avg_ms": 6,
         "cache": 16,
-        "fragment": 6,
         "tokens": 8,
         "checks": 6,
     }
@@ -1032,7 +1020,6 @@ def _project_cells(
             "-",
             "-",
             "-",
-            "-",
             _style("error", color, Ansi.RED),
         )
     metrics = snapshot.metrics or {}
@@ -1041,7 +1028,6 @@ def _project_cells(
     avg_ms = _float_at(
         metrics, ("requests", "by_operation", "context_pack", "avg_elapsed_ms")
     )
-    cache_ratio = _float_at(metrics, ("cache", "hit_ratio"))
     fragment_ratio = _fragment_cache_ratio(metrics)
     tokens_spared_by_mcp = _tokens_spared_by_mcp(metrics)
     checks = _matrix_status(snapshot.matrix or {}, color)
@@ -1053,8 +1039,7 @@ def _project_cells(
         fmt_int(requests),
         fmt_int(packs),
         fmt_ms(avg_ms),
-        f"{_bar(cache_ratio, cache_bar_width, color)} {cache_ratio * 100:5.1f}%",
-        f"{fragment_ratio * 100:5.1f}%",
+        f"{_bar(fragment_ratio, cache_bar_width, color)} {fragment_ratio * 100:5.1f}%",
         fmt_int(tokens_spared_by_mcp),
         checks,
     )
@@ -1226,7 +1211,6 @@ def _performance_cache_rows(
     background: dict[str, Any],
     freshness: dict[str, Any],
 ) -> list[tuple[str, str]]:
-    cache = metrics.get("cache", {}) if isinstance(metrics.get("cache"), dict) else {}
     index_job = (
         background.get("index_refresh", {})
         if isinstance(background.get("index_refresh"), dict)
@@ -1247,16 +1231,8 @@ def _performance_cache_rows(
         ("cache maintenance", _background_job_summary(cache_job)),
         ("background queue", fmt_int(background.get("queue_depth", 0))),
         (
-            "cache hit ratio",
-            f"{float(cache.get('hit_ratio', 0.0) or 0.0) * 100:5.1f}%",
-        ),
-        (
             "fragment hit ratio",
             f"{_fragment_cache_ratio(metrics) * 100:5.1f}%",
-        ),
-        (
-            "lookup search cache",
-            _namespace_cache_summary(metrics, "context_lookup.search"),
         ),
         (
             "skill card cache",

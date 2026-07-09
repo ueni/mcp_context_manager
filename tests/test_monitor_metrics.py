@@ -422,14 +422,21 @@ def test_render_dashboard_contains_visual_summary() -> None:
     )
 
     assert "mcp-context-manager metrics" in rendered
-    assert "| cache hit          | [##############----]  75.0% |" in rendered
+    assert "lookup cache" not in rendered
+    project_header = next(
+        line
+        for line in rendered.splitlines()
+        if line.startswith("|   |") and "| project id" in line
+    )
+    assert "cache |  mcp tok" in project_header
+    assert "|  frag |" not in project_header
     assert "| fragment cache     | [##############----]  80.0% |" in rendered
     assert "| token spared/saved |                       12.0k |" in rendered
     assert "| project" in rendered
     assert "| Alpha" in rendered
     assert "| alpha-123" in rendered
     assert "|   10 |    3 |" in rendered
-    assert "|  80.0% |" in rendered
+    assert "| [######-]  80.0% |    12.0k |" in rendered
     assert "2 pass" in rendered
 
 
@@ -585,8 +592,10 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "mcp-context-manager project details" in detail
     assert "| project            | Alpha" in detail
     assert "| project id         | alpha-123" in detail
-    assert "| fragment cache     | 8/2 h/m   80.0%" in detail
+    assert "| fragment cache" in detail
+    assert " 8/2 h/m   80.0%" in detail
     assert "token spared/saved" in detail
+    assert "lookup cache" not in detail
     assert any("| a" in line and "pass" in line for line in detail.splitlines())
     assert "Context matrix check a" in detail
     assert "Context matrix check a (lower is better)" in detail
@@ -620,10 +629,11 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "freshness" in performance
     assert "last_good" in performance
     assert "background queue" in performance
-    assert "2/1 h/m" in performance
     assert "4/1 h/m" in performance
+    assert "fragment hit ratio" in performance
     assert "skill card cache" in performance
     assert "warmup" in performance
+    assert "lookup cache" not in performance
     assert "2 runs, avg 18.5, last 12.0, 3 queries" in performance
     performance_footer = next(
         line
