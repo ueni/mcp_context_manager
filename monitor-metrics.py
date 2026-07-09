@@ -670,6 +670,11 @@ def render_performance_view(
     freshness = freshness if isinstance(freshness, dict) else {}
     background = metrics.get("background", {})
     background = background if isinstance(background, dict) else {}
+    stage_column_overhead = 4 * 10 + 5 * 3 + 1
+    stage_column_width = max(
+        24,
+        min(48, width - stage_column_overhead),
+    )
     stage_rows = _performance_stage_rows(metrics)
     cache_rows = _performance_cache_rows(metrics, background, freshness)
     lines = [
@@ -678,10 +683,10 @@ def render_performance_view(
         f"project:  {_project_name(snapshot.target)}",
         "",
         *_render_table(
-            ("stage", "avg ms", "min ms", "max ms"),
+            ("stage", "avg ms", "min ms", "max ms", "last ms"),
             stage_rows,
-            widths=(max(24, min(48, width - 36)), 10, 10, 10),
-            aligns=("left", "right", "right", "right"),
+            widths=(stage_column_width, 10, 10, 10, 10),
+            aligns=("left", "right", "right", "right", "right"),
         ),
         "",
         *_render_table(
@@ -1185,10 +1190,39 @@ RETRIEVAL_BREAKDOWN_STAGES = (
 )
 
 
+def _recent_context_pack_stage_ms(metrics: dict[str, Any], name: str) -> float | None:
+    recent_rows = metrics.get("recent")
+    if not isinstance(recent_rows, list):
+        return None
+    for row in reversed(recent_rows):
+        if not isinstance(row, dict):
+            continue
+        operation = row.get("operation")
+        if operation is None:
+            operation = row.get("operation_name")
+        if operation != "context_pack":
+            continue
+        stage_timings = row.get("stage_timings_ms")
+        if not isinstance(stage_timings, dict):
+            continue
+        last_elapsed_ms = stage_timings.get(name)
+        if isinstance(last_elapsed_ms, (int, float)):
+            return float(last_elapsed_ms)
+    return None
+
+
 def _context_pack_stage_stats(metrics: dict[str, Any], name: str) -> dict[str, Any]:
     stages = metrics.get("benchmarks", {}).get("stage_latency_ms_by_operation", {})
     pack_stages = stages.get("context_pack", {}) if isinstance(stages, dict) else {}
     stats = pack_stages.get(name, {}) if isinstance(pack_stages, dict) else {}
+    if (
+        isinstance(stats, dict)
+        and "last_elapsed_ms" not in stats
+    ):
+        recent_last_ms = _recent_context_pack_stage_ms(metrics.get("benchmarks", {}), name)
+        if recent_last_ms is not None:
+            stats = dict(stats)
+            stats["last_elapsed_ms"] = recent_last_ms
     return stats if isinstance(stats, dict) else {}
 
 
@@ -1208,8 +1242,8 @@ def _performance_retrieval_bottleneck(metrics: dict[str, Any]) -> str:
     return "-"
 
 
-def _performance_stage_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str, str]]:
-    rows: list[tuple[str, str, str, str]] = []
+def _performance_stage_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str]] = []
     for name in (
         "total_ms",
         "index_refresh_ms",
@@ -1231,6 +1265,7 @@ def _performance_stage_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str
                 fmt_ms(stats.get("avg_elapsed_ms", 0.0)),
                 fmt_ms(stats.get("min_elapsed_ms", 0.0)),
                 fmt_ms(stats.get("max_elapsed_ms", 0.0)),
+                fmt_ms(stats.get("last_elapsed_ms", 0.0)),
             )
         )
     return rows

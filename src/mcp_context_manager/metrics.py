@@ -619,6 +619,7 @@ class ContextMetrics:
             elapsed if min_elapsed is None else min(float(min_elapsed), elapsed)
         )
         stats["max_elapsed_ms"] = max(float(stats.get("max_elapsed_ms", 0.0)), elapsed)
+        stats["last_elapsed_ms"] = elapsed
 
     def _public_stats(self, stats: dict[str, Any]) -> dict[str, Any]:
         public = self._public_latency_stats(stats)
@@ -742,6 +743,7 @@ class ContextMetrics:
             "avg_elapsed_ms": round(total_elapsed / count, 3) if count else 0.0,
             "min_elapsed_ms": round(float(stats.get("min_elapsed_ms") or 0.0), 3),
             "max_elapsed_ms": round(float(stats.get("max_elapsed_ms", 0.0)), 3),
+            "last_elapsed_ms": round(float(stats.get("last_elapsed_ms", 0.0)), 3),
         }
 
     def _measurement_check(

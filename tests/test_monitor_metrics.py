@@ -123,6 +123,7 @@ class FakeClient:
                             "avg_elapsed_ms": 42.5,
                             "min_elapsed_ms": 20.0,
                             "max_elapsed_ms": 80.0,
+                            "last_elapsed_ms": 64.0,
                         },
                         "index_refresh_ms": {
                             "avg_elapsed_ms": 3.0,
@@ -684,6 +685,8 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
 
     assert "mcp-context-manager performance" in performance
     assert "| total_ms" in performance
+    assert "| total_ms" in performance and "64.0" in performance
+    assert "last ms" in performance
     assert "| index_refresh_ms" in performance
     assert "| candidate_retrieval_ms" in performance
     assert "| search_fragment_ms" in performance
@@ -713,6 +716,116 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     )
     assert performance_footer.startswith("keys: Up/Down select")
     assert "refresh=5.0s" in performance_footer
+
+    narrow_performance = monitor.render_monitor_screen(
+        snapshots,
+        url="http://localhost:8000/mcp",
+        color=False,
+        width=100,
+        state=state,
+    )
+    narrow_lines = narrow_performance.splitlines()
+    stage_start = next(index for index, line in enumerate(narrow_lines) if line.startswith("| stage"))
+    stage_end = next(
+        index
+        for index, line in enumerate(narrow_lines[stage_start + 1 :], start=stage_start + 1)
+        if line.startswith("| signal ")
+    )
+    stage_lines = narrow_lines[stage_start:stage_end]
+    assert all(
+        monitor._visible_len(line) <= 100 for line in stage_lines
+    )
+
+
+def test_context_pack_stage_stats_prefers_last_elapsed_ms_when_present() -> None:
+    monitor = load_monitor_module()
+    metrics: dict[str, Any] = {
+        "benchmarks": {
+            "stage_latency_ms_by_operation": {
+                "context_pack": {
+                    "candidate_retrieval_ms": {
+                        "avg_elapsed_ms": 17.0,
+                        "min_elapsed_ms": 3.0,
+                        "max_elapsed_ms": 21.0,
+                        "last_elapsed_ms": 55.0,
+                    },
+                },
+            },
+            "recent": [
+                {
+                    "operation": "context_pack",
+                    "stage_timings_ms": {"candidate_retrieval_ms": 44.0},
+                },
+            ],
+        },
+    }
+
+    stage_rows = monitor._performance_stage_rows(metrics)
+    candidate_row = next(row for row in stage_rows if row[0] == "candidate_retrieval_ms")
+    assert candidate_row == (
+        "candidate_retrieval_ms",
+        "17.0",
+        "3.0",
+        "21.0",
+        "55.0",
+    )
+
+
+def test_context_pack_stage_stats_falls_back_to_latest_recent_value_when_last_missing() -> None:
+    monitor = load_monitor_module()
+    metrics: dict[str, Any] = {
+        "benchmarks": {
+            "stage_latency_ms_by_operation": {
+                "context_pack": {
+                    "candidate_retrieval_ms": {
+                        "avg_elapsed_ms": 17.0,
+                        "min_elapsed_ms": 3.0,
+                        "max_elapsed_ms": 21.0,
+                    },
+                    "index_refresh_ms": {
+                        "avg_elapsed_ms": 4.0,
+                        "min_elapsed_ms": 1.0,
+                        "max_elapsed_ms": 5.0,
+                        "last_elapsed_ms": 88.0,
+                    },
+                },
+            },
+            "recent": [
+                {
+                    "operation": "context_pack",
+                    "stage_timings_ms": {
+                        "candidate_retrieval_ms": 12.0,
+                        "index_refresh_ms": 99.0,
+                    },
+                },
+                {
+                    "operation": "search",
+                },
+                {
+                    "operation": "context_pack",
+                    "stage_timings_ms": {"candidate_retrieval_ms": 42.0},
+                },
+            ],
+        },
+    }
+
+    stage_rows = monitor._performance_stage_rows(metrics)
+    candidate_row = next(row for row in stage_rows if row[0] == "candidate_retrieval_ms")
+    assert candidate_row == (
+        "candidate_retrieval_ms",
+        "17.0",
+        "3.0",
+        "21.0",
+        "42.0",
+    )
+    index_row = next(row for row in stage_rows if row[0] == "index_refresh_ms")
+    assert index_row == (
+        "index_refresh_ms",
+        "4.0",
+        "1.0",
+        "5.0",
+        "88.0",
+    )
 
 
 def test_mcp_loading_status_renders_in_controls() -> None:
