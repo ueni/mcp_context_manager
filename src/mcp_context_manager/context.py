@@ -38,6 +38,7 @@ DEFAULT_BACKGROUND_REFRESH_INTERVAL_SECONDS = 5.0
 CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR = 6
 RETRIEVAL_SEARCH_TERM_SCHEMA = "retrieval.search_term.v1"
 RETRIEVAL_FILE_SUMMARY_SCHEMA = "retrieval.file_summary.v1"
+RETRIEVAL_TEST_OWNER_PATHS_SCHEMA = "retrieval.test_owner_paths.v1"
 RETRIEVAL_SEARCH_TERM_POOL_SIZE = 40
 RETRIEVAL_FILE_SUMMARY_MAX_CHARS = 1200
 CACHE_ENTRY_SCHEMA_VERSION = 2
@@ -57,6 +58,7 @@ FRAGMENT_CACHE_NAMESPACES = {
     "context_lookup.search",
     "retrieval.search_term",
     "retrieval.file_summary",
+    "retrieval.test_owner_paths",
 }
 GENERIC_RETRIEVAL_TERMS = {
     "a",
@@ -1154,12 +1156,23 @@ class ContextService:
         )
         for rel in explicit_paths:
             try:
-                if whole_repo_current and self.index.indexed_path_current(rel):
+                is_directory = self.config.resolve_repo_path(rel).is_dir()
+            except ValueError:
+                is_directory = False
+            try:
+                if (not force) and self.index.indexed_path_current(rel) and (
+                    not is_directory or whole_repo_current
+                ):
                     result["skipped_count"] = int(result["skipped_count"]) + 1
+                    reason = (
+                        "signature_unchanged_path_current"
+                        if whole_repo_current
+                        else "indexed_path_current"
+                    )
                     result["skipped_paths"].append(
                         {
                             "path": rel,
-                            "reason": "signature_unchanged_path_current",
+                            "reason": reason,
                         }
                     )
                     continue
@@ -1747,6 +1760,42 @@ class ContextService:
                 },
             )
         return summary, False, miss_detail
+
+    def _memoized_file_summary(
+        self,
+        path: str,
+        line_anchor: int,
+        refresh_signature: str,
+        refresh_signature_available: bool,
+        request_memo: dict[
+            tuple[str, int, str], tuple[dict[str, Any], bool, dict[str, Any]]
+        ],
+        retrieval_stats: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool | None, dict[str, Any]]:
+        canonical_path = self._canonical_cache_path(path)
+        anchor = max(0, int(line_anchor))
+        key = (canonical_path, anchor, refresh_signature)
+        if key in request_memo:
+            retrieval_stats["file_summary_memo_hits"] = int(
+                retrieval_stats.get("file_summary_memo_hits", 0) or 0
+            ) + 1
+            summary, summary_hit, miss_detail = request_memo[key]
+            if summary_hit:
+                return summary, True, miss_detail
+            if not refresh_signature_available:
+                return summary, False, {}
+            return summary, True, {}
+        retrieval_stats["file_summary_memo_misses"] = int(
+            retrieval_stats.get("file_summary_memo_misses", 0) or 0
+        ) + 1
+        summary, summary_hit, miss_detail = self._cached_file_summary(
+            canonical_path,
+            line_anchor=anchor,
+            refresh_signature=refresh_signature,
+            refresh_signature_available=refresh_signature_available,
+        )
+        request_memo[key] = (summary, summary_hit, miss_detail)
+        return summary, summary_hit, miss_detail
 
     def _dedupe_file_summary_targets(
         self,
@@ -2831,6 +2880,10 @@ class ContextService:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         omitted: list[dict[str, Any]] = []
+        file_summary_memo: dict[
+            tuple[str, int, str],
+            tuple[dict[str, Any], bool, dict[str, Any]],
+        ] = {}
         retrieval_stats: dict[str, Any] = {
             "schema": "context_pack.retrieval_plan.v1",
             "profile": profile,
@@ -2863,13 +2916,18 @@ class ContextService:
             "chunk_hits": 0,
             "chunk_misses": 0,
             "chunk_hit_ratio": 0.0,
+            "file_summary_memo_hits": 0,
+            "file_summary_memo_misses": 0,
+            "test_owner_path_cache_hit": False,
         }
 
         def count_source(source: str) -> None:
             counts = retrieval_stats.setdefault("source_counts", {})
             counts[source] = int(counts.get(source, 0)) + 1
 
-        def count_fragment(hit: bool, detail: dict[str, Any]) -> None:
+        def count_fragment(hit: bool | None, detail: dict[str, Any]) -> None:
+            if hit is None:
+                return
             if hit:
                 retrieval_stats["fragment_hits"] = int(
                     retrieval_stats.get("fragment_hits", 0)
@@ -2881,7 +2939,9 @@ class ContextService:
             if detail:
                 retrieval_stats.setdefault("fragment_miss_details", []).append(detail)
 
-        def count_chunk(hit: bool) -> None:
+        def count_chunk(hit: bool | None) -> None:
+            if hit is None:
+                return
             key = "chunk_hits" if hit else "chunk_misses"
             retrieval_stats[key] = int(retrieval_stats.get(key, 0) or 0) + 1
 
@@ -2897,11 +2957,13 @@ class ContextService:
 
         for rel in explicit_paths:
             try:
-                summary, summary_hit, miss_detail = self._cached_file_summary(
+                summary, summary_hit, miss_detail = self._memoized_file_summary(
                     rel,
                     line_anchor=0,
                     refresh_signature=refresh_signature,
                     refresh_signature_available=refresh_signature_available,
+                    request_memo=file_summary_memo,
+                    retrieval_stats=retrieval_stats,
                 )
                 count_fragment(summary_hit, miss_detail)
                 count_chunk(summary_hit)
@@ -2985,11 +3047,13 @@ class ContextService:
                 for row in search["results"][:search_summary_limit]:
                     path = row["path"]
                     line = int(row.get("line") or self._first_matching_line(path, terms) or 1)
-                    summary, summary_hit, miss_detail = self._cached_file_summary(
+                    summary, summary_hit, miss_detail = self._memoized_file_summary(
                         path,
                         line_anchor=line,
                         refresh_signature=refresh_signature,
                         refresh_signature_available=refresh_signature_available,
+                        request_memo=file_summary_memo,
+                        retrieval_stats=retrieval_stats,
                     )
                     count_fragment(summary_hit, miss_detail)
                     count_chunk(summary_hit)
@@ -3033,11 +3097,13 @@ class ContextService:
                 symbols = self.index.symbols(query=" ".join(terms), limit=symbol_limit)
                 retrieval_stats["symbol_result_count"] = len(symbols["symbols"])
                 for row in symbols["symbols"]:
-                    summary, summary_hit, miss_detail = self._cached_file_summary(
+                    summary, summary_hit, miss_detail = self._memoized_file_summary(
                         str(row["path"]),
                         line_anchor=max(1, int(row["line_start"])),
                         refresh_signature=refresh_signature,
                         refresh_signature_available=refresh_signature_available,
+                        request_memo=file_summary_memo,
+                        retrieval_stats=retrieval_stats,
                     )
                     count_fragment(summary_hit, miss_detail)
                     count_chunk(summary_hit)
@@ -3080,6 +3146,7 @@ class ContextService:
             count_fragment=count_fragment,
             count_chunk=count_chunk,
             retrieval_stats=retrieval_stats,
+            file_summary_memo=file_summary_memo,
         )
         self._apply_route_ranking(
             candidates=candidates,
@@ -3109,20 +3176,34 @@ class ContextService:
         count_fragment: Any,
         count_chunk: Any,
         retrieval_stats: dict[str, Any],
+        file_summary_memo: dict[
+            tuple[str, int, str],
+            tuple[dict[str, Any], bool, dict[str, Any]],
+        ],
     ) -> None:
         started = time.perf_counter()
         seen = {str(item.get("path", "")) for item in candidates}
         added = 0
-        for owner in self._test_owner_paths(explicit_paths, max_results=8):
+        owners, owner_cache_hit = self._cached_test_owner_paths(
+            explicit_paths,
+            max_results=8,
+            refresh_signature=refresh_signature,
+            refresh_signature_available=refresh_signature_available,
+        )
+        retrieval_stats["test_owner_path_cache_hit"] = bool(owner_cache_hit)
+        retrieval_stats["test_owner_path_count"] = len(owners)
+        for owner in owners:
             path = str(owner.get("path", ""))
             if not path or path in seen:
                 continue
             try:
-                summary, summary_hit, miss_detail = self._cached_file_summary(
+                summary, summary_hit, miss_detail = self._memoized_file_summary(
                     path,
                     line_anchor=1,
                     refresh_signature=refresh_signature,
                     refresh_signature_available=refresh_signature_available,
+                    request_memo=file_summary_memo,
+                    retrieval_stats=retrieval_stats,
                 )
             except Exception:
                 continue
@@ -3286,7 +3367,7 @@ class ContextService:
             for row in self._test_owner_paths([path], max_results=max_results)
         ]
 
-    def _test_owner_paths(
+    def _test_owner_direct_paths(
         self, paths: list[str], max_results: int = 10
     ) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
@@ -3312,6 +3393,26 @@ class ContextService:
                     seen.add(candidate)
             if len(rows) >= max_results:
                 break
+        return rows[:max_results]
+
+    def _test_owner_paths(
+        self, paths: list[str], max_results: int = 10
+    ) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for row in self._test_owner_direct_paths(paths, max_results=max_results):
+            if row["path"] not in seen:
+                rows.append(row)
+                seen.add(row["path"])
+        if len(rows) >= max_results:
+            return rows[:max_results]
+        for raw_path in paths:
+            rel = self._canonical_cache_path(raw_path)
+            if not rel or rel.startswith(("tests/", "test/")):
+                continue
+            stem = Path(rel).stem
+            if len(rows) >= max_results:
+                break
             try:
                 search = self.index.search(
                     query=stem,
@@ -3329,6 +3430,115 @@ class ContextService:
                 if len(rows) >= max_results:
                     break
         return rows[:max_results]
+
+    def _test_owner_paths_cache_key(
+        self,
+        paths: list[str],
+        max_results: int,
+        refresh_signature: str,
+    ) -> str:
+        return self._cache_key(
+            "retrieval.test_owner_paths",
+            {
+                "schema": RETRIEVAL_TEST_OWNER_PATHS_SCHEMA,
+                "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                "project_id": self.config.project_id,
+                "explicit_paths": self._canonical_cache_paths(paths),
+                "max_results": max(1, int(max_results)),
+                "refresh_signature": refresh_signature,
+            },
+        )
+
+    def _store_test_owner_paths_cache(
+        self,
+        key: str,
+        canonical_paths: list[str],
+        refresh_signature: str,
+        max_results: int,
+        rows: list[dict[str, str]],
+    ) -> None:
+        self._cache_set(
+            key,
+            {
+                "schema": RETRIEVAL_TEST_OWNER_PATHS_SCHEMA,
+                "explicit_paths": canonical_paths,
+                "refresh_signature": refresh_signature,
+                "max_results": max_results,
+                "count": len(rows),
+                "rows": rows,
+            },
+            namespace="retrieval.test_owner_paths",
+            metadata={
+                "schema": RETRIEVAL_TEST_OWNER_PATHS_SCHEMA,
+                "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                "explicit_paths": canonical_paths,
+                "refresh_signature": refresh_signature,
+                "max_results": max_results,
+            },
+        )
+
+    def _cached_test_owner_paths(
+        self,
+        paths: list[str],
+        max_results: int,
+        refresh_signature: str,
+        refresh_signature_available: bool,
+    ) -> tuple[list[dict[str, str]], bool]:
+        canonical_paths = self._canonical_cache_paths(paths)
+        limit = max(1, int(max_results))
+        if not canonical_paths:
+            return [], False
+        if not refresh_signature_available:
+            return self._test_owner_paths(canonical_paths, max_results=limit), False
+        key = self._test_owner_paths_cache_key(
+            canonical_paths,
+            max_results=limit,
+            refresh_signature=refresh_signature,
+        )
+        lookup = self._cache_lookup(key)
+        cached = lookup.get("value") if lookup["hit"] else None
+        if (
+            isinstance(cached, dict)
+            and cached.get("schema") == RETRIEVAL_TEST_OWNER_PATHS_SCHEMA
+        ):
+            rows = [
+                {"path": str(row.get("path", "")), "confidence": str(row.get("confidence", ""))}
+                for row in cached.get("rows", [])
+                if isinstance(row, dict) and row.get("path")
+            ]
+            direct_rows = self._test_owner_direct_paths(
+                canonical_paths, max_results=limit
+            )
+            if direct_rows:
+                merged: list[dict[str, str]] = []
+                seen: set[str] = set()
+                for row in [*direct_rows, *rows]:
+                    path = str(row.get("path", ""))
+                    if not path or path in seen:
+                        continue
+                    merged.append(row)
+                    seen.add(path)
+                    if len(merged) >= limit:
+                        break
+                if merged != rows[:limit]:
+                    self._store_test_owner_paths_cache(
+                        key,
+                        canonical_paths=canonical_paths,
+                        refresh_signature=refresh_signature,
+                        max_results=limit,
+                        rows=merged,
+                    )
+                    return merged, False
+            return rows[:limit], True
+        rows = self._test_owner_paths(canonical_paths, max_results=limit)
+        self._store_test_owner_paths_cache(
+            key,
+            canonical_paths=canonical_paths,
+            refresh_signature=refresh_signature,
+            max_results=limit,
+            rows=rows,
+        )
+        return rows, False
 
     def _explain_cache(self, path: str, max_results: int) -> dict[str, Any]:
         rel = self._canonical_cache_path(path)

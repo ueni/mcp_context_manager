@@ -576,3 +576,248 @@ def test_context_pack_rejects_prompt_path_noise(service: ContextService) -> None
     assert not any(path in {"0.2", "e.g", "i.e"} for path in omitted_paths)
     assert pack["request"]["changed_files"] == []
     assert pack["request"]["focus_paths"] == []
+
+
+def test_file_summary_request_memo_reuses_duplicate_targets(
+    service: ContextService, monkeypatch
+) -> None:
+    service.context_admin(mode="index_refresh")
+    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+    original = service._cached_file_summary
+    calls: list[tuple[str, int]] = []
+
+    def counted_summary(*args, **kwargs):
+        path = kwargs.get("path", args[0] if args else "")
+        line_anchor = kwargs.get("line_anchor", args[1] if len(args) > 1 else 0)
+        calls.append((str(path), int(line_anchor)))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_cached_file_summary", counted_summary)
+    request_memo = {}
+    retrieval_stats = {}
+
+    first = service._memoized_file_summary(
+        "src/auth.py",
+        line_anchor=1,
+        refresh_signature=refresh_signature,
+        refresh_signature_available=refresh_signature_available,
+        request_memo=request_memo,
+        retrieval_stats=retrieval_stats,
+    )
+    second = service._memoized_file_summary(
+        "./src/auth.py",
+        line_anchor=1,
+        refresh_signature=refresh_signature,
+        refresh_signature_available=refresh_signature_available,
+        request_memo=request_memo,
+        retrieval_stats=retrieval_stats,
+    )
+
+    assert first[0] == second[0]
+    assert second[1] is True
+    assert calls == [("src/auth.py", 1)]
+    assert second[2] == {}
+    assert retrieval_stats["file_summary_memo_hits"] == 1
+    assert retrieval_stats["file_summary_memo_misses"] == 1
+
+
+def test_file_summary_duplicate_targets_count_single_fragment_chunk_miss_and_memo_hit(
+    service: ContextService, monkeypatch
+) -> None:
+    service.context_admin(mode="index_refresh")
+    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+    original = service._cached_file_summary
+    cached_calls: list[tuple[str, int]] = []
+
+    def counted_summary(*args, **kwargs):
+        path = kwargs.get("path", args[0] if args else "")
+        line_anchor = kwargs.get("line_anchor", args[1] if len(args) > 1 else 0)
+        cached_calls.append((str(path), int(line_anchor)))
+        summary, _summary_hit, _miss_detail = original(*args, **kwargs)
+        return (
+            summary,
+            False,
+            {
+                "schema": "cache_miss_detail.v1",
+                "namespace": "retrieval.file_summary",
+                "path": str(path),
+                "line_anchor": int(line_anchor),
+                "reason": "forced_for_test",
+            },
+        )
+
+    monkeypatch.setattr(service, "_cached_file_summary", counted_summary)
+    monkeypatch.setattr(
+        service, "_cached_test_owner_paths", lambda *args, **kwargs: ([], False)
+    )
+
+    _, _, retrieval_stats = service._context_pack_candidates(
+        terms=[],
+        explicit_paths=["src/auth.py", "./src/auth.py"],
+        profile="compact",
+        route="diagnostic",
+        max_items=1,
+        requested_max_items=1,
+        refresh_signature=refresh_signature,
+        refresh_signature_available=refresh_signature_available,
+    )
+
+    assert cached_calls == [("src/auth.py", 0)]
+    assert retrieval_stats["fragment_misses"] == 1
+    assert retrieval_stats["fragment_hits"] == 1
+    assert retrieval_stats["chunk_misses"] == 1
+    assert retrieval_stats["chunk_hits"] == 1
+    assert retrieval_stats["file_summary_memo_hits"] == 1
+    assert retrieval_stats["file_summary_memo_misses"] == 1
+    assert len(retrieval_stats["fragment_miss_details"]) == 1
+    assert retrieval_stats["fragment_miss_details"][0]["reason"] == "forced_for_test"
+
+
+def test_test_owner_paths_cache_reuses_index_search(
+    service: ContextService, monkeypatch
+) -> None:
+    service.context_admin(mode="index_refresh")
+    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+    original_search = service.index.search
+    calls: list[str] = []
+
+    def counted_search(*args, **kwargs):
+        calls.append(str(kwargs.get("query", args[0] if args else "")))
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setattr(service.index, "search", counted_search)
+
+    first, first_hit = service._cached_test_owner_paths(
+        ["src/auth.py"],
+        max_results=8,
+        refresh_signature=refresh_signature,
+        refresh_signature_available=refresh_signature_available,
+    )
+    second, second_hit = service._cached_test_owner_paths(
+        ["./src/auth.py"],
+        max_results=8,
+        refresh_signature=refresh_signature,
+        refresh_signature_available=refresh_signature_available,
+    )
+
+    assert first
+    assert first == second
+    assert first_hit is False
+    assert second_hit is True
+    assert calls == ["auth"]
+
+
+def test_explicit_path_refresh_skips_current_indexed_paths(
+    service: ContextService, monkeypatch
+) -> None:
+    service.context_admin(mode="index_refresh")
+
+    def fail_scoped_refresh(*args, **kwargs):
+        raise AssertionError("current explicit path should not refresh")
+
+    monkeypatch.setattr(service, "_ensure_index_fresh", fail_scoped_refresh)
+
+    result = service._refresh_explicit_paths(
+        ["src/auth.py"],
+        whole_repo_refresh={"skipped": True, "reason": "last_good_index"},
+        force=False,
+    )
+
+    assert result["refreshed_count"] == 0
+    assert result["skipped_count"] == 1
+    assert result["skipped_paths"] == [
+        {"path": "src/auth.py", "reason": "indexed_path_current"}
+    ]
+
+
+def test_explicit_directory_path_refresh_not_skipped_without_whole_repo_signature_unchanged(
+    service: ContextService, monkeypatch
+) -> None:
+    service.context_admin(mode="index_refresh")
+    calls = []
+
+    def counted_refresh(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return {"reason": "scoped_refresh"}
+
+    monkeypatch.setattr(service, "_ensure_index_fresh", counted_refresh)
+
+    result = service._refresh_explicit_paths(
+        ["src"],
+        whole_repo_refresh={"skipped": True, "reason": "last_good_index"},
+        force=False,
+    )
+
+    assert result["refreshed_count"] == 1
+    assert result["skipped_count"] == 0
+    assert result["refreshed_paths"] == [
+        {"path": "src", "reason": "scoped_refresh"}
+    ]
+    assert calls
+
+
+def test_cached_empty_test_owner_paths_rechecks_direct_test_files(
+    service: ContextService, sample_repo
+) -> None:
+    source_file = sample_repo / "src" / "foo.py"
+    source_file.write_text("def foo():\n    return \"foo\"\n", encoding="utf-8")
+    service.context_admin(mode="index_refresh")
+    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+
+    first, first_hit = service._cached_test_owner_paths(
+        ["src/foo.py"],
+        max_results=8,
+        refresh_signature=refresh_signature,
+        refresh_signature_available=refresh_signature_available,
+    )
+    assert first == []
+    assert first_hit is False
+
+    (sample_repo / "tests" / "test_foo.py").write_text(
+        "def test_foo():\n    assert foo.foo() == \"foo\"\n",
+        encoding="utf-8",
+    )
+
+    second, second_hit = service._cached_test_owner_paths(
+        ["src/foo.py"],
+        max_results=8,
+        refresh_signature=refresh_signature,
+        refresh_signature_available=refresh_signature_available,
+    )
+
+    assert second == [{"path": "tests/test_foo.py", "confidence": "high"}]
+    assert second_hit is False
+
+
+def test_cached_test_owner_paths_merges_new_direct_test_files(
+    service: ContextService, sample_repo
+) -> None:
+    service.context_admin(mode="index_refresh")
+    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+
+    first, first_hit = service._cached_test_owner_paths(
+        ["src/auth.py"],
+        max_results=8,
+        refresh_signature=refresh_signature,
+        refresh_signature_available=refresh_signature_available,
+    )
+    assert first == [{"path": "tests/test_auth.py", "confidence": "high"}]
+    assert first_hit is False
+
+    (sample_repo / "tests" / "auth_test.py").write_text(
+        "def test_auth_alias():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    second, second_hit = service._cached_test_owner_paths(
+        ["src/auth.py"],
+        max_results=8,
+        refresh_signature=refresh_signature,
+        refresh_signature_available=refresh_signature_available,
+    )
+
+    assert second[:2] == [
+        {"path": "tests/test_auth.py", "confidence": "high"},
+        {"path": "tests/auth_test.py", "confidence": "high"},
+    ]
+    assert second_hit is False
