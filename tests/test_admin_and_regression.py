@@ -25,6 +25,14 @@ def _write_many_python_files(repo: Path, count: int = 12) -> None:
         )
 
 
+def _write_fallback_only_file(repo: Path, term: str = "fallbackonly") -> None:
+    indexed_terms = "\n".join(f"unique_token_{idx}" for idx in range(4100))
+    (repo / "large.py").write_text(
+        f"{indexed_terms}\n# {term} appears after the index term cap\n",
+        encoding="utf-8",
+    )
+
+
 def _count_python_read_bytes(repo: Path, monkeypatch) -> list[str]:
     original_read_bytes = Path.read_bytes
     read_paths: list[str] = []
@@ -225,7 +233,7 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
         == int(sum(warmup["file_summary_cache"]["source_counts"].values()))
     )
     assert all(row["path"] == "src" for row in warmup["search_cache"]["queries"])
-    assert fallback_flags == [False, False, False]
+    assert fallback_flags == []
     assert warmup["cache"]["entry_count_after"] >= warmup["search_cache"]["query_count"]
     assert "retrieval.search_term" in warmup["cache"]["namespaces_after"]
     assert "context_pack.retrieval" not in warmup["cache"]["namespaces_after"]
@@ -244,9 +252,11 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert warmup_check["samples"] == 1
     assert warmup_check["current"] == metrics["warmup"]["avg_elapsed_ms"]
 
+    fallback_flags.clear()
     lookup = service.context_lookup(mode="search", query="test", path="src")
 
-    assert lookup["cache"]["hit"] is True
+    assert any(fallback_flags)
+    assert lookup["cache"]["fragment_misses"] >= 1
     assert lookup["cache"]["namespace"] == "context_lookup.search"
 
     second = service.context_admin(mode="warmup", path="src", max_entries=3)
@@ -264,6 +274,26 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert explicit["file_summary_cache"]["summary_count"] == 0
     assert explicit["stage_timings_ms"]["search_ms"] >= 0
     assert explicit["stage_timings_ms"]["file_summary_ms"] >= 0
+
+
+def test_context_lookup_search_keeps_public_fallback_search_path(
+    service: ContextService,
+    monkeypatch,
+) -> None:
+    original_search = service.index.search
+    fallback_flags: list[bool] = []
+
+    def counted_search(*args, **kwargs):
+        fallback_flags.append(bool(kwargs.get("allow_fallback", True)))
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setattr(service.index, "search", counted_search)
+
+    result = service.context_lookup(mode="search", query="auth publicfallback")
+
+    assert result["results"]
+    assert fallback_flags
+    assert all(fallback_flags)
 
 
 def test_context_admin_warmup_scopes_symbol_summary_targets(service: ContextService, monkeypatch) -> None:
@@ -372,6 +402,11 @@ def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
     assert benchmark["runs"][3]["cache_hit"] is False
     assert benchmark["runs"][3]["fragment_hit_ratio"] >= 0.2
     assert "search_ranking_ms" in benchmark["runs"][0]["stage_timings_ms"]
+    assert "search_fragment_ms" in benchmark["runs"][0]["stage_timings_ms"]
+    assert "search_merge_ms" in benchmark["runs"][0]["stage_timings_ms"]
+    assert "search_summary_ms" in benchmark["runs"][0]["stage_timings_ms"]
+    assert "symbol_lookup_ms" in benchmark["runs"][0]["stage_timings_ms"]
+    assert "test_owner_summary_ms" in benchmark["runs"][0]["stage_timings_ms"]
     assert "reference_write_ms" in benchmark["runs"][0]["stage_timings_ms"]
     assert "response_assembly_ms" in benchmark["runs"][0]["stage_timings_ms"]
     assert benchmark["runs"][0]["token_counting"]["token_count_source"] == "estimate"
@@ -657,6 +692,115 @@ def test_context_pack_cache_miss_uses_specific_reason(
     )
 
 
+def test_context_pack_search_cache_without_fallback_does_not_suppress_public_fallback_lookup(
+    service: ContextService, monkeypatch
+) -> None:
+    service.context_pack("auth", max_items=2)
+
+    original_search = service.index.search
+    observed_fallback_flags: list[bool] = []
+
+    def tracked_search(*args, **kwargs):
+        observed_fallback_flags.append(bool(kwargs.get("allow_fallback", False)))
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setattr(service.index, "search", tracked_search)
+
+    lookup = service.context_lookup(mode="search", query="auth")
+
+    assert any(observed_fallback_flags)
+    assert lookup["cache"]["fragment_misses"] >= 1
+
+
+def test_public_search_cache_with_fallback_does_not_reuse_index_only_context_pack_fragments(
+    service: ContextService, monkeypatch
+) -> None:
+    service.context_lookup(mode="search", query="auth")
+
+    original_search_fragment = service.index.search_fragment
+    observed = []
+
+    def tracked_search_fragment(*args, **kwargs):
+        observed.append((args, kwargs))
+        return original_search_fragment(*args, **kwargs)
+
+    monkeypatch.setattr(service.index, "search_fragment", tracked_search_fragment)
+
+    pack = service.context_pack("auth", max_items=1)
+
+    assert observed
+    assert pack["cache"]["fragment_misses"] >= 1
+    assert any(
+        detail.get("reason") == "fallback_policy_changed"
+        for detail in pack["cache"]["miss_details"]
+    )
+
+
+def test_index_only_empty_fragment_does_not_suppress_public_fallback_scan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_fallback_only_file(repo)
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    service.context_pack("fallbackonly", max_items=1)
+
+    original_search = service.index.search
+    fallback_flags: list[bool] = []
+
+    def tracked_search(*args, **kwargs):
+        fallback_flags.append(bool(kwargs.get("allow_fallback", False)))
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setattr(service.index, "search", tracked_search)
+
+    lookup = service.context_lookup(mode="search", query="fallbackonly")
+
+    assert any(fallback_flags)
+    assert lookup["cache"]["fragment_misses"] >= 1
+    assert lookup["results"]
+    assert lookup["results"][0]["source"] == "scan"
+
+
+def test_public_fallback_scan_fragment_does_not_feed_index_only_context_pack(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_fallback_only_file(repo)
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    lookup = service.context_lookup(mode="search", query="fallbackonly")
+    assert lookup["results"]
+    assert lookup["results"][0]["source"] == "scan"
+
+    original_search_fragment = service.index.search_fragment
+    observed = []
+
+    def tracked_search_fragment(*args, **kwargs):
+        observed.append((args, kwargs))
+        return original_search_fragment(*args, **kwargs)
+
+    monkeypatch.setattr(service.index, "search_fragment", tracked_search_fragment)
+
+    pack = service.context_pack("fallbackonly", max_items=1)
+
+    assert observed
+    assert pack["cache"]["fragment_misses"] >= 1
+    assert all(item.get("source") != "scan" for item in pack["items"])
+
+
 def test_context_pack_changed_signature_invalidates_fragments(
     service: ContextService, sample_repo: Path
 ) -> None:
@@ -816,6 +960,61 @@ def test_warm_context_pack_reuses_search_fragments_for_response_assembly(
     assert warm["cache"]["fragment_hits"] > 0
     assert warm["metrics"]["stage_timings_ms"]["candidate_retrieval_ms"] >= 0.0
     assert warm["references"][0]["reference_id"] != first["references"][0]["reference_id"]
+
+
+def test_cold_context_pack_uses_indexed_search_fragments_without_public_search(
+    service: ContextService,
+    monkeypatch,
+) -> None:
+    def fail_search(*_args, **_kwargs):
+        raise AssertionError("context_pack should use indexed search fragments")
+
+    monkeypatch.setattr(service.index, "search", fail_search)
+
+    pack = service.context_pack(
+        "review auth login fastpath",
+        max_items=2,
+        output_profile="compact",
+        diagnostics="full",
+    )
+
+    timings = pack["metrics"]["stage_timings_ms"]
+    assert pack["items"]
+    assert pack["metrics"]["retrieval_plan"]["search_result_count"] >= 1
+    assert timings["search_fragment_ms"] >= 0.0
+    assert timings["search_merge_ms"] >= 0.0
+    assert timings["search_summary_ms"] >= 0.0
+
+
+def test_compact_context_pack_limits_search_summary_extraction(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_many_python_files(repo, count=30)
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    pack = service.context_pack(
+        "review needle",
+        max_items=1,
+        output_profile="compact",
+        diagnostics="full",
+    )
+    plan = pack["metrics"]["retrieval_plan"]
+
+    assert pack["items"]
+    assert plan["search_result_count"] > plan["search_summary_limit"]
+    assert plan["search_summary_limit"] == 8
+    assert plan["search_summary_count"] == 8
+    assert any(
+        row.get("reason_code") == "search_summary_limit"
+        for row in pack["omitted"]
+    )
 
 
 def test_stable_context_pack_uses_last_good_index_and_queues_refresh(

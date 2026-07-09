@@ -106,6 +106,31 @@ class FakeClient:
                             "min_elapsed_ms": 0.0,
                             "max_elapsed_ms": 60.0,
                         },
+                        "search_fragment_ms": {
+                            "avg_elapsed_ms": 4.0,
+                            "min_elapsed_ms": 1.0,
+                            "max_elapsed_ms": 8.0,
+                        },
+                        "search_merge_ms": {
+                            "avg_elapsed_ms": 7.0,
+                            "min_elapsed_ms": 1.0,
+                            "max_elapsed_ms": 16.0,
+                        },
+                        "search_summary_ms": {
+                            "avg_elapsed_ms": 6.0,
+                            "min_elapsed_ms": 1.0,
+                            "max_elapsed_ms": 14.0,
+                        },
+                        "symbol_lookup_ms": {
+                            "avg_elapsed_ms": 2.0,
+                            "min_elapsed_ms": 0.0,
+                            "max_elapsed_ms": 5.0,
+                        },
+                        "test_owner_summary_ms": {
+                            "avg_elapsed_ms": 1.0,
+                            "min_elapsed_ms": 0.0,
+                            "max_elapsed_ms": 4.0,
+                        },
                         "skill_guidance_ms": {
                             "avg_elapsed_ms": 2.0,
                             "min_elapsed_ms": 1.0,
@@ -625,7 +650,16 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "mcp-context-manager performance" in performance
     assert "| total_ms" in performance
     assert "| index_refresh_ms" in performance
+    assert "| candidate_retrieval_ms" in performance
+    assert "| search_fragment_ms" in performance
+    assert "| search_merge_ms" in performance
+    assert "| search_summary_ms" in performance
+    assert "| symbol_lookup_ms" in performance
+    assert "| test_owner_summary_ms" in performance
     assert "| skill_guidance_ms" in performance
+    assert "| retrieval bottleneck" in performance
+    assert "search_merge_ms" in performance
+    assert "search_ranking_ms" not in performance
     assert "freshness" in performance
     assert "last_good" in performance
     assert "background queue" in performance

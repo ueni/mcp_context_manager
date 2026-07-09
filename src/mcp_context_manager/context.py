@@ -59,21 +59,30 @@ FRAGMENT_CACHE_NAMESPACES = {
     "retrieval.file_summary",
 }
 GENERIC_RETRIEVAL_TERMS = {
+    "a",
     "add",
+    "an",
     "and",
+    "are",
+    "as",
     "behavior",
     "bug",
     "build",
+    "by",
     "change",
     "code",
     "debug",
     "diff",
     "fix",
     "for",
+    "in",
     "implement",
     "implementation",
+    "is",
     "issue",
     "merge",
+    "of",
+    "on",
     "plan",
     "pr",
     "real",
@@ -84,6 +93,8 @@ GENERIC_RETRIEVAL_TERMS = {
     "run",
     "test",
     "tests",
+    "the",
+    "to",
     "update",
     "verify",
     "with",
@@ -477,6 +488,7 @@ class ContextService:
             profile=profile,
             route=route,
             max_items=retrieval_max_items,
+            requested_max_items=max_items,
             refresh_signature=refresh_signature,
             refresh_signature_available=refresh_signature_available,
         )
@@ -487,6 +499,20 @@ class ContextService:
         stage_timings["snippet_batch_ms"] = round(
             float(retrieval_stats.get("snippet_batch_ms", 0.0)), 3
         )
+        retrieval_stage_timings = retrieval_stats.get("stage_timings_ms", {})
+        if not isinstance(retrieval_stage_timings, dict):
+            retrieval_stage_timings = {}
+        for timing_key in (
+            "search_fragment_ms",
+            "search_merge_ms",
+            "search_summary_ms",
+            "symbol_lookup_ms",
+            "test_owner_summary_ms",
+        ):
+            stage_timings[timing_key] = round(
+                float(retrieval_stage_timings.get(timing_key, 0.0) or 0.0),
+                3,
+            )
         fragment_hits = int(retrieval_stats.get("fragment_hits", 0) or 0)
         fragment_misses = int(retrieval_stats.get("fragment_misses", 0) or 0)
         fragment_miss_details = [
@@ -1170,6 +1196,21 @@ class ContextService:
             return RETRIEVAL_SEARCH_TERM_POOL_SIZE
         return requested
 
+    def _search_summary_limit(
+        self,
+        profile: str,
+        requested_max_items: int,
+        result_count: int,
+    ) -> int:
+        requested = max(1, int(requested_max_items))
+        if profile in {"minimal", "compact"}:
+            limit = max(requested * 2, 8)
+        elif profile == "normal":
+            limit = max(requested * 3, 12)
+        else:
+            limit = max(0, int(result_count))
+        return min(max(0, int(result_count)), limit)
+
     def _search_term_cache_key(
         self,
         term: str,
@@ -1177,6 +1218,7 @@ class ContextService:
         include_globs: list[str] | None,
         pool_size: int,
         refresh_signature: str,
+        allow_fallback: bool,
     ) -> str:
         return self._cache_key(
             "retrieval.search_term",
@@ -1189,6 +1231,7 @@ class ContextService:
                 "include_globs": self._canonical_cache_globs(include_globs),
                 "term": term,
                 "pool_size": self._search_pool_size(pool_size),
+                "allow_fallback": bool(allow_fallback),
             },
         )
 
@@ -1214,6 +1257,7 @@ class ContextService:
         miss_details: list[dict[str, Any]] = []
         fragment_hits = 0
         fragment_misses = 0
+        fragment_started = time.perf_counter()
         for term in shard_terms:
             fragment = self._cached_search_term(
                 term=term,
@@ -1230,11 +1274,14 @@ class ContextService:
             else:
                 fragment_misses += 1
                 miss_details.append(fragment["miss_detail"])
+        search_fragment_ms = self._elapsed_ms(fragment_started)
+        merge_started = time.perf_counter()
         rows = self._merge_search_fragments(
             terms=terms,
             fragments=fragments,
             max_results=max_results,
         )
+        search_merge_ms = self._elapsed_ms(merge_started)
         result = {
             "schema": "context_search.v1",
             "query": query,
@@ -1289,6 +1336,10 @@ class ContextService:
             "fragment_misses": fragment_misses,
             "fragment_hit_ratio": self._hit_ratio(fragment_hits, fragment_misses),
             "miss_details": miss_details[:12],
+            "stage_timings_ms": {
+                "search_fragment_ms": search_fragment_ms,
+                "search_merge_ms": search_merge_ms,
+            },
         }
 
     def _cached_search_term(
@@ -1309,6 +1360,7 @@ class ContextService:
             include_globs=canonical_globs,
             pool_size=pool_size,
             refresh_signature=refresh_signature,
+            allow_fallback=allow_fallback,
         )
         miss_detail = {
             "schema": "cache_miss_detail.v1",
@@ -1346,17 +1398,30 @@ class ContextService:
                         "include_globs": canonical_globs,
                         "refresh_signature": refresh_signature,
                         "pool_size": self._search_pool_size(pool_size),
+                        "allow_fallback": bool(allow_fallback),
                     },
                 )
             )
-        result = self.index.search(
-            query=term,
-            path=canonical_path,
-            max_results=self._search_pool_size(pool_size),
-            include_globs=canonical_globs or None,
-            allow_fallback=allow_fallback,
-        )
-        rows = [row for row in result.get("results", []) if isinstance(row, dict)]
+        if allow_fallback:
+            result = self.index.search(
+                query=term,
+                path=canonical_path,
+                max_results=self._search_pool_size(pool_size),
+                include_globs=canonical_globs or None,
+                allow_fallback=True,
+            )
+            rows = [row for row in result.get("results", []) if isinstance(row, dict)]
+        else:
+            rows = [
+                row
+                for row in self.index.search_fragment(
+                    term=term,
+                    path=canonical_path,
+                    max_results=self._search_pool_size(pool_size),
+                    include_globs=canonical_globs or None,
+                )
+                if isinstance(row, dict)
+            ]
         if refresh_signature_available:
             self._cache_set(
                 key,
@@ -1367,6 +1432,7 @@ class ContextService:
                     "include_globs": canonical_globs,
                     "refresh_signature": refresh_signature,
                     "pool_size": self._search_pool_size(pool_size),
+                    "allow_fallback": bool(allow_fallback),
                     "count": len(rows),
                     "results": rows,
                 },
@@ -1378,6 +1444,7 @@ class ContextService:
                     "include_globs": canonical_globs,
                     "refresh_signature": refresh_signature,
                     "pool_size": self._search_pool_size(pool_size),
+                    "allow_fallback": bool(allow_fallback),
                 },
             )
         return {
@@ -1902,6 +1969,7 @@ class ContextService:
         profile: str,
         route: str,
         max_items: int,
+        requested_max_items: int,
         refresh_signature: str,
         refresh_signature_available: bool,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -1920,8 +1988,16 @@ class ContextService:
             "symbol_result_count": 0,
             "symbol_summary_count": 0,
             "symbol_lookup_skipped": False,
+            "search_summary_limit": 0,
             "snippet_request_count": 0,
             "snippet_batch_ms": 0.0,
+            "stage_timings_ms": {
+                "search_fragment_ms": 0.0,
+                "search_merge_ms": 0.0,
+                "search_summary_ms": 0.0,
+                "symbol_lookup_ms": 0.0,
+                "test_owner_summary_ms": 0.0,
+            },
             "source_counts": {},
             "reusable_terms": self._reusable_retrieval_terms(terms),
             "fragment_hits": 0,
@@ -1952,6 +2028,16 @@ class ContextService:
         def count_chunk(hit: bool) -> None:
             key = "chunk_hits" if hit else "chunk_misses"
             retrieval_stats[key] = int(retrieval_stats.get(key, 0) or 0) + 1
+
+        def add_stage_timing(key: str, elapsed_ms: float) -> None:
+            stage_rows = retrieval_stats.setdefault("stage_timings_ms", {})
+            if not isinstance(stage_rows, dict):
+                stage_rows = {}
+                retrieval_stats["stage_timings_ms"] = stage_rows
+            stage_rows[key] = round(
+                float(stage_rows.get(key, 0.0) or 0.0) + float(elapsed_ms),
+                3,
+            )
 
         for rel in explicit_paths:
             try:
@@ -2001,6 +2087,17 @@ class ContextService:
                     allow_fallback=False,
                     include_index=False,
                 )
+                for timing_key in ("search_fragment_ms", "search_merge_ms"):
+                    add_stage_timing(
+                        timing_key,
+                        float(
+                            search_cache.get("stage_timings_ms", {}).get(
+                                timing_key, 0.0
+                            )
+                            if isinstance(search_cache.get("stage_timings_ms"), dict)
+                            else 0.0
+                        ),
+                    )
                 retrieval_stats["fragment_hits"] = int(
                     retrieval_stats.get("fragment_hits", 0)
                 ) + int(search_cache.get("fragment_hits", 0) or 0)
@@ -2013,7 +2110,23 @@ class ContextService:
                     if isinstance(row, dict)
                 )
                 retrieval_stats["search_result_count"] = len(search["results"])
-                for row in search["results"]:
+                search_summary_limit = self._search_summary_limit(
+                    profile=profile,
+                    requested_max_items=requested_max_items,
+                    result_count=len(search["results"]),
+                )
+                retrieval_stats["search_summary_limit"] = search_summary_limit
+                if len(search["results"]) > search_summary_limit:
+                    omitted.append(
+                        {
+                            "reason_code": "search_summary_limit",
+                            "detail": "lower-ranked search hits deferred before summary extraction",
+                            "candidate_count": len(search["results"]),
+                            "summary_limit": search_summary_limit,
+                        }
+                    )
+                search_summary_started = time.perf_counter()
+                for row in search["results"][:search_summary_limit]:
                     path = row["path"]
                     line = int(row.get("line") or self._first_matching_line(path, terms) or 1)
                     summary, summary_hit, miss_detail = self._cached_file_summary(
@@ -2036,6 +2149,9 @@ class ContextService:
                         retrieval_stats.get("search_summary_count", 0)
                     ) + 1
                     count_source(str(row.get("source", "search")))
+                add_stage_timing(
+                    "search_summary_ms", self._elapsed_ms(search_summary_started)
+                )
             except Exception as exc:
                 omitted.append({"reason_code": "search_failed", "detail": type(exc).__name__})
 
@@ -2045,8 +2161,8 @@ class ContextService:
             queued_path_count = len({str(item.get("path", "")) for item in candidates})
             if (
                 profile in {"minimal", "compact"}
-                and len(candidates) >= max_items * 2
-                and queued_path_count >= max_items
+                and len(candidates) >= requested_max_items * 2
+                and queued_path_count >= requested_max_items
             ):
                 retrieval_stats["symbol_lookup_skipped"] = True
                 omitted.append(
@@ -2057,6 +2173,7 @@ class ContextService:
                     }
                 )
             else:
+                symbol_started = time.perf_counter()
                 symbols = self.index.symbols(query=" ".join(terms), limit=symbol_limit)
                 retrieval_stats["symbol_result_count"] = len(symbols["symbols"])
                 for row in symbols["symbols"]:
@@ -2084,6 +2201,7 @@ class ContextService:
                         retrieval_stats.get("symbol_summary_count", 0)
                     ) + 1
                     count_source("symbol_index")
+                add_stage_timing("symbol_lookup_ms", self._elapsed_ms(symbol_started))
         except Exception:
             pass
 
@@ -2136,6 +2254,7 @@ class ContextService:
         count_chunk: Any,
         retrieval_stats: dict[str, Any],
     ) -> None:
+        started = time.perf_counter()
         seen = {str(item.get("path", "")) for item in candidates}
         added = 0
         for owner in self._test_owner_paths(explicit_paths, max_results=8):
@@ -2164,6 +2283,13 @@ class ContextService:
             seen.add(path)
             added += 1
         retrieval_stats["test_owner_summary_count"] = added
+        stage_rows = retrieval_stats.setdefault("stage_timings_ms", {})
+        if isinstance(stage_rows, dict):
+            stage_rows["test_owner_summary_ms"] = round(
+                float(stage_rows.get("test_owner_summary_ms", 0.0) or 0.0)
+                + self._elapsed_ms(started),
+                3,
+            )
 
     def _apply_route_ranking(
         self,
@@ -3860,6 +3986,15 @@ class ContextService:
             str(row.get("term", "")) == expected_term for row in signature_rows
         ):
             return "terms_changed"
+        expected_allow_fallback = metadata.get("allow_fallback")
+        if expected_allow_fallback is not None:
+            expected_fallback = self._cache_bool(expected_allow_fallback)
+            if not any(
+                "allow_fallback" in row and self._cache_bool(row.get("allow_fallback"))
+                == expected_fallback
+                for row in signature_rows
+            ):
+                return "fallback_policy_changed"
         expected_pool_size = metadata.get("pool_size")
         if expected_pool_size is not None and not any(
             int(row.get("pool_size", 0) or 0) == int(expected_pool_size)
@@ -3867,6 +4002,13 @@ class ContextService:
         ):
             return "limit_bucket_changed"
         return "no_compatible_entry"
+
+    def _cache_bool(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).lower() in {"1", "true", "on", "yes"}
 
     def _cache_row_status(self, row: dict[str, Any]) -> dict[str, Any]:
         if str(row.get("status", "")).lower() in {"stale", "invalidated"}:

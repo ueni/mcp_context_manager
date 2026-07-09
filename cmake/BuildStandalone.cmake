@@ -46,6 +46,7 @@ python3 -m pip install --upgrade pip
 python3 -m pip install pyinstaller .
 pyinstaller \
   --onefile \
+  --optimize 1 \
   --name "$MCP_OUTPUT_NAME" \
   --distpath /workspace/dist \
   --workpath "/workspace/.downloads/pyinstaller/build-$MCP_OUTPUT_NAME" \
@@ -70,6 +71,7 @@ python -m pip install --upgrade pip
 python -m pip install pyinstaller .
 pyinstaller \
   --onefile \
+  --optimize 1 \
   --name "$MCP_OUTPUT_NAME" \
   --distpath /workspace/dist \
   --workpath "/workspace/.downloads/pyinstaller/build-$MCP_OUTPUT_NAME" \

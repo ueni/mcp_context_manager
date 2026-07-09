@@ -638,10 +638,61 @@ class ContextIndex:
         terms = normalize_query_terms(query, max_terms=8)
         if not terms:
             raise ValueError("query must contain at least one searchable term")
+        root_rel = self._search_root_rel(path)
+        rows = self._indexed_search_rows(
+            terms=terms,
+            root_rel=root_rel,
+            max_results=max_results,
+            include_globs=include_globs,
+        )
+        if not rows and allow_fallback:
+            rows = self._fallback_search(terms, root_rel=root_rel, limit=max_results * 4)
+            rows = self._rank_search_rows(
+                rows=rows,
+                terms=terms,
+                root_rel=root_rel,
+                max_results=max_results,
+                include_globs=include_globs,
+            )
+        return {
+            "schema": "context_search.v1",
+            "query": query,
+            "terms": terms,
+            "count": len(rows),
+            "results": rows,
+            "index": self.status(),
+        }
+
+    def search_fragment(
+        self,
+        term: str,
+        path: str = ".",
+        max_results: int = 20,
+        include_globs: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        terms = normalize_query_terms(term, max_terms=1)
+        if not terms:
+            raise ValueError("term must contain at least one searchable term")
+        root_rel = self._search_root_rel(path)
+        return self._indexed_search_rows(
+            terms=terms,
+            root_rel=root_rel,
+            max_results=max_results,
+            include_globs=include_globs,
+        )
+
+    def _search_root_rel(self, path: str) -> str:
         root_path = self.config.resolve_repo_path(path)
         root_rel = self.config.repo_relative(root_path)
-        if root_rel == ".":
-            root_rel = ""
+        return "" if root_rel == "." else root_rel
+
+    def _indexed_search_rows(
+        self,
+        terms: list[str],
+        root_rel: str,
+        max_results: int,
+        include_globs: list[str] | None,
+    ) -> list[dict[str, Any]]:
         matched: dict[str, dict[str, Any]] = {}
         for term in terms:
             for _key, row in self.store.iter_json(_term_prefix(term)):
@@ -678,10 +729,22 @@ class ContextIndex:
                 ):
                     current["line"] = int(row.get("first_line", 1) or 1)
                     current["excerpt"] = str(row.get("excerpt", ""))
-        rows = list(matched.values())
-        if not rows and allow_fallback:
-            rows = self._fallback_search(terms, root_rel=root_rel, limit=max_results * 4)
+        return self._rank_search_rows(
+            rows=list(matched.values()),
+            terms=terms,
+            root_rel=root_rel,
+            max_results=max_results,
+            include_globs=include_globs,
+        )
 
+    def _rank_search_rows(
+        self,
+        rows: list[dict[str, Any]],
+        terms: list[str],
+        root_rel: str,
+        max_results: int,
+        include_globs: list[str] | None,
+    ) -> list[dict[str, Any]]:
         filtered: list[dict[str, Any]] = []
         for row in rows:
             rel = row["path"]
@@ -699,15 +762,7 @@ class ContextIndex:
             score += min(float(row.get("term_count", 0)), 8.0) * 0.25
             filtered.append({**row, "score": round(score, 4), "terms": terms})
         filtered.sort(key=lambda item: (-float(item["score"]), item["path"]))
-        results = filtered[:max_results]
-        return {
-            "schema": "context_search.v1",
-            "query": query,
-            "terms": terms,
-            "count": len(results),
-            "results": results,
-            "index": self.status(),
-        }
+        return filtered[:max_results]
 
     def _fallback_search(
         self, terms: list[str], root_rel: str, limit: int

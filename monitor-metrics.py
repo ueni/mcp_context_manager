@@ -1176,23 +1176,53 @@ def _measurement_check_rows(
     return rows
 
 
-def _performance_stage_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+RETRIEVAL_BREAKDOWN_STAGES = (
+    "search_fragment_ms",
+    "search_merge_ms",
+    "search_summary_ms",
+    "symbol_lookup_ms",
+    "test_owner_summary_ms",
+)
+
+
+def _context_pack_stage_stats(metrics: dict[str, Any], name: str) -> dict[str, Any]:
     stages = metrics.get("benchmarks", {}).get("stage_latency_ms_by_operation", {})
     pack_stages = stages.get("context_pack", {}) if isinstance(stages, dict) else {}
+    stats = pack_stages.get(name, {}) if isinstance(pack_stages, dict) else {}
+    return stats if isinstance(stats, dict) else {}
+
+
+def _performance_retrieval_bottleneck(metrics: dict[str, Any]) -> str:
+    top_name = ""
+    top_ms = -1.0
+    for name in RETRIEVAL_BREAKDOWN_STAGES:
+        stats = _context_pack_stage_stats(metrics, name)
+        avg_ms = stats.get("avg_elapsed_ms")
+        if not isinstance(avg_ms, (float, int)):
+            continue
+        if avg_ms > top_ms:
+            top_ms = avg_ms
+            top_name = name
+    if top_name and top_ms > 0:
+        return f"{top_name} ({fmt_ms(top_ms)} ms)"
+    return "-"
+
+
+def _performance_stage_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str, str]]:
     rows: list[tuple[str, str, str, str]] = []
     for name in (
         "total_ms",
         "index_refresh_ms",
         "explicit_path_refresh_ms",
         "candidate_retrieval_ms",
-        "search_ranking_ms",
+        *RETRIEVAL_BREAKDOWN_STAGES,
         "snippet_batch_ms",
         "skill_guidance_ms",
         "cache_lookup_ms",
         "reference_write_ms",
         "response_assembly_ms",
     ):
-        stats = pack_stages.get(name, {}) if isinstance(pack_stages, dict) else {}
+        stats = _context_pack_stage_stats(metrics, name)
         if not isinstance(stats, dict):
             stats = {}
         rows.append(
@@ -1234,6 +1264,7 @@ def _performance_cache_rows(
             "fragment hit ratio",
             f"{_fragment_cache_ratio(metrics) * 100:5.1f}%",
         ),
+        ("retrieval bottleneck", _performance_retrieval_bottleneck(metrics)),
         (
             "skill card cache",
             _namespace_cache_summary(metrics, "skill.compiled"),
