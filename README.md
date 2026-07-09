@@ -46,8 +46,8 @@ Use it when you want agents to:
   snippets, tests, memory, and references most likely to matter for the task.
 - Spend tokens on reasoning instead of context archaeology. Compact packs
   summarize and rank evidence while keeping full details available on demand.
-- Stay fast across follow-up turns. Incremental indexing, retrieval cache,
-  fragment cache, and chunk reuse keep unchanged context work from being
+- Stay fast across follow-up turns. Incremental indexing, fragment caches for
+  retrieval, and chunk reuse keep unchanged context work from being
   repeated.
 - Review and debug with traceable evidence. Every selected item carries path,
   line hints, reasons, confidence, provenance, and a `detail_lookup` route back
@@ -81,8 +81,7 @@ reads, smaller prompts, and better evidence discipline before code changes.
 - Git or file-metadata refresh signatures to skip unchanged repository scans.
 - Chunk-addressed summary metadata by chunk id, line range, content digest,
   extractor version, and redaction version.
-- Request-level retrieval cache plus fragment caches for search terms and file
-  summaries.
+- Fragment caches for search terms and file summaries.
 - Optional skill guidance compiled from non-secret `context_memory` records in
   `skills/<provider>` namespaces, cached as compact cards and returned by
   `context_pack` only when relevant.

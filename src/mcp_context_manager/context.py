@@ -55,7 +55,6 @@ DIAGNOSTIC_LEVELS = {"none", "summary", "full"}
 CACHE_STRATEGIES = {"stable", "fresh", "cold"}
 FRAGMENT_CACHE_NAMESPACES = {
     "context_lookup.search",
-    "context_pack.retrieval",
     "retrieval.search_term",
     "retrieval.file_summary",
 }
@@ -432,7 +431,6 @@ class ContextService:
         budget = max_output_chars or int(self._budget()["max_output_chars"])
         route = classify_route(prompt)
         terms = normalize_query_terms(prompt, max_terms=12)
-        terms_key = " ".join(sorted(set(terms)))
         explicit_paths = self._collect_paths(prompt, changed_files or [], focus_paths or [])
         stage_started = time.perf_counter()
         explicit_refresh = self._refresh_explicit_paths(
@@ -459,110 +457,49 @@ class ContextService:
             CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR,
             max(1, max_items),
         )
-        cache_key = self._context_pack_retrieval_cache_key(
+        cache_key = self._context_pack_fragment_cache_key(
             route=route,
             terms=terms,
             explicit_paths=explicit_paths,
             refresh_signature=refresh_signature,
         )
-        stage_started = time.perf_counter()
-        if refresh_index or cache_strategy == "cold":
-            cache_lookup = {
-                "hit": False,
-                "status": "disabled",
-                "reason": "disabled_cache_strategy"
-                if cache_strategy == "cold"
-                else "disabled_refresh_index",
-                "warnings": [],
-            }
-        else:
-            cache_lookup = self._cache_lookup(cache_key)
-        cached = cache_lookup.get("value") if cache_lookup["hit"] else None
-        stage_timings["cache_lookup_ms"] = self._elapsed_ms(stage_started)
-        cache_hit = isinstance(cached, dict)
-        cache_reason = str(cache_lookup.get("reason") or "miss")
+        stage_timings["cache_lookup_ms"] = 0.0
+        cache_hit = False
+        cache_status = "active" if refresh_signature_available else "disabled"
+        cache_reason = "signature_unavailable" if not refresh_signature_available else "no_fragments"
         fragment_hits = 0
         fragment_misses = 0
         fragment_miss_details: list[dict[str, Any]] = []
-        if isinstance(cached, dict):
-            candidates = list(cached.get("candidates", []))
-            retrieval_omitted = list(cached.get("omitted", []))
-            retrieval_stats = dict(cached.get("retrieval_stats", {}))
-            retrieval_stats["fragment_hits"] = 0
-            retrieval_stats["fragment_misses"] = 0
-            retrieval_stats["fragment_hit_ratio"] = 0.0
-            retrieval_stats["fragment_miss_details"] = []
-            retrieval_stats["whole_pack_cache_hit"] = True
-            stage_timings["candidate_retrieval_ms"] = 0.0
-            stage_timings["search_ranking_ms"] = 0.0
-            stage_timings["snippet_batch_ms"] = 0.0
-            cache_reason = "hit"
-        else:
-            cache_reason = (
-                "disabled_cache_strategy"
-                if cache_strategy == "cold"
-                else "disabled_refresh_index"
-                if refresh_index
-                else cache_reason
-                if cache_reason in {"expired", "invalidated", "invalid_payload"}
-                else self._cache_miss_reason(
-                    namespace="context_pack.retrieval",
-                    metadata={
-                        "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
-                        "prompt_sha256": prompt_sha256,
-                        "terms_key": terms_key,
-                        "explicit_paths": self._canonical_cache_paths(explicit_paths),
-                        "refresh_signature": refresh_signature,
-                    },
-                )
-            )
-            stage_started = time.perf_counter()
-            candidates, retrieval_omitted, retrieval_stats = self._context_pack_candidates(
-                terms=terms,
-                explicit_paths=explicit_paths,
-                profile=profile,
-                route=route,
-                max_items=retrieval_max_items,
-                refresh_signature=refresh_signature,
-                refresh_signature_available=refresh_signature_available,
-            )
-            stage_timings["candidate_retrieval_ms"] = self._elapsed_ms(stage_started)
-            stage_timings["search_ranking_ms"] = stage_timings[
-                "candidate_retrieval_ms"
-            ]
-            stage_timings["snippet_batch_ms"] = round(
-                float(retrieval_stats.get("snippet_batch_ms", 0.0)), 3
-            )
-            fragment_hits = int(retrieval_stats.get("fragment_hits", 0) or 0)
-            fragment_misses = int(retrieval_stats.get("fragment_misses", 0) or 0)
-            fragment_miss_details = [
-                row
-                for row in retrieval_stats.get("fragment_miss_details", [])
-                if isinstance(row, dict)
-            ]
-            if refresh_signature_available:
-                self._cache_set(
-                    cache_key,
-                    {
-                        "schema": "context_pack.retrieval_cache.v1",
-                        "prompt_sha256": prompt_sha256,
-                        "route": route,
-                        "terms": terms,
-                        "candidates": candidates,
-                        "omitted": retrieval_omitted,
-                        "retrieval_stats": retrieval_stats,
-                    },
-                    namespace="context_pack.retrieval",
-                    metadata={
-                        "prompt_sha256": prompt_sha256,
-                        "route": route,
-                        "refresh_signature": refresh_signature,
-                        "terms_key": terms_key,
-                        "explicit_paths": self._canonical_cache_paths(explicit_paths),
-                    },
-                )
-            elif cache_reason == "no_compatible_entry":
-                cache_reason = "signature_unavailable"
+        stage_started = time.perf_counter()
+        candidates, retrieval_omitted, retrieval_stats = self._context_pack_candidates(
+            terms=terms,
+            explicit_paths=explicit_paths,
+            profile=profile,
+            route=route,
+            max_items=retrieval_max_items,
+            refresh_signature=refresh_signature,
+            refresh_signature_available=refresh_signature_available,
+        )
+        stage_timings["candidate_retrieval_ms"] = self._elapsed_ms(stage_started)
+        stage_timings["search_ranking_ms"] = stage_timings[
+            "candidate_retrieval_ms"
+        ]
+        stage_timings["snippet_batch_ms"] = round(
+            float(retrieval_stats.get("snippet_batch_ms", 0.0)), 3
+        )
+        fragment_hits = int(retrieval_stats.get("fragment_hits", 0) or 0)
+        fragment_misses = int(retrieval_stats.get("fragment_misses", 0) or 0)
+        fragment_miss_details = [
+            row
+            for row in retrieval_stats.get("fragment_miss_details", [])
+            if isinstance(row, dict)
+        ]
+        cache_reason = self._context_pack_fragment_cache_reason(
+            fragment_hits=fragment_hits,
+            fragment_misses=fragment_misses,
+            miss_details=fragment_miss_details,
+            refresh_signature_available=refresh_signature_available,
+        )
         stage_started = time.perf_counter()
         omitted = list(retrieval_omitted)
         response_candidates = self._profile_candidates(candidates, profile)
@@ -593,10 +530,10 @@ class ContextService:
                 "cache": {
                     "hit": cache_hit,
                     "key": cache_key,
-                    "namespace": "context_pack.retrieval",
+                    "namespace": "context_pack.fragments",
                     "reason": cache_reason,
-                    "status": str(cache_lookup.get("status", "missing")),
-                    "warnings": list(cache_lookup.get("warnings") or []),
+                    "status": cache_status,
+                    "warnings": [],
                     "fragment_hits": fragment_hits,
                     "fragment_misses": fragment_misses,
                     "fragment_hit_ratio": self._hit_ratio(
@@ -698,11 +635,11 @@ class ContextService:
             "cache": {
                 "hit": cache_hit,
                 "key": cache_key,
-                "namespace": "context_pack.retrieval",
+                "namespace": "context_pack.fragments",
                 "reason": cache_reason,
-                "status": str(cache_lookup.get("status", "missing")),
-                "expires_at": str(cache_lookup.get("expires_at", "")),
-                "warnings": list(cache_lookup.get("warnings") or []),
+                "status": cache_status,
+                "expires_at": "",
+                "warnings": [],
                 "fragment_hits": fragment_hits,
                 "fragment_misses": fragment_misses,
                 "fragment_hit_ratio": self._hit_ratio(
@@ -794,7 +731,7 @@ class ContextService:
         self.metrics.record_event(
             "context_pack",
             elapsed_ms=elapsed_ms,
-            cache_hit=cache_hit,
+            cache_hit=None,
             estimated_input_tokens_saved=estimated_tokens_saved,
             baseline_input_tokens_est=baseline_tokens,
             output_tokens_est=output_tokens,
@@ -807,7 +744,7 @@ class ContextService:
             omitted_count=len(omitted),
             route=route,
             stage_timings_ms=stage_timings,
-            cache_namespace="context_pack.retrieval",
+            cache_namespace="context_pack.fragments",
             cache_reason=cache_reason,
             fragment_cache_hits=fragment_hits,
             fragment_cache_misses=fragment_misses,
@@ -1179,7 +1116,7 @@ class ContextService:
     def _first_matching_line(self, path: str, terms: list[str]) -> int:
         return self.index.first_matching_line(path, terms)
 
-    def _context_pack_retrieval_cache_key(
+    def _context_pack_fragment_cache_key(
         self,
         route: str,
         terms: list[str],
@@ -1187,7 +1124,7 @@ class ContextService:
         refresh_signature: str,
     ) -> str:
         return self._cache_key(
-            "context_pack.retrieval",
+            "context_pack.fragments",
             {
                 "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
                 "route": route,
@@ -1197,6 +1134,26 @@ class ContextService:
                 "project_id": self.config.project_id,
             },
         )
+
+    def _context_pack_fragment_cache_reason(
+        self,
+        fragment_hits: int,
+        fragment_misses: int,
+        miss_details: list[dict[str, Any]],
+        refresh_signature_available: bool,
+    ) -> str:
+        if not refresh_signature_available:
+            return "signature_unavailable"
+        if fragment_misses == 0:
+            return "fragment_hit" if fragment_hits else "no_fragments"
+        reasons = [
+            str(detail.get("reason", ""))
+            for detail in miss_details
+            if isinstance(detail, dict) and detail.get("reason")
+        ]
+        if reasons and len(set(reasons)) == 1:
+            return reasons[0]
+        return "fragment_miss"
 
     def _current_refresh_signature(self) -> tuple[str, bool]:
         status_signature, status_available = self.index.stored_refresh_signature()
@@ -3146,11 +3103,11 @@ class ContextService:
 
     def _benchmark_prompt_variation(self, focus_paths: list[str]) -> str:
         if not focus_paths:
-            return "inspect repository context retrieval cache behavior"
+            return "inspect repository context fragment cache behavior"
         terms = " ".join(
             path.replace("/", " ").replace(".", " ") for path in focus_paths[:3]
         )
-        return f"inspect {terms} retrieval cache and implementation details"
+        return f"inspect {terms} fragment cache and implementation details"
 
     def _state_browser(
         self,

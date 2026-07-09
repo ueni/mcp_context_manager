@@ -207,14 +207,8 @@ or stack-frame-like symbols and nearby tests for debug.
 
 ## Chunk And Fragment Cache
 
-The server has both request-level retrieval caching and smaller reusable
-fragments.
-
-Request-level retrieval cache keys include route, normalized terms, explicit
-paths, and refresh signature. This allows exact repeated context-pack retrieval
-to skip candidate building.
-
-Fragment cache entries support reuse across prompt variations:
+The server caches reusable retrieval fragments rather than full context-pack
+candidate lists. Fragment cache entries support reuse across prompt variations:
 
 - `retrieval.search_term` caches term search results.
 - `retrieval.file_summary` caches summary fragments.

@@ -133,8 +133,11 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     assert metrics["cache"]["hits"] >= 1
     assert metrics["cache"]["misses"] >= 1
     assert metrics["cache"]["reasons"]["hit"] >= 1
-    assert metrics["cache"]["by_namespace"]["context_pack.retrieval"]["hits"] >= 1
     assert metrics["cache"]["by_namespace"]["context_lookup.search"]["hits"] >= 1
+    assert "context_pack.retrieval" not in metrics["cache"]["by_namespace"]
+    assert metrics["cache"]["context_pack_fragment_hits"] >= warm_pack["cache"][
+        "fragment_hits"
+    ]
     assert metrics["tokens"]["estimated_input_tokens_saved"] >= pack["metrics"]["estimated_input_tokens_saved"]
     assert metrics["tokens"]["tokens_spared_by_mcp_est"] >= pack["metrics"]["tokens_spared_by_mcp_est"]
     assert (
@@ -153,7 +156,9 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     assert metrics["references"]["bytes_deferred_est"] >= pack["metrics"][
         "references_bytes_deferred_est"
     ]
-    assert warm_pack["cache"]["reason"] == "hit"
+    assert warm_pack["cache"]["hit"] is False
+    assert warm_pack["cache"]["namespace"] == "context_pack.fragments"
+    assert warm_pack["cache"]["fragment_hits"] > 0
     assert metrics["benchmarks"]["latency_ms_by_operation"]["context_pack"]["count"] >= 1
     assert "stage_latency_ms_by_operation" in metrics["benchmarks"]
     assert "snippet_batch_ms" in metrics["benchmarks"]["stage_latency_ms_by_operation"]["context_pack"]
@@ -360,8 +365,10 @@ def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
         "prompt_variation_reuse",
         "compact_focus",
     ]
-    assert benchmark["runs"][1]["cache_hit"] is True
-    assert benchmark["runs"][2]["cache_hit"] is True
+    assert benchmark["runs"][1]["cache_hit"] is False
+    assert benchmark["runs"][1]["fragment_hits"] > 0
+    assert benchmark["runs"][2]["cache_hit"] is False
+    assert benchmark["runs"][2]["fragment_hits"] > 0
     assert benchmark["runs"][3]["cache_hit"] is False
     assert benchmark["runs"][3]["fragment_hit_ratio"] >= 0.2
     assert "search_ranking_ms" in benchmark["runs"][0]["stage_timings_ms"]
@@ -486,27 +493,21 @@ def test_cache_prune_runs_opportunistically_when_due(
     assert last_pruned["result"]["expired_removed"] >= 1
 
 
-def test_invalidated_context_pack_cache_reports_stale(
+def test_context_pack_does_not_write_whole_retrieval_cache(
     service: ContextService,
 ) -> None:
-    first = service.context_pack("review auth token behavior", max_items=2)
-    deadline = datetime.now(timezone.utc) + timedelta(seconds=2)
-    while datetime.now(timezone.utc) < deadline:
-        if not service._background_status()["cache_prune"]["pending"]:
-            break
-        Event().wait(0.01)
-    cache_key = first["cache"]["key"]
-    row = service.store.get_json(f"cache:{cache_key}")
-    row["status"] = "invalidated"
-    row["invalidated_at"] = datetime.now(timezone.utc).isoformat()
-    service.store.put_json(f"cache:{cache_key}", row)
+    pack = service.context_pack("review auth token behavior", max_items=2)
 
-    second = service.context_pack("review auth token behavior", max_items=2)
+    whole_pack_rows = [
+        row
+        for _key, row in service.store.iter_json("cache:")
+        if isinstance(row, dict) and row.get("namespace") == "context_pack.retrieval"
+    ]
 
-    assert second["cache"]["hit"] is False
-    assert second["cache"]["status"] == "stale"
-    assert second["cache"]["reason"] == "invalidated"
-    assert second["cache"]["warnings"][0]["code"] == "cache_stale"
+    assert pack["cache"]["hit"] is False
+    assert pack["cache"]["namespace"] == "context_pack.fragments"
+    assert pack["cache"]["key"].startswith("context_pack.fragments:")
+    assert whole_pack_rows == []
 
 
 def test_target_tokenizer_unavailable_falls_back_to_estimate(
@@ -611,7 +612,9 @@ def test_cold_then_warm_context_pack_flow(service: ContextService) -> None:
     assert cold["items"]
     assert warm["items"]
     assert cold["cache"]["hit"] is False
-    assert warm["cache"]["hit"] is True
+    assert warm["cache"]["hit"] is False
+    assert warm["cache"]["namespace"] == "context_pack.fragments"
+    assert warm["cache"]["fragment_hits"] > 0
     assert warm["metrics"]["elapsed_ms"] >= 0
     assert warm["references"][0]["reference_id"].startswith("ctxref-")
 
@@ -647,7 +650,11 @@ def test_context_pack_cache_miss_uses_specific_reason(
     changed_terms = service.context_pack("review config settings behavior", max_items=2)
 
     assert changed_terms["cache"]["hit"] is False
-    assert changed_terms["cache"]["reason"] == "terms_changed"
+    assert changed_terms["cache"]["reason"] in {"fragment_miss", "terms_changed"}
+    assert any(
+        detail["reason"] == "terms_changed"
+        for detail in changed_terms["cache"]["miss_details"]
+    )
 
 
 def test_context_pack_changed_signature_invalidates_fragments(
@@ -680,7 +687,8 @@ def test_unrelated_edit_reuses_unchanged_chunk_summaries(
 
     assert first["items"]
     assert second["items"]
-    assert second["cache"]["hit"] is True
+    assert second["cache"]["hit"] is False
+    assert second["cache"]["fragment_hits"] > 0
     assert second["cache"]["index_freshness"]["state"] == "last_good"
 
 
@@ -779,30 +787,34 @@ def test_legacy_retrieval_cache_rows_are_stale_and_pruned(
     assert service.store.get_json("cache:legacy-search-fragment") is None
 
 
-def test_warm_context_pack_reuses_retrieval_for_response_assembly(
+def test_warm_context_pack_reuses_search_fragments_for_response_assembly(
     service: ContextService, monkeypatch
 ) -> None:
     first = service.context_pack(
-        "review auth login token behavior", max_items=2, max_output_chars=5000
+        "review auth login token behavior",
+        max_items=2,
+        max_output_chars=5000,
+        output_profile="compact",
     )
 
-    def fail_retrieval(*_args, **_kwargs):
-        raise AssertionError("warm pack should reuse cached retrieval")
+    def fail_search(*_args, **_kwargs):
+        raise AssertionError("warm pack should reuse cached search fragments")
 
-    monkeypatch.setattr(service.index, "search", fail_retrieval)
-    monkeypatch.setattr(service.index, "symbols", fail_retrieval)
-    monkeypatch.setattr(service.index, "snippet_batch", fail_retrieval)
+    monkeypatch.setattr(service.index, "search", fail_search)
 
     warm = service.context_pack(
-        "review auth login token behavior", max_items=2, max_output_chars=3200
+        "review auth login token behavior",
+        max_items=2,
+        max_output_chars=3200,
+        output_profile="compact",
     )
 
     assert first["items"]
     assert warm["items"]
-    assert warm["cache"]["hit"] is True
-    assert warm["cache"]["reason"] == "hit"
-    assert warm["metrics"]["stage_timings_ms"]["candidate_retrieval_ms"] == 0.0
-    assert warm["metrics"]["stage_timings_ms"]["snippet_batch_ms"] == 0.0
+    assert warm["cache"]["hit"] is False
+    assert warm["cache"]["namespace"] == "context_pack.fragments"
+    assert warm["cache"]["fragment_hits"] > 0
+    assert warm["metrics"]["stage_timings_ms"]["candidate_retrieval_ms"] >= 0.0
     assert warm["references"][0]["reference_id"] != first["references"][0]["reference_id"]
 
 
@@ -820,7 +832,9 @@ def test_stable_context_pack_uses_last_good_index_and_queues_refresh(
     pack = service.context_pack("review auth token behavior", max_items=2)
     metrics = service.context_admin(mode="metrics")
 
-    assert pack["cache"]["hit"] is True
+    assert pack["cache"]["hit"] is False
+    assert pack["cache"]["namespace"] == "context_pack.fragments"
+    assert pack["cache"]["fragment_hits"] > 0
     assert pack["cache"]["index_freshness"]["state"] == "last_good"
     assert pack["metrics"]["stage_timings_ms"]["index_refresh_ms"] < 50
     assert metrics["background"]["index_refresh"]["status"] in {
@@ -915,35 +929,35 @@ def test_background_index_refresh_deduplicates_concurrent_stable_packs(
     assert second["indexing"]["background"]["index_refresh"]["deduplicated_count"] >= 1
 
 
-def test_context_pack_retrieval_cache_normalizes_paths_and_item_floor(
-    service: ContextService, monkeypatch
+def test_context_pack_fragment_cache_normalizes_paths_and_item_floor(
+    service: ContextService,
 ) -> None:
     first = service.context_pack(
         "review auth token behavior",
         changed_files=["src/auth.py", "tests/test_auth.py"],
         focus_paths=["src/auth.py"],
         max_items=2,
+        output_profile="compact",
     )
-
-    def fail_retrieval(*_args, **_kwargs):
-        raise AssertionError("warm pack should reuse normalized retrieval cache")
-
-    monkeypatch.setattr(service.index, "search", fail_retrieval)
-    monkeypatch.setattr(service.index, "symbols", fail_retrieval)
-    monkeypatch.setattr(service.index, "snippet_batch", fail_retrieval)
 
     warm = service.context_pack(
         "review auth token behavior",
         changed_files=["./tests/test_auth.py", "src/auth.py"],
         focus_paths=["tests/test_auth.py", "./src/auth.py"],
         max_items=4,
+        output_profile="compact",
     )
 
     assert first["items"]
     assert warm["items"]
-    assert warm["cache"]["hit"] is True
-    assert warm["cache"]["reason"] == "hit"
-    assert warm["metrics"]["stage_timings_ms"]["candidate_retrieval_ms"] == 0.0
+    assert warm["cache"]["hit"] is False
+    assert warm["cache"]["namespace"] == "context_pack.fragments"
+    assert warm["cache"]["fragment_hits"] > 0
+    assert not [
+        row
+        for _key, row in service.store.iter_json("cache:")
+        if isinstance(row, dict) and row.get("namespace") == "context_pack.retrieval"
+    ]
 
 
 def test_external_state_dir_supports_container_layout(
@@ -1117,7 +1131,8 @@ def test_warm_context_pack_does_not_probe_every_unchanged_file(
     pack = service.context_pack("review needle", max_items=1)
 
     assert pack["items"]
-    assert pack["cache"]["hit"] is True
+    assert pack["cache"]["hit"] is False
+    assert pack["cache"]["fragment_hits"] > 0
     assert len(set(read_paths)) < 30
     assert text_paths == []
 

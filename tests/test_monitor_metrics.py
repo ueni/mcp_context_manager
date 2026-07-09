@@ -40,7 +40,7 @@ class FakeClient:
                 "context_pack_fragment_misses": 2,
                 "context_pack_fragment_hit_ratio": 0.8,
                 "by_namespace": {
-                    "context_pack.retrieval": {
+                    "context_lookup.search": {
                         "hits": 2,
                         "misses": 1,
                         "hit_ratio": 0.667,

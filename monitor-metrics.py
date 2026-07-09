@@ -1127,7 +1127,6 @@ def _measurement_check_rows(
         "candidates_per_selected": "Candidates per selected",
         "retrieval.context_pack.candidates_per_selected": "Ranked candidates per selected item",
         "cache_hit_ratio": "Cache hit ratio",
-        "cache.context_pack_retrieval_hit_ratio": "Context-pack retrieval cache hit ratio",
         "cache.context_pack_fragment_hit_ratio": "Context-pack fragment cache hit ratio",
         "cache.hit_ratio": "Overall cache hit ratio",
         "external_calls_saved": "External calls saved",
@@ -1256,8 +1255,8 @@ def _performance_cache_rows(
             f"{_fragment_cache_ratio(metrics) * 100:5.1f}%",
         ),
         (
-            "retrieval cache",
-            _namespace_cache_summary(metrics, "context_pack.retrieval"),
+            "lookup search cache",
+            _namespace_cache_summary(metrics, "context_lookup.search"),
         ),
         (
             "skill card cache",

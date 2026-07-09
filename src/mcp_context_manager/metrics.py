@@ -787,16 +787,6 @@ class ContextMetrics:
             cache = snapshot.get("cache", {})
             samples = int(cache.get("hits", 0) or 0) + int(cache.get("misses", 0) or 0)
             return float(cache.get("hit_ratio", 0.0)), samples
-        if key == "cache.context_pack_retrieval_hit_ratio":
-            namespace = (
-                snapshot.get("cache", {})
-                .get("by_namespace", {})
-                .get("context_pack.retrieval", {})
-            )
-            samples = int(namespace.get("hits", 0) or 0) + int(
-                namespace.get("misses", 0) or 0
-            )
-            return float(namespace.get("hit_ratio", 0.0)), samples
         if key == "cache.context_pack_fragment_hit_ratio":
             cache = snapshot.get("cache", {})
             samples = int(cache.get("context_pack_fragment_hits", 0) or 0) + int(

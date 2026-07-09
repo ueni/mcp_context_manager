@@ -60,9 +60,11 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert pack["metrics"]["references_bytes_deferred_est"] > 0
     assert pack["metrics"]["retrieval_plan"]["detail_mode"] == "context_lookup.snippet"
     assert pack["metrics"]["retrieval_plan"]["snippet_request_count"] == 0
-    assert pack["cache"]["namespace"] == "context_pack.retrieval"
+    assert pack["cache"]["namespace"] == "context_pack.fragments"
     assert pack["cache"]["reason"] in {
-        "miss",
+        "fragment_hit",
+        "fragment_miss",
+        "no_fragments",
         "no_compatible_entry",
         "terms_changed",
         "path_changed",
