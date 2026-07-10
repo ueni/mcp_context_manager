@@ -437,6 +437,18 @@ python3 benchmarks/context_pack_benchmark.py --repo .
 The benchmark covers forced cold refresh, warm cache reuse, repeated prompt
 reuse, prompt-variation fragment reuse, and compact focused retrieval.
 
+Reuse `benchmarks/cache_hit_prompts.json` for realistic cache-hit benchmark prompts
+covering mcp-context-manager and feso paths. The suite is designed for:
+
+- cold run: execute each prompt once from a cold cache,
+- warm run: repeat unchanged prompts to measure hit behavior,
+- variant run: execute wording-variant prompts (`mcp_retrieval_variant`) to test fragment reuse,
+- explicit-path stress: run prompts with explicit file/directory focus (`mcp_test_owner`, `mcp_dir_focus`, `mcp_docs`) on a clean run.
+
+Track: `fragment_hits`, `fragment_misses`, `fragment_hit_ratio`,
+`search_fragment_ms`, `search_summary_ms`, `test_owner_summary_ms`, and
+`file_summary_memo_hits`.
+
 ## Live Metrics Monitor
 
 `monitor-metrics.py` is a terminal dashboard that queries `context_admin(mode="projects")`,
