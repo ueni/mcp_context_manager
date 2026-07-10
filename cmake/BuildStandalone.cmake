@@ -22,6 +22,7 @@ mcp_docker_command(MCP_DOCKER_COMMAND)
 set(_common_mounts
     -v "${MCP_DOCKER_WORKSPACE_DIR}:/workspace"
     -v "${MCP_DOCKER_DOWNLOAD_CACHE_DIR}:/workspace/.downloads"
+    -v "/etc/ssl/certs:/host-ssl-certs:ro"
     -w /workspace
 )
 
@@ -39,9 +40,17 @@ APT_CACHE_OPTIONS="-o Dir::Cache::archives=/workspace/.downloads/apt/cache -o Di
 apt-get $APT_CACHE_OPTIONS update
 apt-get $APT_CACHE_OPTIONS install -y --no-install-recommends \
   python3 python3-pip python3.10-dev libpython3.10 \
-  libffi-dev libssl-dev binutils build-essential
+  ca-certificates libffi-dev libssl-dev binutils build-essential cargo rustc
+update-ca-certificates
 export PIP_CACHE_DIR=/workspace/.downloads/pip
 export PIP_ROOT_USER_ACTION=ignore
+CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+if [ -f /host-ssl-certs/ca-certificates.crt ]; then
+  CERT_FILE=/host-ssl-certs/ca-certificates.crt
+fi
+export SSL_CERT_FILE="$CERT_FILE"
+export REQUESTS_CA_BUNDLE="$CERT_FILE"
+export CARGO_HTTP_CAINFO="$CERT_FILE"
 python3 -m pip install --upgrade pip
 python3 -m pip install pyinstaller .
 pyinstaller \
@@ -51,6 +60,7 @@ pyinstaller \
   --distpath /workspace/dist \
   --workpath "/workspace/.downloads/pyinstaller/build-$MCP_OUTPUT_NAME" \
   --specpath "/workspace/.downloads/pyinstaller/spec-$MCP_OUTPUT_NAME" \
+  --collect-all tantivy \
   --collect-all mcp_context_manager \
   src/mcp_context_manager/__main__.py
 chown -R "$(stat -c "%u:%g" /workspace)" /workspace/dist /workspace/.downloads
@@ -64,9 +74,18 @@ mkdir -p /workspace/dist \
   /workspace/.downloads/pyinstaller
 chown -R 0:0 /workspace/.downloads/pip /workspace/.downloads/pyinstaller
 apk add --cache-dir /workspace/.downloads/apk --update-cache \
-  binutils build-base musl-dev libffi-dev openssl-dev
+  ca-certificates binutils build-base musl-dev libffi-dev openssl-dev \
+  cargo rust python3-dev
+update-ca-certificates
 export PIP_CACHE_DIR=/workspace/.downloads/pip
 export PIP_ROOT_USER_ACTION=ignore
+CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+if [ -f /host-ssl-certs/ca-certificates.crt ]; then
+  CERT_FILE=/host-ssl-certs/ca-certificates.crt
+fi
+export SSL_CERT_FILE="$CERT_FILE"
+export REQUESTS_CA_BUNDLE="$CERT_FILE"
+export CARGO_HTTP_CAINFO="$CERT_FILE"
 python -m pip install --upgrade pip
 python -m pip install pyinstaller .
 pyinstaller \
@@ -76,6 +95,7 @@ pyinstaller \
   --distpath /workspace/dist \
   --workpath "/workspace/.downloads/pyinstaller/build-$MCP_OUTPUT_NAME" \
   --specpath "/workspace/.downloads/pyinstaller/spec-$MCP_OUTPUT_NAME" \
+  --collect-all tantivy \
   --collect-all mcp_context_manager \
   src/mcp_context_manager/__main__.py
 chown -R "$(stat -c "%u:%g" /workspace)" /workspace/dist /workspace/.downloads

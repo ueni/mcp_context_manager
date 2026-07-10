@@ -545,6 +545,37 @@ def test_render_dashboard_keeps_long_project_names_readable() -> None:
     assert "2 fail" in rendered
 
 
+def test_measurement_matrix_marks_critical_failures() -> None:
+    monitor = load_monitor_module()
+    matrix = {
+        "checks": [
+            {
+                "key": "latency.context_pack.avg_elapsed_ms",
+                "status": "fail",
+                "operator": "<=",
+            },
+            {
+                "key": "cache.context_pack_fragment_hit_ratio",
+                "status": "fail",
+                "operator": ">=",
+                "severity": "critical",
+            },
+            {
+                "key": "tokens.context_pack.compression_ratio",
+                "status": "fail",
+                "operator": "<=",
+            },
+        ]
+    }
+
+    rows = monitor._measurement_check_rows(matrix, color=False)
+
+    assert monitor._matrix_status(matrix, color=False) == "2 critical"
+    assert rows[0][1] == "critical"
+    assert rows[1][1] == "critical"
+    assert rows[2][1] == "fail"
+
+
 def test_interactive_key_bindings_update_state() -> None:
     monitor = load_monitor_module()
     state = monitor.MonitorState(selected_index=0, refresh_interval=5.0)

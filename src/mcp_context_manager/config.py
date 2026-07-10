@@ -118,6 +118,10 @@ class ContextConfig:
     def references_dir(self) -> Path:
         return self.state_dir / "references"
 
+    @property
+    def tantivy_index_dir(self) -> Path:
+        return self.state_dir / "tantivy-index"
+
     def ensure_state_dirs(self) -> None:
         for path in [
             self.store_path.parent,

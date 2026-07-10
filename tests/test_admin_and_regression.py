@@ -5,7 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier, Event, Lock
 from typing import Any
 
 from mcp_context_manager.config import ContextConfig
@@ -19,6 +19,7 @@ from mcp_context_manager.context import (
     WARMUP_MANIFEST_KEY,
     ContextService,
 )
+from mcp_context_manager.tantivy_index import TantivySearchIndex
 
 
 def _write_many_python_files(repo: Path, count: int = 12) -> None:
@@ -125,10 +126,13 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     service.context_admin(mode="index_refresh")
     first = service.context_lookup(mode="search", query="auth token")
     second = service.context_lookup(mode="search", query="auth token")
+    _cache_key, fragment_row = _search_fragment_cache_row(service, term="auth")
     assert first["cache"]["hit"] is False
     assert second["cache"]["hit"] is True
     assert second["cache"]["namespace"] == "context_lookup.search"
     assert second["cache"]["reason"] == "hit"
+    assert fragment_row["metadata"]["backend_version"].startswith("tantivy:")
+    assert fragment_row["value"]["backend_version"].startswith("tantivy:")
 
     varied_query = service.context_lookup(
         mode="search",
@@ -895,7 +899,7 @@ def test_warmup_includes_test_owner_summary_targets(
     assert warmup["file_summary_cache"]["source_counts"]["test_owner"] >= 1
 
 
-def test_context_lookup_search_keeps_public_fallback_search_path(
+def test_context_lookup_search_keeps_public_search_path(
     service: ContextService,
     monkeypatch,
 ) -> None:
@@ -911,6 +915,7 @@ def test_context_lookup_search_keeps_public_fallback_search_path(
     result = service.context_lookup(mode="search", query="auth publicfallback")
 
     assert result["results"]
+    assert {row["source"] for row in result["results"]} == {"tantivy"}
     assert fallback_flags
     assert all(fallback_flags)
 
@@ -981,6 +986,61 @@ def test_context_admin_warmup_serializes_concurrent_project_writes(
         "context_cache.warmup.v1",
     ]
     assert all(result["search_cache"]["query_count"] == 3 for result in results)
+
+
+def test_tantivy_sidecar_rebuild_serializes_shared_index_dir(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    index_dir = tmp_path / "state" / "tantivy-index"
+    records = [
+        {
+            "path": "src/a.py",
+            "content": "needle = 'a'\n",
+            "language": "python",
+            "sha256": "a",
+            "mtime_ns": 1,
+        },
+        {
+            "path": "src/b.py",
+            "content": "needle = 'b'\n",
+            "language": "python",
+            "sha256": "b",
+            "mtime_ns": 2,
+        },
+    ]
+    indexes = [TantivySearchIndex(index_dir), TantivySearchIndex(index_dir)]
+    start = Barrier(2)
+    guard = Lock()
+    active_writes = 0
+    overlap_detected = False
+    original_write_full = TantivySearchIndex._write_full
+
+    def slow_write_full(self: TantivySearchIndex, rows: list[dict[str, Any]]) -> None:
+        nonlocal active_writes, overlap_detected
+        with guard:
+            overlap_detected = overlap_detected or active_writes > 0
+            active_writes += 1
+        try:
+            time.sleep(0.05)
+            original_write_full(self, rows)
+        finally:
+            with guard:
+                active_writes -= 1
+
+    monkeypatch.setattr(TantivySearchIndex, "_write_full", slow_write_full)
+
+    def rebuild(index: TantivySearchIndex) -> int:
+        start.wait(timeout=2)
+        return index.rebuild(records)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(rebuild, index) for index in indexes]
+        results = [future.result(timeout=5) for future in futures]
+
+    assert results == [2, 2]
+    assert overlap_detected is False
+    assert indexes[0].search(["needle"], limit=10)
 
 
 def test_cache_stats_tolerates_legacy_cache_rows_without_namespace(
@@ -1350,7 +1410,7 @@ def test_context_pack_cache_miss_uses_specific_reason(
     )
 
 
-def test_context_pack_search_cache_without_fallback_does_not_suppress_public_fallback_lookup(
+def test_context_pack_search_cache_policy_does_not_suppress_public_lookup(
     service: ContextService, monkeypatch
 ) -> None:
     service.context_pack("auth", max_items=2)
@@ -1394,7 +1454,7 @@ def test_public_search_cache_with_fallback_does_not_reuse_index_only_context_pac
     )
 
 
-def test_index_only_empty_fragment_does_not_suppress_public_fallback_scan(
+def test_tantivy_fragment_beyond_legacy_term_cap_does_not_suppress_public_lookup(
     tmp_path: Path, monkeypatch
 ) -> None:
     repo = tmp_path / "repo"
@@ -1423,10 +1483,10 @@ def test_index_only_empty_fragment_does_not_suppress_public_fallback_scan(
     assert any(fallback_flags)
     assert lookup["cache"]["fragment_misses"] >= 1
     assert lookup["results"]
-    assert lookup["results"][0]["source"] == "scan"
+    assert lookup["results"][0]["source"] == "tantivy"
 
 
-def test_public_fallback_scan_fragment_does_not_feed_index_only_context_pack(
+def test_public_search_fragment_does_not_feed_index_only_context_pack_cache(
     tmp_path: Path, monkeypatch
 ) -> None:
     repo = tmp_path / "repo"
@@ -1441,7 +1501,7 @@ def test_public_fallback_scan_fragment_does_not_feed_index_only_context_pack(
 
     lookup = service.context_lookup(mode="search", query="fallbackonly")
     assert lookup["results"]
-    assert lookup["results"][0]["source"] == "scan"
+    assert lookup["results"][0]["source"] == "tantivy"
 
     original_search_fragment = service.index.search_fragment
     observed = []
@@ -1456,7 +1516,7 @@ def test_public_fallback_scan_fragment_does_not_feed_index_only_context_pack(
 
     assert observed
     assert pack["cache"]["fragment_misses"] >= 1
-    assert all(item.get("source") != "scan" for item in pack["items"])
+    assert pack["items"]
 
 
 def test_context_pack_changed_signature_invalidates_fragments(
@@ -1587,6 +1647,26 @@ def test_legacy_retrieval_cache_rows_are_stale_and_pruned(
 
     assert pruned["stale_removed"] >= 1
     assert service.store.get_json("cache:legacy-search-fragment") is None
+
+
+def test_search_fragment_cache_backend_version_invalidates_old_rows(
+    service: ContextService,
+) -> None:
+    service.context_lookup(mode="search", query="auth")
+    cache_key, row = _search_fragment_cache_row(service, term="auth")
+    row["metadata"]["backend_version"] = "term_index:legacy"
+    row["value"]["backend_version"] = "term_index:legacy"
+    service.store.put_json(cache_key, row)
+    stale_lookup = service._cache_lookup(cache_key.removeprefix("cache:"))
+
+    second = service.context_lookup(mode="search", query="auth")
+    _new_cache_key, new_row = _search_fragment_cache_row(service, term="auth")
+
+    assert stale_lookup["hit"] is False
+    assert stale_lookup["reason"] == "backend_changed"
+    assert second["cache"]["hit"] is False
+    assert new_row["metadata"]["backend_version"] == service.index.search_backend_version()
+    assert second["results"]
 
 
 def test_warm_context_pack_reuses_search_fragments_for_response_assembly(
@@ -1835,9 +1915,9 @@ def test_external_state_dir_supports_container_layout(
     assert health["repo_path"] == "."
     assert health["state_dir"] == "state"
     assert health["index"]["index_available"] is True
-    assert health["index"]["search_mode"] == "term_index"
+    assert health["index"]["search_mode"] == "tantivy"
     assert index["index_available"] is True
-    assert index["search_mode"] == "term_index"
+    assert index["search_mode"] == "tantivy"
     assert pack["repo"]["path"] == "."
     assert pack["repo"]["state_dir"] == "state"
     assert memory["repo_boundary_enforced"] is True

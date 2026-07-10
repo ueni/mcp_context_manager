@@ -56,6 +56,12 @@ INTERVAL_STEP = 1.0
 DEFAULT_TERMINAL_COLUMNS = 160
 DEFAULT_TERMINAL_LINES = 30
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+CRITICAL_MATRIX_KEYS = {
+    "latency.context_pack.avg_elapsed_ms",
+    "latency.context_pack.p95_recent_ms",
+    "latency.context_pack.index_refresh_avg_ms",
+    "latency.context_admin.warmup.avg_elapsed_ms",
+}
 
 
 class Ansi:
@@ -1150,8 +1156,8 @@ def _measurement_check_rows(
     for check in checks:
         if not isinstance(check, dict):
             continue
-        status = str(check.get("status") or "-")
         check_key = str(check.get("key") or "-")
+        status = _check_status_label(check)
         description = check.get("description")
         if description is None:
             description = check.get("desc")
@@ -1552,6 +1558,8 @@ def _box_lines(lines: list[str], width: int) -> list[str]:
 def _status_text(status: str, color: bool) -> str:
     if status == "pass":
         return _style(status, color, Ansi.GREEN)
+    if status == "critical":
+        return _style(status, color, Ansi.BOLD + Ansi.RED)
     if status == "fail":
         return _style(status, color, Ansi.RED)
     if status == "insufficient":
@@ -1630,17 +1638,41 @@ def _matrix_status(matrix: dict[str, Any], color: bool) -> str:
     checks = matrix.get("checks") if isinstance(matrix, dict) else None
     if not isinstance(checks, list) or not checks:
         return "-"
-    counts = {"pass": 0, "fail": 0, "insufficient": 0}
+    counts = {"pass": 0, "critical": 0, "fail": 0, "insufficient": 0}
     for check in checks:
         if isinstance(check, dict):
-            status = str(check.get("status") or "")
+            status = _check_status_label(check)
             if status in counts:
                 counts[status] += 1
+    if counts["critical"]:
+        return _style(f"{counts['critical']} critical", color, Ansi.BOLD + Ansi.RED)
     if counts["fail"]:
         return _style(f"{counts['fail']} fail", color, Ansi.RED)
     if counts["insufficient"]:
         return _style(f"{counts['pass']} pass", color, Ansi.YELLOW)
     return _style(f"{counts['pass']} pass", color, Ansi.GREEN)
+
+
+def _check_status_label(check: dict[str, Any]) -> str:
+    status = str(check.get("status") or "-").strip().lower()
+    if status != "fail":
+        return status
+    return "critical" if _check_severity(check) == "critical" else "fail"
+
+
+def _check_severity(check: dict[str, Any]) -> str:
+    severity = str(
+        check.get("severity")
+        or check.get("priority")
+        or check.get("level")
+        or ""
+    ).strip().lower()
+    if severity:
+        return severity
+    key = str(check.get("key") or "").strip().lower()
+    if key in CRITICAL_MATRIX_KEYS:
+        return "critical"
+    return ""
 
 
 def _bar(ratio: float, width: int, color: bool) -> str:

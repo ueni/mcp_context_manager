@@ -11,6 +11,12 @@ from typing import Any, Iterator
 
 from .config import ContextConfig
 from .store import ContextStore
+from .tantivy_index import (
+    TANTIVY_SCHEMA_VERSION,
+    TANTIVY_SEARCH_MODE,
+    TantivySearchIndex,
+    tantivy_refresh_signature,
+)
 from .util import (
     TEXT_EXTENSIONS,
     git_snapshot,
@@ -45,6 +51,7 @@ class ContextIndex:
         self._status_cache_at = 0.0
         self._status_lock = threading.Lock()
         self._status_refresh_future = None
+        self._tantivy = TantivySearchIndex(config.tantivy_index_dir)
 
     def _iter_candidate_files(self, root: Path, max_files: int) -> list[CandidateFile]:
         files: list[CandidateFile] = []
@@ -210,6 +217,14 @@ class ContextIndex:
                     txn,
                 )
 
+        self._sync_tantivy_sidecar(
+            deleted_paths=[
+                rel
+                for rel, _existing in prepared_deletes
+            ]
+            + [str(update["rel"]) for update in prepared_updates],
+            records=[update["record"] for update in prepared_updates],
+        )
         self._invalidate_status_cache()
         status = self.status(use_cache=False)
         return {
@@ -223,8 +238,8 @@ class ContextIndex:
             "updated_count": updated_count,
             "unchanged_count": unchanged_count,
             "removed_count": removed_count,
-            "fts_enabled": False,
-            "search_mode": "term_index",
+            "fts_enabled": True,
+            "search_mode": TANTIVY_SEARCH_MODE,
         }
 
     def refresh_if_needed(
@@ -430,6 +445,7 @@ class ContextIndex:
 
     def _compute_status(self) -> dict[str, Any]:
         meta = self._meta()
+        tantivy_meta = self._tantivy.status_metadata()
         file_count = self.store.count("index:file:")
         symbol_count = self.store.count("index:symbol:")
         import_count = self.store.count("index:import:")
@@ -440,8 +456,15 @@ class ContextIndex:
             "file_count": int(file_count),
             "symbol_count": int(symbol_count),
             "import_count": int(import_count),
-            "fts_enabled": False,
-            "search_mode": "term_index",
+            "fts_enabled": True,
+            "search_mode": TANTIVY_SEARCH_MODE,
+            "search_backend_version": tantivy_meta["backend_version"],
+            "tantivy": {
+                **tantivy_meta,
+                "doc_count": int(meta.get("tantivy_doc_count", "0") or 0),
+                "refresh_signature": meta.get("tantivy_refresh_signature", ""),
+                "sidecar_signature": meta.get("tantivy_sidecar_signature", ""),
+            },
             "generated_at": meta.get("generated_at", ""),
             "git_head": meta.get("git_head", ""),
             "git_branch": meta.get("git_branch", ""),
@@ -639,21 +662,12 @@ class ContextIndex:
         if not terms:
             raise ValueError("query must contain at least one searchable term")
         root_rel = self._search_root_rel(path)
-        rows = self._indexed_search_rows(
+        rows = self._tantivy_search_rows(
             terms=terms,
             root_rel=root_rel,
             max_results=max_results,
             include_globs=include_globs,
         )
-        if not rows and allow_fallback:
-            rows = self._fallback_search(terms, root_rel=root_rel, limit=max_results * 4)
-            rows = self._rank_search_rows(
-                rows=rows,
-                terms=terms,
-                root_rel=root_rel,
-                max_results=max_results,
-                include_globs=include_globs,
-            )
         return {
             "schema": "context_search.v1",
             "query": query,
@@ -674,7 +688,7 @@ class ContextIndex:
         if not terms:
             raise ValueError("term must contain at least one searchable term")
         root_rel = self._search_root_rel(path)
-        return self._indexed_search_rows(
+        return self._tantivy_search_rows(
             terms=terms,
             root_rel=root_rel,
             max_results=max_results,
@@ -686,21 +700,33 @@ class ContextIndex:
         root_rel = self.config.repo_relative(root_path)
         return "" if root_rel == "." else root_rel
 
-    def _indexed_search_rows(
+    def search_backend_version(self) -> str:
+        return self._tantivy.backend_version()
+
+    def _tantivy_search_rows(
         self,
         terms: list[str],
         root_rel: str,
         max_results: int,
         include_globs: list[str] | None,
     ) -> list[dict[str, Any]]:
-        matched: dict[str, dict[str, Any]] = {}
-        for term in terms:
-            for _key, row in self.store.iter_json(_term_prefix(term)):
-                if not isinstance(row, dict):
+        self._ensure_tantivy_available()
+        rows: list[dict[str, Any]] = []
+        candidate_limit = self._tantivy_candidate_limit(max_results)
+        scoped = bool(root_rel or include_globs)
+        max_candidate_limit = (
+            max(candidate_limit, self.store.count("index:file:"))
+            if scoped
+            else candidate_limit
+        )
+        seen_paths: set[str] = set()
+        while True:
+            hits = self._tantivy.search(terms, limit=candidate_limit)
+            for hit in hits:
+                rel = str(hit.get("path", ""))
+                if not rel or rel in seen_paths:
                     continue
-                rel = str(row.get("path", ""))
-                if not rel:
-                    continue
+                seen_paths.add(rel)
                 if root_rel and rel != root_rel and not rel.startswith(
                     root_rel.rstrip("/") + "/"
                 ):
@@ -709,33 +735,164 @@ class ContextIndex:
                     fnmatch.fnmatch(rel, glob) for glob in include_globs
                 ):
                     continue
-                current = matched.setdefault(
-                    rel,
-                    {
-                        "path": rel,
-                        "line": int(row.get("first_line", 1) or 1),
-                        "excerpt": str(row.get("excerpt", "")),
-                        "source": "term_index",
-                        "term_hits": 0,
-                        "term_count": 0,
-                    },
+                row = self._tantivy_lmdb_search_row(
+                    rel=rel,
+                    terms=terms,
+                    tantivy_score=float(hit.get("tantivy_score", 0.0) or 0.0),
                 )
-                current["term_hits"] = int(current.get("term_hits", 0)) + 1
-                current["term_count"] = int(current.get("term_count", 0)) + int(
-                    row.get("count", 1) or 1
-                )
-                if int(row.get("first_line", 1) or 1) < int(
-                    current.get("line", 1) or 1
-                ):
-                    current["line"] = int(row.get("first_line", 1) or 1)
-                    current["excerpt"] = str(row.get("excerpt", ""))
+                if row is not None:
+                    rows.append(row)
+            if (
+                not scoped
+                or len(rows) >= max_results
+                or len(hits) < candidate_limit
+                or candidate_limit >= max_candidate_limit
+            ):
+                break
+            next_limit = min(max_candidate_limit, max(candidate_limit * 2, candidate_limit + 200))
+            if next_limit <= candidate_limit:
+                break
+            candidate_limit = next_limit
         return self._rank_search_rows(
-            rows=list(matched.values()),
+            rows=rows,
             terms=terms,
             root_rel=root_rel,
             max_results=max_results,
             include_globs=include_globs,
         )
+
+    def _tantivy_candidate_limit(self, max_results: int) -> int:
+        requested = max(1, int(max_results))
+        return min(max(requested * 50, 200), 2000)
+
+    def _tantivy_lmdb_search_row(
+        self, rel: str, terms: list[str], tantivy_score: float
+    ) -> dict[str, Any] | None:
+        indexed = self.store.get_json(_file_key(rel), {})
+        if not isinstance(indexed, dict):
+            return None
+        content = indexed.get("content")
+        if not isinstance(content, str):
+            return None
+        line, excerpt = self._first_matching_excerpt(rel, content, terms)
+        haystack = f"{rel}\n{content}".lower()
+        unique_terms = sorted(set(terms))
+        term_hits = sum(1 for term in unique_terms if term in haystack)
+        term_count = sum(haystack.count(term) for term in unique_terms)
+        return {
+            "path": rel,
+            "line": line,
+            "excerpt": excerpt,
+            "source": TANTIVY_SEARCH_MODE,
+            "term_hits": term_hits,
+            "term_count": term_count,
+            "tantivy_score": round(float(tantivy_score), 6),
+        }
+
+    def _first_matching_excerpt(
+        self, rel: str, content: str, terms: list[str]
+    ) -> tuple[int, str]:
+        for idx, line in enumerate(content.splitlines(), start=1):
+            low = line.lower()
+            if any(term in low for term in terms):
+                return idx, line.strip()[:240]
+        indexed = self.store.get_json(_file_key(rel), {})
+        summary = indexed.get("summary", {}) if isinstance(indexed, dict) else {}
+        if isinstance(summary, dict) and summary.get("excerpt"):
+            return int(summary.get("start_line", 1) or 1), str(summary["excerpt"])[:240]
+        return 1, rel
+
+    def _ensure_tantivy_available(self) -> None:
+        expected_doc_count = self.store.count("index:file:")
+        if self._tantivy_meta_current(expected_doc_count) and self._tantivy.is_healthy(
+            expected_doc_count=expected_doc_count
+        ):
+            return
+        self._rebuild_tantivy_from_lmdb()
+
+    def _sync_tantivy_sidecar(
+        self,
+        deleted_paths: list[str],
+        records: list[dict[str, Any]],
+    ) -> None:
+        expected_doc_count = self.store.count("index:file:")
+        if (
+            not deleted_paths
+            and not records
+            and self._tantivy_meta_current(expected_doc_count)
+            and self._tantivy.is_healthy(expected_doc_count=expected_doc_count)
+        ):
+            return
+        if not self._tantivy_meta_compatible() or not self._tantivy.is_healthy():
+            doc_count = self._rebuild_tantivy_from_lmdb()
+        elif not deleted_paths and not records:
+            doc_count = self._rebuild_tantivy_from_lmdb()
+        else:
+            doc_count = self._tantivy.apply_changes(
+                deleted_paths=deleted_paths,
+                records=records,
+            )
+            if doc_count != self.store.count("index:file:"):
+                doc_count = self._rebuild_tantivy_from_lmdb()
+        self._store_tantivy_meta(doc_count)
+
+    def _rebuild_tantivy_from_lmdb(self) -> int:
+        records = self._all_file_records()
+        doc_count = self._tantivy.rebuild(records)
+        self._store_tantivy_meta(doc_count)
+        return doc_count
+
+    def _all_file_records(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for _key, row in self.store.iter_json("index:file:"):
+            if not isinstance(row, dict):
+                continue
+            if not isinstance(row.get("content"), str):
+                continue
+            rows.append(row)
+        rows.sort(key=lambda row: str(row.get("path", "")))
+        return rows
+
+    def _tantivy_meta_current(self, expected_doc_count: int) -> bool:
+        if not self._tantivy_meta_compatible():
+            return False
+        meta = self._meta()
+        try:
+            return int(meta.get("tantivy_doc_count", "0") or 0) == int(
+                expected_doc_count
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _tantivy_meta_compatible(self) -> bool:
+        meta = self._meta()
+        if meta.get("tantivy_schema_version", "") != TANTIVY_SCHEMA_VERSION:
+            return False
+        if meta.get("tantivy_package_version", "") != self._tantivy.package_version():
+            return False
+        return meta.get("tantivy_backend_version", "") == self._tantivy.backend_version()
+
+    def _store_tantivy_meta(self, doc_count: int) -> None:
+        metadata = self._tantivy.status_metadata()
+        refresh_signature, refresh_signature_available = self.stored_refresh_signature()
+        sidecar_signature = tantivy_refresh_signature(
+            TANTIVY_SCHEMA_VERSION,
+            int(doc_count),
+            [refresh_signature] if refresh_signature else [],
+        )
+        with self.store.write_txn() as txn:
+            self._set_meta("tantivy_schema_version", TANTIVY_SCHEMA_VERSION, txn)
+            self._set_meta("tantivy_package_version", metadata["package_version"], txn)
+            self._set_meta("tantivy_engine_version", metadata["engine_version"], txn)
+            self._set_meta("tantivy_backend_version", metadata["backend_version"], txn)
+            self._set_meta("tantivy_doc_count", str(int(doc_count)), txn)
+            self._set_meta("tantivy_refresh_signature", refresh_signature, txn)
+            self._set_meta(
+                "tantivy_refresh_signature_available",
+                "true" if refresh_signature_available else "false",
+                txn,
+            )
+            self._set_meta("tantivy_sidecar_signature", sidecar_signature, txn)
 
     def _rank_search_rows(
         self,
@@ -754,45 +911,19 @@ class ContextIndex:
                 continue
             if include_globs and not any(fnmatch.fnmatch(rel, glob) for glob in include_globs):
                 continue
-            score = sum(2.0 for term in terms if term in rel.lower())
+            score = float(row.get("tantivy_score", 0.0) or 0.0)
+            score += sum(2.0 for term in terms if term in rel.lower())
             score += sum(
                 1.0 for term in terms if term in str(row.get("excerpt", "")).lower()
             )
             score += float(row.get("term_hits", 0)) * 2.5
             score += min(float(row.get("term_count", 0)), 8.0) * 0.25
-            filtered.append({**row, "score": round(score, 4), "terms": terms})
+            public_row = {key: value for key, value in row.items() if key != "_base_score"}
+            public_row["score"] = round(score, 4)
+            public_row["terms"] = terms
+            filtered.append(public_row)
         filtered.sort(key=lambda item: (-float(item["score"]), item["path"]))
         return filtered[:max_results]
-
-    def _fallback_search(
-        self, terms: list[str], root_rel: str, limit: int
-    ) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        root = self.config.repo_path / root_rel if root_rel else self.config.repo_path
-        for candidate in self._iter_candidate_files(root, max_files=5000):
-            path = candidate.path
-            rel = str(path.relative_to(self.config.repo_path)).replace("\\", "/")
-            if is_likely_binary(path):
-                continue
-            try:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            for idx, line in enumerate(lines, start=1):
-                low = line.lower()
-                if any(term in low for term in terms):
-                    rows.append(
-                        {
-                            "path": rel,
-                            "line": idx,
-                            "excerpt": line.strip()[:240],
-                            "source": "scan",
-                        }
-                    )
-                    break
-            if len(rows) >= limit:
-                break
-        return rows
 
     def symbols(self, query: str = "", limit: int = 50) -> dict[str, Any]:
         terms = normalize_query_terms(query, max_terms=8)

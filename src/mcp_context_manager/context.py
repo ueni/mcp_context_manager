@@ -989,7 +989,7 @@ class ContextService:
             "unchanged_count": 0,
             "removed_count": 0,
             "fts_enabled": bool(status.get("fts_enabled", False)),
-            "search_mode": str(status.get("search_mode", "term_index")),
+            "search_mode": str(status.get("search_mode", "tantivy")),
             "skipped": True,
             "reason": "last_good_index",
             "freshness": "last_good",
@@ -1287,6 +1287,7 @@ class ContextService:
                 "term": term,
                 "pool_size": self._search_pool_size(pool_size),
                 "allow_fallback": bool(allow_fallback),
+                "backend_version": self.index.search_backend_version(),
             },
         )
 
@@ -1356,6 +1357,7 @@ class ContextService:
                 "include_globs": self._canonical_cache_globs(include_globs),
                 "terms": sorted(set(terms)),
                 "pool_size": pool_size,
+                "backend_version": self.index.search_backend_version(),
             },
         )
         miss_reasons = [
@@ -1374,7 +1376,17 @@ class ContextService:
         status = "active"
         if any(reason == "expired" for reason in miss_reasons):
             status = "expired"
-        elif any(reason in {"invalidated", "legacy_schema_version", "legacy_missing_refresh_signature"} for reason in miss_reasons):
+        elif any(
+            reason
+            in {
+                "invalidated",
+                "legacy_schema_version",
+                "legacy_missing_refresh_signature",
+                "legacy_missing_backend_version",
+                "backend_changed",
+            }
+            for reason in miss_reasons
+        ):
             status = "stale"
         if not refresh_signature_available:
             reason = "signature_unavailable"
@@ -1454,6 +1466,7 @@ class ContextService:
                         "refresh_signature": refresh_signature,
                         "pool_size": self._search_pool_size(pool_size),
                         "allow_fallback": bool(allow_fallback),
+                        "backend_version": self.index.search_backend_version(),
                     },
                 )
             )
@@ -1488,6 +1501,7 @@ class ContextService:
                     "refresh_signature": refresh_signature,
                     "pool_size": self._search_pool_size(pool_size),
                     "allow_fallback": bool(allow_fallback),
+                    "backend_version": self.index.search_backend_version(),
                     "count": len(rows),
                     "results": rows,
                 },
@@ -1500,6 +1514,7 @@ class ContextService:
                     "refresh_signature": refresh_signature,
                     "pool_size": self._search_pool_size(pool_size),
                     "allow_fallback": bool(allow_fallback),
+                    "backend_version": self.index.search_backend_version(),
                 },
             )
         return {
@@ -1531,9 +1546,10 @@ class ContextService:
                         "path": path,
                         "line": int(row.get("line", 1) or 1),
                         "excerpt": str(row.get("excerpt", "")),
-                        "source": str(row.get("source", "term_index")),
+                        "source": str(row.get("source", "tantivy")),
                         "term_hits": 0,
                         "term_count": 0,
+                        "tantivy_score": 0.0,
                         "_matched_terms": set(),
                     },
                 )
@@ -1544,6 +1560,10 @@ class ContextService:
                     row.get("term_count", 1) or 1
                 )
                 current["_matched_terms"].add(fragment_term)
+                current["tantivy_score"] = max(
+                    float(current.get("tantivy_score", 0.0) or 0.0),
+                    float(row.get("tantivy_score", row.get("score", 0.0)) or 0.0),
+                )
                 row_line = int(row.get("line", 1) or 1)
                 if row_line < int(current.get("line", 1) or 1):
                     current["line"] = row_line
@@ -1553,7 +1573,8 @@ class ContextService:
         for row in matched.values():
             path = str(row["path"])
             excerpt = str(row.get("excerpt", ""))
-            score = sum(2.0 for term in terms if term in path.lower())
+            score = float(row.get("tantivy_score", 0.0) or 0.0)
+            score += sum(2.0 for term in terms if term in path.lower())
             score += sum(1.0 for term in terms if term in excerpt.lower())
             score += float(row.get("term_hits", 0)) * 2.5
             score += min(float(row.get("term_count", 0)), 8.0) * 0.25
@@ -5135,6 +5156,12 @@ class ContextService:
                 for row in signature_rows
             ):
                 return "fallback_policy_changed"
+        expected_backend = str(metadata.get("backend_version", ""))
+        if expected_backend and not any(
+            str(row.get("backend_version", "")) == expected_backend
+            for row in signature_rows
+        ):
+            return "backend_changed"
         expected_pool_size = metadata.get("pool_size")
         if expected_pool_size is not None and not any(
             int(row.get("pool_size", 0) or 0) == int(expected_pool_size)
@@ -5209,6 +5236,30 @@ class ContextService:
                         }
                     ],
                 }
+            if namespace == "retrieval.search_term":
+                backend_version = str(metadata.get("backend_version", ""))
+                if not backend_version:
+                    return {
+                        "status": "stale",
+                        "reason": "legacy_missing_backend_version",
+                        "warnings": [
+                            {
+                                "code": "cache_legacy",
+                                "message": "cache row has no search backend version",
+                            }
+                        ],
+                    }
+                if backend_version != self.index.search_backend_version():
+                    return {
+                        "status": "stale",
+                        "reason": "backend_changed",
+                        "warnings": [
+                            {
+                                "code": "cache_stale",
+                                "message": "cache row was created by a different search backend",
+                            }
+                        ],
+                    }
         expires_at = parse_iso(str(row.get("expires_at", "")))
         if expires_at and expires_at < datetime.now(timezone.utc):
             return {

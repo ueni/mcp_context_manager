@@ -37,11 +37,16 @@ def test_index_refresh_search_symbols_and_snippet(service: ContextService) -> No
     assert refresh["schema"] == "context_index.refresh.v1"
     assert refresh["file_count"] >= 4
     assert refresh["symbol_count"] >= 3
+    assert refresh["fts_enabled"] is True
+    assert refresh["search_mode"] == "tantivy"
 
     search = service.context_lookup(mode="search", query="issue token auth")
     assert search["schema"] == "context_search.v1"
     assert search["count"] > 0
     assert any(row["path"] == "src/auth.py" for row in search["results"])
+    assert {row["source"] for row in search["results"]} == {"tantivy"}
+    assert search["index"]["fts_enabled"] is True
+    assert search["index"]["search_mode"] == "tantivy"
 
     symbols = service.context_lookup(mode="symbols", query="AuthService")
     assert symbols["schema"] == "context_symbols.v1"
@@ -215,10 +220,13 @@ def test_subdirectory_git_worktree_uses_file_metadata_signature(
     assert refreshed["reason"] == "signature_changed"
 
 
-def test_path_scoped_fts_search_applies_path_before_limit(tmp_path: Path) -> None:
+def test_path_scoped_fts_search_applies_path_before_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    for idx in range(20):
+    for idx in range(12):
         (repo / f"root_match_{idx:02d}.py").write_text(
             "needle = 'root'\n", encoding="utf-8"
         )
@@ -233,12 +241,127 @@ def test_path_scoped_fts_search_applies_path_before_limit(tmp_path: Path) -> Non
     )
 
     service.context_admin(mode="index_refresh")
+    monkeypatch.setattr(service.index, "_tantivy_candidate_limit", lambda _: 3)
     search = service.context_lookup(
         mode="search", query="needle", path="target", max_results=1
     )
 
     assert search["count"] == 1
     assert search["results"][0]["path"] == "target/hit.py"
+    assert search["results"][0]["source"] == "tantivy"
+
+
+def test_tantivy_finds_terms_beyond_legacy_term_cap(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    indexed_terms = "\n".join(f"unique_token_{idx}" for idx in range(4100))
+    (repo / "large.py").write_text(
+        f"{indexed_terms}\n# fallbackonly appears after the old term cap\n",
+        encoding="utf-8",
+    )
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    service.context_admin(mode="index_refresh")
+    search = service.context_lookup(mode="search", query="fallbackonly")
+
+    assert search["count"] == 1
+    assert search["results"][0]["path"] == "large.py"
+    assert search["results"][0]["source"] == "tantivy"
+
+
+def test_scoped_refresh_updates_and_removes_tantivy_documents(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "target"
+    target.mkdir()
+    changed = target / "changed.py"
+    deleted = target / "deleted.py"
+    changed.write_text("oldneedle = True\n", encoding="utf-8")
+    deleted.write_text("deleteme = True\n", encoding="utf-8")
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    service.context_admin(mode="index_refresh")
+    changed.write_text("newneedle = True\n", encoding="utf-8")
+    deleted.unlink()
+    refresh = service.context_admin(mode="index_refresh", path="target")
+
+    assert refresh["updated_count"] == 1
+    assert refresh["removed_count"] == 1
+    assert service.context_lookup(mode="search", query="newneedle")["results"][0][
+        "path"
+    ] == "target/changed.py"
+    assert service.context_lookup(mode="search", query="oldneedle")["results"] == []
+    assert service.context_lookup(mode="search", query="deleteme")["results"] == []
+
+
+def test_tantivy_search_honors_include_globs(service: ContextService) -> None:
+    service.context_admin(mode="index_refresh")
+
+    search = service.context_lookup(
+        mode="search",
+        query="token",
+        include_globs=["tests/**"],
+    )
+
+    assert search["results"]
+    assert all(row["path"].startswith("tests/") for row in search["results"])
+
+
+def test_tantivy_include_globs_fetches_past_candidate_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    src = repo / "src"
+    src.mkdir()
+    for idx in range(8):
+        (src / f"root_match_{idx:02d}.py").write_text(
+            "needle = 'root'\n", encoding="utf-8"
+        )
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "hit.py").write_text("needle = 'scoped'\n", encoding="utf-8")
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    service.context_admin(mode="index_refresh")
+    monkeypatch.setattr(service.index, "_tantivy_candidate_limit", lambda _: 2)
+    search = service.context_lookup(
+        mode="search",
+        query="needle",
+        include_globs=["tests/**"],
+        max_results=1,
+    )
+
+    assert search["count"] == 1
+    assert search["results"][0]["path"] == "tests/hit.py"
+
+
+def test_missing_tantivy_sidecar_rebuilds_from_lmdb(service: ContextService) -> None:
+    service.context_admin(mode="index_refresh")
+    shutil.rmtree(service.config.tantivy_index_dir)
+
+    search = service.context_lookup(mode="search", query="auth token")
+    status = service.context_admin(mode="index_status")
+
+    assert search["results"]
+    assert status["search_mode"] == "tantivy"
+    assert status["tantivy"]["doc_count"] == status["file_count"]
 
 
 def test_tree_omits_generated_state(service: ContextService) -> None:
