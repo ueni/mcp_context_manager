@@ -63,7 +63,7 @@ CRITICAL_MATRIX_KEYS = {
     "latency.context_pack.index_refresh_avg_ms",
     "latency.context_admin.warmup.avg_elapsed_ms",
 }
-EXPECTED_SERVER_VERSION = "1.2.1"
+EXPECTED_SERVER_VERSION = "1.3.1"
 EXPECTED_SERVER_VERSION = (
     os.environ.get("MCP_EXPECTED_SERVER_VERSION", "").strip()
     or EXPECTED_SERVER_VERSION
