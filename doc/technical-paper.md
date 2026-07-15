@@ -152,9 +152,12 @@ bounded:
 8. Retrieve compact memory for the route and session.
 9. Build or reuse retrieval candidates.
 10. Apply profile shaping and budget selection.
-11. Store omitted/full evidence behind a result reference.
-12. Compute complete-response token, latency, cache, and reference metrics.
-13. Return a compact packet plus `omitted_ref` and `diagnostics_ref`.
+11. Derive a bounded prompt-warmup manifest from normalized terms, explicit
+    paths, selected anchors, and learned route targets.
+12. Store omitted/full evidence behind a result reference.
+13. Compute complete-response token, latency, cache, and reference metrics.
+14. Return a compact packet plus `omitted_ref` and `diagnostics_ref`, then
+    enqueue refresh-signature-scoped fragment warmup off the request path.
 
 The public result includes selected items with path, line hints, reason codes,
 confidence, content, provenance, prompt-injection signals, and `detail_lookup`
@@ -309,8 +312,9 @@ conclusions.
 
 ## Metrics And Evaluation
 
-`ContextMetrics` records tool events, latency, cache hits, route counts, token
-estimates, external-call savings, and reference bytes deferred. Metrics are
+`ContextMetrics` records tool events, latency, per-fragment-namespace cache
+hits, prompt-warmup coverage/skips/completions, route counts, token estimates,
+external-call savings, and reference bytes deferred. Metrics are
 available through `context_admin(mode="metrics")` and summarized in
 `repo://metrics`.
 

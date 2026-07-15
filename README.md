@@ -47,8 +47,8 @@ Use it when you want agents to:
 - Spend tokens on reasoning instead of context archaeology. Compact packs
   summarize and rank evidence while keeping full details available on demand.
 - Stay fast across follow-up turns. Incremental indexing, fragment caches for
-  retrieval, and chunk reuse keep unchanged context work from being
-  repeated.
+  retrieval, prompt-aware background warmup, and chunk reuse keep unchanged
+  context work from being repeated without serving stale evidence.
 - Review and debug with traceable evidence. Every selected item carries path,
   line hints, reasons, confidence, provenance, and a `detail_lookup` route back
   to raw snippets.
@@ -448,6 +448,18 @@ python3 benchmarks/context_pack_benchmark.py --repo .
 The benchmark covers forced cold refresh, warm cache reuse, repeated prompt
 reuse, prompt-variation fragment reuse, and compact focused retrieval.
 
+Run the isolated prompt-aware warmup benchmark:
+
+```bash
+python3 benchmarks/cache_prompt_warmup_benchmark.py --repo .
+```
+
+It executes a matched empty-fragment baseline and the sequence cold pack,
+background-warmup completion, then related prompt. The command fails unless the
+warm runs reach a 60% fragment hit ratio, improve median latency by at least
+30%, preserve selected order and anchors, and retain all required fixture
+anchors. Temporary generated state is used by default.
+
 Reuse `benchmarks/cache_hit_prompts.json` for realistic cache-hit benchmark prompts
 covering mcp-context-manager and feso paths. The suite is designed for:
 
@@ -458,7 +470,9 @@ covering mcp-context-manager and feso paths. The suite is designed for:
 
 Track: `fragment_hits`, `fragment_misses`, `fragment_hit_ratio`,
 `search_fragment_ms`, `search_summary_ms`, `test_owner_summary_ms`, and
-`file_summary_memo_hits`.
+`file_summary_memo_hits`. Per-namespace hit ratios are reported for
+`retrieval.search_term`, `retrieval.file_summary`, and
+`retrieval.test_owner_paths`; whole-pack cache figures remain diagnostic.
 
 ## Live Metrics Monitor
 

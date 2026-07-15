@@ -36,8 +36,8 @@ def cpu_executor() -> ThreadPoolExecutor:
 class BackgroundJobRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._jobs: dict[tuple[str, str], Future[Any]] = {}
-        self._state: dict[tuple[str, str], dict[str, Any]] = {}
+        self._jobs: dict[tuple[str, str, str], Future[Any]] = {}
+        self._state: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     def submit(
         self,
@@ -47,15 +47,25 @@ class BackgroundJobRegistry:
         *,
         executor: ThreadPoolExecutor | None = None,
         min_interval_seconds: float = 0.0,
+        dedupe_key: str = "",
     ) -> dict[str, Any]:
-        key = (project_id, kind)
+        key = (project_id, kind, dedupe_key)
         now = time.time()
         with self._lock:
             future = self._jobs.get(key)
             if future is not None and not future.done():
                 state = self._state.setdefault(key, {})
-                state["deduplicated_count"] = int(state.get("deduplicated_count", 0)) + 1
-                return self._public_job(project_id, kind, future, state, deduplicated=True)
+                state["deduplicated_count"] = (
+                    int(state.get("deduplicated_count", 0)) + 1
+                )
+                return self._public_job(
+                    project_id,
+                    kind,
+                    dedupe_key,
+                    future,
+                    state,
+                    deduplicated=True,
+                )
             state = self._state.setdefault(key, {})
             last_started = float(state.get("last_started_monotonic", 0.0) or 0.0)
             if (
@@ -66,6 +76,7 @@ class BackgroundJobRegistry:
                 return {
                     "project_id": project_id,
                     "kind": kind,
+                    "dedupe_key": dedupe_key,
                     "status": "throttled",
                     "pending": False,
                     "deduplicated": False,
@@ -84,9 +95,16 @@ class BackgroundJobRegistry:
             )
             future = (executor or _IO_EXECUTOR).submit(self._run, key, work)
             self._jobs[key] = future
-            return self._public_job(project_id, kind, future, state, deduplicated=False)
+            return self._public_job(
+                project_id,
+                kind,
+                dedupe_key,
+                future,
+                state,
+                deduplicated=False,
+            )
 
-    def _run(self, key: tuple[str, str], work: Callable[[], Any]) -> Any:
+    def _run(self, key: tuple[str, str, str], work: Callable[[], Any]) -> Any:
         with self._lock:
             state = self._state.setdefault(key, {})
             state["status"] = "running"
@@ -126,12 +144,21 @@ class BackgroundJobRegistry:
     def status(self, project_id: str | None = None) -> dict[str, Any]:
         with self._lock:
             rows: list[dict[str, Any]] = []
-            for (row_project_id, kind), state in sorted(self._state.items()):
+            for (row_project_id, kind, dedupe_key), state in sorted(
+                self._state.items()
+            ):
                 if project_id and row_project_id != project_id:
                     continue
-                future = self._jobs.get((row_project_id, kind))
+                future = self._jobs.get((row_project_id, kind, dedupe_key))
                 rows.append(
-                    self._public_job(row_project_id, kind, future, state, deduplicated=False)
+                    self._public_job(
+                        row_project_id,
+                        kind,
+                        dedupe_key,
+                        future,
+                        state,
+                        deduplicated=False,
+                    )
                 )
         pending = [row for row in rows if row["pending"]]
         return {
@@ -146,6 +173,7 @@ class BackgroundJobRegistry:
         self,
         project_id: str,
         kind: str,
+        dedupe_key: str,
         future: Future[Any] | None,
         state: dict[str, Any],
         *,
@@ -162,6 +190,7 @@ class BackgroundJobRegistry:
         return {
             "project_id": project_id,
             "kind": kind,
+            "dedupe_key": dedupe_key,
             "status": public_status,
             "pending": pending,
             "deduplicated": deduplicated,

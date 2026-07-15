@@ -65,8 +65,7 @@ CRITICAL_MATRIX_KEYS = {
 }
 EXPECTED_SERVER_VERSION = "1.3.1"
 EXPECTED_SERVER_VERSION = (
-    os.environ.get("MCP_EXPECTED_SERVER_VERSION", "").strip()
-    or EXPECTED_SERVER_VERSION
+    os.environ.get("MCP_EXPECTED_SERVER_VERSION", "").strip() or EXPECTED_SERVER_VERSION
 )
 
 
@@ -185,10 +184,7 @@ class McpHttpClient:
                 server_version = str(server_info.get("version") or "").strip()
             if EXPECTED_SERVER_VERSION and server_version != EXPECTED_SERVER_VERSION:
                 actual = server_version or "not reported"
-                warning = (
-                    f"WARNING: monitor expects server {EXPECTED_SERVER_VERSION}, "
-                    f"connected server is {actual}"
-                )
+                warning = f"WARNING: monitor expects server {EXPECTED_SERVER_VERSION}, connected server is {actual}"
                 print(
                     _style(warning, sys.stderr.isatty(), Ansi.YELLOW),
                     file=sys.stderr,
@@ -238,10 +234,9 @@ class McpHttpClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                response_session = (
-                    response.headers.get("Mcp-Session-Id")
-                    or response.headers.get("mcp-session-id")
-                )
+                response_session = response.headers.get(
+                    "Mcp-Session-Id"
+                ) or response.headers.get("mcp-session-id")
                 if response_session:
                     with self._lock:
                         self.session_id = response_session
@@ -378,8 +373,7 @@ def collect_snapshots(
     known_by_id = {target.project_id: target for target in known_projects}
 
     targets = [
-        known_by_id.get(pid, ProjectTarget(project_id=pid))
-        for pid in project_ids
+        known_by_id.get(pid, ProjectTarget(project_id=pid)) for pid in project_ids
     ]
     if not targets:
         targets = known_projects
@@ -564,9 +558,12 @@ def render_dashboard(
     refresh_interval: float | None = None,
     status_line: str = "",
 ) -> str:
-    width = width or shutil.get_terminal_size(
-        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
-    ).columns
+    width = (
+        width
+        or shutil.get_terminal_size(
+            (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+        ).columns
+    )
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     ok_rows = [row for row in snapshots if row.metrics and not row.error]
     totals = _aggregate_totals(ok_rows)
@@ -634,9 +631,12 @@ def render_project_detail(
     width: int | None,
     state: MonitorState,
 ) -> str:
-    width = width or shutil.get_terminal_size(
-        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
-    ).columns
+    width = (
+        width
+        or shutil.get_terminal_size(
+            (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+        ).columns
+    )
     metrics = snapshot.metrics or {}
     fragment_hits = _int_at(metrics, ("cache", "context_pack_fragment_hits"))
     fragment_misses = _int_at(metrics, ("cache", "context_pack_fragment_misses"))
@@ -687,7 +687,9 @@ def render_project_detail(
         lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
     check_rows = _measurement_check_rows(snapshot.matrix or {}, color)
     if check_rows:
-        key_width = max(24, min(max(_visible_len(row[0]) for row in check_rows), width - 64))
+        key_width = max(
+            24, min(max(_visible_len(row[0]) for row in check_rows), width - 64)
+        )
         description_width = max(14, max(_visible_len(row[4]) for row in check_rows))
         lines.extend(
             [
@@ -717,9 +719,12 @@ def render_performance_view(
     width: int | None,
     state: MonitorState,
 ) -> str:
-    width = width or shutil.get_terminal_size(
-        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
-    ).columns
+    width = (
+        width
+        or shutil.get_terminal_size(
+            (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+        ).columns
+    )
     metrics = snapshot.metrics or {}
     freshness = metrics.get("index_freshness", {})
     freshness = freshness if isinstance(freshness, dict) else {}
@@ -747,6 +752,7 @@ def render_performance_view(
         *_render_table(
             ("signal", "value"),
             cache_rows,
+            widths=(20, max(20, width - 27)),
             aligns=("left", "left"),
         ),
     ]
@@ -801,9 +807,7 @@ def render_state_browser(
     if state.state_error:
         lines.append(_style(f"ERROR: {state.state_error}", color, Ansi.RED))
         lines.append(
-            _browser_controls(
-                state, color, status_line=_mcp_status_line(state, color)
-            )
+            _browser_controls(state, color, status_line=_mcp_status_line(state, color))
         )
         return "\n".join(lines)
     prefix_counts = payload.get("prefix_counts") if isinstance(payload, dict) else []
@@ -831,9 +835,7 @@ def render_state_browser(
     table_rows = [
         _state_row_cells(
             row,
-            selected=(
-                state.state_scroll_offset + index == state.state_selected_index
-            ),
+            selected=(state.state_scroll_offset + index == state.state_selected_index),
         )
         for index, row in enumerate(visible_rows)
         if isinstance(row, dict)
@@ -849,9 +851,7 @@ def render_state_browser(
     if not table_rows:
         lines.append("No generated-state rows for this project.")
     lines.append(
-        _browser_controls(
-            state, color, status_line=_mcp_status_line(state, color)
-        )
+        _browser_controls(state, color, status_line=_mcp_status_line(state, color))
     )
     return "\n".join(lines)
 
@@ -1173,6 +1173,9 @@ def _measurement_check_rows(
         "retrieval.context_pack.candidates_per_selected": "Ranked candidates per selected item",
         "cache_hit_ratio": "Cache hit ratio",
         "cache.context_pack_fragment_hit_ratio": "Context-pack fragment cache hit ratio",
+        "cache.retrieval.search_term.hit_ratio": "Search-term fragment cache hit ratio",
+        "cache.retrieval.file_summary.hit_ratio": "File-summary fragment cache hit ratio",
+        "cache.retrieval.test_owner_paths.hit_ratio": "Test-owner fragment cache hit ratio",
         "cache.hit_ratio": "Overall cache hit ratio",
         "external_calls_saved": "External calls saved",
         "tooling.external_calls_saved_per_pack": "Estimated external tool calls avoided per pack",
@@ -1270,11 +1273,10 @@ def _context_pack_stage_stats(metrics: dict[str, Any], name: str) -> dict[str, A
     stages = metrics.get("benchmarks", {}).get("stage_latency_ms_by_operation", {})
     pack_stages = stages.get("context_pack", {}) if isinstance(stages, dict) else {}
     stats = pack_stages.get(name, {}) if isinstance(pack_stages, dict) else {}
-    if (
-        isinstance(stats, dict)
-        and "last_elapsed_ms" not in stats
-    ):
-        recent_last_ms = _recent_context_pack_stage_ms(metrics.get("benchmarks", {}), name)
+    if isinstance(stats, dict) and "last_elapsed_ms" not in stats:
+        recent_last_ms = _recent_context_pack_stage_ms(
+            metrics.get("benchmarks", {}), name
+        )
         if recent_last_ms is not None:
             stats = dict(stats)
             stats["last_elapsed_ms"] = recent_last_ms
@@ -1297,7 +1299,9 @@ def _performance_retrieval_bottleneck(metrics: dict[str, Any]) -> str:
     return "-"
 
 
-def _performance_stage_rows(metrics: dict[str, Any]) -> list[tuple[str, str, str, str, str]]:
+def _performance_stage_rows(
+    metrics: dict[str, Any],
+) -> list[tuple[str, str, str, str, str]]:
     rows: list[tuple[str, str, str, str, str]] = []
     for name in (
         "total_ms",
@@ -1358,6 +1362,18 @@ def _performance_cache_rows(
         (
             "fragment hit ratio",
             f"{_fragment_cache_ratio(metrics) * 100:5.1f}%",
+        ),
+        (
+            "search-term cache",
+            _namespace_cache_summary(metrics, "retrieval.search_term"),
+        ),
+        (
+            "file-summary cache",
+            _namespace_cache_summary(metrics, "retrieval.file_summary"),
+        ),
+        (
+            "test-owner cache",
+            _namespace_cache_summary(metrics, "retrieval.test_owner_paths"),
         ),
         ("retrieval bottleneck", _performance_retrieval_bottleneck(metrics)),
         (
@@ -1436,6 +1452,17 @@ def _auto_warmup_summary(metrics: dict[str, Any], job: dict[str, Any]) -> str:
         parts.append(pending)
     if reason:
         parts.append(f"reason {reason}")
+    coverage = auto_learn.get("last_coverage", {})
+    if isinstance(coverage, dict) and int(coverage.get("planned", 0) or 0):
+        parts.append(
+            f"coverage {fmt_int(coverage.get('completed', 0))}/{fmt_int(coverage.get('planned', 0))}"
+        )
+    deduplicated = int(auto_learn.get("deduplicated_count", 0) or 0)
+    failures = int(auto_learn.get("failure_count", 0) or 0)
+    if deduplicated:
+        parts.append(f"{fmt_int(deduplicated)} dedup")
+    if failures:
+        parts.append(f"{fmt_int(failures)} failed")
     return ", ".join(parts)
 
 
@@ -1595,10 +1622,7 @@ def _box_lines(lines: list[str], width: int) -> list[str]:
             continue
         for wrapped in _wrap_block(line, width - 4):
             boxed.append(
-                "| "
-                + wrapped
-                + " " * max(0, width - 4 - _visible_len(wrapped))
-                + " |"
+                "| " + wrapped + " " * max(0, width - 4 - _visible_len(wrapped)) + " |"
             )
     boxed.append(border)
     return boxed
@@ -1643,11 +1667,10 @@ def _render_table(
         widths = tuple(
             max(
                 _visible_len(headers[index]),
-                *((
-                    _visible_len(row[index])
-                    for row in text_rows
-                    if index < len(row)
-                ) or [0]),
+                *(
+                    (_visible_len(row[index]) for row in text_rows if index < len(row))
+                    or [0]
+                ),
             )
             for index in range(len(headers))
         )
@@ -1710,12 +1733,11 @@ def _check_status_label(check: dict[str, Any]) -> str:
 
 
 def _check_severity(check: dict[str, Any]) -> str:
-    severity = str(
-        check.get("severity")
-        or check.get("priority")
-        or check.get("level")
-        or ""
-    ).strip().lower()
+    severity = (
+        str(check.get("severity") or check.get("priority") or check.get("level") or "")
+        .strip()
+        .lower()
+    )
     if severity:
         return severity
     key = str(check.get("key") or "").strip().lower()
@@ -2067,7 +2089,9 @@ def handle_key(
         state.state_scroll_offset = 0
         return "redraw"
     if key == "end" and state.view == "state":
-        state.state_selected_index = _clamped_index(state_row_count - 1, state_row_count)
+        state.state_selected_index = _clamped_index(
+            state_row_count - 1, state_row_count
+        )
         return "redraw"
     if key == "search" and state.view == "state":
         state.state_search = ""
@@ -2179,7 +2203,9 @@ def _fetch_state_browser_result(
     selected = _clamped_index(selected_index, len(snapshots))
     target = snapshots[selected].target
     try:
-        return StateBrowserResult(target=target, payload=fetch_state_browser(client, target))
+        return StateBrowserResult(
+            target=target, payload=fetch_state_browser(client, target)
+        )
     except Exception as exc:
         return StateBrowserResult(target=target, error=friendly_mcp_error(exc))
 
@@ -2203,12 +2229,12 @@ def _apply_state_browser_result(
     state.state_scroll_offset = _adjust_scroll_offset(
         state.state_scroll_offset,
         state.state_selected_index,
-                _state_visible_count(
-                    shutil.get_terminal_size(
-                        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
-                    ).lines,
-                    False,
-                ),
+        _state_visible_count(
+            shutil.get_terminal_size(
+                (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+            ).lines,
+            False,
+        ),
         _state_row_count(state),
     )
 
@@ -2318,8 +2344,7 @@ def _warmup_result_summary(payload: dict[str, Any]) -> str:
         hits = _int_at(payload, ("file_summary_cache", "hits"))
         misses = _int_at(payload, ("file_summary_cache", "misses"))
         parts.append(
-            f"{fmt_int(summaries)} summaries "
-            f"({fmt_int(hits)} hit/{fmt_int(misses)} miss)"
+            f"{fmt_int(summaries)} summaries ({fmt_int(hits)} hit/{fmt_int(misses)} miss)"
         )
 
     hot_chunks = payload.get("hot_chunks")
@@ -2331,8 +2356,7 @@ def _warmup_result_summary(payload: dict[str, Any]) -> str:
     test_owner_targets = payload.get("test_owner_targets")
     if isinstance(test_owner_targets, dict):
         parts.append(
-            f"{fmt_int(_int_at(payload, ('test_owner_targets', 'target_count')))} "
-            "test targets"
+            f"{fmt_int(_int_at(payload, ('test_owner_targets', 'target_count')))} test targets"
         )
 
     parts.append(f"{fmt_int(files)} files")
@@ -2400,9 +2424,10 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
     queued_prune = False
     fd = sys.stdin.fileno()
 
-    with ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="monitor-mcp"
-    ) as executor, RawTerminal(enabled=True):
+    with (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="monitor-mcp") as executor,
+        RawTerminal(enabled=True),
+    ):
         while True:
             now = time.monotonic()
             if pending and pending.future.done():

@@ -17,6 +17,7 @@ from mcp_context_manager.context import (
     WARMUP_AUTO_JOB_KIND,
     WARMUP_AUTO_LEARN_KEY,
     WARMUP_MANIFEST_KEY,
+    WARMUP_PROMPT_MANIFEST_KEY,
     ContextService,
 )
 from mcp_context_manager.tantivy_index import TantivySearchIndex
@@ -112,12 +113,14 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     compact_contracts = service.context_admin(
         mode="contracts", contract_profile="compact"
     )
-    assert compact_contracts["metrics"]["compact_contract_tokens_est"] < contracts[
-        "metrics"
-    ]["contract_tokens_est"]
-    assert "context_pack.v1" in compact_contracts["contracts"]["context_pack"][
-        "output_schema_names"
-    ]
+    assert (
+        compact_contracts["metrics"]["compact_contract_tokens_est"]
+        < contracts["metrics"]["contract_tokens_est"]
+    )
+    assert (
+        "context_pack.v1"
+        in compact_contracts["contracts"]["context_pack"]["output_schema_names"]
+    )
     compact_pack_contract = service.context_admin(
         mode="contracts", tool_name="context_pack", contract_profile="compact"
     )
@@ -167,36 +170,64 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
     assert metrics["cache"]["reasons"]["hit"] >= 1
     assert metrics["cache"]["by_namespace"]["context_lookup.search"]["hits"] >= 1
     assert "context_pack.retrieval" not in metrics["cache"]["by_namespace"]
-    assert metrics["cache"]["context_pack_fragment_hits"] >= warm_pack["cache"][
-        "fragment_hits"
-    ]
-    assert metrics["tokens"]["estimated_input_tokens_saved"] >= pack["metrics"]["estimated_input_tokens_saved"]
-    assert metrics["tokens"]["tokens_spared_by_mcp_est"] >= pack["metrics"]["tokens_spared_by_mcp_est"]
+    assert (
+        metrics["cache"]["context_pack_fragment_hits"]
+        >= warm_pack["cache"]["fragment_hits"]
+    )
+    assert (
+        metrics["tokens"]["estimated_input_tokens_saved"]
+        >= pack["metrics"]["estimated_input_tokens_saved"]
+    )
+    assert (
+        metrics["tokens"]["tokens_spared_by_mcp_est"]
+        >= pack["metrics"]["tokens_spared_by_mcp_est"]
+    )
     assert (
         metrics["tokens"]["tokens_spared_by_mcp_est"]
         == metrics["tokens"]["estimated_input_tokens_saved"]
     )
     assert metrics["tokens"]["avg_tokens_spared_by_mcp_est_per_pack"] >= 0
     assert "context_pack" in metrics["tokens"]["tokens_spared_by_mcp_reason"]
-    assert metrics["tokens"]["baseline_input_tokens_est"] >= pack["metrics"]["baseline_input_tokens_est"]
-    assert metrics["tokens"]["output_tokens_est"] >= pack["metrics"]["output_tokens_est"]
-    assert metrics["tooling"]["external_tool_calls_saved_est"] >= pack["metrics"]["external_tool_calls_saved_est"]
-    assert metrics["tooling"]["contract_chars"] >= compact_contracts["metrics"][
-        "compact_contract_chars"
-    ]
+    assert (
+        metrics["tokens"]["baseline_input_tokens_est"]
+        >= pack["metrics"]["baseline_input_tokens_est"]
+    )
+    assert (
+        metrics["tokens"]["output_tokens_est"] >= pack["metrics"]["output_tokens_est"]
+    )
+    assert (
+        metrics["tooling"]["external_tool_calls_saved_est"]
+        >= pack["metrics"]["external_tool_calls_saved_est"]
+    )
+    assert (
+        metrics["tooling"]["contract_chars"]
+        >= compact_contracts["metrics"]["compact_contract_chars"]
+    )
     assert metrics["tooling"]["compact_contract_tokens_saved_est"] > 0
-    assert metrics["references"]["bytes_deferred_est"] >= pack["metrics"][
-        "references_bytes_deferred_est"
-    ]
+    assert (
+        metrics["references"]["bytes_deferred_est"]
+        >= pack["metrics"]["references_bytes_deferred_est"]
+    )
     assert warm_pack["cache"]["hit"] is False
     assert warm_pack["cache"]["namespace"] == "context_pack.fragments"
     assert warm_pack["cache"]["fragment_hits"] > 0
-    assert metrics["benchmarks"]["latency_ms_by_operation"]["context_pack"]["count"] >= 1
+    assert (
+        metrics["benchmarks"]["latency_ms_by_operation"]["context_pack"]["count"] >= 1
+    )
     assert "stage_latency_ms_by_operation" in metrics["benchmarks"]
-    assert "snippet_batch_ms" in metrics["benchmarks"]["stage_latency_ms_by_operation"]["context_pack"]
-    assert "search_ranking_ms" in metrics["benchmarks"]["stage_latency_ms_by_operation"]["context_pack"]
+    assert (
+        "snippet_batch_ms"
+        in metrics["benchmarks"]["stage_latency_ms_by_operation"]["context_pack"]
+    )
+    assert (
+        "search_ranking_ms"
+        in metrics["benchmarks"]["stage_latency_ms_by_operation"]["context_pack"]
+    )
     assert metrics["tokens"]["token_counting"]["token_count_source"] == "estimate"
-    assert metrics["requests"]["by_operation"]["context_lookup.search"]["result_count"] >= first["count"]
+    assert (
+        metrics["requests"]["by_operation"]["context_lookup.search"]["result_count"]
+        >= first["count"]
+    )
     assert resource["schema"] == "context_metrics.v1"
     assert resource["requests"]["total"] == metrics["requests"]["total"]
 
@@ -213,9 +244,9 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
         "tooling.external_calls_saved_per_pack",
         "references.bytes_deferred_est",
     }.issubset({check["key"] for check in matrix["checks"]})
-    assert {
-        check["status"] for check in matrix["checks"]
-    }.issubset({"pass", "fail", "insufficient"})
+    assert {check["status"] for check in matrix["checks"]}.issubset(
+        {"pass", "fail", "insufficient"}
+    )
 
     matrix_bundle = service.context_admin(mode="metrics_and_matrix")
     assert matrix_bundle["schema"] == "context_metrics_and_matrix.v1"
@@ -250,16 +281,23 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert warmup["stage_timings_ms"]["search_ms"] >= 0
     assert warmup["stage_timings_ms"]["file_summary_ms"] >= 0
     assert warmup["search_cache"]["query_count"] == 3
-    assert {
-        row["term"] for row in warmup["search_cache"]["queries"]
-    }.isdisjoint(GENERIC_RETRIEVAL_TERMS)
-    assert all(row["source"] in {"default_seed", "route_seed"} for row in warmup["search_cache"]["queries"])
+    assert {row["term"] for row in warmup["search_cache"]["queries"]}.isdisjoint(
+        GENERIC_RETRIEVAL_TERMS
+    )
+    assert all(
+        row["source"] in {"default_seed", "route_seed"}
+        for row in warmup["search_cache"]["queries"]
+    )
     assert warmup["file_summary_cache"]["summary_count"] > 0
-    assert warmup["file_summary_cache"]["summary_count"] <= (min(3 * 4, 80) + min(3 * 2, 40))
-    assert warmup["file_summary_cache"]["hits"] + warmup["file_summary_cache"]["misses"] == warmup["file_summary_cache"]["summary_count"]
+    assert warmup["file_summary_cache"]["summary_count"] <= (
+        min(3 * 4, 80) + min(3 * 2, 40)
+    )
     assert (
-        warmup["file_summary_cache"]["summary_count"]
-        == int(sum(warmup["file_summary_cache"]["source_counts"].values()))
+        warmup["file_summary_cache"]["hits"] + warmup["file_summary_cache"]["misses"]
+        == warmup["file_summary_cache"]["summary_count"]
+    )
+    assert warmup["file_summary_cache"]["summary_count"] == int(
+        sum(warmup["file_summary_cache"]["source_counts"].values())
     )
     assert all(row["path"] == "src" for row in warmup["search_cache"]["queries"])
     assert fallback_flags == []
@@ -268,7 +306,9 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert "context_lookup.search" not in warmup["cache"]["namespaces_after"]
     assert "context_pack.retrieval" not in warmup["cache"]["namespaces_after"]
     assert warmup["term_stats"]["namespace"] == "warmup.term_stats"
-    assert warmup["term_stats"]["updated_count"] >= warmup["search_cache"]["query_count"]
+    assert (
+        warmup["term_stats"]["updated_count"] >= warmup["search_cache"]["query_count"]
+    )
     assert warmup["route_seeds"]["schema"] == "warmup.route_seeds.v1"
     assert warmup["hot_chunks"]["namespace"] == "warmup.hot_chunks"
     assert warmup["test_owner_targets"]["namespace"] == "warmup.test_owner_targets"
@@ -279,9 +319,10 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
         "context_pack_search_allow_fallback": False,
         "context_lookup_search_warmed": False,
     }
-    assert service.store.get_json(WARMUP_MANIFEST_KEY)["refresh_signature"] == warmup[
-        "manifest"
-    ]["refresh_signature"]
+    assert (
+        service.store.get_json(WARMUP_MANIFEST_KEY)["refresh_signature"]
+        == warmup["manifest"]["refresh_signature"]
+    )
     state = service.context_admin(
         mode="state_browser",
         state_prefix="warmup:",
@@ -289,9 +330,7 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     )
     assert state["entry_count"] >= 3
     assert {
-        row["schema"]
-        for row in state["rows"]
-        if row["schema"].startswith("warmup.")
+        row["schema"] for row in state["rows"] if row["schema"].startswith("warmup.")
     }.issuperset(
         {
             "warmup.manifest.v1",
@@ -305,7 +344,9 @@ def test_context_admin_warmup_preinitializes_index_and_search_cache(
     assert metrics["warmup"]["manual_count"] == 1
     assert metrics["warmup"]["auto_count"] == 0
     assert metrics["warmup"]["query_count"] == warmup["search_cache"]["query_count"]
-    assert metrics["warmup"]["last_query_count"] == warmup["search_cache"]["query_count"]
+    assert (
+        metrics["warmup"]["last_query_count"] == warmup["search_cache"]["query_count"]
+    )
     assert metrics["warmup"]["last_elapsed_ms"] >= 0
     matrix = service.context_admin(mode="measurement_matrix")
     warmup_check = next(
@@ -353,16 +394,18 @@ def test_warmup_prefers_learned_route_terms_and_records_hot_chunks(
     warmed_terms = [row["term"] for row in warmup["search_cache"]["queries"]]
 
     assert set(warmed_terms) == {"auth", "token"}
-    assert all(row["source"] == "route_seed" for row in warmup["search_cache"]["queries"])
+    assert all(
+        row["source"] == "route_seed" for row in warmup["search_cache"]["queries"]
+    )
     assert set(warmup["route_seeds"]["route_seeds"]["review"][:2]) == {
         "auth",
         "token",
     }
     assert warmup["hot_chunks"]["target_count"] >= 1
     assert warmup["file_summary_cache"]["source_counts"]["hot_chunk"] >= 1
-    assert {
-        row["term"] for row in warmup["manifest"]["warmed_terms"]
-    }.issuperset({"auth", "token"})
+    assert {row["term"] for row in warmup["manifest"]["warmed_terms"]}.issuperset(
+        {"auth", "token"}
+    )
     assert warmup["manifest"]["warmed_summaries"]
 
     hot_rows = [
@@ -455,24 +498,38 @@ def test_auto_warmup_runs_and_warms_learned_fragment_layers(
     _wait_for_auto_warmup(service)
 
     manifest = service.store.get_json(WARMUP_MANIFEST_KEY)
+    prompt_manifest = service.store.get_json(WARMUP_PROMPT_MANIFEST_KEY)
     stats = service.context_admin(mode="cache_stats")
     metrics = service.context_admin(mode="metrics")
     state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
-    summary_sources = {
-        row.get("source") for row in manifest["warmed_summaries"] if isinstance(row, dict)
-    }
 
     assert manifest["trigger"] == "auto"
     assert {row["source"] for row in manifest["warmed_terms"]}.issubset(
-        {"route_seed", "default_seed"}
+        {"prompt_term", "route_seed"}
     )
-    assert {"hot_chunk", "test_owner"}.issubset(summary_sources)
+    assert prompt_manifest["schema"] == "warmup.prompt_manifest.v1"
+    assert prompt_manifest["prompt_terms"][:2] == ["auth", "token"]
+    assert prompt_manifest["paths"][0] == {
+        "path": "src/auth.py",
+        "source": "changed_file",
+    }
+    assert prompt_manifest["selected_targets"]
+    assert len(prompt_manifest["prompt_terms"]) <= service.config.auto_learn_max_entries
+    assert len(prompt_manifest["paths"]) <= service.config.auto_learn_max_entries
+    assert (
+        len(prompt_manifest["selected_targets"])
+        <= service.config.auto_learn_max_entries
+    )
+    assert manifest["coverage"]["planned"] >= manifest["coverage"]["completed"]
+    assert manifest["skip_reasons"]["request_memo"] >= 1
     assert "retrieval.search_term" in stats["namespaces"]
     assert "retrieval.file_summary" in stats["namespaces"]
     assert "context_lookup.search" not in stats["namespaces"]
     assert "context_pack.retrieval" not in stats["namespaces"]
     assert state["last_auto_status"] == "complete"
     assert state["last_run_at"]
+    assert state["completed_count"] >= 1
+    assert state["last_coverage"] == manifest["coverage"]
     assert metrics["warmup"]["auto_count"] >= 1
     assert metrics["warmup"]["manual_count"] == 0
     assert metrics["warmup"]["last_auto_status"] == "complete"
@@ -495,29 +552,27 @@ def test_auto_warmup_deduplicates_pending_jobs_and_respects_min_interval(
     started = Event()
     release = Event()
 
-    def slow_warmup(
-        path: str = ".",
-        max_files: int | None = None,
-        max_entries: int = 100,
-        trigger: str = "manual",
-    ) -> dict[str, Any]:
+    def slow_warmup(manifest: dict[str, Any]) -> dict[str, Any]:
         started.set()
         release.wait(timeout=2)
         return {
-            "schema": "context_cache.warmup.v1",
-            "trigger": trigger,
-            "search_cache": {"query_count": max_entries},
-            "file_summary_cache": {"summary_count": 0, "hits": 0, "misses": 0},
+            "schema": "context_cache.prompt_warmup.v1",
+            "status": "complete",
+            "reason_code": "auto_warmup_completed",
+            "coverage": {"planned": 1, "completed": 1, "skipped": 0, "ratio": 1.0},
+            "skip_reasons": {},
         }
 
-    monkeypatch.setattr(service, "_cache_warmup", slow_warmup)
+    monkeypatch.setattr(service, "_prompt_aware_cache_warmup", slow_warmup)
 
+    pack_started = time.perf_counter()
     service.context_pack(
         "review auth token behavior",
         changed_files=["src/auth.py"],
         max_items=1,
         output_profile="compact",
     )
+    assert time.perf_counter() - pack_started < 1.0
     assert started.wait(timeout=1)
 
     service.context_pack(
@@ -544,6 +599,73 @@ def test_auto_warmup_deduplicates_pending_jobs_and_respects_min_interval(
     state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
 
     assert state["last_reason_code"] == "enqueue_throttled"
+
+
+def test_auto_warmup_deduplication_is_scoped_to_refresh_signature(
+    sample_repo: Path,
+    monkeypatch,
+) -> None:
+    service = ContextService(
+        ContextConfig(
+            repo_path=sample_repo.resolve(),
+            state_dir=(sample_repo / ".mcp-context-manager").resolve(),
+            max_output_chars=6000,
+            auto_learn_min_packs=1,
+            auto_learn_min_interval_seconds=60,
+            auto_learn_max_entries=4,
+        )
+    )
+    started = [Event(), Event()]
+    release = Event()
+    signatures: list[str] = []
+    signature_lock = Lock()
+
+    def slow_warmup(manifest: dict[str, Any]) -> dict[str, Any]:
+        with signature_lock:
+            index = len(signatures)
+            signatures.append(str(manifest.get("refresh_signature", "")))
+            started[index].set()
+        release.wait(timeout=2)
+        return {
+            "schema": "context_cache.prompt_warmup.v1",
+            "status": "complete",
+            "reason_code": "auto_warmup_completed",
+            "coverage": {"planned": 1, "completed": 1, "skipped": 0, "ratio": 1.0},
+            "skip_reasons": {},
+        }
+
+    monkeypatch.setattr(service, "_prompt_aware_cache_warmup", slow_warmup)
+    service.context_pack(
+        "review auth token behavior",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+    assert started[0].wait(timeout=1)
+
+    auth_file = sample_repo / "src" / "auth.py"
+    auth_file.write_text(
+        auth_file.read_text(encoding="utf-8") + "\nTOKEN_VERSION = 2\n",
+        encoding="utf-8",
+    )
+    service.context_pack(
+        "review auth token validation",
+        changed_files=["src/auth.py"],
+        refresh_index=True,
+        max_items=1,
+        output_profile="compact",
+    )
+    assert started[1].wait(timeout=1)
+
+    background = service._background_status()[WARMUP_AUTO_JOB_KIND]
+    state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
+    assert len(set(signatures)) == 2
+    assert background["signature_count"] >= 2
+    assert state["last_reason_code"] != "enqueue_deduplicated"
+    assert state["enqueued_count"] >= 2
+
+    release.set()
+    _wait_for_auto_warmup(service)
 
 
 def test_auto_learn_cache_can_be_disabled_with_env(
@@ -594,21 +716,18 @@ def test_auto_learn_state_and_jobs_are_project_isolated(
         for project_id in ("project-a", "project-b")
     ]
 
-    def no_op_warmup(
-        path: str = ".",
-        max_files: int | None = None,
-        max_entries: int = 100,
-        trigger: str = "manual",
-    ) -> dict[str, Any]:
+    def no_op_warmup(manifest: dict[str, Any]) -> dict[str, Any]:
         return {
-            "schema": "context_cache.warmup.v1",
+            "schema": "context_cache.prompt_warmup.v1",
             "project_id": "",
-            "trigger": trigger,
-            "search_cache": {"query_count": max_entries},
+            "status": "complete",
+            "reason_code": "auto_warmup_completed",
+            "coverage": {"planned": 0, "completed": 0, "skipped": 0, "ratio": 0.0},
+            "skip_reasons": {},
         }
 
     for svc in services:
-        monkeypatch.setattr(svc, "_cache_warmup", no_op_warmup)
+        monkeypatch.setattr(svc, "_prompt_aware_cache_warmup", no_op_warmup)
         svc.context_pack(
             "review auth token behavior",
             changed_files=["src/auth.py"],
@@ -623,6 +742,154 @@ def test_auto_learn_state_and_jobs_are_project_isolated(
     assert [state["project_id"] for state in states] == ["project-a", "project-b"]
     assert [state["observed_context_pack_count"] for state in states] == [1, 1]
     assert [row["project_id"] for row in backgrounds] == ["project-a", "project-b"]
+
+
+def test_prompt_warmup_skips_stale_signature_without_writing_fragments(
+    service: ContextService,
+    monkeypatch,
+) -> None:
+    service.index.refresh()
+    refresh_signature, available = service._current_refresh_signature()
+    assert available is True
+    manifest = {
+        "schema": "warmup.prompt_manifest.v1",
+        "project_id": service.config.project_id,
+        "refresh_signature": refresh_signature,
+        "refresh_signature_available": True,
+        "dedupe_key": "stale-test",
+        "route": "review",
+        "prompt_terms": ["auth"],
+        "paths": [{"path": "src/auth.py", "source": "changed_file"}],
+        "selected_targets": [],
+        "request_memo_targets": [],
+        "learned_route_seeds": [],
+    }
+    before = service.store.count("cache:")
+    monkeypatch.setattr(
+        service,
+        "_current_refresh_signature",
+        lambda: ("files:changed", True),
+    )
+
+    result = service._prompt_aware_cache_warmup(manifest)
+
+    assert result["status"] == "skipped"
+    assert result["reason_code"] == "stale_refresh_signature"
+    assert result["skip_reasons"] == {"stale_refresh_signature": 1}
+    assert service.store.count("cache:") == before
+
+
+def test_prompt_warmup_skips_generic_no_result_and_unavailable_targets(
+    service: ContextService,
+) -> None:
+    service.index.refresh()
+    refresh_signature, available = service._current_refresh_signature()
+    assert available is True
+    missing_term = "zzzzpromptwarmupnomatch"
+    manifest = {
+        "schema": "warmup.prompt_manifest.v1",
+        "project_id": service.config.project_id,
+        "refresh_signature": refresh_signature,
+        "refresh_signature_available": True,
+        "dedupe_key": "skip-test",
+        "route": "review",
+        "prompt_terms": ["review", missing_term],
+        "paths": [{"path": "src/missing.py", "source": "focus_path"}],
+        "selected_targets": [],
+        "request_memo_targets": [],
+        "learned_route_seeds": [],
+    }
+
+    result = service._prompt_aware_cache_warmup(manifest)
+    cached_terms = {
+        str(row.get("metadata", {}).get("term", ""))
+        for _key, row in service.store.iter_json("cache:retrieval.search_term:")
+        if isinstance(row, dict)
+    }
+
+    assert result["status"] == "complete"
+    assert result["skip_reasons"]["generic_term"] == 1
+    assert result["skip_reasons"]["no_results"] == 1
+    assert result["skip_reasons"]["unavailable_path"] == 2
+    assert missing_term not in cached_terms
+
+
+def test_related_prompt_reuses_warmed_fragments_without_selection_regression(
+    sample_repo: Path,
+    tmp_path: Path,
+) -> None:
+    common = {
+        "repo_path": sample_repo.resolve(),
+        "max_output_chars": 6000,
+        "auto_learn_min_packs": 1,
+        "auto_learn_min_interval_seconds": 0,
+        "auto_learn_max_entries": 6,
+    }
+    warm_service = ContextService(
+        ContextConfig(
+            state_dir=(tmp_path / "warm-state").resolve(),
+            **common,
+        )
+    )
+    cold_service = ContextService(
+        ContextConfig(
+            state_dir=(tmp_path / "cold-state").resolve(),
+            auto_learn_cache=False,
+            **{
+                key: value
+                for key, value in common.items()
+                if not key.startswith("auto_learn_")
+            },
+        )
+    )
+    warm_service.index.refresh()
+    cold_service.index.refresh()
+    initial_request = {
+        "prompt": "review auth token behavior",
+        "changed_files": ["src/auth.py"],
+        "focus_paths": ["tests/test_auth.py"],
+        "max_items": 3,
+        "output_profile": "compact",
+    }
+    variant_request = {
+        **initial_request,
+        "prompt": "inspect token auth validation behavior",
+    }
+
+    warm_service.context_pack(**initial_request)
+    _wait_for_auto_warmup(warm_service)
+    warm = warm_service.context_pack(**variant_request)
+    cold = cold_service.context_pack(**variant_request)
+
+    def fields(pack: dict[str, Any]) -> list[tuple[Any, ...]]:
+        return [
+            (
+                item["path"],
+                item["start_line"],
+                item["end_line"],
+                item["reason_codes"],
+                item["confidence"],
+                item["detail_lookup"],
+                item["provenance"],
+            )
+            for item in pack["items"]
+        ]
+
+    assert fields(warm) == fields(cold)
+    assert [row["schema"] for row in warm["references"]] == [
+        row["schema"] for row in cold["references"]
+    ]
+    assert warm["cache"]["fragment_hit_ratio"] >= 0.6
+    assert warm["cache"]["by_namespace"]["retrieval.search_term"]["hits"] >= 2
+    assert warm["cache"]["by_namespace"]["retrieval.file_summary"]["hits"] >= 2
+    assert warm["cache"]["by_namespace"]["retrieval.test_owner_paths"]["hits"] >= 1
+    metrics = warm_service.context_admin(mode="metrics")
+    for namespace in (
+        "retrieval.search_term",
+        "retrieval.file_summary",
+        "retrieval.test_owner_paths",
+    ):
+        assert namespace in metrics["cache"]["by_namespace"]
 
 
 def test_warmup_route_seeds_prefer_matching_path_scope(
@@ -921,7 +1188,9 @@ def test_context_lookup_search_keeps_public_search_path(
     assert all(fallback_flags)
 
 
-def test_context_admin_warmup_scopes_symbol_summary_targets(service: ContextService, monkeypatch) -> None:
+def test_context_admin_warmup_scopes_symbol_summary_targets(
+    service: ContextService, monkeypatch
+) -> None:
     scoped_summary_paths: list[str] = []
 
     original_cached_file_summary = service._cached_file_summary
@@ -954,13 +1223,17 @@ def test_context_admin_warmup_scopes_symbol_summary_targets(service: ContextServ
 
     monkeypatch.setattr(service, "_cached_file_summary", tracked_file_summary)
     monkeypatch.setattr(service.index, "symbols", staged_symbols)
-    monkeypatch.setattr(service, "_warm_search_caches", lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(
+        service, "_warm_search_caches", lambda *args, **kwargs: ([], [])
+    )
 
     warmup = service.context_admin(mode="warmup", path="tests", max_entries=1)
 
     assert warmup["file_summary_cache"]["source_counts"]["symbol"] == 1
     assert warmup["file_summary_cache"]["summary_count"] == 1
-    assert all(path == "tests" or path.startswith("tests/") for path in scoped_summary_paths)
+    assert all(
+        path == "tests" or path.startswith("tests/") for path in scoped_summary_paths
+    )
 
 
 def test_context_admin_warmup_serializes_concurrent_project_writes(
@@ -1102,7 +1375,10 @@ def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
         assert run["tokens_spared_by_mcp_est"] == max(
             0, baseline["output_tokens_est"] - run["output_tokens_est"]
         )
-    assert benchmark["compact_contract_sample"]["schema"] == "tool_output_contracts.compact.v1"
+    assert (
+        benchmark["compact_contract_sample"]["schema"]
+        == "tool_output_contracts.compact.v1"
+    )
     assert benchmark["compact_contract_sample"]["contract_tokens_saved_est"] > 0
     assert benchmark["measurement_matrix"]["schema"] == "context_measurement_matrix.v1"
     checks = {
@@ -1111,8 +1387,7 @@ def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
     latency = checks["latency.context_pack.avg_elapsed_ms"]
     assert latency["samples"] == benchmark["run_count"]
     assert latency["current"] == round(
-        sum(run["elapsed_ms"] for run in benchmark["runs"])
-        / benchmark["run_count"],
+        sum(run["elapsed_ms"] for run in benchmark["runs"]) / benchmark["run_count"],
         3,
     )
     assert (
@@ -1178,8 +1453,10 @@ def test_cache_default_ttl_and_prune_age_are_30_days(
 
     assert row["ttl_seconds"] == 30 * 24 * 60 * 60
     assert row["ttl_seconds"] == DEFAULT_CACHE_TTL_SECONDS
-    assert timedelta(days=29, hours=23) <= expires_at - updated_at <= timedelta(
-        days=30, minutes=1
+    assert (
+        timedelta(days=29, hours=23)
+        <= expires_at - updated_at
+        <= timedelta(days=30, minutes=1)
     )
 
     row["updated_at"] = (datetime.now(timezone.utc) - timedelta(days=29)).isoformat()
@@ -1203,7 +1480,9 @@ def test_cache_prune_runs_opportunistically_when_due(
             "schema_version": 2,
             "created_at": (datetime.now(timezone.utc) - timedelta(days=31)).isoformat(),
             "updated_at": (datetime.now(timezone.utc) - timedelta(days=31)).isoformat(),
-            "expires_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+            "expires_at": (
+                datetime.now(timezone.utc) - timedelta(minutes=1)
+            ).isoformat(),
             "ttl_seconds": DEFAULT_CACHE_TTL_SECONDS,
             "status": "active",
             "namespace": "test",
@@ -1416,9 +1695,10 @@ def test_context_pack_prompt_variation_reuses_fragments(
     assert varied["cache"]["fragment_hit_ratio"] >= 0.2
 
     metrics = service.context_admin(mode="metrics")
-    assert metrics["cache"]["context_pack_fragment_hits"] >= varied["cache"][
-        "fragment_hits"
-    ]
+    assert (
+        metrics["cache"]["context_pack_fragment_hits"]
+        >= varied["cache"]["fragment_hits"]
+    )
     assert metrics["cache"]["context_pack_fragment_hit_ratio"] >= 0.2
 
 
@@ -1471,7 +1751,7 @@ def test_public_search_cache_with_fallback_does_not_reuse_index_only_context_pac
 
     monkeypatch.setattr(service.index, "search_fragment", tracked_search_fragment)
 
-    pack = service.context_pack("auth", max_items=1)
+    pack = service.context_pack("auth", max_items=1, output_profile="compact")
 
     assert observed
     assert pack["cache"]["fragment_misses"] >= 1
@@ -1539,7 +1819,7 @@ def test_public_search_fragment_does_not_feed_index_only_context_pack_cache(
 
     monkeypatch.setattr(service.index, "search_fragment", tracked_search_fragment)
 
-    pack = service.context_pack("fallbackonly", max_items=1)
+    pack = service.context_pack("fallbackonly", max_items=1, output_profile="compact")
 
     assert observed
     assert pack["cache"]["fragment_misses"] >= 1
@@ -1549,14 +1829,19 @@ def test_public_search_fragment_does_not_feed_index_only_context_pack_cache(
 def test_context_pack_changed_signature_invalidates_fragments(
     service: ContextService, sample_repo: Path
 ) -> None:
-    service.context_pack("review auth token behavior", max_items=2)
+    service.context_pack(
+        "review auth token behavior", max_items=2, output_profile="compact"
+    )
     auth_file = sample_repo / "src" / "auth.py"
     auth_file.write_text(
-        auth_file.read_text(encoding="utf-8") + "\ndef token_refresh():\n    return True\n",
+        auth_file.read_text(encoding="utf-8")
+        + "\ndef token_refresh():\n    return True\n",
         encoding="utf-8",
     )
 
-    changed = service.context_pack("inspect auth token flow", max_items=2)
+    changed = service.context_pack(
+        "inspect auth token flow", max_items=2, output_profile="compact"
+    )
 
     assert changed["cache"]["fragment_misses"] > 0
     assert any(
@@ -1568,11 +1853,15 @@ def test_context_pack_changed_signature_invalidates_fragments(
 def test_unrelated_edit_reuses_unchanged_chunk_summaries(
     service: ContextService, sample_repo: Path
 ) -> None:
-    first = service.context_pack("review auth token behavior", max_items=2)
+    first = service.context_pack(
+        "review auth token behavior", max_items=2, output_profile="compact"
+    )
     unrelated = sample_repo / "config" / "other.toml"
     unrelated.write_text("other = true\n", encoding="utf-8")
 
-    second = service.context_pack("review auth token behavior", max_items=2)
+    second = service.context_pack(
+        "review auth token behavior", max_items=2, output_profile="compact"
+    )
 
     assert first["items"]
     assert second["items"]
@@ -1604,7 +1893,9 @@ def test_context_pack_missing_refresh_signature_skips_fragment_writes(
 ) -> None:
     monkeypatch.setattr(service, "_current_refresh_signature", lambda: ("", False))
 
-    pack = service.context_pack("review auth token behavior", max_items=2)
+    pack = service.context_pack(
+        "review auth token behavior", max_items=2, output_profile="compact"
+    )
     stats = service.context_admin(mode="cache_stats")
 
     assert pack["cache"]["reason"] == "signature_unavailable"
@@ -1613,8 +1904,8 @@ def test_context_pack_missing_refresh_signature_skips_fragment_writes(
         detail["reason"] == "signature_unavailable"
         for detail in pack["cache"]["miss_details"]
     )
-    assert "retrieval.search_term" not in stats["namespaces"]
-    assert "retrieval.file_summary" not in stats["namespaces"]
+    assert stats["namespaces"]["retrieval.search_term"]["entry_count"] == 0
+    assert stats["namespaces"]["retrieval.file_summary"]["entry_count"] == 0
 
 
 def test_quality_eval_and_tool_only_admin_modes(
@@ -1692,7 +1983,9 @@ def test_search_fragment_cache_backend_version_invalidates_old_rows(
     assert stale_lookup["hit"] is False
     assert stale_lookup["reason"] == "backend_changed"
     assert second["cache"]["hit"] is False
-    assert new_row["metadata"]["backend_version"] == service.index.search_backend_version()
+    assert (
+        new_row["metadata"]["backend_version"] == service.index.search_backend_version()
+    )
     assert second["results"]
 
 
@@ -1724,7 +2017,9 @@ def test_warm_context_pack_reuses_search_fragments_for_response_assembly(
     assert warm["cache"]["namespace"] == "context_pack.fragments"
     assert warm["cache"]["fragment_hits"] > 0
     assert warm["metrics"]["stage_timings_ms"]["candidate_retrieval_ms"] >= 0.0
-    assert warm["references"][0]["reference_id"] != first["references"][0]["reference_id"]
+    assert (
+        warm["references"][0]["reference_id"] != first["references"][0]["reference_id"]
+    )
 
 
 def test_cold_context_pack_uses_indexed_search_fragments_without_public_search(
@@ -1777,8 +2072,7 @@ def test_compact_context_pack_limits_search_summary_extraction(
     assert plan["search_summary_limit"] == 8
     assert plan["search_summary_count"] == 8
     assert any(
-        row.get("reason_code") == "search_summary_limit"
-        for row in pack["omitted"]
+        row.get("reason_code") == "search_summary_limit" for row in pack["omitted"]
     )
 
 
@@ -1816,7 +2110,8 @@ def test_explicit_paths_refresh_before_context_pack_returns(
     service.context_pack("review auth token behavior", max_items=2)
     auth_file = sample_repo / "src" / "auth.py"
     auth_file.write_text(
-        auth_file.read_text(encoding="utf-8") + "\ndef explicit_refresh_marker():\n    return True\n",
+        auth_file.read_text(encoding="utf-8")
+        + "\ndef explicit_refresh_marker():\n    return True\n",
         encoding="utf-8",
     )
 

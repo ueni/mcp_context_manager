@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import json
 
-from mcp_context_manager.context import WARMUP_AUTO_LEARN_KEY, ContextService
+from mcp_context_manager.context import (
+    WARMUP_AUTO_LEARN_KEY,
+    WARMUP_PROMPT_MANIFEST_KEY,
+    ContextService,
+)
 
 
-def test_context_pack_returns_cited_budgeted_items_and_reference(service: ContextService) -> None:
+def test_context_pack_returns_cited_budgeted_items_and_reference(
+    service: ContextService,
+) -> None:
     service.context_memory(
         mode="summary_upsert",
         namespace="route/coding",
@@ -37,9 +43,10 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert "storage" not in pack["references"][0]
     assert "path" not in pack["references"][0]["resolver"]
     assert pack["budget"]["estimated_output_tokens"] > 0
-    assert pack["budget"]["estimated_output_tokens"] == service._token_count(
-        json.dumps(pack, ensure_ascii=False)
-    ).count
+    assert (
+        pack["budget"]["estimated_output_tokens"]
+        == service._token_count(json.dumps(pack, ensure_ascii=False)).count
+    )
     assert pack["budget"]["token_counting"]["token_count_source"] == "estimate"
     assert pack["safety"]["repository_boundary_enforced"] is True
     assert pack["items"][0]["confidence"] > 0
@@ -50,17 +57,29 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert pack["metrics"]["stage_timings_ms"]["reference_write_ms"] >= 0
     assert pack["metrics"]["stage_timings_ms"]["response_assembly_ms"] >= 0
     assert pack["metrics"]["stage_timings_ms"]["snippet_batch_ms"] >= 0
-    assert pack["metrics"]["baseline_input_tokens_est"] >= pack["metrics"]["output_tokens_est"]
+    assert (
+        pack["metrics"]["baseline_input_tokens_est"]
+        >= pack["metrics"]["output_tokens_est"]
+    )
     assert pack["metrics"]["output_token_scope"] == "complete_response"
     assert pack["metrics"]["baseline_kind"] == "ranked_candidate_evidence_estimate"
     assert pack["metrics"]["token_counting"]["token_count_source"] == "estimate"
-    assert pack["metrics"]["token_savings_formula"] == "max(0, baseline_input_tokens_est - output_tokens_est)"
-    assert pack["metrics"]["tokens_spared_by_mcp_formula"] == "max(0, baseline_input_tokens_est - output_tokens_est)"
+    assert (
+        pack["metrics"]["token_savings_formula"]
+        == "max(0, baseline_input_tokens_est - output_tokens_est)"
+    )
+    assert (
+        pack["metrics"]["tokens_spared_by_mcp_formula"]
+        == "max(0, baseline_input_tokens_est - output_tokens_est)"
+    )
     assert (
         pack["metrics"]["tokens_spared_by_mcp_est"]
         == pack["metrics"]["estimated_input_tokens_saved"]
     )
-    assert "not a measured MCP-versus-no-MCP" in pack["metrics"]["tokens_spared_by_mcp_reason"]
+    assert (
+        "not a measured MCP-versus-no-MCP"
+        in pack["metrics"]["tokens_spared_by_mcp_reason"]
+    )
     assert pack["metrics"]["external_tool_calls_saved_est"] >= 1
     assert pack["metrics"]["references_bytes_deferred_est"] > 0
     assert pack["metrics"]["retrieval_plan"]["detail_mode"] == "context_lookup.snippet"
@@ -86,6 +105,13 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert "fragment_misses" in pack["cache"]
     assert "fragment_hit_ratio" in pack["cache"]
     assert "chunk_hit_ratio" in pack["cache"]
+    assert set(pack["cache"]["by_namespace"]).issubset(
+        {
+            "retrieval.search_term",
+            "retrieval.file_summary",
+            "retrieval.test_owner_paths",
+        }
+    )
 
     resolved = service.result_reference_resolve(reference=pack["references"][0])
     assert resolved["status"] == "resolved"
@@ -110,9 +136,9 @@ def test_context_pack_cold_bypasses_persistent_retrieval_cache(
 
     assert cold["cache"]["fragment_hits"] == 0
     assert cold["cache"]["fragment_misses"] > 0
-    assert {
-        detail["reason"] for detail in cold["cache"]["miss_details"]
-    } == {"cache_bypassed"}
+    assert {detail["reason"] for detail in cold["cache"]["miss_details"]} == {
+        "cache_bypassed"
+    }
     rewarmed = service.context_pack(**request)
     assert rewarmed["cache"]["fragment_hits"] > 0
 
@@ -126,6 +152,7 @@ def test_context_pack_records_bounded_auto_learn_state(service: ContextService) 
     )
 
     state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
+    manifest = service.store.get_json(WARMUP_PROMPT_MANIFEST_KEY)
 
     assert state["schema"] == "warmup.auto_learn.v1"
     assert state["enabled"] is True
@@ -133,8 +160,13 @@ def test_context_pack_records_bounded_auto_learn_state(service: ContextService) 
     assert state["last_reason_code"] == "below_min_packs"
     assert state["last_route"] == "review"
     assert state["learned_target_counts"]["route_seeds"] >= 1
-    assert "prompt" not in json.dumps(state)
+    assert "review auth token behavior" not in json.dumps(state)
     assert str(service.config.repo_path) not in json.dumps(state)
+    assert manifest["schema"] == "warmup.prompt_manifest.v1"
+    assert manifest["prompt_terms"] == ["auth", "token"]
+    assert manifest["paths"][0]["path"] == "src/auth.py"
+    assert len(manifest["selected_targets"]) <= service.config.auto_learn_max_entries
+    assert "review auth token behavior" not in json.dumps(manifest)
 
 
 def test_context_pack_does_not_iter_json_warmup_target_prefixes(
@@ -163,9 +195,13 @@ def test_context_pack_does_not_iter_json_warmup_target_prefixes(
     )
 
 
-def test_context_pack_redacts_secret_like_content(service: ContextService, sample_repo) -> None:
+def test_context_pack_redacts_secret_like_content(
+    service: ContextService, sample_repo
+) -> None:
     secret_file = sample_repo / "src" / "secretish.py"
-    secret_file.write_text('API_TOKEN = "super-secret-token-value-123456"\n', encoding="utf-8")
+    secret_file.write_text(
+        'API_TOKEN = "super-secret-token-value-123456"\n', encoding="utf-8"
+    )
 
     pack = service.context_pack(
         prompt="review src/secretish.py token handling",
@@ -206,7 +242,14 @@ def test_minimal_pack_is_cache_stable_and_reference_backed(
     assert raw_prompt not in json.dumps(pack)
     assert pack["items"]
     item = pack["items"][0]
-    assert list(item) == ["path", "lines", "reason", "confidence", "content", "detail_lookup"]
+    assert list(item) == [
+        "path",
+        "lines",
+        "reason",
+        "confidence",
+        "content",
+        "detail_lookup",
+    ]
     assert item["confidence"] in {"high", "medium", "low"}
     assert item["detail_lookup"]["mode"] == "snippet"
 
@@ -408,8 +451,7 @@ def test_context_pack_skill_guidance_redacts_and_ignores_expired_or_nonmatching(
             "description": "Use when debugging deployment tokens.",
             "triggers": ["deployment", "token"],
             "instructions": (
-                "Must inspect /home/user/private/token.txt and "
-                "API_TOKEN = super-secret-token-value-123456."
+                "Must inspect /home/user/private/token.txt and API_TOKEN = super-secret-token-value-123456."
             ),
         },
         ttl_days=7,
@@ -533,7 +575,7 @@ def test_context_pack_reads_explicit_text_file_that_is_not_indexed(
 ) -> None:
     lock_file = sample_repo / "poetry.lock"
     lock_file.write_text(
-        "[[package]]\nname = \"critical-dependency\"\nversion = \"1.2.3\"\n",
+        '[[package]]\nname = "critical-dependency"\nversion = "1.2.3"\n',
         encoding="utf-8",
     )
 
@@ -570,9 +612,9 @@ def test_context_pack_reference_does_not_persist_raw_prompt(
 def _stored_reference_body(service: ContextService, reference_id: str) -> str:
     record = service.references.store.get_json(f"reference:{reference_id}", {})
     if record.get("storage") == "file":
-        return (
-            service.config.references_dir / str(record.get("path", ""))
-        ).read_text(encoding="utf-8")
+        return (service.config.references_dir / str(record.get("path", ""))).read_text(
+            encoding="utf-8"
+        )
     return str(record.get("body", ""))
 
 
@@ -585,7 +627,9 @@ def test_context_pack_budget_omits_extra_candidates(service: ContextService) -> 
 
     assert len(pack["items"]) == 1
     assert pack["omitted"]
-    assert {row["reason_code"] for row in pack["omitted"]}.intersection({"item_limit", "budget_exhausted", "duplicate"})
+    assert {row["reason_code"] for row in pack["omitted"]}.intersection(
+        {"item_limit", "budget_exhausted", "duplicate"}
+    )
 
 
 def test_context_pack_rejects_prompt_path_noise(service: ContextService) -> None:
@@ -613,7 +657,9 @@ def test_file_summary_request_memo_reuses_duplicate_targets(
     service: ContextService, monkeypatch
 ) -> None:
     service.context_admin(mode="index_refresh")
-    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+    refresh_signature, refresh_signature_available = (
+        service._current_refresh_signature()
+    )
     original = service._cached_file_summary
     calls: list[tuple[str, int]] = []
 
@@ -656,7 +702,9 @@ def test_file_summary_duplicate_targets_count_single_fragment_chunk_miss_and_mem
     service: ContextService, monkeypatch
 ) -> None:
     service.context_admin(mode="index_refresh")
-    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+    refresh_signature, refresh_signature_available = (
+        service._current_refresh_signature()
+    )
     original = service._cached_file_summary
     cached_calls: list[tuple[str, int]] = []
 
@@ -694,21 +742,27 @@ def test_file_summary_duplicate_targets_count_single_fragment_chunk_miss_and_mem
     )
 
     assert cached_calls == [("src/auth.py", 0)]
-    assert retrieval_stats["fragment_misses"] == 1
+    assert retrieval_stats["fragment_misses"] == 2
     assert retrieval_stats["fragment_hits"] == 1
     assert retrieval_stats["chunk_misses"] == 1
     assert retrieval_stats["chunk_hits"] == 1
     assert retrieval_stats["file_summary_memo_hits"] == 1
     assert retrieval_stats["file_summary_memo_misses"] == 1
-    assert len(retrieval_stats["fragment_miss_details"]) == 1
+    assert len(retrieval_stats["fragment_miss_details"]) == 2
     assert retrieval_stats["fragment_miss_details"][0]["reason"] == "forced_for_test"
+    assert (
+        retrieval_stats["fragment_namespaces"]["retrieval.test_owner_paths"]["misses"]
+        == 1
+    )
 
 
 def test_test_owner_paths_cache_reuses_index_search(
     service: ContextService, monkeypatch
 ) -> None:
     service.context_admin(mode="index_refresh")
-    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+    refresh_signature, refresh_signature_available = (
+        service._current_refresh_signature()
+    )
     original_search = service.index.search
     calls: list[str] = []
 
@@ -781,9 +835,7 @@ def test_explicit_directory_path_refresh_not_skipped_without_whole_repo_signatur
 
     assert result["refreshed_count"] == 1
     assert result["skipped_count"] == 0
-    assert result["refreshed_paths"] == [
-        {"path": "src", "reason": "scoped_refresh"}
-    ]
+    assert result["refreshed_paths"] == [{"path": "src", "reason": "scoped_refresh"}]
     assert calls
 
 
@@ -791,9 +843,11 @@ def test_cached_empty_test_owner_paths_rechecks_direct_test_files(
     service: ContextService, sample_repo
 ) -> None:
     source_file = sample_repo / "src" / "foo.py"
-    source_file.write_text("def foo():\n    return \"foo\"\n", encoding="utf-8")
+    source_file.write_text('def foo():\n    return "foo"\n', encoding="utf-8")
     service.context_admin(mode="index_refresh")
-    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+    refresh_signature, refresh_signature_available = (
+        service._current_refresh_signature()
+    )
 
     first, first_hit = service._cached_test_owner_paths(
         ["src/foo.py"],
@@ -805,7 +859,7 @@ def test_cached_empty_test_owner_paths_rechecks_direct_test_files(
     assert first_hit is False
 
     (sample_repo / "tests" / "test_foo.py").write_text(
-        "def test_foo():\n    assert foo.foo() == \"foo\"\n",
+        'def test_foo():\n    assert foo.foo() == "foo"\n',
         encoding="utf-8",
     )
 
@@ -824,7 +878,9 @@ def test_cached_test_owner_paths_merges_new_direct_test_files(
     service: ContextService, sample_repo
 ) -> None:
     service.context_admin(mode="index_refresh")
-    refresh_signature, refresh_signature_available = service._current_refresh_signature()
+    refresh_signature, refresh_signature_available = (
+        service._current_refresh_signature()
+    )
 
     first, first_hit = service._cached_test_owner_paths(
         ["src/auth.py"],

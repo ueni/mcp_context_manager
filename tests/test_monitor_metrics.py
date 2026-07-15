@@ -28,9 +28,7 @@ class FakeClient:
             "project_id": project_id,
             "requests": {
                 "total": 10,
-                "by_operation": {
-                    "context_pack": {"count": 3, "avg_elapsed_ms": 42.5}
-                },
+                "by_operation": {"context_pack": {"count": 3, "avg_elapsed_ms": 42.5}},
             },
             "cache": {
                 "hits": 6,
@@ -44,6 +42,21 @@ class FakeClient:
                         "hits": 2,
                         "misses": 1,
                         "hit_ratio": 0.667,
+                    },
+                    "retrieval.search_term": {
+                        "hits": 6,
+                        "misses": 2,
+                        "hit_ratio": 0.75,
+                    },
+                    "retrieval.file_summary": {
+                        "hits": 5,
+                        "misses": 1,
+                        "hit_ratio": 0.8333,
+                    },
+                    "retrieval.test_owner_paths": {
+                        "hits": 2,
+                        "misses": 1,
+                        "hit_ratio": 0.6667,
                     },
                     "skill.compiled": {
                         "hits": 4,
@@ -76,6 +89,14 @@ class FakeClient:
                     "observed_context_pack_count": 4,
                     "last_reason_code": "auto_warmup_completed",
                     "last_auto_status": "complete",
+                    "deduplicated_count": 2,
+                    "failure_count": 0,
+                    "last_coverage": {
+                        "planned": 8,
+                        "completed": 6,
+                        "skipped": 2,
+                        "ratio": 0.75,
+                    },
                     "learned_target_counts": {
                         "route_seeds": 2,
                         "hot_chunks": 1,
@@ -343,9 +364,7 @@ class ConcurrentMetricsClient(FakeClient):
             self.calls.append((name, arguments))
             self._active_metrics += 1
             self.metrics_started += 1
-            self.max_active_metrics = max(
-                self.max_active_metrics, self._active_metrics
-            )
+            self.max_active_metrics = max(self.max_active_metrics, self._active_metrics)
             if self.metrics_started >= 2:
                 self._release.set()
         self._release.wait(timeout=0.5)
@@ -553,10 +572,7 @@ def test_mcp_initialize_warns_once_for_server_version_mismatch(capsys) -> None:
     client.initialize()
     client.initialize()
 
-    warning = (
-        f"WARNING: monitor expects server {monitor.EXPECTED_SERVER_VERSION}, "
-        "connected server is 9.9.9"
-    )
+    warning = f"WARNING: monitor expects server {monitor.EXPECTED_SERVER_VERSION}, connected server is 9.9.9"
     assert capsys.readouterr().err.count(warning) == 1
 
 
@@ -577,8 +593,7 @@ def test_mcp_initialize_warns_when_server_does_not_report_version(capsys) -> Non
     client.initialize()
 
     assert capsys.readouterr().err == (
-        f"WARNING: monitor expects server {monitor.EXPECTED_SERVER_VERSION}, "
-        "connected server is not reported\n"
+        f"WARNING: monitor expects server {monitor.EXPECTED_SERVER_VERSION}, connected server is not reported\n"
     )
 
 
@@ -615,9 +630,7 @@ def test_render_dashboard_keeps_long_project_names_readable() -> None:
         metrics={
             "requests": {
                 "total": 4,
-                "by_operation": {
-                    "context_pack": {"count": 4, "avg_elapsed_ms": 413.9}
-                },
+                "by_operation": {"context_pack": {"count": 4, "avg_elapsed_ms": 413.9}},
             },
             "cache": {
                 "hits": 0,
@@ -712,7 +725,9 @@ def test_interactive_key_bindings_update_state() -> None:
         state_selected_index=0,
         state_search_active=False,
     )
-    assert monitor.handle_key("escape", state, row_count=3, state_row_count=2) == "redraw"
+    assert (
+        monitor.handle_key("escape", state, row_count=3, state_row_count=2) == "redraw"
+    )
     assert state.view == "table"
     state.view = "performance"
     assert monitor.handle_key("escape", state, row_count=3) == "redraw"
@@ -727,13 +742,24 @@ def test_interactive_key_bindings_update_state() -> None:
     assert state.view == "state"
     assert monitor.handle_key("down", state, row_count=3, state_row_count=2) == "redraw"
     assert state.state_selected_index == 1
-    assert monitor.handle_key("enter", state, row_count=3, state_row_count=2) == "state_entry"
-    assert monitor.handle_key("refresh", state, row_count=3, state_row_count=2) == "ignore"
-    assert monitor.handle_key("warmup", state, row_count=3, state_row_count=2) == "ignore"
-    assert monitor.handle_key("prune", state, row_count=3, state_row_count=2) == "ignore"
+    assert (
+        monitor.handle_key("enter", state, row_count=3, state_row_count=2)
+        == "state_entry"
+    )
+    assert (
+        monitor.handle_key("refresh", state, row_count=3, state_row_count=2) == "ignore"
+    )
+    assert (
+        monitor.handle_key("warmup", state, row_count=3, state_row_count=2) == "ignore"
+    )
+    assert (
+        monitor.handle_key("prune", state, row_count=3, state_row_count=2) == "ignore"
+    )
     assert monitor.handle_key("plus", state, row_count=3, state_row_count=2) == "ignore"
     state.state_search_active = True
-    assert monitor.handle_key("warmup", state, row_count=3, state_row_count=2) == "redraw"
+    assert (
+        monitor.handle_key("warmup", state, row_count=3, state_row_count=2) == "redraw"
+    )
     assert state.state_search == "w"
 
     state.view = "table"
@@ -800,7 +826,9 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "Context matrix check a (lower is better)" in detail
     assert "Average context-pack request latency (lower is better)" in detail
     latency_row = next(
-        line for line in detail.splitlines() if "latency.context_pack.avg_elapsed_ms" in line
+        line
+        for line in detail.splitlines()
+        if "latency.context_pack.avg_elapsed_ms" in line
     )
     latency_description = latency_row.split("|")[-2].strip()
     assert "latency.context_pack.avg_elapsed_ms" not in latency_description
@@ -841,12 +869,17 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "background queue" in performance
     assert "4/1 h/m" in performance
     assert "fragment hit ratio" in performance
+    assert "search-term cache" in performance
+    assert "file-summary cache" in performance
+    assert "test-owner cache" in performance
     assert "skill card cache" in performance
     assert "warmup" in performance
     assert "lookup cache" not in performance
     assert "2 runs, avg 18.5, last 12.0, 3 queries" in performance
     assert "auto warmup" in performance
     assert "1 auto runs, complete, idle, reason auto_warmup_completed" in performance
+    assert "coverage 6/8" in performance
+    assert "2 dedup" in performance
     performance_footer = next(
         line
         for line in reversed(performance.splitlines())
@@ -863,16 +896,18 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
         state=state,
     )
     narrow_lines = narrow_performance.splitlines()
-    stage_start = next(index for index, line in enumerate(narrow_lines) if line.startswith("| stage"))
+    stage_start = next(
+        index for index, line in enumerate(narrow_lines) if line.startswith("| stage")
+    )
     stage_end = next(
         index
-        for index, line in enumerate(narrow_lines[stage_start + 1 :], start=stage_start + 1)
+        for index, line in enumerate(
+            narrow_lines[stage_start + 1 :], start=stage_start + 1
+        )
         if line.startswith("| signal ")
     )
     stage_lines = narrow_lines[stage_start:stage_end]
-    assert all(
-        monitor._visible_len(line) <= 100 for line in stage_lines
-    )
+    assert all(monitor._visible_len(line) <= 100 for line in stage_lines)
 
 
 def test_context_pack_stage_stats_prefers_last_elapsed_ms_when_present() -> None:
@@ -899,7 +934,9 @@ def test_context_pack_stage_stats_prefers_last_elapsed_ms_when_present() -> None
     }
 
     stage_rows = monitor._performance_stage_rows(metrics)
-    candidate_row = next(row for row in stage_rows if row[0] == "candidate_retrieval_ms")
+    candidate_row = next(
+        row for row in stage_rows if row[0] == "candidate_retrieval_ms"
+    )
     assert candidate_row == (
         "candidate_retrieval_ms",
         "17.0",
@@ -909,7 +946,9 @@ def test_context_pack_stage_stats_prefers_last_elapsed_ms_when_present() -> None
     )
 
 
-def test_context_pack_stage_stats_falls_back_to_latest_recent_value_when_last_missing() -> None:
+def test_context_pack_stage_stats_falls_back_to_latest_recent_value_when_last_missing() -> (
+    None
+):
     monitor = load_monitor_module()
     metrics: dict[str, Any] = {
         "benchmarks": {
@@ -948,7 +987,9 @@ def test_context_pack_stage_stats_falls_back_to_latest_recent_value_when_last_mi
     }
 
     stage_rows = monitor._performance_stage_rows(metrics)
-    candidate_row = next(row for row in stage_rows if row[0] == "candidate_retrieval_ms")
+    candidate_row = next(
+        row for row in stage_rows if row[0] == "candidate_retrieval_ms"
+    )
     assert candidate_row == (
         "candidate_retrieval_ms",
         "17.0",
@@ -1238,8 +1279,7 @@ def test_warmup_selected_project_calls_admin_and_sets_status() -> None:
     assert state.mcp_error == ""
     assert (
         state.mcp_status
-        == "warmed Alpha: 3 terms, 5 summaries (2 hit/3 miss), "
-        "2 hot chunks, 4 test targets, 12 files"
+        == "warmed Alpha: 3 terms, 5 summaries (2 hit/3 miss), 2 hot chunks, 4 test targets, 12 files"
     )
     assert (
         "context_admin",
@@ -1279,7 +1319,9 @@ def test_prune_selected_project_calls_admin_and_sets_status() -> None:
 def test_refresh_result_replaces_current_table_snapshot() -> None:
     monitor = load_monitor_module()
     stale_snapshot = monitor.ProjectSnapshot(
-        target=monitor.ProjectTarget(project_id="alpha-123", name="Alpha", source="known"),
+        target=monitor.ProjectTarget(
+            project_id="alpha-123", name="Alpha", source="known"
+        ),
         metrics={
             "schema": "context_metrics.v1",
             "requests": {"total": 1, "by_operation": {"context_pack": {"count": 1}}},
@@ -1288,7 +1330,9 @@ def test_refresh_result_replaces_current_table_snapshot() -> None:
     full_refresh_snapshot = [
         stale_snapshot,
         monitor.ProjectSnapshot(
-            target=monitor.ProjectTarget(project_id="beta-456", name="Beta", source="known"),
+            target=monitor.ProjectTarget(
+                project_id="beta-456", name="Beta", source="known"
+            ),
             metrics={"schema": "context_metrics.v1", "requests": {"total": 2}},
             matrix={"checks": [{"key": "a", "status": "pass"}]},
         ),
@@ -1321,9 +1365,13 @@ def test_state_browser_filters_rows_with_search_input() -> None:
     state = monitor.MonitorState(selected_index=0, view="state", refresh_interval=5.0)
     monitor._load_state_browser(client, state, snapshots)
 
-    assert monitor.handle_key("search", state, row_count=1, state_row_count=4) == "redraw"
+    assert (
+        monitor.handle_key("search", state, row_count=1, state_row_count=4) == "redraw"
+    )
     for key in ("text:m", "text:e", "text:m"):
-        assert monitor.handle_key(key, state, row_count=1, state_row_count=4) == "redraw"
+        assert (
+            monitor.handle_key(key, state, row_count=1, state_row_count=4) == "redraw"
+        )
 
     assert state.state_search == "mem"
     assert state.state_search_active
@@ -1342,7 +1390,9 @@ def test_state_browser_filters_rows_with_search_input() -> None:
     assert "memory:def" in rendered
     assert "cache:abc" not in rendered
 
-    assert monitor.handle_key("enter", state, row_count=1, state_row_count=1) == "redraw"
+    assert (
+        monitor.handle_key("enter", state, row_count=1, state_row_count=1) == "redraw"
+    )
     assert not state.state_search_active
 
 

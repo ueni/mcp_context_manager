@@ -5,6 +5,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 from .config import ContextConfig
@@ -119,6 +120,7 @@ WARMUP_MANIFEST_KEY = "warmup:manifest"
 WARMUP_NEGATIVE_TERMS_KEY = "warmup:negative_terms"
 WARMUP_ROUTE_SEEDS_KEY = "warmup:route_seeds"
 WARMUP_AUTO_LEARN_KEY = "warmup:auto_learn"
+WARMUP_PROMPT_MANIFEST_KEY = "warmup:prompt_manifest"
 WARMUP_AUTO_JOB_KIND = "cache_auto_warmup"
 
 
@@ -190,12 +192,16 @@ class ContextService:
             }
         if mode == "snippet":
             self._ensure_index_fresh(path=path)
-            result = self.index.snippet(path=path, start_line=start_line, end_line=end_line)
+            result = self.index.snippet(
+                path=path, start_line=start_line, end_line=end_line
+            )
             self._record_metric("context_lookup.snippet", started, result_count=1)
             return result
         if mode == "tree":
             self._ensure_index_fresh(path=path)
-            result = self.index.tree(path=path, max_entries=max_entries, max_depth=max_depth)
+            result = self.index.tree(
+                path=path, max_entries=max_entries, max_depth=max_depth
+            )
             self._record_metric(
                 "context_lookup.tree",
                 started,
@@ -213,7 +219,9 @@ class ContextService:
             return result
         if mode == "chunk":
             self._ensure_index_fresh(path=path)
-            result = self._chunk_lookup(path=path, start_line=start_line, end_line=end_line)
+            result = self._chunk_lookup(
+                path=path, start_line=start_line, end_line=end_line
+            )
             self._record_metric("context_lookup.chunk", started, result_count=1)
             return result
         if mode == "impact":
@@ -281,13 +289,22 @@ class ContextService:
         include_expired: bool = False,
         max_entries: int = 100,
     ) -> dict[str, Any]:
-        allowed = {"get", "upsert", "summary_upsert", "decision_record", "validate", "compact"}
+        allowed = {
+            "get",
+            "upsert",
+            "summary_upsert",
+            "decision_record",
+            "validate",
+            "compact",
+        }
         if mode not in allowed:
             raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
         if mode == "upsert":
             if namespace is None or key is None:
                 raise ValueError("namespace and key are required for upsert")
-            return self.memory.upsert(namespace, key, value, ttl_days, confidence, source, tags)
+            return self.memory.upsert(
+                namespace, key, value, ttl_days, confidence, source, tags
+            )
         if mode == "summary_upsert":
             if namespace is None:
                 raise ValueError("namespace is required for summary_upsert")
@@ -312,7 +329,11 @@ class ContextService:
             return self.memory.validate()
         if mode == "compact":
             return self.memory.compact(namespace=namespace)
-        return self.memory.get(namespace=namespace, include_expired=include_expired, max_entries=max_entries)
+        return self.memory.get(
+            namespace=namespace,
+            include_expired=include_expired,
+            max_entries=max_entries,
+        )
 
     def context_admin(
         self,
@@ -373,7 +394,10 @@ class ContextService:
         if mode == "cache_stats":
             return {"schema": "context_cache.stats.v1", **self._cache_stats()}
         if mode == "cache_prune":
-            return {"schema": "context_cache.prune.v1", **self._cache_prune(max_age_minutes)}
+            return {
+                "schema": "context_cache.prune.v1",
+                **self._cache_prune(max_age_minutes),
+            }
         if mode == "warmup":
             return self._cache_warmup(
                 path=path,
@@ -463,7 +487,9 @@ class ContextService:
         budget = max_output_chars or int(self._budget()["max_output_chars"])
         route = classify_route(prompt)
         terms = normalize_query_terms(prompt, max_terms=12)
-        explicit_paths = self._collect_paths(prompt, changed_files or [], focus_paths or [])
+        explicit_paths = self._collect_paths(
+            prompt, changed_files or [], focus_paths or []
+        )
         stage_started = time.perf_counter()
         explicit_refresh = self._refresh_explicit_paths(
             explicit_paths,
@@ -484,7 +510,9 @@ class ContextService:
         stage_timings["skill_guidance_ms"] = self._elapsed_ms(stage_started)
         prompt_sha256 = sha256_text(prompt)
         token_counting = self.token_counter.metadata()
-        refresh_signature, refresh_signature_available = self._current_refresh_signature()
+        refresh_signature, refresh_signature_available = (
+            self._current_refresh_signature()
+        )
         retrieval_max_items = max(
             CONTEXT_PACK_RETRIEVAL_ITEM_FLOOR,
             max(1, max_items),
@@ -498,7 +526,11 @@ class ContextService:
         stage_timings["cache_lookup_ms"] = 0.0
         cache_hit = False
         cache_status = "active" if refresh_signature_available else "disabled"
-        cache_reason = "signature_unavailable" if not refresh_signature_available else "no_fragments"
+        cache_reason = (
+            "signature_unavailable"
+            if not refresh_signature_available
+            else "no_fragments"
+        )
         fragment_hits = 0
         fragment_misses = 0
         fragment_miss_details: list[dict[str, Any]] = []
@@ -515,9 +547,7 @@ class ContextService:
             cache_reads_enabled=cache_strategy != "cold",
         )
         stage_timings["candidate_retrieval_ms"] = self._elapsed_ms(stage_started)
-        stage_timings["search_ranking_ms"] = stage_timings[
-            "candidate_retrieval_ms"
-        ]
+        stage_timings["search_ranking_ms"] = stage_timings["candidate_retrieval_ms"]
         stage_timings["snippet_batch_ms"] = round(
             float(retrieval_stats.get("snippet_batch_ms", 0.0)), 3
         )
@@ -542,6 +572,21 @@ class ContextService:
             for row in retrieval_stats.get("fragment_miss_details", [])
             if isinstance(row, dict)
         ]
+        fragment_namespaces = {
+            str(namespace): {
+                "hits": int(row.get("hits", 0) or 0),
+                "misses": int(row.get("misses", 0) or 0),
+                "hit_ratio": self._hit_ratio(
+                    int(row.get("hits", 0) or 0),
+                    int(row.get("misses", 0) or 0),
+                ),
+                "reasons": dict(sorted((row.get("reasons", {}) or {}).items())),
+            }
+            for namespace, row in sorted(
+                (retrieval_stats.get("fragment_namespaces", {}) or {}).items()
+            )
+            if isinstance(row, dict)
+        }
         cache_reason = self._context_pack_fragment_cache_reason(
             fragment_hits=fragment_hits,
             fragment_misses=fragment_misses,
@@ -563,16 +608,18 @@ class ContextService:
         )
         stage_timings["selection_ms"] = self._elapsed_ms(stage_started)
         omitted.extend(omitted_budget)
+        prompt_warmup_manifest: dict[str, Any] = {}
         try:
-            self._warmup_record_context_pack_usage(
+            prompt_warmup_manifest = self._prompt_warmup_manifest(
                 route=route,
                 terms=terms,
+                changed_files=changed_files or [],
+                focus_paths=focus_paths or [],
+                explicit_paths=explicit_paths,
                 selected=selected,
                 retrieval_stats=retrieval_stats,
-            )
-            self._maybe_enqueue_auto_warmup(
-                route=route,
-                retrieval_stats=retrieval_stats,
+                refresh_signature=refresh_signature,
+                refresh_signature_available=refresh_signature_available,
             )
         except Exception:
             pass
@@ -605,14 +652,21 @@ class ContextService:
                     "chunk_hit_ratio": float(
                         retrieval_stats.get("chunk_hit_ratio", 0.0) or 0.0
                     ),
+                    "by_namespace": fragment_namespaces,
                     "miss_details": fragment_miss_details[:12],
                 },
             },
-            summary={"route": route, "candidate_count": len(response_candidates), "selected_count": len(selected)},
+            summary={
+                "route": route,
+                "candidate_count": len(response_candidates),
+                "selected_count": len(selected),
+            },
             ttl_hours=24,
         )
         stage_timings["reference_write_ms"] = self._elapsed_ms(stage_started)
-        candidate_chars = sum(int(item.get("raw_chars", 0)) for item in response_candidates)
+        candidate_chars = sum(
+            int(item.get("raw_chars", 0)) for item in response_candidates
+        )
         selected_chars = sum(int(item.get("raw_chars", 0)) for item in selected)
         baseline_count = self._baseline_input_token_count(response_candidates)
         output_tokens = 0
@@ -658,7 +712,7 @@ class ContextService:
                 "project_id": self.config.project_id,
                 "root_uri_hash": sha256_text(self.config.root_uri)
                 if self.config.root_uri
-                    else "",
+                else "",
             },
             "request": request_metadata,
             "indexing": {
@@ -677,7 +731,9 @@ class ContextService:
                 "candidate_count": len(response_candidates),
                 "omitted_count": len(omitted),
                 "route": route,
-                "candidates_per_selected": round(len(response_candidates) / len(selected), 3)
+                "candidates_per_selected": round(
+                    len(response_candidates) / len(selected), 3
+                )
                 if selected
                 else 0.0,
             },
@@ -695,14 +751,13 @@ class ContextService:
                 "warnings": [],
                 "fragment_hits": fragment_hits,
                 "fragment_misses": fragment_misses,
-                "fragment_hit_ratio": self._hit_ratio(
-                    fragment_hits, fragment_misses
-                ),
+                "fragment_hit_ratio": self._hit_ratio(fragment_hits, fragment_misses),
                 "chunk_hits": int(retrieval_stats.get("chunk_hits", 0) or 0),
                 "chunk_misses": int(retrieval_stats.get("chunk_misses", 0) or 0),
                 "chunk_hit_ratio": float(
                     retrieval_stats.get("chunk_hit_ratio", 0.0) or 0.0
                 ),
+                "by_namespace": fragment_namespaces,
                 "miss_details": fragment_miss_details[:12],
                 "index_refresh": {
                     "skipped": bool(index_refresh.get("skipped", False)),
@@ -743,7 +798,11 @@ class ContextService:
                 "tokens_spared_by_mcp_formula": "max(0, baseline_input_tokens_est - output_tokens_est)",
             },
             "next_actions": [
-                {"action": "resolve_reference", "when": "Need full omitted candidate evidence", "reference_id": full_reference["reference_id"]}
+                {
+                    "action": "resolve_reference",
+                    "when": "Need full omitted candidate evidence",
+                    "reference_id": full_reference["reference_id"],
+                }
             ],
         }
         if skill_guidance:
@@ -779,8 +838,13 @@ class ContextService:
             )
         elif profile == "lean":
             result = self._lean_context_pack(
-                route, selected, omitted, full_reference, diagnostics_reference,
-                terms, skill_guidance,
+                route,
+                selected,
+                omitted,
+                full_reference,
+                diagnostics_reference,
+                terms,
+                skill_guidance,
             )
         elif diagnostics != "full":
             result["cache"] = self._cache_summary(result["cache"])
@@ -793,9 +857,7 @@ class ContextService:
                 json.dumps(result, ensure_ascii=False)
             )
             measured_output_tokens = output_token_count.count
-            measured_baseline_tokens = max(
-                baseline_count.count, measured_output_tokens
-            )
+            measured_baseline_tokens = max(baseline_count.count, measured_output_tokens)
             measured_tokens_saved = max(
                 0, measured_baseline_tokens - measured_output_tokens
             )
@@ -853,8 +915,17 @@ class ContextService:
             cache_reason=cache_reason,
             fragment_cache_hits=fragment_hits,
             fragment_cache_misses=fragment_misses,
+            fragment_cache_namespaces=fragment_namespaces,
         )
         self._cache_prune_if_due_best_effort()
+        if prompt_warmup_manifest:
+            try:
+                self._maybe_enqueue_auto_warmup(
+                    manifest=prompt_warmup_manifest,
+                    retrieval_stats=retrieval_stats,
+                )
+            except Exception:
+                pass
         return result
 
     def result_reference_resolve(
@@ -863,20 +934,29 @@ class ContextService:
         reference: dict[str, Any] | None = None,
         expected_hash: str = "",
     ) -> dict[str, Any]:
-        return self.references.resolve(reference_id=reference_id, reference=reference, expected_hash=expected_hash)
+        return self.references.resolve(
+            reference_id=reference_id, reference=reference, expected_hash=expected_hash
+        )
 
     def repo_summary_resource(self) -> str:
         return json.dumps(self.index.workspace_facts(), indent=2, sort_keys=True)
 
     def repo_file_resource(self, path: str) -> str:
-        snippet = self.index.snippet(path=path, start_line=1, end_line=100000, max_chars=self.config.max_output_chars)
+        snippet = self.index.snippet(
+            path=path,
+            start_line=1,
+            end_line=100000,
+            max_chars=self.config.max_output_chars,
+        )
         return snippet["content"]
 
     def repo_tree_resource(self, path: str) -> str:
         return json.dumps(self.index.tree(path=path), indent=2, sort_keys=True)
 
     def repo_context_resource(self, reference_id: str) -> str:
-        return json.dumps(self.references.resolve(reference_id=reference_id), indent=2, sort_keys=True)
+        return json.dumps(
+            self.references.resolve(reference_id=reference_id), indent=2, sort_keys=True
+        )
 
     def repo_metrics_resource(self) -> str:
         return json.dumps(self.metrics.snapshot(), indent=2, sort_keys=True)
@@ -895,16 +975,16 @@ class ContextService:
                     "config_file": "~/.codex/config.toml or trusted-project .codex/config.toml",
                     "toml": (
                         "[mcp_servers.mcp-context-manager]\n"
-                        "url = \"http://localhost:8000/mcp\"\n"
+                        'url = "http://localhost:8000/mcp"\n'
                         "required = true\n"
                         "enabled_tools = [\n"
-                        "  \"context_pack\",\n"
-                        "  \"context_lookup\",\n"
-                        "  \"context_memory\",\n"
-                        "  \"context_admin\",\n"
-                        "  \"result_reference_resolve\",\n"
+                        '  "context_pack",\n'
+                        '  "context_lookup",\n'
+                        '  "context_memory",\n'
+                        '  "context_admin",\n'
+                        '  "result_reference_resolve",\n'
                         "]\n"
-                        "default_tools_approval_mode = \"auto\"\n"
+                        'default_tools_approval_mode = "auto"\n'
                     ),
                     "effect": (
                         "required=true fails startup or resume if this enabled "
@@ -933,7 +1013,7 @@ class ContextService:
                     "client_profile; when output_profile is omitted, "
                     "client_profile=codex uses minimal and other clients use "
                     "the configured default. "
-                    "context_admin(mode=\"profile_calibrate\") reports "
+                    'context_admin(mode="profile_calibrate") reports '
                     "recommendations only; it does not set active state. Must "
                     "use context_lookup for targeted follow-up snippets, "
                     "search, trees, symbols, or references before broad shell "
@@ -946,8 +1026,8 @@ class ContextService:
                     "structured, non-secret repository facts, summaries, "
                     "decisions, validation, compaction, or reusable skill "
                     "guidance stored under skills/<provider>. Store raw skill "
-                    "records with context_memory(mode=\"upsert\") or "
-                    "pre-summarized cards with mode=\"summary_upsert\" in a "
+                    'records with context_memory(mode="upsert") or '
+                    'pre-summarized cards with mode="summary_upsert" in a '
                     "skills/codex, skills/claude, skills/copilot, or "
                     "skills/custom namespace, then call context_pack so "
                     "matching guidance can be compiled and cached. Avoid broad "
@@ -989,7 +1069,7 @@ class ContextService:
                         },
                     },
                     "calibration": (
-                        "context_admin(mode=\"profile_calibrate\") reports "
+                        'context_admin(mode="profile_calibrate") reports '
                         "recommendations but does not mutate session or server state."
                     ),
                 },
@@ -1064,40 +1144,40 @@ class ContextService:
 
     def _background_status(self) -> dict[str, Any]:
         status = background_jobs.status(self._background_project_id())
-        by_kind = {
-            str(row.get("kind")): row
-            for row in status.get("jobs", [])
-            if isinstance(row, dict)
-        }
+        kind_rows: dict[str, list[dict[str, Any]]] = {}
+        for row in status.get("jobs", []):
+            if isinstance(row, dict):
+                kind_rows.setdefault(str(row.get("kind", "")), []).append(row)
+
+        def kind_status(kind: str) -> dict[str, Any]:
+            rows = kind_rows.get(kind, [])
+            if not rows:
+                return {
+                    "kind": kind,
+                    "status": "idle",
+                    "pending": False,
+                    "last_error": "",
+                }
+            rows.sort(
+                key=lambda row: (
+                    bool(row.get("pending", False)),
+                    str(row.get("last_started_at", "")),
+                ),
+                reverse=True,
+            )
+            latest = dict(rows[0])
+            latest["pending"] = any(bool(row.get("pending", False)) for row in rows)
+            latest["deduplicated_count"] = sum(
+                int(row.get("deduplicated_count", 0) or 0) for row in rows
+            )
+            latest["signature_count"] = len(rows)
+            return latest
+
         return {
             **status,
-            "index_refresh": by_kind.get(
-                "index_refresh",
-                {
-                    "kind": "index_refresh",
-                    "status": "idle",
-                    "pending": False,
-                    "last_error": "",
-                },
-            ),
-            "cache_prune": by_kind.get(
-                "cache_prune",
-                {
-                    "kind": "cache_prune",
-                    "status": "idle",
-                    "pending": False,
-                    "last_error": "",
-                },
-            ),
-            WARMUP_AUTO_JOB_KIND: by_kind.get(
-                WARMUP_AUTO_JOB_KIND,
-                {
-                    "kind": WARMUP_AUTO_JOB_KIND,
-                    "status": "idle",
-                    "pending": False,
-                    "last_error": "",
-                },
-            ),
+            "index_refresh": kind_status("index_refresh"),
+            "cache_prune": kind_status("cache_prune"),
+            WARMUP_AUTO_JOB_KIND: kind_status(WARMUP_AUTO_JOB_KIND),
         }
 
     def _index_freshness(self, refresh: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1129,9 +1209,10 @@ class ContextService:
         return snapshot
 
     def _background_project_id(self) -> str:
-        return self.config.project_id or sha256_text(
-            str(self.config.repo_path.resolve())
-        )[:24]
+        return (
+            self.config.project_id
+            or sha256_text(str(self.config.repo_path.resolve()))[:24]
+        )
 
     def _record_metric(
         self,
@@ -1155,7 +1236,9 @@ class ContextService:
     def _elapsed_ms(self, started: float) -> float:
         return round((time.perf_counter() - started) * 1000, 3)
 
-    def _collect_paths(self, prompt: str, changed: list[str], focus: list[str]) -> list[str]:
+    def _collect_paths(
+        self, prompt: str, changed: list[str], focus: list[str]
+    ) -> list[str]:
         safe: list[str] = []
         for item in [*changed, *focus]:
             if not item or item in safe:
@@ -1165,7 +1248,9 @@ class ContextService:
             except ValueError:
                 continue
             safe.append(item)
-        for match in re.findall(r"(?<![\w/.-])[\w./-]+\.[A-Za-z0-9]{1,8}(?=\b|:)", prompt):
+        for match in re.findall(
+            r"(?<![\w/.-])[\w./-]+\.[A-Za-z0-9]{1,8}(?=\b|:)", prompt
+        ):
             if match in safe:
                 continue
             if self._is_prompt_path_candidate_current_or_existing(match):
@@ -1207,8 +1292,10 @@ class ContextService:
             except ValueError:
                 is_directory = False
             try:
-                if (not force) and self.index.indexed_path_current(rel) and (
-                    not is_directory or whole_repo_current
+                if (
+                    (not force)
+                    and self.index.indexed_path_current(rel)
+                    and (not is_directory or whole_repo_current)
                 ):
                     result["skipped_count"] = int(result["skipped_count"]) + 1
                     reason = (
@@ -1353,7 +1440,9 @@ class ContextService:
         terms = normalize_query_terms(query, max_terms=8)
         if not terms:
             raise ValueError("query must contain at least one searchable term")
-        refresh_signature, refresh_signature_available = self._current_refresh_signature()
+        refresh_signature, refresh_signature_available = (
+            self._current_refresh_signature()
+        )
         shard_terms = reusable_terms if reusable_terms is not None else terms
         shard_terms = [term for term in shard_terms if term]
         pool_size = self._search_pool_size(max_results)
@@ -1477,6 +1566,7 @@ class ContextService:
         refresh_signature_available: bool,
         allow_fallback: bool = True,
         cache_reads_enabled: bool = True,
+        cache_empty_results: bool = True,
     ) -> dict[str, Any]:
         canonical_path = self._canonical_cache_path(path)
         canonical_globs = self._canonical_cache_globs(include_globs)
@@ -1501,13 +1591,19 @@ class ContextService:
         if refresh_signature_available and cache_reads_enabled:
             lookup = self._cache_lookup(key)
             cached = lookup.get("value") if lookup["hit"] else None
-            if isinstance(cached, dict) and cached.get("schema") == RETRIEVAL_SEARCH_TERM_SCHEMA:
+            if (
+                isinstance(cached, dict)
+                and cached.get("schema") == RETRIEVAL_SEARCH_TERM_SCHEMA
+            ):
                 return {
                     "term": term,
                     "results": [
-                        row for row in cached.get("results", []) if isinstance(row, dict)
+                        row
+                        for row in cached.get("results", [])
+                        if isinstance(row, dict)
                     ],
                     "cache_hit": True,
+                    "cache_written": False,
                     "cache_key": key,
                     "miss_detail": {},
                 }
@@ -1551,7 +1647,10 @@ class ContextService:
                 )
                 if isinstance(row, dict)
             ]
-        if refresh_signature_available:
+        cache_written = bool(
+            refresh_signature_available and (rows or cache_empty_results)
+        )
+        if cache_written:
             self._cache_set(
                 key,
                 {
@@ -1582,6 +1681,7 @@ class ContextService:
             "term": term,
             "results": rows,
             "cache_hit": False,
+            "cache_written": cache_written,
             "cache_key": key,
             "miss_detail": miss_detail,
         }
@@ -1645,9 +1745,7 @@ class ContextService:
             score += float(row.get("term_hits", 0)) * 2.5
             score += min(float(row.get("term_count", 0)), 8.0) * 0.25
             public_row = {
-                key: value
-                for key, value in row.items()
-                if key != "_matched_terms"
+                key: value for key, value in row.items() if key != "_matched_terms"
             }
             public_row["score"] = round(score, 4)
             public_row["terms"] = terms
@@ -1690,9 +1788,7 @@ class ContextService:
             return rows
         exact = exact_rows[0]
         rest = [
-            row
-            for row in rows
-            if str(row.get("path", "")).lower() != exact_rel_lower
+            row for row in rows if str(row.get("path", "")).lower() != exact_rel_lower
         ]
         return [exact, *rest][:max_results]
 
@@ -1752,7 +1848,8 @@ class ContextService:
             "size": int(stat.st_size),
             "mtime_ns": int(stat.st_mtime_ns),
             "sha256": digest,
-            "cache_token": digest or f"stat:{int(stat.st_size)}:{int(stat.st_mtime_ns)}",
+            "cache_token": digest
+            or f"stat:{int(stat.st_size)}:{int(stat.st_mtime_ns)}",
         }
 
     def _file_summary_cache_key(
@@ -1912,9 +2009,9 @@ class ContextService:
         anchor = max(0, int(line_anchor))
         key = (canonical_path, anchor, refresh_signature)
         if key in request_memo:
-            retrieval_stats["file_summary_memo_hits"] = int(
-                retrieval_stats.get("file_summary_memo_hits", 0) or 0
-            ) + 1
+            retrieval_stats["file_summary_memo_hits"] = (
+                int(retrieval_stats.get("file_summary_memo_hits", 0) or 0) + 1
+            )
             summary, summary_hit, miss_detail = request_memo[key]
             if not cache_reads_enabled:
                 return summary, None, {}
@@ -1923,9 +2020,17 @@ class ContextService:
             if not refresh_signature_available:
                 return summary, False, {}
             return summary, True, {}
-        retrieval_stats["file_summary_memo_misses"] = int(
-            retrieval_stats.get("file_summary_memo_misses", 0) or 0
-        ) + 1
+        retrieval_stats["file_summary_memo_misses"] = (
+            int(retrieval_stats.get("file_summary_memo_misses", 0) or 0) + 1
+        )
+        memo_targets = retrieval_stats.setdefault("file_summary_memo_targets", [])
+        if isinstance(memo_targets, list):
+            memo_targets.append(
+                {
+                    "path": canonical_path,
+                    "line_anchor": anchor,
+                }
+            )
         summary, summary_hit, miss_detail = self._cached_file_summary(
             canonical_path,
             line_anchor=anchor,
@@ -2024,7 +2129,9 @@ class ContextService:
         row["route"] = route
         row["path_scope"] = path_scope
         row["result_count"] = result_count
-        row["result_count_total"] = int(row.get("result_count_total", 0) or 0) + result_count
+        row["result_count_total"] = (
+            int(row.get("result_count_total", 0) or 0) + result_count
+        )
         row["selected_count"] = int(row.get("selected_count", 0) or 0) + selected_count
         if cache_hit is not None:
             counter = "hit_total" if cache_hit else "miss_total"
@@ -2082,7 +2189,9 @@ class ContextService:
     def _warmup_rebuild_route_seeds(self, path_scope: str = ".") -> dict[str, Any]:
         path_scope = self._warmup_path_scope(path_scope)
         negative_terms = self._warmup_negative_terms()
-        candidates: dict[str, list[dict[str, Any]]] = {route: [] for route in WARMUP_ROUTES}
+        candidates: dict[str, list[dict[str, Any]]] = {
+            route: [] for route in WARMUP_ROUTES
+        }
         for _key, row in self.store.iter_json("warmup:term_stats:"):
             if not isinstance(row, dict):
                 continue
@@ -2127,15 +2236,15 @@ class ContextService:
                 )
             )
             selected_rows = rows[:WARMUP_MAX_SEEDS_PER_ROUTE]
-            route_seeds[route] = [str(row.get("term", "")) for row in selected_rows if row.get("term")]
+            route_seeds[route] = [
+                str(row.get("term", "")) for row in selected_rows if row.get("term")
+            ]
             route_seed_details[route] = [
                 {
                     "term": str(row.get("term", "")),
                     "path_scope": str(row.get("path_scope", ".")),
                     "selected_count": int(row.get("selected_count", 0) or 0),
-                    "result_count_total": int(
-                        row.get("_result_count_total", 0) or 0
-                    ),
+                    "result_count_total": int(row.get("_result_count_total", 0) or 0),
                     "last_used_at": str(row.get("last_used_at", "")),
                 }
                 for row in selected_rows
@@ -2190,9 +2299,9 @@ class ContextService:
             return 3
         if row_path_scope == ".":
             return 2
-        if row_path_scope.startswith(requested_scope + "/") or requested_scope.startswith(
-            row_path_scope + "/"
-        ):
+        if row_path_scope.startswith(
+            requested_scope + "/"
+        ) or requested_scope.startswith(row_path_scope + "/"):
             return 1
         return 0
 
@@ -2309,12 +2418,141 @@ class ContextService:
         self._warmup_record_test_owner_targets(route=route, selected=selected)
         self._warmup_rebuild_route_seeds()
 
-    def _maybe_enqueue_auto_warmup(
+    def _warmup_record_prompt_manifest_usage(
+        self, manifest: dict[str, Any]
+    ) -> dict[str, Any]:
+        route = str(manifest.get("route", ""))
+        route = route if route in WARMUP_ROUTES else "coding"
+        selected = [
+            {
+                "path": str(row.get("path", "")),
+                "start_line": max(0, int(row.get("line_anchor", 1) or 1)),
+            }
+            for row in manifest.get("selected_targets", [])
+            if isinstance(row, dict) and row.get("path")
+        ]
+        result_count = max(0, int(manifest.get("search_result_count", 0) or 0))
+        for term in self._reusable_retrieval_terms(
+            [str(value) for value in manifest.get("prompt_terms", [])]
+        ):
+            self._warmup_update_term_stats(
+                term=term,
+                route=route,
+                path_scope=".",
+                result_count=result_count,
+                selected_count=1 if selected and result_count else 0,
+                cache_hit=None,
+                selection_observed=True,
+            )
+        self._warmup_record_hot_chunks(route=route, selected=selected)
+        self._warmup_record_test_owner_targets(route=route, selected=selected)
+        return self._warmup_rebuild_route_seeds()
+
+    def _prompt_warmup_manifest(
         self,
         route: str,
+        terms: list[str],
+        changed_files: list[str],
+        focus_paths: list[str],
+        explicit_paths: list[str],
+        selected: list[dict[str, Any]],
+        retrieval_stats: dict[str, Any],
+        refresh_signature: str,
+        refresh_signature_available: bool,
+    ) -> dict[str, Any]:
+        limit = max(1, int(self.config.auto_learn_max_entries))
+        path_rows: list[dict[str, str]] = []
+        seen_paths: set[str] = set()
+
+        def add_paths(paths: list[str], source: str) -> None:
+            for value in paths:
+                if len(path_rows) >= limit:
+                    return
+                try:
+                    path = self._canonical_cache_path(value)
+                except ValueError:
+                    continue
+                if path in {"", "."} or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                path_rows.append({"path": path, "source": source})
+
+        add_paths(changed_files, "changed_file")
+        add_paths(focus_paths, "focus_path")
+        add_paths(explicit_paths, "prompt_path")
+
+        selected_targets = self._dedupe_file_summary_targets(
+            [
+                {
+                    "path": str(item.get("path", "")),
+                    "line_anchor": max(0, int(item.get("start_line", 1) or 1)),
+                    "source": "selected_item",
+                }
+                for item in selected
+                if item.get("path")
+            ]
+        )[:limit]
+        request_memo_targets = self._dedupe_file_summary_targets(
+            [
+                row
+                for row in retrieval_stats.get("file_summary_memo_targets", [])
+                if isinstance(row, dict)
+            ]
+        )[: limit * 2]
+        route_seed_payload = self.store.get_json(WARMUP_ROUTE_SEEDS_KEY)
+        route_seeds = (
+            route_seed_payload.get("route_seeds", {})
+            if isinstance(route_seed_payload, dict)
+            else {}
+        )
+        route_seeds = route_seeds if isinstance(route_seeds, dict) else {}
+        learned_route_seeds = [
+            term
+            for term in self._reusable_retrieval_terms(
+                [str(value) for value in route_seeds.get(route, [])]
+            )
+            if term not in GENERIC_RETRIEVAL_TERMS
+        ][:limit]
+        prompt_terms = self._reusable_retrieval_terms(terms)[:limit]
+        identity = {
+            "project_id": self.config.project_id,
+            "refresh_signature": refresh_signature,
+            "route": route,
+            "prompt_terms": prompt_terms,
+            "paths": path_rows,
+            "selected_targets": selected_targets,
+        }
+        return {
+            "schema": "warmup.prompt_manifest.v1",
+            "generated_at": now_iso(),
+            "project_id": self.config.project_id,
+            "refresh_signature": refresh_signature,
+            "refresh_signature_available": refresh_signature_available,
+            "dedupe_key": sha256_text(
+                json.dumps(identity, sort_keys=True, separators=(",", ":"))
+            )[:24],
+            "route": route,
+            "max_entries": limit,
+            "prompt_terms": prompt_terms,
+            "paths": path_rows,
+            "selected_targets": selected_targets,
+            "request_memo_targets": request_memo_targets,
+            "learned_route_seeds": learned_route_seeds,
+            "learned_hot_chunks": [],
+            "search_result_count": int(
+                retrieval_stats.get("search_result_count", 0) or 0
+            ),
+            "raw_prompt_persisted": False,
+        }
+
+    def _maybe_enqueue_auto_warmup(
+        self,
+        manifest: dict[str, Any],
         retrieval_stats: dict[str, Any],
     ) -> None:
+        route = str(manifest.get("route", ""))
         now = now_iso()
+        self.store.put_json(WARMUP_PROMPT_MANIFEST_KEY, manifest)
         state = self._auto_learn_state()
         observed_count = int(state.get("observed_context_pack_count", 0) or 0) + 1
         target_counts = self._auto_learn_target_counts()
@@ -2330,6 +2568,14 @@ class ContextService:
                 "last_observed_at": now,
                 "last_route": route,
                 "learned_target_counts": target_counts,
+                "last_manifest": {
+                    "schema": str(manifest.get("schema", "")),
+                    "refresh_signature": str(manifest.get("refresh_signature", "")),
+                    "dedupe_key": str(manifest.get("dedupe_key", "")),
+                    "prompt_term_count": len(manifest.get("prompt_terms", [])),
+                    "path_count": len(manifest.get("paths", [])),
+                    "selected_target_count": len(manifest.get("selected_targets", [])),
+                },
                 "last_fragment_hit_ratio": float(
                     retrieval_stats.get("fragment_hit_ratio", 0.0) or 0.0
                 ),
@@ -2340,7 +2586,14 @@ class ContextService:
             reason = "disabled"
         elif observed_count < int(self.config.auto_learn_min_packs):
             reason = "below_min_packs"
-        elif not self._auto_learn_has_targets(target_counts):
+        elif not bool(manifest.get("refresh_signature_available", False)):
+            reason = "signature_unavailable"
+        elif not (
+            self._auto_learn_has_targets(target_counts)
+            or manifest.get("prompt_terms")
+            or manifest.get("paths")
+            or manifest.get("selected_targets")
+        ):
             reason = "no_learned_targets"
         if reason:
             state["last_reason_code"] = reason
@@ -2349,19 +2602,23 @@ class ContextService:
 
         state["last_enqueue_attempt_at"] = now
         self._auto_learn_write_state({**state, "last_reason_code": "enqueue_attempt"})
+        start_gate = Event()
 
         def run_auto_warmup() -> dict[str, Any]:
+            start_gate.wait(timeout=1.0)
             self._auto_learn_mark_run(
                 status="running",
                 reason_code="auto_warmup_running",
             )
             try:
-                result = self._cache_warmup(
-                    path=".",
-                    max_entries=int(self.config.auto_learn_max_entries),
-                    trigger="auto",
-                )
+                result = self._prompt_aware_cache_warmup(manifest)
             except Exception as exc:
+                self.metrics.record_event(
+                    "context_admin.warmup",
+                    elapsed_ms=0.0,
+                    warmup_trigger="auto",
+                    warmup_status="failed",
+                )
                 self._auto_learn_mark_run(
                     status="failed",
                     reason_code="auto_warmup_failed",
@@ -2369,8 +2626,9 @@ class ContextService:
                 )
                 raise
             self._auto_learn_mark_run(
-                status="complete",
-                reason_code="auto_warmup_completed",
+                status=str(result.get("status", "complete")),
+                reason_code=str(result.get("reason_code", "auto_warmup_completed")),
+                result=result,
             )
             return result
 
@@ -2380,14 +2638,20 @@ class ContextService:
             run_auto_warmup,
             executor=io_executor(),
             min_interval_seconds=float(self.config.auto_learn_min_interval_seconds),
+            dedupe_key=str(manifest.get("refresh_signature", "")),
         )
         if job.get("status") == "throttled":
             reason = "enqueue_throttled"
+            state["throttled_count"] = int(state.get("throttled_count", 0) or 0) + 1
         elif job.get("deduplicated"):
             reason = "enqueue_deduplicated"
+            state["deduplicated_count"] = (
+                int(state.get("deduplicated_count", 0) or 0) + 1
+            )
         elif job.get("pending"):
             reason = "enqueued"
             state["last_enqueue_at"] = now
+            state["enqueued_count"] = int(state.get("enqueued_count", 0) or 0) + 1
         else:
             reason = str(job.get("status") or "enqueue_status_unknown")
         state.update(
@@ -2395,12 +2659,336 @@ class ContextService:
                 "last_reason_code": reason,
                 "last_background_status": str(job.get("status") or ""),
                 "last_background_pending": bool(job.get("pending", False)),
-                "last_background_deduplicated": bool(
-                    job.get("deduplicated", False)
-                ),
+                "last_background_deduplicated": bool(job.get("deduplicated", False)),
             }
         )
         self._auto_learn_write_state(state)
+        start_gate.set()
+
+    def _prompt_aware_cache_warmup(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        limit = max(1, int(self.config.auto_learn_max_entries))
+        expected_signature = str(manifest.get("refresh_signature", ""))
+        current_signature, signature_available = self._current_refresh_signature()
+        skip_reasons: dict[str, int] = {}
+        namespace_stats: dict[str, dict[str, Any]] = {
+            namespace: {"hits": 0, "misses": 0, "reasons": {}}
+            for namespace in (
+                "retrieval.search_term",
+                "retrieval.file_summary",
+                "retrieval.test_owner_paths",
+            )
+        }
+
+        def skip(reason: str) -> None:
+            skip_reasons[reason] = int(skip_reasons.get(reason, 0) or 0) + 1
+
+        def count_fragment(namespace: str, hit: bool, reason: str = "") -> None:
+            row = namespace_stats[namespace]
+            counter = "hits" if hit else "misses"
+            row[counter] = int(row.get(counter, 0) or 0) + 1
+            if reason:
+                reasons = row.setdefault("reasons", {})
+                reasons[reason] = int(reasons.get(reason, 0) or 0) + 1
+
+        if (
+            not signature_available
+            or not expected_signature
+            or current_signature != expected_signature
+        ):
+            skip("stale_refresh_signature")
+            elapsed_ms = self._elapsed_ms(started)
+            self.metrics.record_event(
+                "context_admin.warmup",
+                elapsed_ms=elapsed_ms,
+                warmup_trigger="auto",
+                warmup_status="skipped",
+            )
+            return {
+                "schema": "context_cache.prompt_warmup.v1",
+                "status": "skipped",
+                "reason_code": "stale_refresh_signature",
+                "elapsed_ms": elapsed_ms,
+                "coverage": {
+                    "planned": 0,
+                    "completed": 0,
+                    "skipped": 1,
+                    "ratio": 0.0,
+                },
+                "skip_reasons": skip_reasons,
+                "fragment_namespaces": namespace_stats,
+            }
+
+        route = str(manifest.get("route", ""))
+        route = route if route in WARMUP_ROUTES else "coding"
+        learned = self._warmup_record_prompt_manifest_usage(manifest)
+        learned_routes = learned.get("route_seeds", {})
+        learned_routes = learned_routes if isinstance(learned_routes, dict) else {}
+        manifest = {
+            **manifest,
+            "learned_route_seeds": self._reusable_retrieval_terms(
+                [
+                    *[str(value) for value in manifest.get("learned_route_seeds", [])],
+                    *[str(value) for value in learned_routes.get(route, [])],
+                ]
+            )[:limit],
+        }
+        negative_terms = self._warmup_negative_terms()
+        warmed_terms: list[dict[str, Any]] = []
+        warmed_summaries: list[dict[str, Any]] = []
+        planned = 0
+        completed = 0
+
+        term_rows = [
+            {"term": str(term), "source": "prompt_term"}
+            for term in manifest.get("prompt_terms", [])
+        ]
+        term_rows.extend(
+            {"term": str(term), "source": "route_seed"}
+            for term in manifest.get("learned_route_seeds", [])
+        )
+        seen_terms: set[str] = set()
+        search_work = 0
+        for row in term_rows:
+            planned += 1
+            normalized = normalize_query_terms(str(row.get("term", "")), max_terms=1)
+            if not normalized or normalized[0] in GENERIC_RETRIEVAL_TERMS:
+                skip("generic_term")
+                continue
+            term = normalized[0]
+            if term in seen_terms:
+                skip("duplicate_term")
+                continue
+            seen_terms.add(term)
+            if self._warmup_is_negative_term(
+                term=term,
+                route=route,
+                path_scope=".",
+                negative_terms=negative_terms,
+            ):
+                skip("negative_term")
+                continue
+            if search_work >= limit:
+                skip("entry_cap")
+                continue
+            search_work += 1
+            fragment = self._cached_search_term(
+                term=term,
+                path=".",
+                include_globs=None,
+                pool_size=RETRIEVAL_SEARCH_TERM_POOL_SIZE,
+                refresh_signature=current_signature,
+                refresh_signature_available=True,
+                allow_fallback=False,
+                cache_empty_results=False,
+            )
+            cache_hit = bool(fragment.get("cache_hit", False))
+            miss_detail = fragment.get("miss_detail", {})
+            miss_reason = (
+                str(miss_detail.get("reason", ""))
+                if isinstance(miss_detail, dict)
+                else ""
+            )
+            count_fragment("retrieval.search_term", cache_hit, miss_reason)
+            result_count = len(fragment.get("results", []))
+            self._warmup_update_term_stats(
+                term=term,
+                route=route,
+                path_scope=".",
+                result_count=result_count,
+                cache_hit=cache_hit,
+                selection_observed=False,
+            )
+            if result_count <= 0:
+                skip("no_results")
+                continue
+            completed += 1
+            warmed_terms.append(
+                {
+                    "term": term,
+                    "route": route,
+                    "source": str(row.get("source", "prompt_term")),
+                    "path_scope": ".",
+                    "cache_hit": cache_hit,
+                    "result_count": result_count,
+                }
+            )
+
+        source_paths: list[str] = []
+        for row in [
+            *manifest.get("paths", []),
+            *manifest.get("selected_targets", []),
+        ]:
+            if not isinstance(row, dict):
+                continue
+            path = str(row.get("path", ""))
+            if path and path not in source_paths:
+                source_paths.append(path)
+
+        owner_summary_targets: list[dict[str, Any]] = []
+        owner_work = 0
+        for source_path in source_paths:
+            planned += 1
+            try:
+                resolved = self.config.resolve_repo_path(source_path)
+            except ValueError:
+                skip("unavailable_path")
+                continue
+            if not resolved.is_file():
+                skip("unavailable_path")
+                continue
+            if owner_work >= limit:
+                skip("entry_cap")
+                continue
+            owner_work += 1
+            owners, cache_hit = self._cached_test_owner_paths(
+                [source_path],
+                max_results=8,
+                refresh_signature=current_signature,
+                refresh_signature_available=True,
+            )
+            count_fragment(
+                "retrieval.test_owner_paths",
+                cache_hit,
+                "" if cache_hit else "no_compatible_entry",
+            )
+            completed += 1
+            owner_summary_targets.extend(
+                {
+                    "path": str(owner.get("path", "")),
+                    "line_anchor": 1,
+                    "source": "test_owner",
+                }
+                for owner in owners
+                if isinstance(owner, dict) and owner.get("path")
+            )
+
+        learned_hot_chunks = self._warmup_hot_chunk_targets(
+            path_scope=".", max_targets=limit
+        )
+        manifest = {
+            **manifest,
+            "learned_hot_chunks": learned_hot_chunks,
+            "updated_at": now_iso(),
+        }
+        self.store.put_json(WARMUP_PROMPT_MANIFEST_KEY, manifest)
+        file_targets = self._dedupe_file_summary_targets(
+            [
+                *[
+                    {
+                        "path": str(row.get("path", "")),
+                        "line_anchor": 0,
+                        "source": str(row.get("source", "prompt_path")),
+                    }
+                    for row in manifest.get("paths", [])
+                    if isinstance(row, dict)
+                ],
+                *manifest.get("selected_targets", []),
+                *learned_hot_chunks,
+                *self._warmup_test_owner_summary_targets(
+                    path_scope=".", max_targets=limit
+                ),
+                *owner_summary_targets,
+            ]
+        )
+        request_memo = {
+            (
+                str(row.get("path", "")),
+                max(0, int(row.get("line_anchor", 0) or 0)),
+            )
+            for row in manifest.get("request_memo_targets", [])
+            if isinstance(row, dict)
+        }
+        summary_work = 0
+        for target in file_targets:
+            planned += 1
+            path = str(target.get("path", ""))
+            anchor = max(0, int(target.get("line_anchor", 0) or 0))
+            if (path, anchor) in request_memo:
+                skip("request_memo")
+                continue
+            try:
+                resolved = self.config.resolve_repo_path(path)
+            except ValueError:
+                skip("unavailable_path")
+                continue
+            if not resolved.is_file():
+                skip("unavailable_path")
+                continue
+            if summary_work >= limit:
+                skip("entry_cap")
+                continue
+            summary_work += 1
+            _, cache_hit, miss_detail = self._cached_file_summary(
+                path=path,
+                line_anchor=anchor,
+                refresh_signature=current_signature,
+                refresh_signature_available=True,
+            )
+            miss_reason = (
+                str(miss_detail.get("reason", ""))
+                if isinstance(miss_detail, dict)
+                else ""
+            )
+            count_fragment("retrieval.file_summary", cache_hit, miss_reason)
+            completed += 1
+            warmed_summaries.append(
+                {
+                    "path": path,
+                    "line_anchor": anchor,
+                    "source": str(target.get("source", "prompt_path")),
+                    "cache_hit": cache_hit,
+                }
+            )
+
+        skipped = sum(skip_reasons.values())
+        coverage = {
+            "planned": planned,
+            "completed": completed,
+            "skipped": skipped,
+            "ratio": round(completed / planned, 4) if planned else 0.0,
+        }
+        warmup_manifest = self._warmup_write_manifest(
+            refresh_signature=current_signature,
+            refresh_signature_available=True,
+            path_scope=".",
+            warmed_terms=warmed_terms,
+            warmed_summaries=warmed_summaries,
+            negative_terms=negative_terms,
+            trigger="auto",
+            prompt_manifest=manifest,
+            coverage=coverage,
+            skip_reasons=skip_reasons,
+        )
+        elapsed_ms = self._elapsed_ms(started)
+        fragment_hits = sum(
+            int(row.get("hits", 0) or 0) for row in namespace_stats.values()
+        )
+        fragment_misses = sum(
+            int(row.get("misses", 0) or 0) for row in namespace_stats.values()
+        )
+        self.metrics.record_event(
+            "context_admin.warmup",
+            elapsed_ms=elapsed_ms,
+            result_count=completed,
+            fragment_cache_hits=fragment_hits,
+            fragment_cache_misses=fragment_misses,
+            fragment_cache_namespaces=namespace_stats,
+            warmup_trigger="auto",
+            warmup_status="complete",
+        )
+        return {
+            "schema": "context_cache.prompt_warmup.v1",
+            "status": "complete",
+            "reason_code": "auto_warmup_completed",
+            "elapsed_ms": elapsed_ms,
+            "coverage": coverage,
+            "skip_reasons": skip_reasons,
+            "fragment_namespaces": namespace_stats,
+            "warmed_terms": warmed_terms,
+            "warmed_summaries": warmed_summaries,
+            "manifest": warmup_manifest,
+        }
 
     def _auto_learn_state(self) -> dict[str, Any]:
         row = self.store.get_json(WARMUP_AUTO_LEARN_KEY)
@@ -2417,14 +3005,10 @@ class ContextService:
                 state.get("observed_context_pack_count", 0) or 0
             ),
             "min_context_pack_count": int(self.config.auto_learn_min_packs),
-            "min_interval_seconds": int(
-                self.config.auto_learn_min_interval_seconds
-            ),
+            "min_interval_seconds": int(self.config.auto_learn_min_interval_seconds),
             "max_entries": int(self.config.auto_learn_max_entries),
             "last_observed_at": str(state.get("last_observed_at", "")),
-            "last_enqueue_attempt_at": str(
-                state.get("last_enqueue_attempt_at", "")
-            ),
+            "last_enqueue_attempt_at": str(state.get("last_enqueue_attempt_at", "")),
             "last_enqueue_at": str(state.get("last_enqueue_at", "")),
             "last_run_at": str(state.get("last_run_at", "")),
             "last_reason_code": str(state.get("last_reason_code", "not_observed")),
@@ -2432,9 +3016,7 @@ class ContextService:
             "learned_target_counts": {
                 "route_seeds": int(counts.get("route_seeds", 0) or 0),
                 "hot_chunks": int(counts.get("hot_chunks", 0) or 0),
-                "test_owner_targets": int(
-                    counts.get("test_owner_targets", 0) or 0
-                ),
+                "test_owner_targets": int(counts.get("test_owner_targets", 0) or 0),
             },
             "last_fragment_hit_ratio": float(
                 state.get("last_fragment_hit_ratio", 0.0) or 0.0
@@ -2448,6 +3030,17 @@ class ContextService:
             "last_background_deduplicated": bool(
                 state.get("last_background_deduplicated", False)
             ),
+            "enqueued_count": int(state.get("enqueued_count", 0) or 0),
+            "deduplicated_count": int(state.get("deduplicated_count", 0) or 0),
+            "throttled_count": int(state.get("throttled_count", 0) or 0),
+            "completed_count": int(state.get("completed_count", 0) or 0),
+            "failure_count": int(state.get("failure_count", 0) or 0),
+            "stale_signature_skip_count": int(
+                state.get("stale_signature_skip_count", 0) or 0
+            ),
+            "last_coverage": state.get("last_coverage", {}),
+            "last_skip_reasons": state.get("last_skip_reasons", {}),
+            "last_manifest": state.get("last_manifest", {}),
         }
         return merged
 
@@ -2484,6 +3077,7 @@ class ContextService:
         status: str,
         reason_code: str,
         error: str = "",
+        result: dict[str, Any] | None = None,
     ) -> None:
         state = self._auto_learn_state()
         state.update(
@@ -2494,6 +3088,17 @@ class ContextService:
                 "last_auto_error": error,
             }
         )
+        if status == "complete":
+            state["completed_count"] = int(state.get("completed_count", 0) or 0) + 1
+        elif status == "failed":
+            state["failure_count"] = int(state.get("failure_count", 0) or 0) + 1
+        elif reason_code == "stale_refresh_signature":
+            state["stale_signature_skip_count"] = (
+                int(state.get("stale_signature_skip_count", 0) or 0) + 1
+            )
+        if isinstance(result, dict):
+            state["last_coverage"] = result.get("coverage", {})
+            state["last_skip_reasons"] = result.get("skip_reasons", {})
         self._auto_learn_write_state(state)
 
     def _auto_learn_target_counts(self) -> dict[str, int]:
@@ -2504,13 +3109,17 @@ class ContextService:
         ):
             route_seeds = route_payload["route_seeds"]
         route_seed_count = sum(
-            len(rows)
-            for rows in route_seeds.values()
-            if isinstance(rows, list)
+            len(rows) for rows in route_seeds.values() if isinstance(rows, list)
         )
+        prompt_manifest = self.store.get_json(WARMUP_PROMPT_MANIFEST_KEY)
+        prompt_manifest = prompt_manifest if isinstance(prompt_manifest, dict) else {}
+        prompt_terms = len(prompt_manifest.get("prompt_terms", []))
+        prompt_targets = len(prompt_manifest.get("selected_targets", []))
         return {
-            "route_seeds": int(route_seed_count),
-            "hot_chunks": int(self.store.count("warmup:hot_chunks:")),
+            "route_seeds": max(int(route_seed_count), prompt_terms),
+            "hot_chunks": max(
+                int(self.store.count("warmup:hot_chunks:")), prompt_targets
+            ),
             "test_owner_targets": int(self.store.count("warmup:test_owner_targets:")),
         }
 
@@ -2525,9 +3134,7 @@ class ContextService:
             "schema": state["schema"],
             "project_id": state["project_id"],
             "enabled": bool(state["enabled"]),
-            "observed_context_pack_count": int(
-                state["observed_context_pack_count"]
-            ),
+            "observed_context_pack_count": int(state["observed_context_pack_count"]),
             "min_context_pack_count": int(state["min_context_pack_count"]),
             "min_interval_seconds": int(state["min_interval_seconds"]),
             "max_entries": int(state["max_entries"]),
@@ -2541,13 +3148,20 @@ class ContextService:
             "last_fragment_hit_ratio": float(state["last_fragment_hit_ratio"]),
             "last_auto_status": state["last_auto_status"],
             "last_auto_error": state["last_auto_error"],
+            "enqueued_count": int(state["enqueued_count"]),
+            "deduplicated_count": int(state["deduplicated_count"]),
+            "throttled_count": int(state["throttled_count"]),
+            "completed_count": int(state["completed_count"]),
+            "failure_count": int(state["failure_count"]),
+            "stale_signature_skip_count": int(state["stale_signature_skip_count"]),
+            "last_coverage": state["last_coverage"],
+            "last_skip_reasons": state["last_skip_reasons"],
+            "last_manifest": state["last_manifest"],
             "background": {
                 "kind": str(background.get("kind", WARMUP_AUTO_JOB_KIND)),
                 "status": str(background.get("status", "idle")),
                 "pending": bool(background.get("pending", False)),
-                "deduplicated_count": int(
-                    background.get("deduplicated_count", 0) or 0
-                ),
+                "deduplicated_count": int(background.get("deduplicated_count", 0) or 0),
                 "last_error": str(background.get("last_error", "")),
             },
         }
@@ -2754,6 +3368,9 @@ class ContextService:
         warmed_summaries: list[dict[str, Any]],
         negative_terms: list[dict[str, Any]],
         trigger: str = "manual",
+        prompt_manifest: dict[str, Any] | None = None,
+        coverage: dict[str, Any] | None = None,
+        skip_reasons: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         manifest = {
             "schema": "warmup.manifest.v1",
@@ -2774,6 +3391,27 @@ class ContextService:
                 max_entries=50,
             ),
         }
+        if prompt_manifest:
+            manifest["prompt_manifest"] = {
+                "schema": str(prompt_manifest.get("schema", "")),
+                "dedupe_key": str(prompt_manifest.get("dedupe_key", "")),
+                "prompt_terms": list(prompt_manifest.get("prompt_terms", []))[:50],
+                "paths": list(prompt_manifest.get("paths", []))[:50],
+                "selected_targets": list(prompt_manifest.get("selected_targets", []))[
+                    :50
+                ],
+                "learned_route_seeds": list(
+                    prompt_manifest.get("learned_route_seeds", [])
+                )[:50],
+                "learned_hot_chunks": list(
+                    prompt_manifest.get("learned_hot_chunks", [])
+                )[:50],
+                "raw_prompt_persisted": False,
+            }
+        if coverage:
+            manifest["coverage"] = dict(coverage)
+        if skip_reasons:
+            manifest["skip_reasons"] = dict(sorted(skip_reasons.items()))
         self.store.put_json(WARMUP_MANIFEST_KEY, manifest)
         return manifest
 
@@ -2781,22 +3419,30 @@ class ContextService:
         self, output_profile: str | None, client_profile: str
     ) -> str:
         profile = output_profile or (
-            "lean" if client_profile == "codex" else self._budget()["default_output_profile"]
+            "lean"
+            if client_profile == "codex"
+            else self._budget()["default_output_profile"]
         )
         if profile not in OUTPUT_PROFILES:
-            raise ValueError("output_profile must be lean, minimal, compact, normal, or verbose")
+            raise ValueError(
+                "output_profile must be lean, minimal, compact, normal, or verbose"
+            )
         return profile
 
     def _normalize_client_profile(self, client_profile: str) -> str:
         profile = (client_profile or "generic").strip().lower()
         if profile not in CLIENT_PROFILES:
-            raise ValueError("client_profile must be codex, claude, copilot, or generic")
+            raise ValueError(
+                "client_profile must be codex, claude, copilot, or generic"
+            )
         return profile
 
     def _normalize_model_profile(self, model_profile: str) -> str:
         profile = (model_profile or "unknown").strip().lower()
         if profile not in MODEL_PROFILES:
-            raise ValueError("model_profile must be openai, anthropic, github, or unknown")
+            raise ValueError(
+                "model_profile must be openai, anthropic, github, or unknown"
+            )
         return profile
 
     def _normalize_diagnostics(self, diagnostics: str) -> str:
@@ -2911,17 +3557,28 @@ class ContextService:
         }
 
     def _lean_context_pack(
-        self, route: str, selected: list[dict[str, Any]], omitted: list[dict[str, Any]],
-        full_reference: dict[str, Any], diagnostics_reference: dict[str, Any],
-        terms: list[str], skill_guidance: dict[str, Any] | None = None,
+        self,
+        route: str,
+        selected: list[dict[str, Any]],
+        omitted: list[dict[str, Any]],
+        full_reference: dict[str, Any],
+        diagnostics_reference: dict[str, Any],
+        terms: list[str],
+        skill_guidance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "schema": "context_pack.lean.v1",
             "route": route,
-            "summary": {"item_count": len(selected), "evidence_deferred": bool(omitted)},
+            "summary": {
+                "item_count": len(selected),
+                "evidence_deferred": bool(omitted),
+            },
             "items": [self._lean_item(item, terms) for item in selected],
-            "resolver": {"tool": "context_lookup", "mode": "snippet",
-                         "description": "Resolve full evidence by path and line anchor."},
+            "resolver": {
+                "tool": "context_lookup",
+                "mode": "snippet",
+                "description": "Resolve full evidence by path and line anchor.",
+            },
             "omitted_ref": full_reference["reference_id"],
             "diagnostics_ref": diagnostics_reference["reference_id"],
         }
@@ -2935,14 +3592,22 @@ class ContextService:
         if len(content) > limit:
             lines = content.splitlines()
             needles = {term.lower() for term in terms if len(term) > 2}
-            chosen = [line for line in lines if any(term in line.lower() for term in needles)]
+            chosen = [
+                line for line in lines if any(term in line.lower() for term in needles)
+            ]
             if not chosen:
                 chosen = lines[:2]
             content = trim_text(" … ".join(chosen), limit)[0]
-        return {"path": item.get("path", ""),
-                "lines": [int(item.get("start_line", 1) or 1), int(item.get("end_line", item.get("start_line", 1)) or 1)],
-                "reason": list(item.get("reason_codes", [])),
-                "confidence": self._confidence_bucket(item), "content": content}
+        return {
+            "path": item.get("path", ""),
+            "lines": [
+                int(item.get("start_line", 1) or 1),
+                int(item.get("end_line", item.get("start_line", 1)) or 1),
+            ],
+            "reason": list(item.get("reason_codes", [])),
+            "confidence": self._confidence_bucket(item),
+            "content": content,
+        }
 
     def _confidence_bucket(self, item: dict[str, Any]) -> str:
         score = float(item.get("score", 0.0) or 0.0)
@@ -2969,6 +3634,7 @@ class ContextService:
             "chunk_hits": int(cache.get("chunk_hits", 0) or 0),
             "chunk_misses": int(cache.get("chunk_misses", 0) or 0),
             "chunk_hit_ratio": float(cache.get("chunk_hit_ratio", 0.0) or 0.0),
+            "by_namespace": cache.get("by_namespace", {}),
             "miss_details": cache.get("miss_details", []),
             "index_freshness": cache.get("index_freshness", {}),
             "background_refresh_pending": bool(
@@ -2976,7 +3642,9 @@ class ContextService:
             ),
         }
 
-    def _metrics_summary(self, metrics: dict[str, Any], diagnostics: str) -> dict[str, Any]:
+    def _metrics_summary(
+        self, metrics: dict[str, Any], diagnostics: str
+    ) -> dict[str, Any]:
         if diagnostics == "full":
             return metrics
         summary = {
@@ -2988,24 +3656,38 @@ class ContextService:
             "baseline_kind": metrics.get("baseline_kind", ""),
             "baseline_input_tokens_est": metrics.get("baseline_input_tokens_est", 0),
             "output_tokens_est": metrics.get("output_tokens_est", 0),
-            "estimated_input_tokens_saved": metrics.get("estimated_input_tokens_saved", 0),
+            "estimated_input_tokens_saved": metrics.get(
+                "estimated_input_tokens_saved", 0
+            ),
             "tokens_spared_by_mcp_est": metrics.get("tokens_spared_by_mcp_est", 0),
             "compression_ratio": metrics.get("compression_ratio", 0.0),
-            "external_tool_calls_saved_est": metrics.get("external_tool_calls_saved_est", 0),
-            "references_bytes_deferred_est": metrics.get("references_bytes_deferred_est", 0),
+            "external_tool_calls_saved_est": metrics.get(
+                "external_tool_calls_saved_est", 0
+            ),
+            "references_bytes_deferred_est": metrics.get(
+                "references_bytes_deferred_est", 0
+            ),
             "token_counting": metrics.get("token_counting", {}),
             "token_savings_formula": metrics.get("token_savings_formula", ""),
-            "tokens_spared_by_mcp_formula": metrics.get("tokens_spared_by_mcp_formula", ""),
-            "tokens_spared_by_mcp_reason": metrics.get("tokens_spared_by_mcp_reason", ""),
+            "tokens_spared_by_mcp_formula": metrics.get(
+                "tokens_spared_by_mcp_formula", ""
+            ),
+            "tokens_spared_by_mcp_reason": metrics.get(
+                "tokens_spared_by_mcp_reason", ""
+            ),
         }
         retrieval_plan = metrics.get("retrieval_plan")
         if isinstance(retrieval_plan, dict):
             summary["retrieval_plan"] = {
-                "schema": retrieval_plan.get("schema", "context_pack.retrieval_plan.v1"),
+                "schema": retrieval_plan.get(
+                    "schema", "context_pack.retrieval_plan.v1"
+                ),
                 "profile": retrieval_plan.get("profile", ""),
                 "detail_mode": retrieval_plan.get("detail_mode", ""),
                 "snippet_request_count": retrieval_plan.get("snippet_request_count", 0),
-                "symbol_lookup_skipped": retrieval_plan.get("symbol_lookup_skipped", False),
+                "symbol_lookup_skipped": retrieval_plan.get(
+                    "symbol_lookup_skipped", False
+                ),
                 "chunk_hits": retrieval_plan.get("chunk_hits", 0),
                 "chunk_misses": retrieval_plan.get("chunk_misses", 0),
                 "chunk_hit_ratio": retrieval_plan.get("chunk_hit_ratio", 0.0),
@@ -3091,11 +3773,13 @@ class ContextService:
             "fragment_misses": 0,
             "fragment_hit_ratio": 0.0,
             "fragment_miss_details": [],
+            "fragment_namespaces": {},
             "chunk_hits": 0,
             "chunk_misses": 0,
             "chunk_hit_ratio": 0.0,
             "file_summary_memo_hits": 0,
             "file_summary_memo_misses": 0,
+            "file_summary_memo_targets": [],
             "test_owner_path_cache_hit": False,
         }
 
@@ -3103,17 +3787,32 @@ class ContextService:
             counts = retrieval_stats.setdefault("source_counts", {})
             counts[source] = int(counts.get(source, 0)) + 1
 
-        def count_fragment(hit: bool | None, detail: dict[str, Any]) -> None:
+        def count_fragment(
+            hit: bool | None,
+            detail: dict[str, Any],
+            namespace: str = "retrieval.file_summary",
+        ) -> None:
             if hit is None:
                 return
+            namespace_rows = retrieval_stats.setdefault("fragment_namespaces", {})
+            namespace_row = namespace_rows.setdefault(
+                namespace,
+                {"hits": 0, "misses": 0, "reasons": {}},
+            )
             if hit:
-                retrieval_stats["fragment_hits"] = int(
-                    retrieval_stats.get("fragment_hits", 0)
-                ) + 1
+                namespace_row["hits"] = int(namespace_row.get("hits", 0) or 0) + 1
+                retrieval_stats["fragment_hits"] = (
+                    int(retrieval_stats.get("fragment_hits", 0)) + 1
+                )
                 return
-            retrieval_stats["fragment_misses"] = int(
-                retrieval_stats.get("fragment_misses", 0)
-            ) + 1
+            namespace_row["misses"] = int(namespace_row.get("misses", 0) or 0) + 1
+            reason = str(detail.get("reason", "") if isinstance(detail, dict) else "")
+            if reason:
+                reasons = namespace_row.setdefault("reasons", {})
+                reasons[reason] = int(reasons.get(reason, 0) or 0) + 1
+            retrieval_stats["fragment_misses"] = (
+                int(retrieval_stats.get("fragment_misses", 0)) + 1
+            )
             if detail:
                 retrieval_stats.setdefault("fragment_miss_details", []).append(detail)
 
@@ -3163,9 +3862,9 @@ class ContextService:
                     source="explicit_path",
                 )
             )
-            retrieval_stats["explicit_summary_count"] = int(
-                retrieval_stats.get("explicit_summary_count", 0)
-            ) + 1
+            retrieval_stats["explicit_summary_count"] = (
+                int(retrieval_stats.get("explicit_summary_count", 0)) + 1
+            )
             count_source("explicit_path")
 
         if terms:
@@ -3207,6 +3906,24 @@ class ContextService:
                     for row in search_cache.get("miss_details", [])
                     if isinstance(row, dict)
                 )
+                search_namespace = retrieval_stats.setdefault(
+                    "fragment_namespaces", {}
+                ).setdefault(
+                    "retrieval.search_term",
+                    {"hits": 0, "misses": 0, "reasons": {}},
+                )
+                search_namespace["hits"] = int(
+                    search_namespace.get("hits", 0) or 0
+                ) + int(search_cache.get("fragment_hits", 0) or 0)
+                search_namespace["misses"] = int(
+                    search_namespace.get("misses", 0) or 0
+                ) + int(search_cache.get("fragment_misses", 0) or 0)
+                search_reasons = search_namespace.setdefault("reasons", {})
+                for detail in search_cache.get("miss_details", []):
+                    if not isinstance(detail, dict) or not detail.get("reason"):
+                        continue
+                    reason = str(detail["reason"])
+                    search_reasons[reason] = int(search_reasons.get(reason, 0) or 0) + 1
                 retrieval_stats["search_result_count"] = len(search["results"])
                 search_summary_limit = self._search_summary_limit(
                     profile=profile,
@@ -3226,7 +3943,9 @@ class ContextService:
                 search_summary_started = time.perf_counter()
                 for row in search["results"][:search_summary_limit]:
                     path = row["path"]
-                    line = int(row.get("line") or self._first_matching_line(path, terms) or 1)
+                    line = int(
+                        row.get("line") or self._first_matching_line(path, terms) or 1
+                    )
                     summary, summary_hit, miss_detail = self._memoized_file_summary(
                         path,
                         line_anchor=line,
@@ -3246,15 +3965,17 @@ class ContextService:
                             source=str(row.get("source", "search")),
                         )
                     )
-                    retrieval_stats["search_summary_count"] = int(
-                        retrieval_stats.get("search_summary_count", 0)
-                    ) + 1
+                    retrieval_stats["search_summary_count"] = (
+                        int(retrieval_stats.get("search_summary_count", 0)) + 1
+                    )
                     count_source(str(row.get("source", "search")))
                 add_stage_timing(
                     "search_summary_ms", self._elapsed_ms(search_summary_started)
                 )
             except Exception as exc:
-                omitted.append({"reason_code": "search_failed", "detail": type(exc).__name__})
+                omitted.append(
+                    {"reason_code": "search_failed", "detail": type(exc).__name__}
+                )
 
         try:
             symbol_limit = max(max_items, 2)
@@ -3301,9 +4022,9 @@ class ContextService:
                             symbol=row,
                         )
                     )
-                    retrieval_stats["symbol_summary_count"] = int(
-                        retrieval_stats.get("symbol_summary_count", 0)
-                    ) + 1
+                    retrieval_stats["symbol_summary_count"] = (
+                        int(retrieval_stats.get("symbol_summary_count", 0)) + 1
+                    )
                     count_source("symbol_index")
                 add_stage_timing("symbol_lookup_ms", self._elapsed_ms(symbol_started))
         except Exception:
@@ -3377,6 +4098,24 @@ class ContextService:
         )
         retrieval_stats["test_owner_path_cache_hit"] = bool(owner_cache_hit)
         retrieval_stats["test_owner_path_count"] = len(owners)
+        if explicit_paths:
+            count_fragment(
+                owner_cache_hit,
+                {}
+                if owner_cache_hit
+                else {
+                    "schema": "cache_miss_detail.v1",
+                    "namespace": "retrieval.test_owner_paths",
+                    "reason": "signature_unavailable"
+                    if not refresh_signature_available
+                    else (
+                        "cache_bypassed"
+                        if not cache_reads_enabled
+                        else "no_compatible_entry"
+                    ),
+                },
+                "retrieval.test_owner_paths",
+            )
         for owner in owners:
             path = str(owner.get("path", ""))
             if not path or path in seen:
@@ -3473,7 +4212,9 @@ class ContextService:
     def _impact_lookup(self, path: str, max_results: int) -> dict[str, Any]:
         related = []
         related.extend(self._test_owner_rows(path=path, max_results=max_results))
-        for symbol in self._related_symbol_rows(path=path, query="", max_results=max_results):
+        for symbol in self._related_symbol_rows(
+            path=path, query="", max_results=max_results
+        ):
             related.append(symbol)
             if len(related) >= max_results:
                 break
@@ -3487,7 +4228,9 @@ class ContextService:
     def _related_symbols_lookup(
         self, path: str, query: str, max_results: int
     ) -> dict[str, Any]:
-        rows = self._related_symbol_rows(path=path, query=query, max_results=max_results)
+        rows = self._related_symbol_rows(
+            path=path, query=query, max_results=max_results
+        )
         return {
             "schema": "context_lookup.related_symbols.v1",
             "source": self._canonical_cache_path(path),
@@ -3509,7 +4252,9 @@ class ContextService:
     ) -> list[dict[str, Any]]:
         rel = self._canonical_cache_path(path)
         terms = normalize_query_terms(query or rel.replace("/", " "), max_terms=8)
-        symbols = self.index.symbols(query=" ".join(terms), limit=max(max_results * 4, 20))
+        symbols = self.index.symbols(
+            query=" ".join(terms), limit=max(max_results * 4, 20)
+        )
         rows: list[dict[str, Any]] = []
         for row in symbols.get("symbols", []):
             if not isinstance(row, dict):
@@ -3529,7 +4274,9 @@ class ContextService:
                         "mode": "snippet",
                         "path": symbol_path,
                         "start_line": int(row.get("line_start", 1) or 1),
-                        "end_line": int(row.get("line_end", row.get("line_start", 1)) or 1),
+                        "end_line": int(
+                            row.get("line_end", row.get("line_start", 1)) or 1
+                        ),
                     },
                 }
             )
@@ -3689,7 +4436,10 @@ class ContextService:
             and cached.get("schema") == RETRIEVAL_TEST_OWNER_PATHS_SCHEMA
         ):
             rows = [
-                {"path": str(row.get("path", "")), "confidence": str(row.get("confidence", ""))}
+                {
+                    "path": str(row.get("path", "")),
+                    "confidence": str(row.get("confidence", "")),
+                }
                 for row in cached.get("rows", [])
                 if isinstance(row, dict) and row.get("path")
             ]
@@ -3789,7 +4539,9 @@ class ContextService:
                 "start_line": summary["start_line"],
             },
             "redactions": summary.get("redactions", []),
-            "prompt_injection_signals": summary.get("prompt_injection_signals", prompt_injection_signals(content)),
+            "prompt_injection_signals": summary.get(
+                "prompt_injection_signals", prompt_injection_signals(content)
+            ),
             "provenance": {
                 "tool": "context_lookup",
                 "mode": "summary",
@@ -3806,7 +4558,13 @@ class ContextService:
         content_budget: int,
         per_path_limit: int = 2,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        candidates.sort(key=lambda item: (-float(item.get("score", 0.0)), item.get("path", ""), item.get("start_line", 0)))
+        candidates.sort(
+            key=lambda item: (
+                -float(item.get("score", 0.0)),
+                item.get("path", ""),
+                item.get("start_line", 0),
+            )
+        )
         selected: list[dict[str, Any]] = []
         omitted: list[dict[str, Any]] = []
         seen_ranges: set[str] = set()
@@ -3816,18 +4574,42 @@ class ContextService:
             path = str(item.get("path", ""))
             key = f"{item.get('path')}:{item.get('start_line')}:{item.get('end_line')}"
             if key in seen_ranges:
-                omitted.append({"path": item.get("path"), "reason_code": "duplicate", "score": item.get("score")})
+                omitted.append(
+                    {
+                        "path": item.get("path"),
+                        "reason_code": "duplicate",
+                        "score": item.get("score"),
+                    }
+                )
                 continue
             seen_ranges.add(key)
             if path_counts.get(path, 0) >= per_path_limit:
-                omitted.append({"path": item.get("path"), "reason_code": "diversity_limit", "score": item.get("score")})
+                omitted.append(
+                    {
+                        "path": item.get("path"),
+                        "reason_code": "diversity_limit",
+                        "score": item.get("score"),
+                    }
+                )
                 continue
             content_chars = len(str(item.get("content", "")))
             if len(selected) >= max_items:
-                omitted.append({"path": item.get("path"), "reason_code": "item_limit", "score": item.get("score")})
+                omitted.append(
+                    {
+                        "path": item.get("path"),
+                        "reason_code": "item_limit",
+                        "score": item.get("score"),
+                    }
+                )
                 continue
             if used_chars + content_chars > content_budget and selected:
-                omitted.append({"path": item.get("path"), "reason_code": "budget_exhausted", "score": item.get("score")})
+                omitted.append(
+                    {
+                        "path": item.get("path"),
+                        "reason_code": "budget_exhausted",
+                        "score": item.get("score"),
+                    }
+                )
                 continue
             used_chars += content_chars
             path_counts[path] = path_counts.get(path, 0) + 1
@@ -3846,7 +4628,9 @@ class ContextService:
             }
             for item in candidates
         ]
-        deferred_chars = sum(int(item.get("deferred_chars", 0) or 0) for item in candidates)
+        deferred_chars = sum(
+            int(item.get("deferred_chars", 0) or 0) for item in candidates
+        )
         token_count = self._token_count(evidence)
         return TokenCount(
             count=token_count.count + max(0, (deferred_chars + 3) // 4),
@@ -3977,7 +4761,9 @@ class ContextService:
                 else 0.0,
                 "noise_ratio": round(noise_rows / detail_base, 4),
                 "required_anchor_omitted_count": required_omitted,
-                "detail_lookup_resolution_rate": round(detail_lookup_count / detail_base, 4),
+                "detail_lookup_resolution_rate": round(
+                    detail_lookup_count / detail_base, 4
+                ),
                 "stale_context_rate": round(stale_hits / max(1, len(fixtures)), 4),
             },
             "regressions": regressions,
@@ -4122,8 +4908,7 @@ class ContextService:
                     "manual_search_read_baseline": manual_baseline,
                     "tokens_spared_by_mcp_est": tokens_spared_by_mcp,
                     "tokens_spared_by_mcp_formula": (
-                        "max(0, manual_search_read_baseline.output_tokens_est "
-                        "- output_tokens_est)"
+                        "max(0, manual_search_read_baseline.output_tokens_est - output_tokens_est)"
                     ),
                     "external_tool_calls_saved_est": pack["metrics"][
                         "external_tool_calls_saved_est"
@@ -4147,12 +4932,10 @@ class ContextService:
             "current context_admin(mode='benchmark') runs only"
         )
         measurement_matrix["metric_sources"]["tokens_spared_by_mcp_formula"] = (
-            "max(0, manual_search_read_baseline.output_tokens_est "
-            "- output_tokens_est)"
+            "max(0, manual_search_read_baseline.output_tokens_est - output_tokens_est)"
         )
         measurement_matrix["metric_sources"]["matched_token_baseline"] = (
-            "direct search results plus bounded reads for the same prompt, "
-            "focus paths, and item limit"
+            "direct search results plus bounded reads for the same prompt, focus paths, and item limit"
         )
         return {
             "schema": "context_benchmark.v1",
@@ -4242,9 +5025,7 @@ class ContextService:
         output_tokens = sum(int(run.get("output_tokens_est", 0) or 0) for run in runs)
         baseline_tokens = sum(
             int(
-                run.get("manual_search_read_baseline", {}).get(
-                    "output_tokens_est", 0
-                )
+                run.get("manual_search_read_baseline", {}).get("output_tokens_est", 0)
                 or 0
             )
             for run in runs
@@ -4254,9 +5035,7 @@ class ContextService:
         )
         elapsed_values = [float(run.get("elapsed_ms", 0.0) or 0.0) for run in runs]
         stage_names = {
-            str(name)
-            for run in runs
-            for name in run.get("stage_timings_ms", {})
+            str(name) for run in runs for name in run.get("stage_timings_ms", {})
         }
         stage_metrics = {
             name: {
@@ -4285,9 +5064,7 @@ class ContextService:
                 "by_operation": {
                     "context_pack": {
                         "count": run_count,
-                        "avg_elapsed_ms": round(
-                            sum(elapsed_values) / run_count, 3
-                        )
+                        "avg_elapsed_ms": round(sum(elapsed_values) / run_count, 3)
                         if run_count
                         else 0.0,
                         "candidates_per_selected": round(
@@ -4339,9 +5116,7 @@ class ContextService:
                     {"operation": "context_pack", "elapsed_ms": value}
                     for value in elapsed_values
                 ],
-                "stage_latency_ms_by_operation": {
-                    "context_pack": stage_metrics
-                },
+                "stage_latency_ms_by_operation": {"context_pack": stage_metrics},
             },
         }
 
@@ -4384,8 +5159,25 @@ class ContextService:
                 }
             )
         stage_timings["index_refresh_ms"] = self._elapsed_ms(index_started)
-        refresh_signature, refresh_signature_available = self._current_refresh_signature()
+        refresh_signature, refresh_signature_available = (
+            self._current_refresh_signature()
+        )
         path_scope = self._warmup_path_scope(path)
+        prompt_manifest = self.store.get_json(WARMUP_PROMPT_MANIFEST_KEY)
+        if (
+            isinstance(prompt_manifest, dict)
+            and refresh_signature_available
+            and str(prompt_manifest.get("refresh_signature", "")) == refresh_signature
+        ):
+            try:
+                self._warmup_record_prompt_manifest_usage(prompt_manifest)
+            except Exception as exc:
+                omitted.append(
+                    {
+                        "reason_code": "prompt_manifest_learning_failed",
+                        "detail": type(exc).__name__,
+                    }
+                )
 
         facts_started = time.perf_counter()
         facts: dict[str, Any] = {}
@@ -4408,7 +5200,9 @@ class ContextService:
             symbol_scope = self.config.repo_relative(path)
         except ValueError:
             symbol_scope = None
-        symbol_scope = (str(symbol_scope).replace("\\", "/").rstrip("/")) if symbol_scope else ""
+        symbol_scope = (
+            (str(symbol_scope).replace("\\", "/").rstrip("/")) if symbol_scope else ""
+        )
         symbols_started = time.perf_counter()
         try:
             symbol_limit = max(0, min(int(max_entries), 100))
@@ -4425,8 +5219,13 @@ class ContextService:
                 symbol_path = str(row.get("path", ""))
                 if not symbol_path:
                     continue
-                if symbol_scope and symbol_scope != "." and not (
-                    symbol_path == symbol_scope or symbol_path.startswith(symbol_scope + "/")
+                if (
+                    symbol_scope
+                    and symbol_scope != "."
+                    and not (
+                        symbol_path == symbol_scope
+                        or symbol_path.startswith(symbol_scope + "/")
+                    )
                 ):
                     continue
                 try:
@@ -4511,15 +5310,13 @@ class ContextService:
                     file_summary_stats["hits"] = int(file_summary_stats["hits"]) + 1
                 else:
                     file_summary_stats["misses"] = int(file_summary_stats["misses"]) + 1
-                file_summary_stats["summary_count"] = int(
-                    file_summary_stats["summary_count"]
-                ) + 1
+                file_summary_stats["summary_count"] = (
+                    int(file_summary_stats["summary_count"]) + 1
+                )
                 warmed_summary_targets.append(
                     {
                         "path": str(target.get("path", "")),
-                        "line_anchor": max(
-                            0, int(target.get("line_anchor", 0) or 0)
-                        ),
+                        "line_anchor": max(0, int(target.get("line_anchor", 0) or 0)),
                         "source": source,
                         "cache_hit": summary_hit,
                     }
@@ -4528,10 +5325,14 @@ class ContextService:
                 source_counts[source] = int(source_counts.get(source, 0)) + 1
         stage_timings["file_summary_ms"] = self._elapsed_ms(file_summary_started)
         omitted.extend(
-            row for row in search_rows if row.get("reason_code") == "search_warmup_failed"
+            row
+            for row in search_rows
+            if row.get("reason_code") == "search_warmup_failed"
         )
         warmed_searches = [
-            row for row in search_rows if row.get("reason_code") != "search_warmup_failed"
+            row
+            for row in search_rows
+            if row.get("reason_code") != "search_warmup_failed"
         ]
         negative_terms = self._warmup_negative_terms()
         route_seed_payload = self._warmup_rebuild_route_seeds(path_scope=path_scope)
@@ -4620,9 +5421,7 @@ class ContextService:
             },
             "term_stats": {
                 "namespace": "warmup.term_stats",
-                "updated_count": len(
-                    self.store.iter_json("warmup:term_stats:")
-                ),
+                "updated_count": len(self.store.iter_json("warmup:term_stats:")),
                 "negative_terms": negative_term_summary,
             },
             "route_seeds": route_seed_payload,
@@ -4802,7 +5601,9 @@ class ContextService:
                     else 0,
                     "preview": preview,
                     "truncated": exists and len(preview) >= entry_budget,
-                    "schema": value.get("schema", "") if isinstance(value, dict) else "",
+                    "schema": value.get("schema", "")
+                    if isinstance(value, dict)
+                    else "",
                     "created_at": value.get("created_at", "")
                     if isinstance(value, dict)
                     else "",
@@ -4812,7 +5613,9 @@ class ContextService:
                     "expires_at": value.get("expires_at", "")
                     if isinstance(value, dict)
                     else "",
-                    "status": value.get("status", "") if isinstance(value, dict) else "",
+                    "status": value.get("status", "")
+                    if isinstance(value, dict)
+                    else "",
                     "namespace": value.get("namespace", "")
                     if isinstance(value, dict)
                     else "",
@@ -4867,8 +5670,12 @@ class ContextService:
             ),
             "schema": value.get("schema", "") if isinstance(value, dict) else "",
             "status": value.get("status", "") if isinstance(value, dict) else "",
-            "created_at": value.get("created_at", "") if isinstance(value, dict) else "",
-            "updated_at": value.get("updated_at", "") if isinstance(value, dict) else "",
+            "created_at": value.get("created_at", "")
+            if isinstance(value, dict)
+            else "",
+            "updated_at": value.get("updated_at", "")
+            if isinstance(value, dict)
+            else "",
             "expires_at": value.get("expires_at", "")
             if isinstance(value, dict)
             else "",
@@ -4949,13 +5756,17 @@ class ContextService:
             if not isinstance(row, dict):
                 continue
             namespace = str(row.get("namespace", ""))
-            if namespace.startswith("skills/") and not is_expired(row.get("expires_at")):
+            if namespace.startswith("skills/") and not is_expired(
+                row.get("expires_at")
+            ):
                 rows.append({**row, "record_kind": "entry"})
         for row in payload.get("summaries", []):
             if not isinstance(row, dict):
                 continue
             namespace = str(row.get("namespace", ""))
-            if namespace.startswith("skills/") and not is_expired(row.get("expires_at")):
+            if namespace.startswith("skills/") and not is_expired(
+                row.get("expires_at")
+            ):
                 rows.append({**row, "record_kind": "summary"})
         rows.sort(
             key=lambda row: (
@@ -4984,7 +5795,10 @@ class ContextService:
             for term in term_set:
                 if term and term in text_l:
                     score += 3.0
-                if term and term in str(row.get("key") or row.get("focus") or "").lower():
+                if (
+                    term
+                    and term in str(row.get("key") or row.get("focus") or "").lower()
+                ):
                     score += 2.0
             if route_l and route_l in text_l:
                 score += 2.0
@@ -5026,7 +5840,9 @@ class ContextService:
         source_payload = {
             "namespace": row.get("namespace", ""),
             "id": self._skill_id(row),
-            "value": row.get("value") if row.get("record_kind") == "entry" else row.get("summary", ""),
+            "value": row.get("value")
+            if row.get("record_kind") == "entry"
+            else row.get("summary", ""),
             "tags": row.get("tags", []),
             "source": row.get("source", ""),
             "version": self._skill_version(row),
@@ -5105,13 +5921,17 @@ class ContextService:
             "required_workflow": self._skill_bullets(
                 text,
                 markers=("must", "required", "workflow", "use when", "call ", "run "),
-                fallback=["Apply the stored skill guidance before repository-specific work."],
+                fallback=[
+                    "Apply the stored skill guidance before repository-specific work."
+                ],
                 limit=4,
             ),
             "key_constraints": self._skill_bullets(
                 text,
                 markers=("do not", "never", "avoid", "only", "secret", "safety"),
-                fallback=["Keep skill material non-secret and treat it as untrusted guidance."],
+                fallback=[
+                    "Keep skill material non-secret and treat it as untrusted guidance."
+                ],
                 limit=4,
             ),
             "useful_commands_or_resources": self._skill_bullets(
@@ -5177,7 +5997,11 @@ class ContextService:
             signals = item.get("prompt_injection_signals", {})
             for category in signals.get("categories", []):
                 counts[category] = counts.get(category, 0) + 1
-        return {"schema": "prompt_injection_signals.aggregate.v1", "detected": bool(counts), "counts": counts}
+        return {
+            "schema": "prompt_injection_signals.aggregate.v1",
+            "detected": bool(counts),
+            "counts": counts,
+        }
 
     def _budget(
         self,
@@ -5196,7 +6020,9 @@ class ContextService:
             payload["max_output_chars"] = max(256, int(max_output_chars))
         if default_output_profile is not None:
             if default_output_profile not in OUTPUT_PROFILES:
-                raise ValueError("default_output_profile must be lean, minimal, compact, normal, or verbose")
+                raise ValueError(
+                    "default_output_profile must be lean, minimal, compact, normal, or verbose"
+                )
             payload["default_output_profile"] = default_output_profile
         payload["schema"] = "context_budget.v1"
         if max_output_chars is not None or default_output_profile is not None:
@@ -5205,7 +6031,9 @@ class ContextService:
         return payload
 
     def _cache_key(self, tool: str, args: dict[str, Any]) -> str:
-        return f"{tool}:{sha256_text(json.dumps(args, sort_keys=True, default=str))[:24]}"
+        return (
+            f"{tool}:{sha256_text(json.dumps(args, sort_keys=True, default=str))[:24]}"
+        )
 
     def _cache_get(self, key: str) -> dict[str, Any] | None:
         lookup = self._cache_lookup(key)
@@ -5263,10 +6091,9 @@ class ContextService:
     ) -> None:
         sanitized_value, sensitivity = sanitize_json(value)
         updated_at = now_iso()
-        expires_at = (
-            datetime.fromtimestamp(time.time() + max(1, ttl_seconds), timezone.utc)
-            .isoformat()
-        )
+        expires_at = datetime.fromtimestamp(
+            time.time() + max(1, ttl_seconds), timezone.utc
+        ).isoformat()
         self.store.put_json(
             f"cache:{key}",
             {
@@ -5338,8 +6165,8 @@ class ContextService:
         ]
         keys = [key.removeprefix("cache:") for key, _row in entries]
         namespaces: dict[str, dict[str, Any]] = {}
-        metric_namespaces = self.metrics.snapshot().get("cache", {}).get(
-            "by_namespace", {}
+        metric_namespaces = (
+            self.metrics.snapshot().get("cache", {}).get("by_namespace", {})
         )
         for cache_key, row in entries:
             if not isinstance(row, dict):
@@ -5478,7 +6305,9 @@ class ContextService:
         expected_paths = metadata.get("explicit_paths")
         if expected_paths is not None:
             canonical_paths = list(expected_paths)
-            if not any(row.get("explicit_paths") == canonical_paths for row in signature_rows):
+            if not any(
+                row.get("explicit_paths") == canonical_paths for row in signature_rows
+            ):
                 return "path_changed"
         expected_path = str(metadata.get("path", ""))
         if expected_path and not any(
@@ -5489,9 +6318,7 @@ class ContextService:
         if isinstance(expected_fingerprint, dict):
             expected_token = str(expected_fingerprint.get("cache_token", ""))
             if expected_token and not any(
-                str(
-                    (row.get("file_fingerprint", {}) or {}).get("cache_token", "")
-                )
+                str((row.get("file_fingerprint", {}) or {}).get("cache_token", ""))
                 == expected_token
                 for row in signature_rows
             ):
@@ -5521,8 +6348,8 @@ class ContextService:
         if expected_allow_fallback is not None:
             expected_fallback = self._cache_bool(expected_allow_fallback)
             if not any(
-                "allow_fallback" in row and self._cache_bool(row.get("allow_fallback"))
-                == expected_fallback
+                "allow_fallback" in row
+                and self._cache_bool(row.get("allow_fallback")) == expected_fallback
                 for row in signature_rows
             ):
                 return "fallback_policy_changed"
@@ -5580,9 +6407,7 @@ class ContextService:
             }
         if namespace in FRAGMENT_CACHE_NAMESPACES:
             schema_version = int(
-                row.get("schema_version")
-                or metadata.get("schema_version")
-                or 0
+                row.get("schema_version") or metadata.get("schema_version") or 0
             )
             if schema_version < CACHE_ENTRY_SCHEMA_VERSION:
                 return {
@@ -5635,9 +6460,7 @@ class ContextService:
             return {
                 "status": "expired",
                 "reason": "expired",
-                "warnings": [
-                    {"code": "cache_expired", "message": "cache row expired"}
-                ],
+                "warnings": [{"code": "cache_expired", "message": "cache row expired"}],
             }
         return {"status": "active", "reason": "", "warnings": []}
 

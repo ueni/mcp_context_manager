@@ -1,0 +1,18 @@
+{
+  "schema": "cache_prompt_warmup_fixture.v1",
+  "cases": [
+    {
+      "id": "prompt_aware_context_cache",
+      "cold_prompt": "review prompt aware cache warmup fragment metrics",
+      "related_prompt": "inspect prompt aware fragment cache metrics and warmup coverage",
+      "focus_paths": [
+        "src/mcp_context_manager/context.py",
+        "src/mcp_context_manager/metrics.py"
+      ],
+      "required_anchors": [
+        "src/mcp_context_manager/context.py",
+        "src/mcp_context_manager/metrics.py"
+      ]
+    }
+  ]
+}

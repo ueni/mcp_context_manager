@@ -80,6 +80,27 @@ MEASUREMENT_TARGETS: tuple[dict[str, Any], ...] = (
         "min_samples": 2,
     },
     {
+        "key": "cache.retrieval.search_term.hit_ratio",
+        "operator": ">=",
+        "target": 0.2,
+        "unit": "ratio",
+        "min_samples": 2,
+    },
+    {
+        "key": "cache.retrieval.file_summary.hit_ratio",
+        "operator": ">=",
+        "target": 0.2,
+        "unit": "ratio",
+        "min_samples": 2,
+    },
+    {
+        "key": "cache.retrieval.test_owner_paths.hit_ratio",
+        "operator": ">=",
+        "target": 0.2,
+        "unit": "ratio",
+        "min_samples": 2,
+    },
+    {
         "key": "tooling.external_calls_saved_per_pack",
         "operator": ">=",
         "target": 2.0,
@@ -129,6 +150,7 @@ class ContextMetrics:
         stage_timings_ms: dict[str, float] | None = None,
         fragment_cache_hits: int = 0,
         fragment_cache_misses: int = 0,
+        fragment_cache_namespaces: dict[str, dict[str, Any]] | None = None,
         warmup_trigger: str = "",
         warmup_status: str = "",
     ) -> None:
@@ -150,9 +172,9 @@ class ContextMetrics:
         totals["output_tokens_est"] = int(totals.get("output_tokens_est", 0)) + max(
             0, int(output_tokens_est)
         )
-        totals["raw_candidate_chars"] = int(
-            totals.get("raw_candidate_chars", 0)
-        ) + max(0, int(raw_candidate_chars))
+        totals["raw_candidate_chars"] = int(totals.get("raw_candidate_chars", 0)) + max(
+            0, int(raw_candidate_chars)
+        )
         totals["selected_chars"] = int(totals.get("selected_chars", 0)) + max(
             0, int(selected_chars)
         )
@@ -197,13 +219,42 @@ class ContextMetrics:
             namespace_reasons[reason] = int(namespace_reasons.get(reason, 0)) + 1
         fragment_hits = max(0, int(fragment_cache_hits))
         fragment_misses = max(0, int(fragment_cache_misses))
-        if fragment_hits or fragment_misses:
-            totals["context_pack_fragment_cache_hits"] = int(
-                totals.get("context_pack_fragment_cache_hits", 0)
-            ) + fragment_hits
-            totals["context_pack_fragment_cache_misses"] = int(
-                totals.get("context_pack_fragment_cache_misses", 0)
-            ) + fragment_misses
+        if operation == "context_pack" and (fragment_hits or fragment_misses):
+            totals["context_pack_fragment_cache_hits"] = (
+                int(totals.get("context_pack_fragment_cache_hits", 0)) + fragment_hits
+            )
+            totals["context_pack_fragment_cache_misses"] = (
+                int(totals.get("context_pack_fragment_cache_misses", 0))
+                + fragment_misses
+            )
+        for namespace, row in sorted((fragment_cache_namespaces or {}).items()):
+            if not isinstance(row, dict):
+                continue
+            namespace_hits = max(0, int(row.get("hits", 0) or 0))
+            namespace_misses = max(0, int(row.get("misses", 0) or 0))
+            if not namespace or not (namespace_hits or namespace_misses):
+                continue
+            namespace_stats = totals.setdefault("cache_namespaces", {}).setdefault(
+                namespace,
+                {
+                    "hits": 0,
+                    "misses": 0,
+                    "reasons": {},
+                },
+            )
+            namespace_stats["hits"] = (
+                int(namespace_stats.get("hits", 0)) + namespace_hits
+            )
+            namespace_stats["misses"] = (
+                int(namespace_stats.get("misses", 0)) + namespace_misses
+            )
+            namespace_reasons = namespace_stats.setdefault("reasons", {})
+            reasons = row.get("reasons", {})
+            reasons = reasons if isinstance(reasons, dict) else {}
+            for reason, count in reasons.items():
+                namespace_reasons[str(reason)] = int(
+                    namespace_reasons.get(str(reason), 0)
+                ) + max(0, int(count or 0))
         if operation == "context_admin.warmup":
             trigger = (warmup_trigger or "manual").strip().lower()
             if trigger not in {"manual", "auto"}:
@@ -316,9 +367,7 @@ class ContextMetrics:
                 "estimated_input_tokens_saved": max(
                     0, int(estimated_input_tokens_saved)
                 ),
-                "tokens_spared_by_mcp_est": max(
-                    0, int(estimated_input_tokens_saved)
-                ),
+                "tokens_spared_by_mcp_est": max(0, int(estimated_input_tokens_saved)),
                 "baseline_input_tokens_est": max(0, int(baseline_input_tokens_est)),
                 "output_tokens_est": max(0, int(output_tokens_est)),
                 "external_tool_calls_saved": max(0, int(external_tool_calls_saved)),
@@ -327,6 +376,7 @@ class ContextMetrics:
                 ),
                 "fragment_cache_hits": fragment_hits,
                 "fragment_cache_misses": fragment_misses,
+                "fragment_cache_namespaces": fragment_cache_namespaces or {},
                 "warmup_trigger": (warmup_trigger or "manual")
                 if operation == "context_admin.warmup"
                 else "",
@@ -353,9 +403,7 @@ class ContextMetrics:
         fragment_total = fragment_hits + fragment_misses
         cache_namespaces = {
             name: self._public_cache_namespace(stats)
-            for name, stats in sorted(
-                totals.get("cache_namespaces", {}).items()
-            )
+            for name, stats in sorted(totals.get("cache_namespaces", {}).items())
             if isinstance(stats, dict)
         }
         operations = {
@@ -386,9 +434,7 @@ class ContextMetrics:
         result_count = int(totals.get("result_count", 0))
         candidate_count = int(totals.get("candidate_count", 0))
         external_calls_saved = int(totals.get("external_tool_calls_saved", 0))
-        references_bytes_deferred = int(
-            totals.get("references_bytes_deferred_est", 0)
-        )
+        references_bytes_deferred = int(totals.get("references_bytes_deferred_est", 0))
         contract_metrics = contract_size_metrics()
         return {
             "schema": "context_metrics.v1",
@@ -404,9 +450,7 @@ class ContextMetrics:
             "cache": {
                 "hits": cache_hits,
                 "misses": cache_misses,
-                "hit_ratio": round(cache_hits / cache_total, 4)
-                if cache_total
-                else 0.0,
+                "hit_ratio": round(cache_hits / cache_total, 4) if cache_total else 0.0,
                 "context_pack_fragment_hits": fragment_hits,
                 "context_pack_fragment_misses": fragment_misses,
                 "context_pack_fragment_hit_ratio": round(
@@ -523,8 +567,7 @@ class ContextMetrics:
                 ),
                 "token_savings_baseline": "ranked_candidate_evidence_estimate",
                 "tokens_spared_by_mcp_scope": (
-                    "deprecated compatibility alias for candidate compression; "
-                    "not a no-MCP measurement"
+                    "deprecated compatibility alias for candidate compression; not a no-MCP measurement"
                 ),
                 "tokens_spared_by_mcp_formula": (
                     "max(0, baseline_input_tokens_est - output_tokens_est)"
@@ -722,9 +765,7 @@ class ContextMetrics:
                 or ""
             ),
             "last_auto_recorded_at": str(
-                totals.get("warmup_last_auto_at")
-                or last_auto.get("recorded_at")
-                or ""
+                totals.get("warmup_last_auto_at") or last_auto.get("recorded_at") or ""
             ),
         }
 
@@ -837,7 +878,9 @@ class ContextMetrics:
                 pack_count,
             )
         if key == "tokens.context_pack.compression_ratio":
-            return float(snapshot.get("tokens", {}).get("compression_ratio", 0.0)), pack_count
+            return float(
+                snapshot.get("tokens", {}).get("compression_ratio", 0.0)
+            ), pack_count
         if key == "retrieval.context_pack.candidates_per_selected":
             return (
                 float(pack.get("candidates_per_selected", 0.0)),
@@ -853,6 +896,11 @@ class ContextMetrics:
                 cache.get("context_pack_fragment_misses", 0) or 0
             )
             return float(cache.get("context_pack_fragment_hit_ratio", 0.0)), samples
+        if key.startswith("cache.retrieval.") and key.endswith(".hit_ratio"):
+            namespace = key.removeprefix("cache.").removesuffix(".hit_ratio")
+            row = snapshot.get("cache", {}).get("by_namespace", {}).get(namespace, {})
+            samples = int(row.get("hits", 0) or 0) + int(row.get("misses", 0) or 0)
+            return float(row.get("hit_ratio", 0.0) or 0.0), samples
         if key == "tooling.external_calls_saved_per_pack":
             return (
                 float(
