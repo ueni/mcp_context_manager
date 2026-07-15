@@ -664,6 +664,7 @@ class ContextIndex:
         root_rel = self._search_root_rel(path)
         rows = self._tantivy_search_rows(
             terms=terms,
+            query=query,
             root_rel=root_rel,
             max_results=max_results,
             include_globs=include_globs,
@@ -690,6 +691,7 @@ class ContextIndex:
         root_rel = self._search_root_rel(path)
         return self._tantivy_search_rows(
             terms=terms,
+            query=term,
             root_rel=root_rel,
             max_results=max_results,
             include_globs=include_globs,
@@ -703,12 +705,27 @@ class ContextIndex:
     def search_backend_version(self) -> str:
         return self._tantivy.backend_version()
 
+    def _path_like_query_rel(self, query: str | None) -> str:
+        query_path = (query or "").strip().replace("\\", "/").strip()
+        normalized = re.sub(r"/+", "/", query_path).strip("./")
+        if not normalized:
+            return ""
+        normalized_lower = normalized.lower()
+        if not (
+            "/" in normalized_lower
+            or "\\" in query_path
+            or re.search(r"\.[A-Za-z0-9_]{1,12}$", normalized_lower)
+        ):
+            return ""
+        return normalized
+
     def _tantivy_search_rows(
         self,
         terms: list[str],
         root_rel: str,
         max_results: int,
         include_globs: list[str] | None,
+        query: str | None = None,
     ) -> list[dict[str, Any]]:
         self._ensure_tantivy_available()
         rows: list[dict[str, Any]] = []
@@ -753,9 +770,22 @@ class ContextIndex:
             if next_limit <= candidate_limit:
                 break
             candidate_limit = next_limit
+        exact_rel = self._path_like_query_rel(query)
+        exact_rel_lower = exact_rel.lower()
+        if exact_rel and not any(
+            str(row.get("path", "")).lower() == exact_rel_lower for row in rows
+        ):
+            exact_row = self._tantivy_lmdb_search_row(
+                rel=exact_rel,
+                terms=terms,
+                tantivy_score=10_000.0,
+            )
+            if exact_row is not None:
+                rows.append(exact_row)
         return self._rank_search_rows(
             rows=rows,
             terms=terms,
+            query=query,
             root_rel=root_rel,
             max_results=max_results,
             include_globs=include_globs,
@@ -898,13 +928,16 @@ class ContextIndex:
         self,
         rows: list[dict[str, Any]],
         terms: list[str],
+        query: str | None,
         root_rel: str,
         max_results: int,
         include_globs: list[str] | None,
     ) -> list[dict[str, Any]]:
+        normalized_path_query = self._path_like_query_rel(query).lower()
         filtered: list[dict[str, Any]] = []
         for row in rows:
             rel = row["path"]
+            rel_lower = str(rel).lower()
             if not self._runtime_visible_rel(rel):
                 continue
             if root_rel and not rel.startswith(root_rel.rstrip("/") + "/") and rel != root_rel:
@@ -912,7 +945,9 @@ class ContextIndex:
             if include_globs and not any(fnmatch.fnmatch(rel, glob) for glob in include_globs):
                 continue
             score = float(row.get("tantivy_score", 0.0) or 0.0)
-            score += sum(2.0 for term in terms if term in rel.lower())
+            if normalized_path_query and rel_lower == normalized_path_query:
+                score += 10_000.0
+            score += sum(2.0 for term in terms if term in rel_lower)
             score += sum(
                 1.0 for term in terms if term in str(row.get("excerpt", "")).lower()
             )

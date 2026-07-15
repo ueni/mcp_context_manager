@@ -274,6 +274,43 @@ def test_tantivy_finds_terms_beyond_legacy_term_cap(tmp_path: Path) -> None:
     assert search["results"][0]["source"] == "tantivy"
 
 
+def test_tantivy_exact_path_match_has_priority_for_path_like_query(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    package = repo / "src" / "mcp_context_manager"
+    package.mkdir(parents=True)
+    (package / "context.py").write_text(
+        "def exact_path_match():\n    return True\n",
+        encoding="utf-8",
+    )
+
+    for index in range(8):
+        (package / f"importer_{index:02d}.py").write_text(
+            (
+                "src mcp_context_manager context context context\n"
+                "src mcp_context_manager context context context py\n"
+                * 12
+            ),
+            encoding="utf-8",
+        )
+    service = ContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(repo / ".mcp-context-manager").resolve(),
+        )
+    )
+
+    service.context_admin(mode="index_refresh")
+    search = service.context_lookup(
+        mode="search", query="src/mcp_context_manager/context.py", max_results=5
+    )
+
+    assert search["count"] == 5
+    assert search["results"][0]["path"] == "src/mcp_context_manager/context.py"
+
+
 def test_scoped_refresh_updates_and_removes_tantivy_documents(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

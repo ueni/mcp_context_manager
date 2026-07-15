@@ -1334,8 +1334,17 @@ class ContextService:
         merge_started = time.perf_counter()
         rows = self._merge_search_fragments(
             terms=terms,
+            query=query,
             fragments=fragments,
             max_results=max_results,
+        )
+        rows = self._promote_exact_path_search_result(
+            rows=rows,
+            query=query,
+            path=path,
+            include_globs=include_globs,
+            max_results=max_results,
+            allow_fallback=allow_fallback,
         )
         search_merge_ms = self._elapsed_ms(merge_started)
         result = {
@@ -1528,9 +1537,12 @@ class ContextService:
     def _merge_search_fragments(
         self,
         terms: list[str],
+        query: str,
         fragments: list[dict[str, Any]],
         max_results: int,
     ) -> list[dict[str, Any]]:
+        exact_rel = self.index._path_like_query_rel(query)
+        exact_rel_lower = exact_rel.lower()
         matched: dict[str, dict[str, Any]] = {}
         for fragment in fragments:
             fragment_term = str(fragment.get("term", ""))
@@ -1574,6 +1586,8 @@ class ContextService:
             path = str(row["path"])
             excerpt = str(row.get("excerpt", ""))
             score = float(row.get("tantivy_score", 0.0) or 0.0)
+            if exact_rel and path.lower() == exact_rel_lower:
+                score += 10_000.0
             score += sum(2.0 for term in terms if term in path.lower())
             score += sum(1.0 for term in terms if term in excerpt.lower())
             score += float(row.get("term_hits", 0)) * 2.5
@@ -1588,6 +1602,47 @@ class ContextService:
             rows.append(public_row)
         rows.sort(key=lambda item: (-float(item["score"]), item["path"]))
         return rows[:max_results]
+
+    def _promote_exact_path_search_result(
+        self,
+        rows: list[dict[str, Any]],
+        query: str,
+        path: str,
+        include_globs: list[str] | None,
+        max_results: int,
+        allow_fallback: bool,
+    ) -> list[dict[str, Any]]:
+        exact_rel = self.index._path_like_query_rel(query)
+        if not exact_rel:
+            return rows
+        exact_rel_lower = exact_rel.lower()
+        if rows and str(rows[0].get("path", "")).lower() == exact_rel_lower:
+            return rows
+        try:
+            exact_result = self.index.search(
+                query=query,
+                path=path,
+                max_results=1,
+                include_globs=include_globs,
+                allow_fallback=allow_fallback,
+            )
+        except Exception:
+            return rows
+        exact_rows = [
+            row
+            for row in exact_result.get("results", [])
+            if isinstance(row, dict)
+            and str(row.get("path", "")).lower() == exact_rel_lower
+        ]
+        if not exact_rows:
+            return rows
+        exact = exact_rows[0]
+        rest = [
+            row
+            for row in rows
+            if str(row.get("path", "")).lower() != exact_rel_lower
+        ]
+        return [exact, *rest][:max_results]
 
     def _canonical_cache_path(self, path: str) -> str:
         try:
