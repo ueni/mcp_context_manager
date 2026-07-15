@@ -270,6 +270,7 @@ def test_context_admin_mcp_tool_accepts_warmup_and_cache_stats(
     admin_tool = registered_tools["context_admin"]
     hints = get_type_hints(admin_tool, include_extras=True)
     assert "warmup" in _annotation_literal_values(hints["mode"])
+    assert "project_prune" in _annotation_literal_values(hints["mode"])
 
     root_uri = f"file://{service.config.repo_path}"
     stats = asyncio.run(

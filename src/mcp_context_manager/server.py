@@ -369,6 +369,7 @@ AdminModeParam = Annotated[
         "index_status",
         "cache_stats",
         "cache_prune",
+        "project_prune",
         "warmup",
         "budget",
         "contracts",
@@ -386,7 +387,7 @@ AdminModeParam = Annotated[
     ],
     _tool_param(
         "Administrative operation: health, projects, index refresh/status, cache "
-        "stats/prune/warmup, budget, output contracts, metrics, targets, "
+        "stats/prune/warmup, project prune, budget, output contracts, metrics, targets, "
         "benchmarks, or generated-state browsing."
     ),
 ]

@@ -4,6 +4,16 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+DEFAULT_PROJECT_MARKERS = (
+    ".git",
+    "pyproject.toml",
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+    "pom.xml",
+    "CMakeLists.txt",
+)
+
 
 @dataclass(frozen=True)
 class ContextConfig:
@@ -27,6 +37,8 @@ class ContextConfig:
     root_uri: str = ""
     allowed_roots: tuple[str, ...] = field(default_factory=tuple)
     root_mappings: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    project_discovery_max_depth: int = 4
+    project_markers: tuple[str, ...] = DEFAULT_PROJECT_MARKERS
 
     @classmethod
     def from_env(cls) -> "ContextConfig":
@@ -43,6 +55,10 @@ class ContextConfig:
             root_mappings=_parse_root_mappings(
                 os.getenv("MCP_CONTEXT_ROOT_MAPPINGS", "")
             ),
+            project_discovery_max_depth=max(
+                0, int(os.getenv("MCP_CONTEXT_PROJECT_DISCOVERY_MAX_DEPTH", "4"))
+            ),
+            project_markers=_project_markers_from_env(),
             max_read_bytes=max(1024, int(os.getenv("MAX_READ_BYTES", "262144"))),
             max_output_chars=max(1024, int(os.getenv("MAX_OUTPUT_CHARS", "12000"))),
             default_output_profile=os.getenv("MCP_CONTEXT_OUTPUT_PROFILE", "compact"),
@@ -94,6 +110,8 @@ class ContextConfig:
             root_uri=root_uri,
             allowed_roots=self.allowed_roots,
             root_mappings=self.root_mappings,
+            project_discovery_max_depth=self.project_discovery_max_depth,
+            project_markers=self.project_markers,
             max_read_bytes=self.max_read_bytes,
             max_output_chars=self.max_output_chars,
             default_output_profile=self.default_output_profile,
@@ -179,6 +197,13 @@ def _split_env_list(value: str) -> tuple[str, ...]:
     for chunk in value.split(os.pathsep):
         raw_parts.extend(chunk.split(","))
     return tuple(part.strip() for part in raw_parts if part.strip())
+
+
+def _project_markers_from_env() -> tuple[str, ...]:
+    value = os.getenv("MCP_CONTEXT_PROJECT_MARKERS")
+    if value is None:
+        return DEFAULT_PROJECT_MARKERS
+    return _split_env_list(value)
 
 
 def _env_bool(value: str | None, default: bool = False) -> bool:

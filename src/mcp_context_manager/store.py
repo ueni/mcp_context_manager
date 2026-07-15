@@ -53,6 +53,15 @@ class LmdbStoreAdapter:
     def exists(self) -> bool:
         return self.path.exists()
 
+    @classmethod
+    def close_path(cls, path: Path) -> None:
+        resolved = path.resolve()
+        with cls._guard:
+            env = cls._envs.pop(resolved, None)
+            cls._env_locks.pop(resolved, None)
+        if env is not None:
+            env.close()
+
     @contextmanager
     def write_txn(self) -> Iterator[Any]:
         with self._env_lock():

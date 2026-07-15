@@ -383,9 +383,12 @@ Example explicit request payload:
 }
 ```
 
-If a client exposes `/home/user/source` as one root, the server treats that
-whole directory as one project. For per-repo isolation, expose or pass roots like
-`file:///home/user/source/my-repo`.
+If a client exposes `/home/user/source` as one MCP root, request selection treats
+that whole directory as the visible project. `context_admin(mode="projects")`
+also discovers independent projects recursively under allowed roots, up to the
+configured depth. Once a project root is discovered, nested repositories,
+submodules, or marker directories under it stay owned by the parent project
+unless a caller explicitly passes the nested `root_uri`.
 
 ## Configuration
 
@@ -395,6 +398,8 @@ whole directory as one project. For per-repo isolation, expose or pass roots lik
 | `MCP_CONTEXT_STATE_DIR` | Generated state directory. |
 | `MCP_CONTEXT_ALLOWED_ROOTS` | Host paths allowed for MCP root URIs. Required for global roots outside `REPO_PATH`. |
 | `MCP_CONTEXT_ROOT_MAPPINGS` | Host-to-container path mappings, such as `/home/user/source=/workspace-roots`. |
+| `MCP_CONTEXT_PROJECT_DISCOVERY_MAX_DEPTH` | Recursive discovery depth under allowed roots. Defaults to `4`. |
+| `MCP_CONTEXT_PROJECT_MARKERS` | Comma- or path-separator-delimited marker filenames for non-Git project discovery. Defaults to `.git`, `pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`, `pom.xml`, and `CMakeLists.txt`. |
 | `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host parent mounted at `/workspace-roots`. |
 | `MCP_CONTEXT_UID` / `MCP_CONTEXT_GID` | Compose build args for the non-root container user. Defaults to `1000:1000`. |
 | `MCP_TRANSPORT` | `stdio` by default, or `streamable-http`. |

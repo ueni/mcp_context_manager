@@ -259,7 +259,7 @@ class ProjectRegistry:
         projects: list[ProjectRoot] = []
         seen: set[str] = set()
         for host_root, local_root in self._configured_scan_roots():
-            for local_path in self._git_project_candidates(local_root):
+            for local_path, source in self._project_candidates(local_root):
                 if len(projects) >= max_projects:
                     return projects
                 try:
@@ -275,7 +275,7 @@ class ProjectRegistry:
                     project = self.project_from_uri(
                         _file_uri_from_path(host_path),
                         name=local_path.name,
-                        source="discovered_git",
+                        source=source,
                     )
                 except ValueError:
                     continue
@@ -300,23 +300,122 @@ class ProjectRegistry:
             )
         return roots
 
-    def _git_project_candidates(self, root: Path) -> list[Path]:
-        candidates = [root]
+    def _project_candidates(self, root: Path) -> list[tuple[Path, str]]:
+        candidates: list[tuple[Path, str]] = []
+        root_candidate: tuple[Path, str] | None = None
+        skip_root = self._should_skip_scan_root_project(root)
+
+        def visit(path: Path, depth: int) -> None:
+            nonlocal root_candidate
+            if path.is_symlink() or not path.is_dir():
+                return
+            source = self._project_candidate_source(path)
+            if source and depth == 0 and skip_root:
+                root_candidate = (path.resolve(), source)
+            elif source:
+                candidates.append((path.resolve(), source))
+                return
+            if depth >= self.config.project_discovery_max_depth:
+                return
+            try:
+                children = sorted(path.iterdir(), key=lambda child: child.name)
+            except OSError:
+                return
+            for child in children:
+                if (
+                    child.is_symlink()
+                    or not child.is_dir()
+                    or child.name.startswith(".")
+                ):
+                    continue
+                visit(child, depth + 1)
+
+        visit(root, 0)
+        if root_candidate is not None and not candidates:
+            candidates.append(root_candidate)
+        return candidates
+
+    def _should_skip_scan_root_project(self, path: Path) -> bool:
+        if (
+            not self.config.allowed_roots
+            or not self.config.root_mappings
+            or self._has_non_git_project_marker(path)
+        ):
+            return False
+        return self._is_configured_scan_root(path) and self._has_child_project_candidate(
+            path
+        )
+
+    def _is_configured_scan_root(self, path: Path) -> bool:
         try:
-            candidates.extend(
-                child
-                for child in sorted(root.iterdir(), key=lambda path: path.name)
-                if not child.is_symlink()
-                and child.is_dir()
-                and not child.name.startswith(".")
+            resolved = path.resolve()
+        except OSError:
+            return False
+        for _host_root, local_root in self._configured_scan_roots():
+            try:
+                if local_root.resolve() == resolved:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _project_is_configured_scan_root(self, project: ProjectRoot) -> bool:
+        if not self.config.allowed_roots:
+            return False
+        host_path = _file_uri_path(project.root_uri)
+        allowed_paths = {
+            _allowed_root_to_path(allowed) for allowed in self.config.allowed_roots
+        }
+        return (
+            host_path in allowed_paths
+            and self._is_configured_scan_root(project.local_path)
+            and self._should_skip_scan_root_project(project.local_path)
+        )
+
+    def _project_candidate_source(self, path: Path) -> str:
+        if (path / ".git").exists():
+            return "discovered_git"
+        if self._has_project_marker(path):
+            return "discovered_marker"
+        return ""
+
+    def _has_non_git_project_marker(self, path: Path) -> bool:
+        try:
+            return any(
+                marker != ".git" and (path / marker).exists()
+                for marker in self.config.project_markers
             )
         except OSError:
-            pass
-        return [
-            candidate.resolve()
-            for candidate in candidates
-            if self._is_git_project_root(candidate)
-        ]
+            return False
+
+    def _has_child_project_candidate(self, root: Path) -> bool:
+        def visit(path: Path, depth: int) -> bool:
+            if depth >= self.config.project_discovery_max_depth:
+                return False
+            try:
+                children = sorted(path.iterdir(), key=lambda child: child.name)
+            except OSError:
+                return False
+            for child in children:
+                if (
+                    child.is_symlink()
+                    or not child.is_dir()
+                    or child.name.startswith(".")
+                ):
+                    continue
+                if self._project_candidate_source(child):
+                    return True
+                if visit(child, depth + 1):
+                    return True
+            return False
+
+        return visit(root, 0)
+
+    def _has_project_marker(self, path: Path) -> bool:
+        try:
+            return any((path / marker).exists() for marker in self.config.project_markers)
+        except OSError:
+            return False
 
     def _is_git_project_root(self, path: Path) -> bool:
         if (path / ".git").exists():
@@ -370,6 +469,8 @@ class ProjectRegistry:
         try:
             project = self.project_from_uri(root_uri, name=name, source="state")
         except ValueError:
+            return None, False
+        if self._project_is_configured_scan_root(project):
             return None, False
         stored_project_id = str(metadata.get("project_id") or "")
         if stored_project_id and stored_project_id != project.project_id:

@@ -81,6 +81,11 @@ mode uses host-to-container path mappings so a host URI such as
 `file:///home/user/source/repo` can be resolved to a container path such as
 `/workspace-roots/repo`. Project ids combine a slug with a root URI hash, which
 keeps generated state isolated even when repositories have the same basename.
+Project listing also performs bounded recursive discovery under configured
+scan roots. Git worktree roots and configured marker files identify independent
+projects; after a project root is accepted, nested repositories, submodules, and
+marker directories below it remain part of that parent unless explicitly
+selected by `root_uri`.
 
 ## Generated-State Storage
 

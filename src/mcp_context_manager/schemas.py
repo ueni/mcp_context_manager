@@ -169,7 +169,7 @@ TOOL_INPUT_PARAMS: dict[str, dict[str, str]] = {
         "root_uri": "Repo file URI.",
     },
     "context_admin": {
-        "mode": "health, projects, index, cache, warmup, budget, contracts, metrics, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
+        "mode": "health, projects, index, cache, project_prune, warmup, budget, contracts, metrics, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
         "path": "Repo-relative path.",
         "max_files": "Index file cap.",
         "max_entries": "Max rows.",
@@ -226,6 +226,7 @@ TOOL_OUTPUT_SCHEMA_NAMES: dict[str, list[str]] = {
         "context_index.status.v1",
         "context_cache.stats.v1",
         "context_cache.prune.v1",
+        "context_project.prune.v1",
         "context_cache.warmup.v1",
         "context_budget.v1",
         "tool_output_contracts.v1",

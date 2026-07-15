@@ -227,6 +227,236 @@ def test_project_list_discovers_git_repositories_under_mapped_parent(
     assert health["project_id"] == project["project_id"]
 
 
+def test_project_list_preserves_allowed_root_that_is_the_repo(
+    tmp_path: Path,
+) -> None:
+    repo = make_repo(tmp_path / "standalone", "standalone")
+    (repo / ".git").mkdir()
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=repo.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(repo),),
+        )
+    )
+
+    listing = manager.context_admin(mode="projects")
+
+    assert listing["count"] == 1
+    assert listing["projects"][0]["name"] == "standalone"
+    assert listing["projects"][0]["source"] == "discovered_git"
+
+
+def test_project_list_discovers_nested_git_repositories_under_mapped_parent(
+    tmp_path: Path,
+) -> None:
+    host_parent = tmp_path / "host-source"
+    container_parent = tmp_path / "workspace-roots"
+    nested_repo = make_repo(container_parent / "org" / "team" / "deep", "deep")
+    (nested_repo / ".git").mkdir()
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=container_parent.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(host_parent),),
+            root_mappings=((str(host_parent), str(container_parent)),),
+        )
+    )
+
+    listing = manager.context_admin(mode="projects")
+
+    assert listing["count"] == 1
+    project = listing["projects"][0]
+    assert project["name"] == "deep"
+    assert project["source"] == "discovered_git"
+    assert project["root"]["mapped"] is True
+
+
+def test_project_list_skips_workspace_parent_and_stale_state(
+    tmp_path: Path,
+) -> None:
+    host_parent = tmp_path / "host-source"
+    container_parent = tmp_path / "workspace-roots"
+    host_parent.mkdir()
+    make_repo(container_parent, "workspace-parent")
+    (container_parent / ".git").mkdir()
+    child_repo = make_repo(container_parent / "real-project", "real")
+    (child_repo / ".git").mkdir()
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=container_parent.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(host_parent),),
+            root_mappings=((str(host_parent), str(container_parent)),),
+        )
+    )
+    stale_parent = manager.registry.project_from_uri(
+        host_parent.as_uri(), name="workspace-roots"
+    )
+    manager.registry.remember_project(stale_parent)
+
+    listing = manager.context_admin(mode="projects")
+
+    assert listing["count"] == 1
+    assert listing["projects"][0]["name"] == "real-project"
+    listing_text = json.dumps(listing, sort_keys=True)
+    assert "workspace-roots" not in listing_text
+    assert stale_parent.project_id not in listing_text
+
+
+def test_project_list_discovers_nested_marker_projects(tmp_path: Path) -> None:
+    host_parent = tmp_path / "host-source"
+    container_parent = tmp_path / "workspace-roots"
+    marker_project = make_repo(
+        container_parent / "org" / "team" / "python-app", "marker"
+    )
+    write_file(marker_project, "pyproject.toml", '[project]\nname = "marker"\n')
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=container_parent.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(host_parent),),
+            root_mappings=((str(host_parent), str(container_parent)),),
+        )
+    )
+
+    listing = manager.context_admin(mode="projects")
+
+    assert listing["count"] == 1
+    project = listing["projects"][0]
+    assert project["name"] == "python-app"
+    assert project["source"] == "discovered_marker"
+    assert project["root"]["mapped"] is True
+
+
+def test_project_discovery_keeps_nested_content_owned_by_parent(
+    tmp_path: Path,
+) -> None:
+    parent = make_repo(tmp_path / "parent", "parent")
+    (parent / ".git").mkdir()
+    child_marker = make_repo(parent / "packages" / "child", "child")
+    write_file(child_marker, "package.json", '{"name": "child"}\n')
+    child_submodule = make_repo(parent / "vendor" / "submodule", "submodule")
+    write_file(child_submodule, ".git", "gitdir: ../../.git/modules/submodule\n")
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=tmp_path.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(tmp_path),),
+        )
+    )
+
+    listing = manager.context_admin(mode="projects")
+
+    assert listing["count"] == 1
+    assert listing["projects"][0]["name"] == "parent"
+    assert listing["projects"][0]["source"] == "discovered_git"
+
+    explicit_child = manager.registry.project_from_uri(child_marker.as_uri())
+    assert explicit_child.name == "child"
+    assert explicit_child.source == "root_uri"
+
+
+def test_project_prune_removes_selected_generated_state(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path / "project", "project")
+    (repo / ".git").mkdir()
+    manager = ProjectContextService(
+        ContextConfig(
+            repo_path=tmp_path.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(tmp_path),),
+        )
+    )
+    listing = manager.context_admin(mode="projects")
+    project_id = listing["projects"][0]["project_id"]
+
+    manager.context_memory(
+        mode="upsert",
+        namespace="workspace",
+        key="marker",
+        value={"ok": True},
+        project_id=project_id,
+    )
+    project_state = tmp_path / "state" / "projects" / project_id
+    assert project_state.exists()
+
+    pruned = manager.context_admin(mode="project_prune", project_id=project_id)
+
+    assert pruned == {
+        "schema": "context_project.prune.v1",
+        "project_id": project_id,
+        "name": "project",
+        "removed": True,
+    }
+    assert not project_state.exists()
+
+
+def test_project_discovery_respects_max_depth(tmp_path: Path) -> None:
+    deep_repo = make_repo(tmp_path / "a" / "b" / "project", "deep")
+    (deep_repo / ".git").mkdir()
+    shallow_manager = ProjectContextService(
+        ContextConfig(
+            repo_path=tmp_path.resolve(),
+            state_dir=(tmp_path / "shallow-state").resolve(),
+            allowed_roots=(str(tmp_path),),
+            project_discovery_max_depth=2,
+        )
+    )
+    deep_manager = ProjectContextService(
+        ContextConfig(
+            repo_path=tmp_path.resolve(),
+            state_dir=(tmp_path / "deep-state").resolve(),
+            allowed_roots=(str(tmp_path),),
+            project_discovery_max_depth=3,
+        )
+    )
+
+    assert shallow_manager.context_admin(mode="projects")["count"] == 0
+    listing = deep_manager.context_admin(mode="projects")
+    assert listing["count"] == 1
+    assert listing["projects"][0]["name"] == "project"
+
+
+def test_project_discovery_config_reads_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REPO_PATH", str(tmp_path))
+    monkeypatch.setenv("MCP_CONTEXT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("MCP_CONTEXT_PROJECT_DISCOVERY_MAX_DEPTH", "2")
+    monkeypatch.setenv("MCP_CONTEXT_PROJECT_MARKERS", "manifest.one,manifest.two")
+
+    config = ContextConfig.from_env()
+
+    assert config.project_discovery_max_depth == 2
+    assert config.project_markers == ("manifest.one", "manifest.two")
+
+
+def test_project_discovery_uses_cheap_markers_without_git_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    for index in range(5):
+        make_repo(root / f"plain-{index}", f"plain-{index}")
+    tracked = make_repo(root / "tracked", "tracked")
+    (tracked / ".git").mkdir()
+
+    def fail_git_snapshot(path: Path) -> dict:
+        raise AssertionError(f"unexpected git probe for {path}")
+
+    monkeypatch.setattr(projects_module, "git_snapshot", fail_git_snapshot)
+    registry = ProjectRegistry(
+        ContextConfig(
+            repo_path=root.resolve(),
+            state_dir=(tmp_path / "state").resolve(),
+            allowed_roots=(str(root),),
+        )
+    )
+
+    projects = registry.discovered_projects()
+
+    assert [project.name for project in projects] == ["tracked"]
+
+
 def test_project_discovery_skips_symlinked_directories_before_git_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

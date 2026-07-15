@@ -224,6 +224,13 @@ class FakeClient:
                 "hot_chunks": {"target_count": 2},
                 "test_owner_targets": {"target_count": 4},
             }
+        if mode == "project_prune":
+            return {
+                "schema": "context_project.prune.v1",
+                "project_id": project_id,
+                "name": "Alpha",
+                "removed": True,
+            }
         if mode == "state_browser":
             state_key = str(arguments.get("state_key") or "")
             if state_key:
@@ -689,6 +696,7 @@ def test_interactive_key_bindings_update_state() -> None:
     assert monitor.decode_key("-") == "minus"
     assert monitor.decode_key("b") == "browser"
     assert monitor.decode_key("p") == "performance"
+    assert monitor.decode_key("P") == "prune"
     assert monitor.decode_key("w") == "warmup"
 
     assert monitor.handle_key("down", state, row_count=3) == "redraw"
@@ -714,6 +722,7 @@ def test_interactive_key_bindings_update_state() -> None:
     assert monitor.handle_key("minus", state, row_count=3) == "redraw"
     assert state.refresh_interval == 5.0
     assert monitor.handle_key("warmup", state, row_count=3) == "warmup"
+    assert monitor.handle_key("prune", state, row_count=3) == "prune"
     assert monitor.handle_key("browser", state, row_count=3) == "browser"
     assert state.view == "state"
     assert monitor.handle_key("down", state, row_count=3, state_row_count=2) == "redraw"
@@ -721,6 +730,7 @@ def test_interactive_key_bindings_update_state() -> None:
     assert monitor.handle_key("enter", state, row_count=3, state_row_count=2) == "state_entry"
     assert monitor.handle_key("refresh", state, row_count=3, state_row_count=2) == "ignore"
     assert monitor.handle_key("warmup", state, row_count=3, state_row_count=2) == "ignore"
+    assert monitor.handle_key("prune", state, row_count=3, state_row_count=2) == "ignore"
     assert monitor.handle_key("plus", state, row_count=3, state_row_count=2) == "ignore"
     state.state_search_active = True
     assert monitor.handle_key("warmup", state, row_count=3, state_row_count=2) == "redraw"
@@ -766,6 +776,7 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "Enter details" in table
     assert "p performance" in table
     assert "w warmup" in table
+    assert "P prune" in table
     assert "refresh=5.0s" in table
 
     state.view = "detail"
@@ -1233,6 +1244,35 @@ def test_warmup_selected_project_calls_admin_and_sets_status() -> None:
     assert (
         "context_admin",
         {"mode": "warmup", "project_id": "alpha-123"},
+    ) in client.calls
+
+
+def test_prune_selected_project_calls_admin_and_sets_status() -> None:
+    monitor = load_monitor_module()
+    client = FakeClient()
+    snapshots = monitor.collect_snapshots(
+        client,
+        project_ids=["alpha-123"],
+        root_uri="",
+        include_matrix=False,
+    )
+    state = monitor.MonitorState(selected_index=0, refresh_interval=5.0)
+
+    with monitor.ThreadPoolExecutor(max_workers=1) as executor:
+        pending = monitor._submit_mcp_operation(
+            executor,
+            "prune",
+            lambda: monitor._fetch_prune_result(client, snapshots, 0),
+        )
+        pending.future.result(timeout=2)
+        updated = monitor._apply_mcp_operation_result(state, snapshots, pending)
+
+    assert updated == snapshots
+    assert state.mcp_error == ""
+    assert state.mcp_status == "pruned Alpha: removed generated state"
+    assert (
+        "context_admin",
+        {"mode": "project_prune", "project_id": "alpha-123"},
     ) in client.calls
 
 

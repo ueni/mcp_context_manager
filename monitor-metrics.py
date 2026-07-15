@@ -138,6 +138,13 @@ class WarmupResult:
 
 
 @dataclass
+class PruneResult:
+    target: ProjectTarget | None
+    payload: dict[str, Any] | None = None
+    error: str = ""
+
+
+@dataclass
 class PendingMcpOperation:
     kind: str
     future: Future[Any]
@@ -444,6 +451,14 @@ def warmup_project(client: Any, target: ProjectTarget) -> dict[str, Any]:
     )
 
 
+def prune_project(client: Any, target: ProjectTarget) -> dict[str, Any]:
+    root_uri = target.name if target.source == "root_uri" else ""
+    return client.call_tool(
+        "context_admin",
+        {"mode": "project_prune", **_selector_args(target, root_uri)},
+    )
+
+
 def friendly_mcp_error(exc: Exception) -> str:
     message = str(exc)
     if "write transaction is already active" in message:
@@ -472,6 +487,17 @@ def friendly_mcp_error(exc: Exception) -> str:
         return (
             "The running MCP server does not support "
             "context_admin(mode='warmup') yet. Rebuild and restart it with "
+            "the current checkout, for example: "
+            "MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up -d --build"
+        )
+    if (
+        "context_adminArguments" in message
+        and "project_prune" in message
+        and "literal_error" in message
+    ):
+        return (
+            "The running MCP server does not support "
+            "context_admin(mode='project_prune') yet. Rebuild and restart it with "
             "the current checkout, for example: "
             "MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up -d --build"
         )
@@ -1098,7 +1124,7 @@ def _controls(
 ) -> str:
     keys = (
         "keys: Up/Down select  Enter details  p performance  b state  Esc table  "
-        "+/- refresh  r reload  w warmup  q quit"
+        "+/- refresh  r reload  w warmup  P prune  q quit"
     )
     controls = (
         f"{keys}   refresh={fmt_seconds(refresh_interval)}"
@@ -1863,8 +1889,10 @@ def decode_key(sequence: str) -> str | None:
         return "refresh"
     if sequence in {"b", "B"}:
         return "browser"
-    if sequence in {"p", "P"}:
+    if sequence == "p":
         return "performance"
+    if sequence == "P":
+        return "prune"
     if sequence in {"w", "W"}:
         return "warmup"
     if sequence == "\x03":
@@ -1915,6 +1943,7 @@ def _search_text_for_key(key: str) -> str:
         "refresh": "r",
         "browser": "b",
         "performance": "p",
+        "prune": "P",
         "warmup": "w",
         "quit": "q",
         "search": "/",
@@ -1991,6 +2020,8 @@ def handle_key(
         return "refresh"
     if key == "warmup" and state.view != "state" and row_count:
         return "warmup"
+    if key == "prune" and state.view != "state" and row_count:
+        return "prune"
     if key == "browser" and row_count:
         state.view = "state"
         state.state_entry = None
@@ -2249,6 +2280,33 @@ def _apply_warmup_result(state: MonitorState, result: WarmupResult) -> None:
     state.mcp_error = ""
 
 
+def _fetch_prune_result(
+    client: Any,
+    snapshots: list[ProjectSnapshot],
+    selected_index: int,
+) -> PruneResult:
+    if not snapshots:
+        return PruneResult(target=None, error="no project selected")
+    selected = _clamped_index(selected_index, len(snapshots))
+    target = snapshots[selected].target
+    try:
+        return PruneResult(target=target, payload=prune_project(client, target))
+    except Exception as exc:
+        return PruneResult(target=target, error=friendly_mcp_error(exc))
+
+
+def _apply_prune_result(state: MonitorState, result: PruneResult) -> None:
+    if result.error:
+        state.mcp_status = ""
+        state.mcp_error = result.error
+        return
+    payload = result.payload or {}
+    project = _project_name(result.target) if result.target else "-"
+    removed = "removed generated state" if payload.get("removed") else "nothing removed"
+    state.mcp_status = f"pruned {project}: {removed}"
+    state.mcp_error = ""
+
+
 def _warmup_result_summary(payload: dict[str, Any]) -> str:
     terms = _int_at(payload, ("search_cache", "query_count"))
     files = _int_at(payload, ("index", "file_count"))
@@ -2305,6 +2363,10 @@ def _apply_mcp_operation_result(
         if isinstance(result, WarmupResult):
             _apply_warmup_result(state, result)
         return snapshots
+    if pending.kind == "prune":
+        if isinstance(result, PruneResult):
+            _apply_prune_result(state, result)
+        return snapshots
     return snapshots
 
 
@@ -2335,6 +2397,7 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
     queued_browser_load = False
     queued_refresh = False
     queued_warmup = False
+    queued_prune = False
     fd = sys.stdin.fileno()
 
     with ThreadPoolExecutor(
@@ -2375,10 +2438,20 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                             client, snapshots, state.selected_index
                         ),
                     )
+                elif queued_prune:
+                    queued_prune = False
+                    _set_mcp_loading(state, "pruning selected project...")
+                    pending = _submit_mcp_operation(
+                        executor,
+                        "prune",
+                        lambda: _fetch_prune_result(
+                            client, snapshots, state.selected_index
+                        ),
+                    )
                 elif queued_refresh:
                     queued_refresh = False
                     force_refresh = True
-                elif completed_kind == "warmup" and not state.mcp_error:
+                elif completed_kind in {"warmup", "prune"} and not state.mcp_error:
                     force_refresh = True
                 else:
                     force_refresh = False
@@ -2487,6 +2560,20 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                     )
                 else:
                     queued_warmup = True
+                    _set_mcp_loading(state, "waiting for current MCP request...")
+                dirty = True
+            if action == "prune":
+                if pending is None:
+                    _set_mcp_loading(state, "pruning selected project...")
+                    pending = _submit_mcp_operation(
+                        executor,
+                        "prune",
+                        lambda: _fetch_prune_result(
+                            client, snapshots, state.selected_index
+                        ),
+                    )
+                else:
+                    queued_prune = True
                     _set_mcp_loading(state, "waiting for current MCP request...")
                 dirty = True
             if action in {"redraw", "refresh"}:

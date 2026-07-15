@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from typing import Any
 
 from .config import ContextConfig
 from .context import DEFAULT_CACHE_MAX_AGE_MINUTES, ContextService
 from .projects import ProjectRegistry, ProjectRoot
+from .store import LmdbStoreAdapter
 from .version import SERVER_VERSION
 
 
@@ -178,6 +180,13 @@ class ProjectContextService:
     ) -> dict[str, Any]:
         if mode == "projects":
             return self._project_list(mcp_roots=mcp_roots)
+        if mode == "project_prune":
+            return self._project_prune(
+                project_id=project_id,
+                root_uri=root_uri,
+                mcp_roots=mcp_roots,
+                path_hints=[path],
+            )
         if mode == "contracts":
             return ContextService(self.config).context_admin(
                 mode="contracts",
@@ -356,6 +365,32 @@ class ProjectContextService:
             listing["projects"] = [legacy.public_metadata()]
             listing["count"] = 1
         return listing
+
+    def _project_prune(
+        self,
+        project_id: str | None = None,
+        root_uri: str | None = None,
+        mcp_roots: list[Any] | None = None,
+        path_hints: list[str] | None = None,
+    ) -> dict[str, Any]:
+        project = self.registry.resolve_project(
+            project_id=project_id,
+            root_uri=root_uri,
+            mcp_roots=mcp_roots,
+            path_hints=path_hints,
+        )
+        self._services.pop(project.project_id, None)
+        project_config = project.to_config(self.config)
+        LmdbStoreAdapter.close_path(project_config.store_path)
+        removed = project.state_dir.exists()
+        if removed:
+            shutil.rmtree(project.state_dir)
+        return {
+            "schema": "context_project.prune.v1",
+            "project_id": project.project_id,
+            "name": project.name,
+            "removed": removed,
+        }
 
     def _project_id_from_reference(self, reference: dict[str, Any] | None) -> str:
         if not reference:
