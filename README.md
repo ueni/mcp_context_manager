@@ -357,6 +357,9 @@ Useful HTTP endpoints:
 | `POST /mcp` | MCP Streamable HTTP endpoint. |
 | `GET /legacy/sse` | MCP legacy SSE compatibility endpoint. |
 
+The stable `version` field in `context_admin(mode="health")` and both health
+endpoints matches `serverInfo.version` from MCP initialization.
+
 ## Multiple Roots
 
 Multiple roots come from the MCP client through the MCP Roots protocol. Compose
@@ -477,12 +480,13 @@ python3 monitor-metrics.py --root-uri file:///home/user/source/my-repo
 Run a pinned remote version in one line:
 
 ```bash
-VER=1.1.1; curl -fsSL "https://raw.githubusercontent.com/ueni/mcp_context_manager/v${VER}/monitor-metrics.py" | python3 - --url http://127.0.0.1:8000/mcp --once
+VER="RELEASE_VERSION"; curl -fsSL "https://raw.githubusercontent.com/ueni/mcp_context_manager/v${VER}/monitor-metrics.py" | python3 - --url http://127.0.0.1:8000/mcp --once
 ```
 
 The dashboard shows request volume, `context_pack` latency, cache hit bars,
 estimated MCP-spared tokens, deferred reference bytes, measurement-matrix
-status, and bounded generated-state rows.
+status, and bounded generated-state rows. It shows a yellow warning when the
+connected MCP server version differs from the version expected by the monitor.
 
 ## Generated State
 
@@ -538,10 +542,12 @@ GitHub Actions owns release artifacts:
 - `Build docker image archive` runs the CMake `docker-image-archive-ci` preset.
 - `Smoke test glibc executable` and `Smoke test musl executable` verify the
   standalone servers before packaging.
-- `Release` is manually dispatched with a version such as `0.2.0`. It creates
-  tag `v0.2.0`, builds with the CMake `release-ci` preset, writes
-  `SHA256SUMS`, signs the checksums with Sigstore, and publishes all artifacts
-  on the GitHub release.
+- `Release` is manually dispatched from a branch with a version such as
+  `1.2.0`. It updates `pyproject.toml` and the standalone monitor's expected
+  server version; creates a `Release v1.2.0` commit and annotated tag; builds
+  with the CMake `release-ci` preset; verifies that both executables report the
+  requested version; writes and signs `SHA256SUMS`; atomically pushes the commit
+  and tag; and publishes all artifacts on the GitHub release.
 
 Verify downloaded release artifacts:
 

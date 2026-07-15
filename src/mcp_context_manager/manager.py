@@ -7,6 +7,7 @@ from typing import Any
 from .config import ContextConfig
 from .context import DEFAULT_CACHE_MAX_AGE_MINUTES, ContextService
 from .projects import ProjectRegistry, ProjectRoot
+from .version import SERVER_VERSION
 
 
 class ProjectContextService:
@@ -190,6 +191,7 @@ class ProjectContextService:
                 return {
                     "schema": "context_admin.health.v1",
                     "ok": True,
+                    "version": SERVER_VERSION,
                     "mode": "global"
                     if visible or not legacy_fallback["safe"]
                     else "legacy",

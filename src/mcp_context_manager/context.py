@@ -27,6 +27,7 @@ from .util import (
     sha256_text,
     trim_text,
 )
+from .version import SERVER_VERSION
 
 DEFAULT_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_CACHE_MAX_AGE_MINUTES = DEFAULT_CACHE_TTL_SECONDS // 60
@@ -354,6 +355,7 @@ class ContextService:
             return {
                 "schema": "context_admin.health.v1",
                 "ok": True,
+                "version": SERVER_VERSION,
                 "repo_path": self.config.display_path(self.config.repo_path),
                 "project_id": self.config.project_id,
                 "state_dir": self.config.display_path(self.config.state_dir),

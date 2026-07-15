@@ -12,7 +12,6 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from importlib import metadata
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, TypeVar
 from urllib.parse import urlsplit
@@ -21,6 +20,7 @@ from .config import ContextConfig
 from .context import DEFAULT_CACHE_MAX_AGE_MINUTES, ContextService
 from .manager import ProjectContextService
 from .runtime import service_executor
+from .version import SERVER_VERSION
 
 try:  # pragma: no cover - optional transport dependency is integration-tested.
     from mcp.server.fastmcp import Context as MCPContext
@@ -520,7 +520,17 @@ def create_mcp(service: ProjectContextService | ContextService | None = None) ->
     if FastMCP is None:
         raise RuntimeError("mcp[cli] is not installed")
     svc = _project_service(service)
-    mcp = FastMCP("mcp-context-manager", instructions=MCP_SERVER_INSTRUCTIONS)
+    fast_mcp_kwargs: dict[str, Any] = {"instructions": MCP_SERVER_INSTRUCTIONS}
+    fast_mcp_signature = inspect.signature(FastMCP)
+    if "version" in fast_mcp_signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in fast_mcp_signature.parameters.values()
+    ):
+        fast_mcp_kwargs["version"] = SERVER_VERSION
+    mcp = FastMCP("mcp-context-manager", **fast_mcp_kwargs)
+    low_level_server = getattr(mcp, "_mcp_server", None)
+    if low_level_server is not None:
+        low_level_server.version = SERVER_VERSION
 
     @mcp.tool()
     async def context_pack(
@@ -1050,11 +1060,7 @@ def _self_update_target_path(explicit: str | None = None) -> Path:
 
 
 def _self_update_target_version() -> str | None:
-    try:
-        version = metadata.version("mcp-context-manager")
-    except metadata.PackageNotFoundError:
-        return None
-    return version
+    return SERVER_VERSION
 
 
 def _self_update_restart_args(argv: list[str]) -> list[str]:

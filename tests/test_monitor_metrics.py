@@ -405,6 +405,34 @@ def test_extract_tool_payload_from_text_content() -> None:
     assert payload["requests"]["total"] == 2
 
 
+def test_mcp_initialize_sends_expected_version_without_warning(capsys) -> None:
+    monitor = load_monitor_module()
+    client = monitor.McpHttpClient("http://localhost:8000/mcp")
+    calls: list[tuple[str, dict[str, Any], bool]] = []
+
+    def fake_rpc(
+        method: str,
+        params: dict[str, Any] | None = None,
+        expect_result: bool = True,
+    ) -> dict[str, Any]:
+        calls.append((method, params or {}, expect_result))
+        if method == "initialize":
+            return {
+                "protocolVersion": "2025-06-18",
+                "serverInfo": {
+                    "name": "mcp-context-manager",
+                    "version": monitor.EXPECTED_SERVER_VERSION,
+                },
+            }
+        return {}
+
+    client.rpc = fake_rpc
+    client.initialize()
+
+    assert calls[0][1]["clientInfo"]["version"] == monitor.EXPECTED_SERVER_VERSION
+    assert capsys.readouterr().err == ""
+
+
 def test_collect_snapshots_enumerates_projects_and_calls_metrics() -> None:
     monitor = load_monitor_module()
     client = FakeClient()
@@ -499,6 +527,74 @@ def test_render_dashboard_contains_visual_summary() -> None:
     assert "|   10 |    3 |" in rendered
     assert "| [######-]  80.0% |    12.0k |" in rendered
     assert "2 pass" in rendered
+
+
+def test_mcp_initialize_warns_once_for_server_version_mismatch(capsys) -> None:
+    monitor = load_monitor_module()
+    client = monitor.McpHttpClient("http://localhost:8000/mcp")
+
+    def fake_rpc(
+        method: str,
+        params: dict[str, Any] | None = None,
+        expect_result: bool = True,
+    ) -> dict[str, Any]:
+        if method == "initialize":
+            return {"serverInfo": {"version": "9.9.9"}}
+        return {}
+
+    client.rpc = fake_rpc
+    client.initialize()
+    client.initialize()
+
+    warning = (
+        f"WARNING: monitor expects server {monitor.EXPECTED_SERVER_VERSION}, "
+        "connected server is 9.9.9"
+    )
+    assert capsys.readouterr().err.count(warning) == 1
+
+
+def test_mcp_initialize_warns_when_server_does_not_report_version(capsys) -> None:
+    monitor = load_monitor_module()
+    client = monitor.McpHttpClient("http://localhost:8000/mcp")
+
+    def fake_rpc(
+        method: str,
+        params: dict[str, Any] | None = None,
+        expect_result: bool = True,
+    ) -> dict[str, Any]:
+        if method == "initialize":
+            return {"serverInfo": {}}
+        return {}
+
+    client.rpc = fake_rpc
+    client.initialize()
+
+    assert capsys.readouterr().err == (
+        f"WARNING: monitor expects server {monitor.EXPECTED_SERVER_VERSION}, "
+        "connected server is not reported\n"
+    )
+
+
+def test_mcp_initialize_skips_warning_without_expected_version(
+    monkeypatch, capsys
+) -> None:
+    monitor = load_monitor_module()
+    monkeypatch.setattr(monitor, "EXPECTED_SERVER_VERSION", "")
+    client = monitor.McpHttpClient("http://localhost:8000/mcp")
+
+    def fake_rpc(
+        method: str,
+        params: dict[str, Any] | None = None,
+        expect_result: bool = True,
+    ) -> dict[str, Any]:
+        if method == "initialize":
+            return {"serverInfo": {"version": "9.9.9"}}
+        return {}
+
+    client.rpc = fake_rpc
+    client.initialize()
+
+    assert capsys.readouterr().err == ""
 
 
 def test_render_dashboard_keeps_long_project_names_readable() -> None:

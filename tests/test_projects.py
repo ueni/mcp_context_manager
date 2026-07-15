@@ -13,6 +13,7 @@ from mcp_context_manager.config import ContextConfig
 from mcp_context_manager.context import ContextService
 from mcp_context_manager.manager import ProjectContextService
 from mcp_context_manager.projects import ProjectRegistry, canonicalize_root_uri
+from mcp_context_manager.version import SERVER_VERSION
 
 
 def write_file(root: Path, rel: str, text: str) -> Path:
@@ -185,6 +186,7 @@ def test_unsafe_global_parent_requires_explicit_project_selection(
 
     health = manager.context_admin(mode="health")
     assert health["ok"] is True
+    assert health["version"] == SERVER_VERSION
     assert health["project_selection_required"] is True
     assert health["visible_project_count"] == 0
     assert health["projects"]["count"] == 1
@@ -417,6 +419,7 @@ def test_workspace_roots_without_mapping_requires_explicit_project_selection(
     health = manager.context_admin(mode="health")
 
     assert health["ok"] is True
+    assert health["version"] == SERVER_VERSION
     assert health["project_selection_required"] is True
     assert health["legacy_fallback"]["safe"] is False
     assert health["legacy_fallback"]["reason"] == "repo_path_outside_configured_roots"

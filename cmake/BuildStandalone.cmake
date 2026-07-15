@@ -60,6 +60,7 @@ pyinstaller \
   --distpath /workspace/dist \
   --workpath "/workspace/.downloads/pyinstaller/build-$MCP_OUTPUT_NAME" \
   --specpath "/workspace/.downloads/pyinstaller/spec-$MCP_OUTPUT_NAME" \
+  --copy-metadata mcp-context-manager \
   --collect-all tantivy \
   --collect-all mcp_context_manager \
   src/mcp_context_manager/__main__.py
@@ -95,6 +96,7 @@ pyinstaller \
   --distpath /workspace/dist \
   --workpath "/workspace/.downloads/pyinstaller/build-$MCP_OUTPUT_NAME" \
   --specpath "/workspace/.downloads/pyinstaller/spec-$MCP_OUTPUT_NAME" \
+  --copy-metadata mcp-context-manager \
   --collect-all tantivy \
   --collect-all mcp_context_manager \
   src/mcp_context_manager/__main__.py

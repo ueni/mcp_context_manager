@@ -337,7 +337,9 @@ The HTTP fallback exposes:
 
 `monitor-metrics.py` is an MCP client that lists projects, fetches metrics and
 measurement matrices, and browses bounded generated state through admin tools.
-It avoids direct state-file reads.
+It avoids direct state-file reads. MCP initialization and health responses expose
+the stable server version; the monitor warns when that version differs from its
+release-pinned expected version.
 
 ## Limitations
 

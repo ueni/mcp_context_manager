@@ -131,10 +131,15 @@ def test_create_http_app_registers_healthz_before_root_mcp_mount(
 def test_create_mcp_advertises_server_instructions(monkeypatch, service) -> None:
     captured: dict[str, object] = {}
 
+    class FakeLowLevelServer:
+        version: str | None = None
+
     class FakeFastMCP:
         def __init__(self, name: str, **kwargs: object):
             captured["name"] = name
             captured.update(kwargs)
+            self._mcp_server = FakeLowLevelServer()
+            captured["low_level_server"] = self._mcp_server
 
         def tool(self):
             return lambda fn: fn
@@ -150,6 +155,8 @@ def test_create_mcp_advertises_server_instructions(monkeypatch, service) -> None
     server_module.create_mcp(service)
 
     assert captured["name"] == "mcp-context-manager"
+    assert captured["version"] == server_module.SERVER_VERSION
+    assert captured["low_level_server"].version == server_module.SERVER_VERSION
     assert captured["instructions"] == MCP_SERVER_INSTRUCTIONS
     assert "First-priority mandatory MCP-first workflow" in MCP_SERVER_INSTRUCTIONS
     assert "other task-routing preferences" in MCP_SERVER_INSTRUCTIONS

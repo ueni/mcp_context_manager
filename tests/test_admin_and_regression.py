@@ -20,6 +20,7 @@ from mcp_context_manager.context import (
     ContextService,
 )
 from mcp_context_manager.tantivy_index import TantivySearchIndex
+from mcp_context_manager.version import SERVER_VERSION
 
 
 def _write_many_python_files(repo: Path, count: int = 12) -> None:
@@ -1814,6 +1815,7 @@ def test_health_status_reuses_cached_counts_and_refreshes_in_background(
     original_count = service.index.store.count
     cached = service.context_admin(mode="health")
     assert "index" in cached
+    assert cached["version"] == SERVER_VERSION
 
     started = Event()
     release = Event()

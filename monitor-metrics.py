@@ -22,6 +22,7 @@ Usage:
 Environment:
   MCP_URL (default: http://localhost:8000/mcp)
   MCP_SESSION_ID (optional)
+  MCP_EXPECTED_SERVER_VERSION (optional override)
 """
 
 from __future__ import annotations
@@ -62,6 +63,11 @@ CRITICAL_MATRIX_KEYS = {
     "latency.context_pack.index_refresh_avg_ms",
     "latency.context_admin.warmup.avg_elapsed_ms",
 }
+EXPECTED_SERVER_VERSION = "1.2.1"
+EXPECTED_SERVER_VERSION = (
+    os.environ.get("MCP_EXPECTED_SERVER_VERSION", "").strip()
+    or EXPECTED_SERVER_VERSION
+)
 
 
 class Ansi:
@@ -155,14 +161,31 @@ class McpHttpClient:
         with self._lock:
             if self.initialized:
                 return
-            self.rpc(
+            initialized = self.rpc(
                 "initialize",
                 {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {},
-                    "clientInfo": {"name": "monitor-metrics", "version": "0.2.0"},
+                    "clientInfo": {
+                        "name": "monitor-metrics",
+                        "version": EXPECTED_SERVER_VERSION or "unknown",
+                    },
                 },
             )
+            server_info = initialized.get("serverInfo")
+            server_version = ""
+            if isinstance(server_info, dict):
+                server_version = str(server_info.get("version") or "").strip()
+            if EXPECTED_SERVER_VERSION and server_version != EXPECTED_SERVER_VERSION:
+                actual = server_version or "not reported"
+                warning = (
+                    f"WARNING: monitor expects server {EXPECTED_SERVER_VERSION}, "
+                    f"connected server is {actual}"
+                )
+                print(
+                    _style(warning, sys.stderr.isatty(), Ansi.YELLOW),
+                    file=sys.stderr,
+                )
             self.rpc("notifications/initialized", {}, expect_result=False)
             self.initialized = True
 
