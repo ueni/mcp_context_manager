@@ -76,7 +76,7 @@ MCP_SERVER_INSTRUCTIONS = (
     "repo tasks, call context_pack first with the user's task; include "
     "changed_files/focus_paths when named. The MCP caller sets client_profile "
     "per request and passes output_profile only when overriding; explicit "
-    "output_profile wins, Codex uses minimal when omitted, and other clients "
+    "output_profile wins, Codex uses lean when omitted, and other clients "
     "use the configured default. Must use context_lookup after context_pack "
     "when targeted "
     "follow-up snippets, search, trees, symbols, or references are needed; do "
@@ -171,7 +171,7 @@ MaxOutputCharsParam = Annotated[
     ),
 ]
 OutputProfileParam = Annotated[
-    Literal["minimal", "compact", "normal", "verbose"] | None,
+    Literal["lean", "minimal", "compact", "normal", "verbose"] | None,
     _tool_param(
         "Output detail level. Use minimal or compact by default; choose normal or "
         "verbose only when the user asks for more evidence."
@@ -410,7 +410,7 @@ MaxAgeMinutesParam = Annotated[
     ),
 ]
 DefaultOutputProfileParam = Annotated[
-    Literal["minimal", "compact", "normal", "verbose"] | None,
+    Literal["lean", "minimal", "compact", "normal", "verbose"] | None,
     _tool_param("Default output profile to inspect with mode=budget."),
 ]
 ToolNameParam = Annotated[

@@ -52,7 +52,7 @@ MEASUREMENT_TARGETS: tuple[dict[str, Any], ...] = (
         "min_samples": 1,
     },
     {
-        "key": "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack",
+        "key": "tokens.context_pack.avg_candidate_compression_per_pack",
         "operator": ">=",
         "target": 500.0,
         "unit": "tokens",
@@ -446,9 +446,8 @@ class ContextMetrics:
                 if pack_count
                 else 0.0,
                 "tokens_spared_by_mcp_reason": (
-                    "context_pack returns compact selected context and defers "
-                    "full evidence behind local references instead of sending "
-                    "all ranked candidate evidence."
+                    "context_pack candidate-compression estimate only; this is "
+                    "not a measured MCP-versus-no-MCP comparison."
                 ),
                 "avg_baseline_input_tokens_per_pack": round(
                     baseline_tokens / pack_count, 3
@@ -521,6 +520,11 @@ class ContextMetrics:
                 "contract_metrics": "context_admin(mode='contracts', contract_profile='compact')",
                 "token_savings_formula": (
                     "max(0, baseline_input_tokens_est - output_tokens_est)"
+                ),
+                "token_savings_baseline": "ranked_candidate_evidence_estimate",
+                "tokens_spared_by_mcp_scope": (
+                    "deprecated compatibility alias for candidate compression; "
+                    "not a no-MCP measurement"
                 ),
                 "tokens_spared_by_mcp_formula": (
                     "max(0, baseline_input_tokens_est - output_tokens_est)"
@@ -823,7 +827,7 @@ class ContextMetrics:
                 ),
                 pack_count,
             )
-        if key == "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack":
+        if key == "tokens.context_pack.avg_candidate_compression_per_pack":
             return (
                 float(
                     snapshot.get("tokens", {}).get(

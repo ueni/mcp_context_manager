@@ -12,6 +12,7 @@ CONTEXT_PACK_SCHEMA: dict[str, Any] = {
         "schema": {
             "enum": [
                 "context_pack.v1",
+                "context_pack.lean.v1",
                 "context_pack.minimal.v1",
                 "context_pack.compact.v2",
                 "context_pack.normal.v2",
@@ -120,7 +121,7 @@ TOOL_INPUT_PARAMS: dict[str, dict[str, str]] = {
         "focus_paths": "Paths to prioritize.",
         "memory_session": "Memory session key.",
         "max_output_chars": "Hard output budget.",
-        "output_profile": "minimal, compact, normal, verbose.",
+        "output_profile": "lean, minimal, compact, normal, verbose.",
         "max_items": "Max context items.",
         "refresh_index": "Force index refresh.",
         "client_profile": "codex, claude, copilot, generic.",

@@ -524,10 +524,10 @@ def test_render_dashboard_contains_visual_summary() -> None:
         for line in rendered.splitlines()
         if line.startswith("|   |") and "| project id" in line
     )
-    assert "cache |  mcp tok" in project_header
+    assert "cache | cand tok" in project_header
     assert "|  frag |" not in project_header
     assert "| fragment cache     | [##############----]  80.0% |" in rendered
-    assert "| token spared/saved |                       12.0k |" in rendered
+    assert "| candidate compact. |                       12.0k |" in rendered
     assert "| project" in rendered
     assert "| Alpha" in rendered
     assert "| alpha-123" in rendered
@@ -793,7 +793,7 @@ def test_render_monitor_screen_marks_selection_and_shows_detail() -> None:
     assert "| project id         | alpha-123" in detail
     assert "| fragment cache" in detail
     assert " 8/2 h/m   80.0%" in detail
-    assert "token spared/saved" in detail
+    assert "candidate compact." in detail
     assert "lookup cache" not in detail
     assert any("| a" in line and "pass" in line for line in detail.splitlines())
     assert "Context matrix check a" in detail

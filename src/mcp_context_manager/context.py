@@ -50,7 +50,7 @@ SKILL_GUIDANCE_MAX_BODY_CHARS = 6000
 CHUNK_LINE_COUNT = 80
 CHUNK_EXTRACTOR_VERSION = "chunk-lines-1"
 CHUNK_REDACTION_VERSION = "redact-1"
-OUTPUT_PROFILES = {"minimal", "compact", "normal", "verbose"}
+OUTPUT_PROFILES = {"lean", "minimal", "compact", "normal", "verbose"}
 CLIENT_PROFILES = {"generic", "codex", "claude", "copilot"}
 MODEL_PROFILES = {"unknown", "openai", "anthropic", "github"}
 DIAGNOSTIC_LEVELS = {"none", "summary", "full"}
@@ -512,6 +512,7 @@ class ContextService:
             requested_max_items=max_items,
             refresh_signature=refresh_signature,
             refresh_signature_available=refresh_signature_available,
+            cache_reads_enabled=cache_strategy != "cold",
         )
         stage_timings["candidate_retrieval_ms"] = self._elapsed_ms(stage_started)
         stage_timings["search_ranking_ms"] = stage_timings[
@@ -558,7 +559,7 @@ class ContextService:
                 profile=profile,
                 max_source_tokens=max_source_tokens,
             ),
-            per_path_limit=1 if profile in {"minimal", "compact"} else 2,
+            per_path_limit=1 if profile in {"lean", "minimal", "compact"} else 2,
         )
         stage_timings["selection_ms"] = self._elapsed_ms(stage_started)
         omitted.extend(omitted_budget)
@@ -613,22 +614,14 @@ class ContextService:
         stage_timings["reference_write_ms"] = self._elapsed_ms(stage_started)
         candidate_chars = sum(int(item.get("raw_chars", 0)) for item in response_candidates)
         selected_chars = sum(int(item.get("raw_chars", 0)) for item in selected)
-        output_token_count = self._token_count(
-            json.dumps(selected, ensure_ascii=False)
-        )
-        output_tokens = output_token_count.count
         baseline_count = self._baseline_input_token_count(response_candidates)
-        baseline_tokens = max(baseline_count.count, output_tokens)
-        token_counting = self._merge_token_counting_metadata(
-            token_counting,
-            output_token_count.metadata(),
-            baseline_count.metadata(),
-        )
+        output_tokens = 0
+        baseline_tokens = baseline_count.count
         estimated_tokens_saved = max(0, baseline_tokens - output_tokens)
         tokens_spared_reason = (
-            "MCP context_pack returned compact selected summaries and deferred "
-            "full evidence behind local references instead of sending all ranked "
-            "candidate evidence."
+            "Candidate-compression estimate only; this is not a measured "
+            "MCP-versus-no-MCP comparison. Use context_admin(mode='benchmark') "
+            "for the matched manual search/read baseline."
         )
         reference_bytes_deferred = int(
             full_reference.get("content", {}).get("size_bytes", 0) or 0
@@ -733,6 +726,8 @@ class ContextService:
                 "candidate_raw_chars": candidate_chars,
                 "selected_raw_chars": selected_chars,
                 "token_counting": token_counting,
+                "output_token_scope": "complete_response",
+                "baseline_kind": "ranked_candidate_evidence_estimate",
                 "baseline_input_tokens_est": baseline_tokens,
                 "output_tokens_est": output_tokens,
                 "estimated_input_tokens_saved": estimated_tokens_saved,
@@ -782,12 +777,62 @@ class ContextService:
                 memory_context=memory_context,
                 skill_guidance=skill_guidance,
             )
+        elif profile == "lean":
+            result = self._lean_context_pack(
+                route, selected, omitted, full_reference, diagnostics_reference,
+                terms, skill_guidance,
+            )
         elif diagnostics != "full":
             result["cache"] = self._cache_summary(result["cache"])
             result["metrics"] = self._metrics_summary(result["metrics"], diagnostics)
             if diagnostics == "none":
                 result.pop("indexing", None)
                 result.pop("safety", None)
+        for _ in range(4):
+            output_token_count = self._token_count(
+                json.dumps(result, ensure_ascii=False)
+            )
+            measured_output_tokens = output_token_count.count
+            measured_baseline_tokens = max(
+                baseline_count.count, measured_output_tokens
+            )
+            measured_tokens_saved = max(
+                0, measured_baseline_tokens - measured_output_tokens
+            )
+            token_counting = self._merge_token_counting_metadata(
+                token_counting,
+                output_token_count.metadata(),
+                baseline_count.metadata(),
+            )
+            if "budget" in result:
+                result["budget"]["estimated_output_tokens"] = measured_output_tokens
+                result["budget"]["token_counting"] = token_counting
+            if "metrics" in result:
+                result["metrics"].update(
+                    {
+                        "output_token_scope": "complete_response",
+                        "baseline_kind": "ranked_candidate_evidence_estimate",
+                        "baseline_input_tokens_est": measured_baseline_tokens,
+                        "output_tokens_est": measured_output_tokens,
+                        "estimated_input_tokens_saved": measured_tokens_saved,
+                        "tokens_spared_by_mcp_est": measured_tokens_saved,
+                        "tokens_spared_by_mcp_reason": tokens_spared_reason,
+                        "compression_ratio": round(
+                            measured_output_tokens / measured_baseline_tokens, 4
+                        )
+                        if measured_baseline_tokens
+                        else 0.0,
+                        "token_counting": token_counting,
+                    }
+                )
+            if (
+                measured_output_tokens == output_tokens
+                and measured_baseline_tokens == baseline_tokens
+            ):
+                break
+            output_tokens = measured_output_tokens
+            baseline_tokens = measured_baseline_tokens
+            estimated_tokens_saved = measured_tokens_saved
         self.metrics.record_event(
             "context_pack",
             elapsed_ms=elapsed_ms,
@@ -921,13 +966,13 @@ class ContextService:
                     "auto_detection": False,
                     "precedence": [
                         "explicit output_profile",
-                        "client_profile=codex implies output_profile=minimal when omitted",
+                        "client_profile=codex implies output_profile=lean when omitted",
                         "configured default_output_profile",
                     ],
                     "client_profiles": {
                         "codex": {
                             "model_profile": "openai",
-                            "recommended_output_profile": "minimal",
+                            "recommended_output_profile": "lean",
                         },
                         "claude": {
                             "model_profile": "anthropic",
@@ -1303,6 +1348,7 @@ class ContextService:
         reusable_terms: list[str] | None = None,
         allow_fallback: bool = True,
         include_index: bool = True,
+        cache_reads_enabled: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         terms = normalize_query_terms(query, max_terms=8)
         if not terms:
@@ -1325,6 +1371,7 @@ class ContextService:
                 refresh_signature=refresh_signature,
                 refresh_signature_available=refresh_signature_available,
                 allow_fallback=allow_fallback,
+                cache_reads_enabled=cache_reads_enabled,
             )
             fragments.append(fragment)
             if fragment["cache_hit"]:
@@ -1429,6 +1476,7 @@ class ContextService:
         refresh_signature: str,
         refresh_signature_available: bool,
         allow_fallback: bool = True,
+        cache_reads_enabled: bool = True,
     ) -> dict[str, Any]:
         canonical_path = self._canonical_cache_path(path)
         canonical_globs = self._canonical_cache_globs(include_globs)
@@ -1450,7 +1498,7 @@ class ContextService:
             if not refresh_signature_available
             else "no_compatible_entry",
         }
-        if refresh_signature_available:
+        if refresh_signature_available and cache_reads_enabled:
             lookup = self._cache_lookup(key)
             cached = lookup.get("value") if lookup["hit"] else None
             if isinstance(cached, dict) and cached.get("schema") == RETRIEVAL_SEARCH_TERM_SCHEMA:
@@ -1481,6 +1529,8 @@ class ContextService:
                     },
                 )
             )
+        elif refresh_signature_available:
+            miss_detail["reason"] = "cache_bypassed"
         if allow_fallback:
             result = self.index.search(
                 query=term,
@@ -1763,6 +1813,7 @@ class ContextService:
         line_anchor: int,
         refresh_signature: str,
         refresh_signature_available: bool,
+        cache_reads_enabled: bool = True,
     ) -> tuple[dict[str, Any], bool, dict[str, Any]]:
         fingerprint = self._file_fingerprint(path)
         anchor = max(0, int(line_anchor))
@@ -1785,27 +1836,33 @@ class ContextService:
                 matched_line=anchor or None,
             )
             return summary, False, miss_detail
-        lookup = self._cache_lookup(key)
-        cached = lookup.get("value") if lookup["hit"] else None
-        if isinstance(cached, dict) and cached.get("schema") == RETRIEVAL_FILE_SUMMARY_SCHEMA:
-            summary = cached.get("summary")
-            if isinstance(summary, dict):
-                return summary, True, {}
-        lookup_reason = str(lookup.get("reason") or "")
-        miss_detail["reason"] = (
-            lookup_reason
-            if lookup_reason not in {"", "miss", "hit"}
-            else self._cache_miss_reason(
-                namespace="retrieval.file_summary",
-                metadata={
-                    "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
-                    "path": fingerprint["path"],
-                    "file_fingerprint": fingerprint,
-                    "line_anchor": anchor,
-                    "chunk_id": chunk["chunk_id"],
-                },
+        if cache_reads_enabled:
+            lookup = self._cache_lookup(key)
+            cached = lookup.get("value") if lookup["hit"] else None
+            if (
+                isinstance(cached, dict)
+                and cached.get("schema") == RETRIEVAL_FILE_SUMMARY_SCHEMA
+            ):
+                summary = cached.get("summary")
+                if isinstance(summary, dict):
+                    return summary, True, {}
+            lookup_reason = str(lookup.get("reason") or "")
+            miss_detail["reason"] = (
+                lookup_reason
+                if lookup_reason not in {"", "miss", "hit"}
+                else self._cache_miss_reason(
+                    namespace="retrieval.file_summary",
+                    metadata={
+                        "schema_version": CACHE_ENTRY_SCHEMA_VERSION,
+                        "path": fingerprint["path"],
+                        "file_fingerprint": fingerprint,
+                        "line_anchor": anchor,
+                        "chunk_id": chunk["chunk_id"],
+                    },
+                )
             )
-        )
+        else:
+            miss_detail["reason"] = "cache_bypassed"
         summary = self.index.file_summary(
             fingerprint["path"],
             max_chars=RETRIEVAL_FILE_SUMMARY_MAX_CHARS,
@@ -1849,6 +1906,7 @@ class ContextService:
             tuple[str, int, str], tuple[dict[str, Any], bool, dict[str, Any]]
         ],
         retrieval_stats: dict[str, Any],
+        cache_reads_enabled: bool = True,
     ) -> tuple[dict[str, Any], bool | None, dict[str, Any]]:
         canonical_path = self._canonical_cache_path(path)
         anchor = max(0, int(line_anchor))
@@ -1858,6 +1916,8 @@ class ContextService:
                 retrieval_stats.get("file_summary_memo_hits", 0) or 0
             ) + 1
             summary, summary_hit, miss_detail = request_memo[key]
+            if not cache_reads_enabled:
+                return summary, None, {}
             if summary_hit:
                 return summary, True, miss_detail
             if not refresh_signature_available:
@@ -1871,6 +1931,7 @@ class ContextService:
             line_anchor=anchor,
             refresh_signature=refresh_signature,
             refresh_signature_available=refresh_signature_available,
+            cache_reads_enabled=cache_reads_enabled,
         )
         request_memo[key] = (summary, summary_hit, miss_detail)
         return summary, summary_hit, miss_detail
@@ -2720,10 +2781,10 @@ class ContextService:
         self, output_profile: str | None, client_profile: str
     ) -> str:
         profile = output_profile or (
-            "minimal" if client_profile == "codex" else self._budget()["default_output_profile"]
+            "lean" if client_profile == "codex" else self._budget()["default_output_profile"]
         )
         if profile not in OUTPUT_PROFILES:
-            raise ValueError("output_profile must be minimal, compact, normal, or verbose")
+            raise ValueError("output_profile must be lean, minimal, compact, normal, or verbose")
         return profile
 
     def _normalize_client_profile(self, client_profile: str) -> str:
@@ -2849,6 +2910,40 @@ class ContextService:
             "detail_lookup": item.get("detail_lookup", {}),
         }
 
+    def _lean_context_pack(
+        self, route: str, selected: list[dict[str, Any]], omitted: list[dict[str, Any]],
+        full_reference: dict[str, Any], diagnostics_reference: dict[str, Any],
+        terms: list[str], skill_guidance: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "schema": "context_pack.lean.v1",
+            "route": route,
+            "summary": {"item_count": len(selected), "evidence_deferred": bool(omitted)},
+            "items": [self._lean_item(item, terms) for item in selected],
+            "resolver": {"tool": "context_lookup", "mode": "snippet",
+                         "description": "Resolve full evidence by path and line anchor."},
+            "omitted_ref": full_reference["reference_id"],
+            "diagnostics_ref": diagnostics_reference["reference_id"],
+        }
+        if skill_guidance:
+            result["skill_guidance"] = skill_guidance
+        return result
+
+    def _lean_item(self, item: dict[str, Any], terms: list[str]) -> dict[str, Any]:
+        limit = 180 if "explicit_path" in item.get("reason_codes", []) else 140
+        content = str(item.get("content", ""))
+        if len(content) > limit:
+            lines = content.splitlines()
+            needles = {term.lower() for term in terms if len(term) > 2}
+            chosen = [line for line in lines if any(term in line.lower() for term in needles)]
+            if not chosen:
+                chosen = lines[:2]
+            content = trim_text(" … ".join(chosen), limit)[0]
+        return {"path": item.get("path", ""),
+                "lines": [int(item.get("start_line", 1) or 1), int(item.get("end_line", item.get("start_line", 1)) or 1)],
+                "reason": list(item.get("reason_codes", [])),
+                "confidence": self._confidence_bucket(item), "content": content}
+
     def _confidence_bucket(self, item: dict[str, Any]) -> str:
         score = float(item.get("score", 0.0) or 0.0)
         confidence = float(item.get("confidence", 0.0) or 0.0)
@@ -2889,6 +2984,8 @@ class ContextService:
             "stage_timings_ms": metrics.get("stage_timings_ms", {}),
             "candidate_count": metrics.get("candidate_count", 0),
             "selected_count": metrics.get("selected_count", 0),
+            "output_token_scope": metrics.get("output_token_scope", ""),
+            "baseline_kind": metrics.get("baseline_kind", ""),
             "baseline_input_tokens_est": metrics.get("baseline_input_tokens_est", 0),
             "output_tokens_est": metrics.get("output_tokens_est", 0),
             "estimated_input_tokens_saved": metrics.get("estimated_input_tokens_saved", 0),
@@ -2923,7 +3020,9 @@ class ContextService:
             copied = dict(item)
             source_chars = int(copied.get("source_chars", 0) or 0)
             is_explicit = "explicit_path" in set(copied.get("reason_codes", []))
-            if profile == "minimal":
+            if profile == "lean":
+                max_chars = 180 if is_explicit else 140
+            elif profile == "minimal":
                 max_chars = 220 if is_explicit else 180
             elif profile == "compact":
                 max_chars = 360 if is_explicit else 260
@@ -2955,6 +3054,7 @@ class ContextService:
         requested_max_items: int,
         refresh_signature: str,
         refresh_signature_available: bool,
+        cache_reads_enabled: bool = True,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         omitted: list[dict[str, Any]] = []
@@ -3042,6 +3142,7 @@ class ContextService:
                     refresh_signature_available=refresh_signature_available,
                     request_memo=file_summary_memo,
                     retrieval_stats=retrieval_stats,
+                    cache_reads_enabled=cache_reads_enabled,
                 )
                 count_fragment(summary_hit, miss_detail)
                 count_chunk(summary_hit)
@@ -3082,6 +3183,7 @@ class ContextService:
                     reusable_terms=reusable_terms,
                     allow_fallback=False,
                     include_index=False,
+                    cache_reads_enabled=cache_reads_enabled,
                 )
                 for timing_key in ("search_fragment_ms", "search_merge_ms"):
                     add_stage_timing(
@@ -3132,6 +3234,7 @@ class ContextService:
                         refresh_signature_available=refresh_signature_available,
                         request_memo=file_summary_memo,
                         retrieval_stats=retrieval_stats,
+                        cache_reads_enabled=cache_reads_enabled,
                     )
                     count_fragment(summary_hit, miss_detail)
                     count_chunk(summary_hit)
@@ -3182,6 +3285,7 @@ class ContextService:
                         refresh_signature_available=refresh_signature_available,
                         request_memo=file_summary_memo,
                         retrieval_stats=retrieval_stats,
+                        cache_reads_enabled=cache_reads_enabled,
                     )
                     count_fragment(summary_hit, miss_detail)
                     count_chunk(summary_hit)
@@ -3225,6 +3329,7 @@ class ContextService:
             count_chunk=count_chunk,
             retrieval_stats=retrieval_stats,
             file_summary_memo=file_summary_memo,
+            cache_reads_enabled=cache_reads_enabled,
         )
         self._apply_route_ranking(
             candidates=candidates,
@@ -3258,6 +3363,7 @@ class ContextService:
             tuple[str, int, str],
             tuple[dict[str, Any], bool, dict[str, Any]],
         ],
+        cache_reads_enabled: bool = True,
     ) -> None:
         started = time.perf_counter()
         seen = {str(item.get("path", "")) for item in candidates}
@@ -3267,6 +3373,7 @@ class ContextService:
             max_results=8,
             refresh_signature=refresh_signature,
             refresh_signature_available=refresh_signature_available,
+            cache_reads_enabled=cache_reads_enabled,
         )
         retrieval_stats["test_owner_path_cache_hit"] = bool(owner_cache_hit)
         retrieval_stats["test_owner_path_count"] = len(owners)
@@ -3282,6 +3389,7 @@ class ContextService:
                     refresh_signature_available=refresh_signature_available,
                     request_memo=file_summary_memo,
                     retrieval_stats=retrieval_stats,
+                    cache_reads_enabled=cache_reads_enabled,
                 )
             except Exception:
                 continue
@@ -3561,6 +3669,7 @@ class ContextService:
         max_results: int,
         refresh_signature: str,
         refresh_signature_available: bool,
+        cache_reads_enabled: bool = True,
     ) -> tuple[list[dict[str, str]], bool]:
         canonical_paths = self._canonical_cache_paths(paths)
         limit = max(1, int(max_results))
@@ -3573,7 +3682,7 @@ class ContextService:
             max_results=limit,
             refresh_signature=refresh_signature,
         )
-        lookup = self._cache_lookup(key)
+        lookup = self._cache_lookup(key) if cache_reads_enabled else {"hit": False}
         cached = lookup.get("value") if lookup["hit"] else None
         if (
             isinstance(cached, dict)
@@ -3920,7 +4029,7 @@ class ContextService:
                 "cache_strategy": "stable",
             },
             "profiles": {
-                "codex": {"output_profile": "minimal", "diagnostics": "summary"},
+                "codex": {"output_profile": "lean", "diagnostics": "summary"},
                 "claude": {"output_profile": "compact", "diagnostics": "summary"},
                 "copilot": {"output_profile": "compact", "tools_only": True},
                 "generic": {"output_profile": self._budget()["default_output_profile"]},
@@ -3961,25 +4070,36 @@ class ContextService:
         prompt = self._benchmark_prompt(focus_paths)
         variation_prompt = self._benchmark_prompt_variation(focus_paths)
         runs = []
-        for name, run_prompt, refresh_index, max_items in [
-            ("cold_refresh", prompt, True, 4),
-            ("warm_cache", prompt, False, 4),
-            ("repeated_prompt", prompt, False, 4),
-            ("prompt_variation_reuse", variation_prompt, False, 4),
-            ("compact_focus", prompt, False, 2),
+        for name, run_prompt, cache_strategy, max_items in [
+            ("cold_refresh", prompt, "cold", 4),
+            ("warm_cache", prompt, "stable", 4),
+            ("repeated_prompt", prompt, "stable", 4),
+            ("prompt_variation_reuse", variation_prompt, "stable", 4),
+            ("compact_focus", prompt, "stable", 2),
         ]:
             pack = self.context_pack(
                 prompt=run_prompt,
                 focus_paths=focus_paths,
                 max_items=max_items,
-                refresh_index=refresh_index,
+                cache_strategy=cache_strategy,
                 output_profile="compact",
                 index_max_files=max_files,
+            )
+            manual_baseline = self._benchmark_manual_search_read_baseline(
+                prompt=run_prompt,
+                focus_paths=focus_paths,
+                max_items=max_items,
+            )
+            tokens_spared_by_mcp = max(
+                0,
+                int(manual_baseline["output_tokens_est"])
+                - int(pack["metrics"]["output_tokens_est"]),
             )
             runs.append(
                 {
                     "name": name,
                     "prompt": run_prompt,
+                    "cache_strategy": cache_strategy,
                     "cache_hit": bool(pack["cache"]["hit"]),
                     "cache_reason": pack["cache"]["reason"],
                     "fragment_hits": int(pack["cache"].get("fragment_hits", 0)),
@@ -3999,6 +4119,12 @@ class ContextService:
                     "estimated_input_tokens_saved": pack["metrics"][
                         "estimated_input_tokens_saved"
                     ],
+                    "manual_search_read_baseline": manual_baseline,
+                    "tokens_spared_by_mcp_est": tokens_spared_by_mcp,
+                    "tokens_spared_by_mcp_formula": (
+                        "max(0, manual_search_read_baseline.output_tokens_est "
+                        "- output_tokens_est)"
+                    ),
                     "external_tool_calls_saved_est": pack["metrics"][
                         "external_tool_calls_saved_est"
                     ],
@@ -4009,6 +4135,24 @@ class ContextService:
             )
         compact_contract = self.context_admin(
             mode="contracts", contract_profile="compact"
+        )
+        measurement_snapshot = self._benchmark_measurement_snapshot(
+            runs=runs,
+            compact_contract=compact_contract,
+        )
+        measurement_matrix = self.metrics.measurement_matrix(
+            snapshot=measurement_snapshot
+        )
+        measurement_matrix["metric_sources"]["runtime_metrics"] = (
+            "current context_admin(mode='benchmark') runs only"
+        )
+        measurement_matrix["metric_sources"]["tokens_spared_by_mcp_formula"] = (
+            "max(0, manual_search_read_baseline.output_tokens_est "
+            "- output_tokens_est)"
+        )
+        measurement_matrix["metric_sources"]["matched_token_baseline"] = (
+            "direct search results plus bounded reads for the same prompt, "
+            "focus paths, and item limit"
         )
         return {
             "schema": "context_benchmark.v1",
@@ -4029,7 +4173,176 @@ class ContextService:
                 "tool_count": len(compact_contract.get("contracts", {})),
             },
             "elapsed_ms": self._elapsed_ms(started),
-            "measurement_matrix": self.metrics.measurement_matrix(),
+            "measurement_matrix": measurement_matrix,
+        }
+
+    def _benchmark_manual_search_read_baseline(
+        self,
+        prompt: str,
+        focus_paths: list[str],
+        max_items: int,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        search = self.index.search(
+            query=prompt,
+            path=".",
+            max_results=max(1, int(max_items)),
+            allow_fallback=True,
+        )
+        targets: list[tuple[str, int]] = [(path, 1) for path in focus_paths]
+        targets.extend(
+            (str(row.get("path", "")), max(1, int(row.get("line", 1) or 1)))
+            for row in search.get("results", [])
+            if isinstance(row, dict) and row.get("path")
+        )
+        reads = []
+        seen: set[str] = set()
+        for path, line in targets:
+            if not path or path in seen or len(reads) >= max(1, int(max_items)):
+                continue
+            seen.add(path)
+            try:
+                reads.append(
+                    self.index.snippet(
+                        path=path,
+                        start_line=line,
+                        max_chars=1200,
+                    )
+                )
+            except Exception:
+                continue
+        workload = {
+            "schema": "context_benchmark.manual_search_read.v1",
+            "kind": "matched_manual_search_read",
+            "search_results": search.get("results", []),
+            "reads": reads,
+        }
+        token_count = self._token_count(json.dumps(workload, ensure_ascii=False))
+        return {
+            "schema": workload["schema"],
+            "kind": workload["kind"],
+            "search_result_count": len(workload["search_results"]),
+            "read_count": len(reads),
+            "output_tokens_est": token_count.count,
+            "token_counting": token_count.metadata(),
+            "elapsed_ms": self._elapsed_ms(started),
+        }
+
+    def _benchmark_measurement_snapshot(
+        self,
+        runs: list[dict[str, Any]],
+        compact_contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        run_count = len(runs)
+        selected_count = sum(int(run.get("selected_count", 0) or 0) for run in runs)
+        candidate_count = sum(int(run.get("candidate_count", 0) or 0) for run in runs)
+        fragment_hits = sum(int(run.get("fragment_hits", 0) or 0) for run in runs)
+        fragment_misses = sum(int(run.get("fragment_misses", 0) or 0) for run in runs)
+        fragment_total = fragment_hits + fragment_misses
+        output_tokens = sum(int(run.get("output_tokens_est", 0) or 0) for run in runs)
+        baseline_tokens = sum(
+            int(
+                run.get("manual_search_read_baseline", {}).get(
+                    "output_tokens_est", 0
+                )
+                or 0
+            )
+            for run in runs
+        )
+        tokens_saved = sum(
+            int(run.get("tokens_spared_by_mcp_est", 0) or 0) for run in runs
+        )
+        elapsed_values = [float(run.get("elapsed_ms", 0.0) or 0.0) for run in runs]
+        stage_names = {
+            str(name)
+            for run in runs
+            for name in run.get("stage_timings_ms", {})
+        }
+        stage_metrics = {
+            name: {
+                "count": run_count,
+                "avg_elapsed_ms": round(
+                    sum(
+                        float(run.get("stage_timings_ms", {}).get(name, 0.0) or 0.0)
+                        for run in runs
+                    )
+                    / run_count,
+                    3,
+                )
+                if run_count
+                else 0.0,
+            }
+            for name in sorted(stage_names)
+        }
+        external_calls_saved = sum(
+            int(run.get("external_tool_calls_saved_est", 0) or 0) for run in runs
+        )
+        references_bytes_deferred = sum(
+            int(run.get("references_bytes_deferred_est", 0) or 0) for run in runs
+        )
+        return {
+            "requests": {
+                "by_operation": {
+                    "context_pack": {
+                        "count": run_count,
+                        "avg_elapsed_ms": round(
+                            sum(elapsed_values) / run_count, 3
+                        )
+                        if run_count
+                        else 0.0,
+                        "candidates_per_selected": round(
+                            candidate_count / selected_count, 3
+                        )
+                        if selected_count
+                        else 0.0,
+                    }
+                }
+            },
+            "cache": {
+                "context_pack_fragment_hits": fragment_hits,
+                "context_pack_fragment_misses": fragment_misses,
+                "context_pack_fragment_hit_ratio": round(
+                    fragment_hits / fragment_total, 4
+                )
+                if fragment_total
+                else 0.0,
+            },
+            "tokens": {
+                "avg_estimated_input_tokens_saved_per_pack": round(
+                    tokens_saved / run_count, 3
+                )
+                if run_count
+                else 0.0,
+                "avg_tokens_spared_by_mcp_est_per_pack": round(
+                    tokens_saved / run_count, 3
+                )
+                if run_count
+                else 0.0,
+                "compression_ratio": round(output_tokens / baseline_tokens, 4)
+                if baseline_tokens
+                else 0.0,
+            },
+            "warmup": {"count": 0, "avg_elapsed_ms": 0.0},
+            "tooling": {
+                "avg_external_tool_calls_saved_per_pack": round(
+                    external_calls_saved / run_count, 3
+                )
+                if run_count
+                else 0.0,
+                "contract_tokens_saved_est": int(
+                    compact_contract["metrics"]["compact_contract_tokens_saved_est"]
+                ),
+            },
+            "references": {"bytes_deferred_est": references_bytes_deferred},
+            "benchmarks": {
+                "recent": [
+                    {"operation": "context_pack", "elapsed_ms": value}
+                    for value in elapsed_values
+                ],
+                "stage_latency_ms_by_operation": {
+                    "context_pack": stage_metrics
+                },
+            },
         }
 
     def _cache_warmup(
@@ -4883,7 +5196,7 @@ class ContextService:
             payload["max_output_chars"] = max(256, int(max_output_chars))
         if default_output_profile is not None:
             if default_output_profile not in OUTPUT_PROFILES:
-                raise ValueError("default_output_profile must be minimal, compact, normal, or verbose")
+                raise ValueError("default_output_profile must be lean, minimal, compact, normal, or verbose")
             payload["default_output_profile"] = default_output_profile
         payload["schema"] = "context_budget.v1"
         if max_output_chars is not None or default_output_profile is not None:

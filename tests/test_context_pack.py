@@ -37,6 +37,9 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert "storage" not in pack["references"][0]
     assert "path" not in pack["references"][0]["resolver"]
     assert pack["budget"]["estimated_output_tokens"] > 0
+    assert pack["budget"]["estimated_output_tokens"] == service._token_count(
+        json.dumps(pack, ensure_ascii=False)
+    ).count
     assert pack["budget"]["token_counting"]["token_count_source"] == "estimate"
     assert pack["safety"]["repository_boundary_enforced"] is True
     assert pack["items"][0]["confidence"] > 0
@@ -48,6 +51,8 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     assert pack["metrics"]["stage_timings_ms"]["response_assembly_ms"] >= 0
     assert pack["metrics"]["stage_timings_ms"]["snippet_batch_ms"] >= 0
     assert pack["metrics"]["baseline_input_tokens_est"] >= pack["metrics"]["output_tokens_est"]
+    assert pack["metrics"]["output_token_scope"] == "complete_response"
+    assert pack["metrics"]["baseline_kind"] == "ranked_candidate_evidence_estimate"
     assert pack["metrics"]["token_counting"]["token_count_source"] == "estimate"
     assert pack["metrics"]["token_savings_formula"] == "max(0, baseline_input_tokens_est - output_tokens_est)"
     assert pack["metrics"]["tokens_spared_by_mcp_formula"] == "max(0, baseline_input_tokens_est - output_tokens_est)"
@@ -55,7 +60,7 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
         pack["metrics"]["tokens_spared_by_mcp_est"]
         == pack["metrics"]["estimated_input_tokens_saved"]
     )
-    assert "MCP context_pack" in pack["metrics"]["tokens_spared_by_mcp_reason"]
+    assert "not a measured MCP-versus-no-MCP" in pack["metrics"]["tokens_spared_by_mcp_reason"]
     assert pack["metrics"]["external_tool_calls_saved_est"] >= 1
     assert pack["metrics"]["references_bytes_deferred_est"] > 0
     assert pack["metrics"]["retrieval_plan"]["detail_mode"] == "context_lookup.snippet"
@@ -73,6 +78,7 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
         "limit_bucket_changed",
         "stale_index",
         "disabled_refresh_index",
+        "cache_bypassed",
         "signature_unavailable",
     }
     assert pack["cache"]["status"] in {"missing", "active", "disabled"}
@@ -84,6 +90,31 @@ def test_context_pack_returns_cited_budgeted_items_and_reference(service: Contex
     resolved = service.result_reference_resolve(reference=pack["references"][0])
     assert resolved["status"] == "resolved"
     assert resolved["content"]["candidate_count"] >= pack["summary"]["item_count"]
+
+
+def test_context_pack_cold_bypasses_persistent_retrieval_cache(
+    service: ContextService,
+) -> None:
+    request = {
+        "prompt": "review auth token behavior",
+        "changed_files": ["src/auth.py"],
+        "max_items": 2,
+        "output_profile": "compact",
+        "diagnostics": "full",
+    }
+    service.context_pack(**request)
+    warm = service.context_pack(**request)
+    assert warm["cache"]["fragment_hits"] > 0
+
+    cold = service.context_pack(**request, cache_strategy="cold")
+
+    assert cold["cache"]["fragment_hits"] == 0
+    assert cold["cache"]["fragment_misses"] > 0
+    assert {
+        detail["reason"] for detail in cold["cache"]["miss_details"]
+    } == {"cache_bypassed"}
+    rewarmed = service.context_pack(**request)
+    assert rewarmed["cache"]["fragment_hits"] > 0
 
 
 def test_context_pack_records_bounded_auto_learn_state(service: ContextService) -> None:

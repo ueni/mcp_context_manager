@@ -208,7 +208,7 @@ def test_admin_budget_contracts_and_cache(service: ContextService) -> None:
         "latency.context_admin.warmup.avg_elapsed_ms",
         "cache.context_pack_fragment_hit_ratio",
         "tokens.context_pack.avg_saved_per_pack",
-        "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack",
+        "tokens.context_pack.avg_candidate_compression_per_pack",
         "tooling.contract_tokens_saved_est",
         "tooling.external_calls_saved_per_pack",
         "references.bytes_deferred_est",
@@ -1064,6 +1064,7 @@ def test_cache_stats_tolerates_legacy_cache_rows_without_namespace(
 
 
 def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
+    service.metrics.record_event("context_pack", elapsed_ms=123456.0)
     benchmark = service.context_admin(mode="benchmark")
 
     assert benchmark["schema"] == "context_benchmark.v1"
@@ -1076,6 +1077,10 @@ def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
         "compact_focus",
     ]
     assert benchmark["runs"][1]["cache_hit"] is False
+    assert benchmark["runs"][0]["cache_strategy"] == "cold"
+    assert benchmark["runs"][0]["fragment_hits"] == 0
+    assert benchmark["runs"][0]["fragment_misses"] > 0
+    assert benchmark["runs"][0]["cache_reason"] == "cache_bypassed"
     assert benchmark["runs"][1]["fragment_hits"] > 0
     assert benchmark["runs"][2]["cache_hit"] is False
     assert benchmark["runs"][2]["fragment_hits"] > 0
@@ -1090,9 +1095,30 @@ def test_context_pack_benchmark_runs_offline(service: ContextService) -> None:
     assert "reference_write_ms" in benchmark["runs"][0]["stage_timings_ms"]
     assert "response_assembly_ms" in benchmark["runs"][0]["stage_timings_ms"]
     assert benchmark["runs"][0]["token_counting"]["token_count_source"] == "estimate"
+    for run in benchmark["runs"]:
+        baseline = run["manual_search_read_baseline"]
+        assert baseline["kind"] == "matched_manual_search_read"
+        assert baseline["read_count"] > 0
+        assert run["tokens_spared_by_mcp_est"] == max(
+            0, baseline["output_tokens_est"] - run["output_tokens_est"]
+        )
     assert benchmark["compact_contract_sample"]["schema"] == "tool_output_contracts.compact.v1"
     assert benchmark["compact_contract_sample"]["contract_tokens_saved_est"] > 0
     assert benchmark["measurement_matrix"]["schema"] == "context_measurement_matrix.v1"
+    checks = {
+        check["key"]: check for check in benchmark["measurement_matrix"]["checks"]
+    }
+    latency = checks["latency.context_pack.avg_elapsed_ms"]
+    assert latency["samples"] == benchmark["run_count"]
+    assert latency["current"] == round(
+        sum(run["elapsed_ms"] for run in benchmark["runs"])
+        / benchmark["run_count"],
+        3,
+    )
+    assert (
+        benchmark["measurement_matrix"]["metric_sources"]["runtime_metrics"]
+        == "current context_admin(mode='benchmark') runs only"
+    )
 
 
 def test_context_pack_benchmark_honors_max_files(

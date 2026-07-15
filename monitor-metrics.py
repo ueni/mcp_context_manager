@@ -670,7 +670,7 @@ def render_project_detail(
             f"{fragment_hits}/{fragment_misses} h/m  {fragment_ratio * 100:5.1f}%",
         ),
         (
-            "token spared/saved",
+            "candidate compact.",
             fmt_int(_tokens_spared_by_mcp(metrics)),
         ),
         (
@@ -971,7 +971,7 @@ def _summary_table(
             "fragment cache",
             f"{_bar(fragment_ratio, 18, color)} {fragment_ratio * 100:5.1f}%",
         ),
-        ("token spared/saved", fmt_int(totals["tokens_spared_by_mcp"])),
+        ("candidate compact.", fmt_int(totals["tokens_spared_by_mcp"])),
         ("refs deferred", fmt_bytes(totals["bytes_deferred"])),
     ]
     return _render_table(("metric", "value"), rows, aligns=("left", "right"))
@@ -997,7 +997,7 @@ def _project_table(
             "pack",
             "avg ms",
             "cache",
-            "mcp tok",
+            "cand tok",
             "checks",
         ),
         rows,
@@ -1181,7 +1181,7 @@ def _measurement_check_rows(
         "references_bytes_deferred": "Deferred references bytes",
         "references.bytes_deferred_est": "Bytes deferred behind local references",
         "tokens.context_pack.avg_saved_per_pack": "Average tokens saved per context pack",
-        "tokens.context_pack.avg_tokens_spared_by_mcp_per_pack": "Average tokens spared by MCP per context pack",
+        "tokens.context_pack.avg_candidate_compression_per_pack": "Average candidate compression per context pack",
         "tokens.context_pack.compression_ratio": "Output tokens as a share of baseline tokens",
     }
 

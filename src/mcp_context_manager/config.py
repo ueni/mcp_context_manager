@@ -21,7 +21,7 @@ class ContextConfig:
     state_dir: Path
     max_read_bytes: int = 262_144
     max_output_chars: int = 12_000
-    default_output_profile: str = "compact"
+    default_output_profile: str = "lean"
     transport: str = "stdio"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -61,7 +61,7 @@ class ContextConfig:
             project_markers=_project_markers_from_env(),
             max_read_bytes=max(1024, int(os.getenv("MAX_READ_BYTES", "262144"))),
             max_output_chars=max(1024, int(os.getenv("MAX_OUTPUT_CHARS", "12000"))),
-            default_output_profile=os.getenv("MCP_CONTEXT_OUTPUT_PROFILE", "compact"),
+            default_output_profile=os.getenv("MCP_CONTEXT_OUTPUT_PROFILE", "lean"),
             transport=os.getenv("MCP_TRANSPORT", "stdio").strip().lower(),
             host=os.getenv("HOST", "127.0.0.1"),
             port=int(os.getenv("PORT", "8000")),

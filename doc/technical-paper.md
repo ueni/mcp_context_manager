@@ -141,7 +141,8 @@ changed file be refreshed without forcing a full repository walk.
 bounded:
 
 1. Validate and normalize request parameters.
-2. Refresh the repository index if stale, forced, fresh, or cold.
+2. Refresh the repository index if stale, forced, fresh, or cold; cold requests
+   also bypass persistent retrieval-cache reads while repopulating them.
 3. Resolve output profile from explicit `output_profile`, `client_profile`, and
    configured default.
 4. Classify the task route.
@@ -152,7 +153,7 @@ bounded:
 9. Build or reuse retrieval candidates.
 10. Apply profile shaping and budget selection.
 11. Store omitted/full evidence behind a result reference.
-12. Compute token, latency, cache, and reference metrics.
+12. Compute complete-response token, latency, cache, and reference metrics.
 13. Return a compact packet plus `omitted_ref` and `diagnostics_ref`.
 
 The public result includes selected items with path, line hints, reason codes,
@@ -317,7 +318,7 @@ The measurement matrix checks:
 
 - context-pack average and p95 latency;
 - index refresh latency;
-- estimated saved input tokens;
+- estimated candidate compression;
 - compression ratio;
 - candidate-to-selected ratio;
 - cache hit ratios;

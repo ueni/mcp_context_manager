@@ -69,7 +69,7 @@ reads, smaller prompts, and better evidence discipline before code changes.
 
 `mcp-context-manager` combines several token, latency, and safety techniques:
 
-- Summary-first `context_pack` output with `minimal`, `compact`, `normal`, and
+- Evidence-first `context_pack` output with `lean`, `minimal`, `compact`, `normal`, and
   `verbose` profiles.
 - Client profiles for Codex, Claude, Copilot, and generic MCP hosts.
 - Prompt echo and volatile runtime metadata disabled by default.
@@ -406,7 +406,7 @@ unless a caller explicitly passes the nested `root_uri`.
 | `HOST` / `PORT` | HTTP bind settings. Compose binds the published port to localhost. |
 | `MAX_READ_BYTES` | Maximum file bytes read for snippets/indexing. |
 | `MAX_OUTPUT_CHARS` | Default output budget. |
-| `MCP_CONTEXT_OUTPUT_PROFILE` | Default profile: `minimal`, `compact`, `normal`, or `verbose`. |
+| `MCP_CONTEXT_OUTPUT_PROFILE` | Default profile: `lean`, `minimal`, `compact`, `normal`, or `verbose`. |
 | `MCP_CONTEXT_LMDB_MAP_SIZE` | LMDB map size in bytes. Defaults to `1073741824` and is clamped to at least `16777216`. |
 | `MCP_CONTEXT_TOKEN_COUNTER` | `estimate` by default, or `target` to try an optional target tokenizer. |
 | `MCP_CONTEXT_TARGET_TOKENIZER` | Target tokenizer name for `target` mode, defaulting to `cl100k_base`. |
@@ -415,11 +415,11 @@ unless a caller explicitly passes the nested `root_uri`.
 
 Use `context_admin(mode="measurement_matrix")` to get the pass/fail target
 matrix for context-pack speed and token economy. Current metrics include
-context-pack latency, index-refresh latency, saved input tokens, compression
+context-pack latency, index-refresh latency, candidate compression, compression
 ratio, candidate-to-selected ratio, cache hit ratios, external calls saved, and
 reference bytes deferred.
 
-Token savings are measured as:
+Per-pack candidate compression is estimated as:
 
 ```text
 tokens_spared_by_mcp_est =
@@ -427,9 +427,12 @@ estimated_input_tokens_saved =
   max(0, baseline_input_tokens_est - output_tokens_est)
 ```
 
-`baseline_input_tokens_est` estimates the candidate evidence an agent would
-likely inspect without ranking. `output_tokens_est` estimates the selected pack
-items returned to the model.
+`baseline_input_tokens_est` estimates the ranked candidate evidence before
+selection. `output_tokens_est` counts the complete context-pack response. This
+is not an MCP-versus-no-MCP measurement. The built-in benchmark separately
+executes a matched manual search/read workload for that comparison.
+`tokens_spared_by_mcp_est` remains a compatibility alias for this candidate
+compression estimate.
 
 Use `context_admin(mode="quality_eval")` to run retrieval-quality fixtures from
 `benchmarks/gold_anchors/*.json`. The report includes anchor recall@3/5, first
@@ -489,7 +492,7 @@ VER="RELEASE_VERSION"; curl -fsSL "https://raw.githubusercontent.com/ueni/mcp_co
 ```
 
 The dashboard shows request volume, `context_pack` latency, cache hit bars,
-estimated MCP-spared tokens, deferred reference bytes, measurement-matrix
+candidate compression, deferred reference bytes, measurement-matrix
 status, and bounded generated-state rows. It shows a yellow warning when the
 connected MCP server version differs from the version expected by the monitor.
 
