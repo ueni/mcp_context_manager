@@ -601,7 +601,7 @@ def test_auto_warmup_deduplicates_pending_jobs_and_respects_min_interval(
     assert state["last_reason_code"] == "enqueue_throttled"
 
 
-def test_auto_warmup_deduplication_is_scoped_to_refresh_signature(
+def test_auto_warmup_coalesces_changed_signatures_and_throttles_project_wide(
     sample_repo: Path,
     monkeypatch,
 ) -> None:
@@ -615,16 +615,13 @@ def test_auto_warmup_deduplication_is_scoped_to_refresh_signature(
             auto_learn_max_entries=4,
         )
     )
-    started = [Event(), Event()]
+    started = Event()
     release = Event()
     signatures: list[str] = []
-    signature_lock = Lock()
 
     def slow_warmup(manifest: dict[str, Any]) -> dict[str, Any]:
-        with signature_lock:
-            index = len(signatures)
-            signatures.append(str(manifest.get("refresh_signature", "")))
-            started[index].set()
+        signatures.append(str(manifest.get("refresh_signature", "")))
+        started.set()
         release.wait(timeout=2)
         return {
             "schema": "context_cache.prompt_warmup.v1",
@@ -641,7 +638,7 @@ def test_auto_warmup_deduplication_is_scoped_to_refresh_signature(
         max_items=1,
         output_profile="compact",
     )
-    assert started[0].wait(timeout=1)
+    assert started.wait(timeout=1)
 
     auth_file = sample_repo / "src" / "auth.py"
     auth_file.write_text(
@@ -655,17 +652,62 @@ def test_auto_warmup_deduplication_is_scoped_to_refresh_signature(
         max_items=1,
         output_profile="compact",
     )
-    assert started[1].wait(timeout=1)
 
     background = service._background_status()[WARMUP_AUTO_JOB_KIND]
     state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
-    assert len(set(signatures)) == 2
-    assert background["signature_count"] >= 2
-    assert state["last_reason_code"] != "enqueue_deduplicated"
-    assert state["enqueued_count"] >= 2
+    assert len(signatures) == 1
+    assert background["signature_count"] == 1
+    assert state["last_reason_code"] == "enqueue_deduplicated"
+    assert state["enqueued_count"] == 1
 
     release.set()
     _wait_for_auto_warmup(service)
+
+    service.context_pack(
+        "debug auth token validation",
+        changed_files=["src/auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+    background = service._background_status()[WARMUP_AUTO_JOB_KIND]
+    state = service.store.get_json(WARMUP_AUTO_LEARN_KEY)
+
+    assert background["signature_count"] == 1
+    assert state["last_reason_code"] == "enqueue_throttled"
+    assert state["enqueued_count"] == 1
+
+
+def test_prompt_manifest_persists_only_repository_relative_paths(
+    sample_repo: Path,
+) -> None:
+    service = ContextService(
+        ContextConfig(
+            repo_path=sample_repo.resolve(),
+            state_dir=(sample_repo / ".mcp-context-manager").resolve(),
+            max_output_chars=6000,
+            auto_learn_cache=False,
+            auto_learn_min_packs=1,
+        )
+    )
+    outside_path = "/home/user/private.txt"
+
+    service.context_pack(
+        "review src/auth.py token handling",
+        changed_files=[outside_path, "../private.txt", "src/auth.py"],
+        focus_paths=[outside_path, "tests/test_auth.py"],
+        max_items=1,
+        output_profile="compact",
+    )
+
+    manifest = service.store.get_json(WARMUP_PROMPT_MANIFEST_KEY)
+    persisted_paths = [row["path"] for row in manifest["paths"]]
+
+    assert persisted_paths == ["src/auth.py", "tests/test_auth.py"]
+    assert outside_path not in json.dumps(manifest)
+    assert all(
+        not path.startswith("/") and not path.startswith("..")
+        for path in persisted_paths
+    )
 
 
 def test_auto_learn_cache_can_be_disabled_with_env(

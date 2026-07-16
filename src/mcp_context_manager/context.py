@@ -1801,6 +1801,15 @@ class ContextService:
                 normalized = normalized[2:]
             return normalized or "."
 
+    def _persistable_repo_path(self, path: object) -> str:
+        """Return a repository-relative path that is safe to store in state."""
+        if not isinstance(path, str) or not path.strip():
+            return ""
+        try:
+            return self.config.repo_relative(path)
+        except ValueError:
+            return ""
+
     def _canonical_cache_paths(self, paths: list[str]) -> list[str]:
         return sorted(
             {
@@ -2468,10 +2477,7 @@ class ContextService:
             for value in paths:
                 if len(path_rows) >= limit:
                     return
-                try:
-                    path = self._canonical_cache_path(value)
-                except ValueError:
-                    continue
+                path = self._persistable_repo_path(value)
                 if path in {"", "."} or path in seen_paths:
                     continue
                 seen_paths.add(path)
@@ -2484,19 +2490,24 @@ class ContextService:
         selected_targets = self._dedupe_file_summary_targets(
             [
                 {
-                    "path": str(item.get("path", "")),
+                    "path": self._persistable_repo_path(item.get("path")),
                     "line_anchor": max(0, int(item.get("start_line", 1) or 1)),
                     "source": "selected_item",
                 }
                 for item in selected
-                if item.get("path")
+                if isinstance(item, dict)
+                and self._persistable_repo_path(item.get("path"))
             ]
         )[:limit]
         request_memo_targets = self._dedupe_file_summary_targets(
             [
-                row
+                {
+                    **row,
+                    "path": self._persistable_repo_path(row.get("path")),
+                }
                 for row in retrieval_stats.get("file_summary_memo_targets", [])
                 if isinstance(row, dict)
+                and self._persistable_repo_path(row.get("path"))
             ]
         )[: limit * 2]
         route_seed_payload = self.store.get_json(WARMUP_ROUTE_SEEDS_KEY)
@@ -2638,7 +2649,6 @@ class ContextService:
             run_auto_warmup,
             executor=io_executor(),
             min_interval_seconds=float(self.config.auto_learn_min_interval_seconds),
-            dedupe_key=str(manifest.get("refresh_signature", "")),
         )
         if job.get("status") == "throttled":
             reason = "enqueue_throttled"
