@@ -1,0 +1,61 @@
+{
+  "schema": "context_native_quality_corpus.v1",
+  "cases": [
+    {
+      "name": "context_pack_engine",
+      "prompt": "Profile native context pack retrieval latency and selection",
+      "focus_paths": ["src/context-core/src/lib.rs", "src/context-index/src/lib.rs"],
+      "required_paths": ["src/context-core/src/lib.rs"],
+      "allowed_paths": ["src/context-core/src/lib.rs", "src/context-index/src/lib.rs", "src/context-testkit/src/bin/benchmark-m3.rs"]
+    },
+    {
+      "name": "state_references",
+      "prompt": "Review LMDB state codec reference expiry and boundary validation",
+      "focus_paths": ["src/context-store/src/lib.rs"],
+      "required_paths": ["src/context-store/src/lib.rs"],
+      "allowed_paths": ["src/context-store/src/lib.rs", "src/context-core/src/lib.rs"]
+    },
+    {
+      "name": "http_contract",
+      "prompt": "Debug Streamable HTTP context pack payload and health routes",
+      "focus_paths": ["src/contextd/src/lib.rs", "scripts/smoke_native_mcp.py"],
+      "required_paths": ["src/contextd/src/lib.rs", "scripts/smoke_native_mcp.py"],
+      "allowed_paths": ["src/contextd/src/lib.rs", "scripts/smoke_native_mcp.py", "README.md"]
+    },
+    {
+      "name": "tantivy_ranking",
+      "prompt": "Explain native Tantivy search reader reload and deterministic ranking",
+      "focus_paths": ["src/context-index/src/lib.rs", "src/context-core/src/lib.rs"],
+      "required_paths": ["src/context-index/src/lib.rs", "src/context-core/src/lib.rs"],
+      "allowed_paths": ["src/context-index/src/lib.rs", "src/context-core/src/lib.rs", "Cargo.toml"]
+    },
+    {
+      "name": "memory_import",
+      "prompt": "Review memory validation compaction and durable v1 import behavior",
+      "focus_paths": ["src/context-core/src/lib.rs", "src/context-store/src/lib.rs"],
+      "required_paths": ["src/context-core/src/lib.rs", "src/context-store/src/lib.rs"],
+      "allowed_paths": ["src/context-core/src/lib.rs", "src/context-store/src/lib.rs", "src/context-store/src/bin/import-v1.rs"]
+    },
+    {
+      "name": "project_routing",
+      "prompt": "Trace multi project root URI routing allowed roots and idle LRU",
+      "focus_paths": ["src/contextd/src/registry.rs"],
+      "required_paths": ["src/contextd/src/registry.rs"],
+      "allowed_paths": ["src/contextd/src/registry.rs", "src/contextd/src/lib.rs"]
+    },
+    {
+      "name": "artifact_build",
+      "prompt": "Build standalone glibc and musl artifacts and validate Docker packaging",
+      "focus_paths": ["cmake/BuildArtifacts.cmake", "cmake/BuildStandalone.cmake", "Dockerfile"],
+      "required_paths": ["cmake/BuildArtifacts.cmake", "cmake/BuildStandalone.cmake"],
+      "allowed_paths": ["CMakeLists.txt", "cmake/BuildArtifacts.cmake", "cmake/BuildStandalone.cmake", "Dockerfile", ".github/workflows/build.yml", ".github/workflows/release.yml"]
+    },
+    {
+      "name": "tool_contracts",
+      "prompt": "Review stable MCP tool schemas and compact v2 output contracts",
+      "focus_paths": ["src/contextd/src/lib.rs", "src/context-core/src/lib.rs"],
+      "required_paths": ["src/contextd/src/lib.rs", "src/context-core/src/lib.rs"],
+      "allowed_paths": ["src/contextd/src/lib.rs", "src/context-core/src/lib.rs", "tests/golden/rust-v2/contracts.json"]
+    }
+  ]
+}

@@ -1,0 +1,140 @@
+{
+  "cases": [
+    {
+      "changed_files": [
+        "src/auth.py"
+      ],
+      "external_ms": 113.487,
+      "focus_paths": [
+        "tests/test_auth.py"
+      ],
+      "internal_ms": 113.421,
+      "name": "changed_auth",
+      "output_tokens_est": 3529,
+      "paths": [
+        "tests/test_auth.py",
+        "tests/test_auth.py",
+        "src/auth.py",
+        "benchmarks/gold_anchors/auth.json",
+        "src/auth.py"
+      ],
+      "prompt": "Review token handling and update tests",
+      "required_paths": [
+        "src/auth.py",
+        "tests/test_auth.py"
+      ],
+      "required_recall": 1.0,
+      "selected_count": 5,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.0586
+    },
+    {
+      "changed_files": [],
+      "external_ms": 107.005,
+      "focus_paths": [
+        "src/auth.py"
+      ],
+      "internal_ms": 106.941,
+      "name": "debug_login",
+      "output_tokens_est": 3327,
+      "paths": [
+        "src/auth.py",
+        "src/auth.py",
+        "tests/test_auth.py",
+        "README.md"
+      ],
+      "prompt": "Debug missing user validation in AuthService.login",
+      "required_paths": [
+        "src/auth.py"
+      ],
+      "required_recall": 1.0,
+      "selected_count": 4,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.0603
+    },
+    {
+      "changed_files": [
+        "README.md"
+      ],
+      "external_ms": 98.627,
+      "focus_paths": [
+        "README.md"
+      ],
+      "internal_ms": 98.565,
+      "name": "docs_auth",
+      "output_tokens_est": 3541,
+      "paths": [
+        "README.md",
+        "README.md",
+        "src/auth.py",
+        "tests/test_auth.py",
+        "benchmarks/gold_anchors/auth.json"
+      ],
+      "prompt": "Update authentication documentation after token changes",
+      "required_paths": [
+        "README.md"
+      ],
+      "required_recall": 1.0,
+      "selected_count": 5,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.063
+    }
+  ],
+  "max_timing_delta_pct": 0.063,
+  "schema": "python_v1_milestone_zero_baseline.v1",
+  "server_version": "1.3.1"
+}

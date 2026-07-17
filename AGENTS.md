@@ -16,8 +16,8 @@ debug, test, docs, security, and general repository tasks.
 2. Pass `root_uri` for the active checkout when available.
 3. Pass `changed_files` and `focus_paths` when the user names paths, branches,
    failing tests, review findings, or likely files.
-4. Set `client_profile` per request. Pass `output_profile` only when
-   intentionally overriding the client/default profile.
+4. Set `client_profile` per request. Use the v2 `evidence_policy` and bounded
+   source/item limits when intentionally changing evidence shape.
 5. Use `context_lookup` for targeted snippets, search, trees, symbols, impact,
    related symbols, test owners, chunks, or cache explanation before broad
    shell inspection.
@@ -79,12 +79,10 @@ For portable agent guidance, read
 
 ## Editing Guidance
 
-- Prefer the existing service boundaries:
-  `server.py` for MCP/HTTP surfaces, `manager.py` for project routing,
-  `projects.py` for root resolution, `context.py` for tool workflows,
-  `index.py` for repository indexing, `store.py` for LMDB access,
-  `references.py` for result handles, `memory.py` for repository memory, and
-  `metrics.py` for measurement.
+- Prefer the existing native service boundaries: `src/contextd` for
+  MCP/HTTP and project routing, `src/context-core` for contracts and tool
+  workflows, `src/context-index` for scanning/chunking/Tantivy, and
+  `src/context-store` for LMDB, references, memory, imports, and telemetry.
 - Keep public tool surfaces small. Prefer strict mode enums and documented
   schemas over adding many overlapping tools.
 - When adding or changing a public result field, document whether it is stable
@@ -96,15 +94,16 @@ For portable agent guidance, read
 
 Run the smallest meaningful validation before handing work back.
 
-- For tool schema, instruction, HTTP, or profile changes, run focused tests in
-  `tests/test_http_payload.py` and `tests/test_admin_and_regression.py`.
-- For context-pack behavior, run focused tests in `tests/test_context_pack.py`
-  and the benchmark when token, latency, or retrieval metrics change.
+- For tool schema, instruction, HTTP, transport, or profile changes, run the
+  focused `contextd`/`context-core` tests and `scripts/smoke_native_mcp.py`.
+- For context-pack behavior, run `context-core` tests and the native benchmark
+  when token, latency, retrieval, caching, or freshness behavior changes.
 - For indexing, boundaries, project routing, references, memory, or store
-  changes, run the matching focused test module.
+  changes, run the matching Cargo package tests.
 - The full offline check is:
 
 ```bash
-python3 -m pytest
-python3 -m ruff check .
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 ```

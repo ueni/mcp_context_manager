@@ -1,0 +1,38 @@
+{
+  "schema": "context_native_release_artifacts.v1",
+  "version": "2.0.0",
+  "artifacts": {
+    "glibc": {
+      "path": "dist/mcp-context-manager-linux-x86_64-glibc",
+      "size_bytes": 20628264,
+      "sha256": "d4bd579a886779a3afb0fd5ff5147329ad50cf2711ad63e244b0f5d77e4b4ed4",
+      "linkage": "dynamic glibc PIE",
+      "interpreter": "/lib64/ld-linux-x86-64.so.2",
+      "smoke": "stdio_http_security_ok"
+    },
+    "musl": {
+      "path": "dist/mcp-context-manager-linux-x86_64-musl",
+      "size_bytes": 20815400,
+      "sha256": "f2a0b5cfd348d3e8948dbfba7db0b625caa32b69e87e9629734292028c53100e",
+      "linkage": "static PIE",
+      "interpreter": null,
+      "smoke": "stdio_http_security_ok"
+    },
+    "docker_image": {
+      "id": "sha256:505a3ac0b1d2cd3b44735e1f3caf132bbc5bbcfd0238feda4f6d24bde1182ad6",
+      "size_bytes": 54965633,
+      "archive_size_bytes": 16834387,
+      "archive_sha256": "8d0078f02ee7e33bdcf79842957d3fc2887de9463d07cfbfea35ce11652ee7c3",
+      "python_runtime_present": false,
+      "smoke": "health_mcp_shutdown_ok"
+    },
+    "sbom": {
+      "path": "dist/mcp-context-manager.cdx.json",
+      "sha256": "463838ea28f7d680c3f0b846bcacd8c01301a2246413e8029ff81f400c8cce6f",
+      "format": "CycloneDX 1.6"
+    }
+  },
+  "binary_size_gate_bytes": 36700160,
+  "binary_size_gate_passed": true,
+  "checksums_verified": true
+}

@@ -1,0 +1,310 @@
+diff --git a/README.md b/README.md
+index f1cd555..675f7be 100644
+--- a/README.md
++++ b/README.md
+@@ -333,6 +333,12 @@ MCP_CONTEXT_STATE_DIR=/home/user/.local/state/mcp-context-manager \
+ mcp-context-manager
+ ```
+ 
++HTTP deployments can require bearer authentication with
++`MCP_HTTP_BEARER_TOKEN`. Host and browser-origin validation are enabled for all
++HTTP routes; use comma-separated `MCP_HTTP_ALLOWED_HOSTS` and
++`MCP_HTTP_ALLOWED_ORIGINS` values when requests arrive through a proxy or a
++non-local hostname.
++
+ Streamable HTTP clients should point at:
+ 
+ ```yaml
+@@ -401,15 +407,20 @@ unless a caller explicitly passes the nested `root_uri`.
+ | `MCP_CONTEXT_PROJECT_DISCOVERY_MAX_DEPTH` | Recursive discovery depth under allowed roots. Defaults to `4`. |
+ | `MCP_CONTEXT_PROJECT_MARKERS` | Comma- or path-separator-delimited marker filenames for non-Git project discovery. Defaults to `.git`, `pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`, `pom.xml`, and `CMakeLists.txt`. |
+ | `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host parent mounted at `/workspace-roots`. |
++| `MCP_CONTEXT_REPO_PATH` | Compose helper for the default repository path inside the container. Set it to a project below `/workspace-roots` when the host mount contains many repositories. |
+ | `MCP_CONTEXT_UID` / `MCP_CONTEXT_GID` | Compose build args for the non-root container user. Defaults to `1000:1000`. |
+ | `MCP_TRANSPORT` | `stdio` by default, or `streamable-http`. |
+ | `HOST` / `PORT` | HTTP bind settings. Compose binds the published port to localhost. |
++| `MCP_HTTP_BEARER_TOKEN` | Optional bearer token required by every HTTP and MCP request. |
++| `MCP_HTTP_ALLOWED_HOSTS` | Optional comma-separated exact `Host` header allowlist. Localhost values for `PORT` are allowed by default. |
++| `MCP_HTTP_ALLOWED_ORIGINS` | Optional comma-separated exact browser `Origin` allowlist. Localhost HTTP origins for `PORT` are allowed by default. |
+ | `MAX_READ_BYTES` | Maximum file bytes read for snippets/indexing. |
+ | `MAX_OUTPUT_CHARS` | Default output budget. |
+ | `MCP_CONTEXT_OUTPUT_PROFILE` | Default profile: `lean`, `minimal`, `compact`, `normal`, or `verbose`. |
+ | `MCP_CONTEXT_LMDB_MAP_SIZE` | LMDB map size in bytes. Defaults to `1073741824` and is clamped to at least `16777216`. |
+ | `MCP_CONTEXT_TOKEN_COUNTER` | `estimate` by default, or `target` to try an optional target tokenizer. |
+ | `MCP_CONTEXT_TARGET_TOKENIZER` | Target tokenizer name for `target` mode, defaulting to `cl100k_base`. |
++| `MCP_CONTEXT_RETRIEVAL_WORKERS` | Process-lifetime bounded retrieval workers. Defaults to `4`, clamped to `1..8`; queued work is capped at twice the worker count. |
+ 
+ ## Metrics And Evaluation
+ 
+@@ -417,7 +428,10 @@ Use `context_admin(mode="measurement_matrix")` to get the pass/fail target
+ matrix for context-pack speed and token economy. Current metrics include
+ context-pack latency, index-refresh latency, candidate compression, compression
+ ratio, candidate-to-selected ratio, cache hit ratios, external calls saved, and
+-reference bytes deferred.
++reference bytes deferred. Retrieval queue diagnostics include queue wait,
++parallel wall time, aggregate worker work, task counts, configured/active workers,
++and queue depth; concurrent stage timings are aggregate worker work and are not
++additive wall-clock latency.
+ 
+ Per-pack candidate compression is estimated as:
+ 
+diff --git a/compose.yaml b/compose.yaml
+index 57a6521..2c345f8 100644
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -13,8 +13,12 @@ services:
+       MCP_CONTEXT_ROOT_MAPPINGS: ${MCP_CONTEXT_ROOT_MAPPINGS:-${MCP_CONTEXT_HOST_ROOT:-${PWD}}=/workspace-roots}
+       MCP_CONTEXT_STATE_DIR: /state
+       MCP_TRANSPORT: streamable-http
++      MCP_HTTP_ALLOWED_HOSTS: ${MCP_HTTP_ALLOWED_HOSTS:-localhost,localhost:8000,127.0.0.1,127.0.0.1:8000,mcp-context-manager,mcp-context-manager:8000,mcp-context-manager-mcp-context-manager-1,mcp-context-manager-mcp-context-manager-1:8000}
++      MCP_HTTP_ALLOWED_ORIGINS: ${MCP_HTTP_ALLOWED_ORIGINS:-}
++      MCP_HTTP_BEARER_TOKEN: ${MCP_HTTP_BEARER_TOKEN:-}
+       PORT: 8000
+-      REPO_PATH: /workspace-roots
++      REPO_PATH: ${MCP_CONTEXT_REPO_PATH:-/workspace-roots}
++      MCP_CONTEXT_RETRIEVAL_WORKERS: ${MCP_CONTEXT_RETRIEVAL_WORKERS:-4}
+     ports:
+       - "127.0.0.1:8000:8000"
+     restart: always
+diff --git a/src/mcp_context_manager/context.py b/src/mcp_context_manager/context.py
+index ddb05e4..48f90d6 100644
+--- a/src/mcp_context_manager/context.py
++++ b/src/mcp_context_manager/context.py
+@@ -13,7 +13,7 @@ from .index import ContextIndex
+ from .memory import ContextMemory
+ from .metrics import ContextMetrics
+ from .references import ResultReferences
+-from .runtime import background_jobs, io_executor
++from .runtime import background_jobs, io_executor, retrieval_executor
+ from .schemas import output_contracts
+ from .store import ContextStore
+ from .token_counter import TokenCount, TokenCounter
+@@ -926,6 +926,11 @@ class ContextService:
+                 )
+             except Exception:
+                 pass
++        final_elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
++        stage_timings["total_ms"] = final_elapsed_ms
++        result_metrics = result.get("metrics")
++        if isinstance(result_metrics, dict):
++            result_metrics["elapsed_ms"] = final_elapsed_ms
+         return result
+ 
+     def result_reference_resolve(
+@@ -3792,6 +3797,8 @@ class ContextService:
+             "file_summary_memo_targets": [],
+             "test_owner_path_cache_hit": False,
+         }
++        retrieval_started = time.perf_counter()
++        retrieval_before = retrieval_executor().metrics()
+ 
+         def count_source(source: str) -> None:
+             counts = retrieval_stats.setdefault("source_counts", {})
+@@ -3842,9 +3849,17 @@ class ContextService:
+                 3,
+             )
+ 
++        explicit_targets: list[str] = []
++        explicit_seen: set[str] = set()
+         for rel in explicit_paths:
+-            try:
+-                summary, summary_hit, miss_detail = self._memoized_file_summary(
++            canonical = self._canonical_cache_path(rel)
++            if canonical in explicit_seen:
++                continue
++            explicit_seen.add(canonical)
++            explicit_targets.append(canonical)
++        explicit_futures = [
++            retrieval_executor().submit(
++                lambda rel=rel: self._memoized_file_summary(
+                     rel,
+                     line_anchor=0,
+                     refresh_signature=refresh_signature,
+@@ -3853,6 +3868,12 @@ class ContextService:
+                     retrieval_stats=retrieval_stats,
+                     cache_reads_enabled=cache_reads_enabled,
+                 )
++            )
++            for rel in explicit_targets
++        ]
++        for rel, future in zip(explicit_targets, explicit_futures):
++            try:
++                summary, summary_hit, miss_detail = future.result()
+                 count_fragment(summary_hit, miss_detail)
+                 count_chunk(summary_hit)
+             except Exception as exc:
+@@ -4079,6 +4100,32 @@ class ContextService:
+             int(retrieval_stats.get("chunk_hits", 0) or 0),
+             int(retrieval_stats.get("chunk_misses", 0) or 0),
+         )
++        retrieval_after = retrieval_executor().metrics()
++        retrieval_stats["queue_wait_ms"] = round(
++            retrieval_after["queue_wait_ms"] - retrieval_before["queue_wait_ms"], 3
++        )
++        retrieval_stats["aggregate_worker_work_ms"] = round(
++            retrieval_after["aggregate_worker_work_ms"]
++            - retrieval_before["aggregate_worker_work_ms"],
++            3,
++        )
++        retrieval_stats["parallel_wall_ms"] = round(
++            (time.perf_counter() - retrieval_started) * 1000, 3
++        )
++        retrieval_executor().record_parallel_wall(retrieval_stats["parallel_wall_ms"])
++        for key in (
++            "submitted_tasks",
++            "completed_tasks",
++            "failed_tasks",
++        ):
++            retrieval_stats[key] = retrieval_after[key] - retrieval_before[key]
++        retrieval_stats.update(
++            {
++                "configured_workers": retrieval_after["configured_workers"],
++                "active_workers": retrieval_after["active_workers"],
++                "queue_depth": retrieval_after["queue_depth"],
++            }
++        )
+         return candidates, omitted, retrieval_stats
+ 
+     def _add_test_owner_candidates(
+diff --git a/src/mcp_context_manager/metrics.py b/src/mcp_context_manager/metrics.py
+index e36f962..70a407b 100644
+--- a/src/mcp_context_manager/metrics.py
++++ b/src/mcp_context_manager/metrics.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ from typing import Any
+ 
+ from .config import ContextConfig
++from .runtime import retrieval_executor
+ from .schemas import contract_size_metrics
+ from .store import ContextStore
+ from .token_counter import TokenCounter
+@@ -469,6 +470,7 @@ class ContextMetrics:
+                 if result_count
+                 else 0.0,
+             },
++            "retrieval_queue": retrieval_executor().metrics(),
+             "warmup": warmup,
+             "tokens": {
+                 "estimated_input_tokens_saved": tokens_saved,
+diff --git a/src/mcp_context_manager/runtime.py b/src/mcp_context_manager/runtime.py
+index 73ee541..24ecf23 100644
+--- a/src/mcp_context_manager/runtime.py
++++ b/src/mcp_context_manager/runtime.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import os
+ import threading
+ import time
+ from concurrent.futures import Future, ThreadPoolExecutor
+@@ -21,6 +22,82 @@ _CPU_EXECUTOR = ThreadPoolExecutor(
+ )
+ 
+ 
++def _retrieval_worker_count() -> int:
++    try:
++        value = int(os.getenv("MCP_CONTEXT_RETRIEVAL_WORKERS", "4"))
++    except ValueError:
++        value = 4
++    return max(1, min(8, value))
++
++
++class BoundedRetrievalQueue:
++    """Process-lifetime retrieval executor with bounded admission."""
++
++    def __init__(self) -> None:
++        self.workers = _retrieval_worker_count()
++        self.capacity = self.workers * 2
++        self._executor = ThreadPoolExecutor(
++            max_workers=self.workers, thread_name_prefix="mcp-retrieval"
++        )
++        self._slots = threading.BoundedSemaphore(self.capacity)
++        self._lock = threading.Lock()
++        self._queued = 0
++        self._active = 0
++        self._submitted = 0
++        self._completed = 0
++        self._failed = 0
++        self._wait_ms = 0.0
++        self._work_ms = 0.0
++        self._parallel_wall_ms = 0.0
++
++    def submit(self, work: Callable[[], Any]) -> Future[Any]:
++        waited = time.perf_counter()
++        self._slots.acquire()
++        wait_ms = (time.perf_counter() - waited) * 1000
++        with self._lock:
++            self._queued += 1
++            self._submitted += 1
++            self._wait_ms += wait_ms
++
++        def run() -> Any:
++            started = time.perf_counter()
++            with self._lock:
++                self._queued -= 1
++                self._active += 1
++            try:
++                return work()
++            except Exception:
++                with self._lock:
++                    self._failed += 1
++                raise
++            finally:
++                with self._lock:
++                    self._active -= 1
++                    self._completed += 1
++                    self._work_ms += (time.perf_counter() - started) * 1000
++                self._slots.release()
++
++        return self._executor.submit(run)
++
++    def metrics(self) -> dict[str, Any]:
++        with self._lock:
++            return {
++                "configured_workers": self.workers,
++                "active_workers": self._active,
++                "queue_depth": self._queued,
++                "submitted_tasks": self._submitted,
++                "completed_tasks": self._completed,
++                "failed_tasks": self._failed,
++                "queue_wait_ms": round(self._wait_ms, 3),
++                "parallel_wall_ms": round(self._parallel_wall_ms, 3),
++                "aggregate_worker_work_ms": round(self._work_ms, 3),
++            }
++
++    def record_parallel_wall(self, elapsed_ms: float) -> None:
++        with self._lock:
++            self._parallel_wall_ms += max(0.0, float(elapsed_ms))
++
++
+ def service_executor() -> ThreadPoolExecutor:
+     return _SERVICE_EXECUTOR
+ 
+@@ -33,6 +110,13 @@ def cpu_executor() -> ThreadPoolExecutor:
+     return _CPU_EXECUTOR
+ 
+ 
++retrieval_queue = BoundedRetrievalQueue()
++
++
++def retrieval_executor() -> BoundedRetrievalQueue:
++    return retrieval_queue
++
++
+ class BackgroundJobRegistry:
+     def __init__(self) -> None:
+         self._lock = threading.Lock()
+diff --git a/src/mcp_context_manager/tantivy_index.py b/src/mcp_context_manager/tantivy_index.py
+index 566e839..86a49d5 100644
+--- a/src/mcp_context_manager/tantivy_index.py
++++ b/src/mcp_context_manager/tantivy_index.py
+@@ -158,6 +158,9 @@ class TantivySearchIndex:
+         index.reload()
+ 
+     def _open_existing(self) -> Any:
++        if self._index is not None and self.index_dir.exists():
++            return self._index
++        self._index = None
+         tantivy = self._module()
+         if not self.index_dir.exists() or not tantivy.Index.exists(str(self.index_dir)):
+             raise FileNotFoundError(str(self.index_dir))

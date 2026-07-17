@@ -1,0 +1,99 @@
+{
+  "gates": {
+    "balanced_pack_median_lte_400_tokens": true,
+    "delta_reduction_gte_80pct": true,
+    "freshness_lte_2s": true,
+    "l0_server_p95_lte_2ms": true,
+    "l1_p95_lte_15ms": true,
+    "local_mcp_l0_p95_lte_10ms": true,
+    "noise_ratio_lte_30pct": true,
+    "required_anchor_recall_100pct": true,
+    "runtime_l0_hits_recorded": true,
+    "warm_miss_p95_lte_50ms": true
+  },
+  "method": {
+    "environment": "devcontainer",
+    "l0_samples": 100,
+    "state": "isolated rust-v2 overlay per run",
+    "transport": "persistent MCP stdio"
+  },
+  "run": 5,
+  "runtime_metrics": {
+    "background": {
+      "status": "idle"
+    },
+    "benchmarks": {},
+    "cache": {
+      "hit_ratio": 0.9900990099009901,
+      "hits": 100,
+      "l0": {
+        "entries": 1,
+        "hits": 100,
+        "misses": 1,
+        "weighted_bytes": 588
+      },
+      "l1": {
+        "approximate_hits": 0,
+        "exact_hits": 0,
+        "retrieval_misses": 1
+      },
+      "misses": 1
+    },
+    "generated_at": "2026-07-17T18:00:46.364989452Z",
+    "index_freshness": {
+      "coalesce_ms": 50,
+      "dirty": false,
+      "generation": 0,
+      "poll_interval_ms": 2000,
+      "refreshes": 0,
+      "strategy": "notify_with_polling_fallback"
+    },
+    "project_id": "legacy-c565911b227a",
+    "references": {
+      "active_count": 1,
+      "total_count": 1
+    },
+    "requests": {
+      "by_tool": {
+        "context_pack": 101
+      },
+      "total": 101
+    },
+    "retrieval": {
+      "backend": "tantivy",
+      "doc_count": 1370,
+      "misses": 1
+    },
+    "retrieval_queue": {
+      "active": 0,
+      "pending": 0
+    },
+    "schema": "context_metrics.v1",
+    "since": "2026-07-17T18:00:46.364989452Z",
+    "tokens": {
+      "input_est": 0,
+      "output_est": 0,
+      "saved_est": 0
+    },
+    "tooling": {
+      "external_calls_saved_est": 0
+    },
+    "updated_at": "2026-07-17T18:00:46.364989452Z",
+    "warmup": {
+      "runs": 0
+    }
+  },
+  "schema": "rust_native_milestone_3.complete_run.v1",
+  "summary": {
+    "balanced_pack_tokens_median": 157,
+    "delta_reduction": 1.0,
+    "freshness_ms": 13.441524,
+    "l0_server_p95_ms": 0.0033009999999999997,
+    "l1_p95_ms": 0.182674,
+    "local_mcp_l0_median_ms": 0.3137135,
+    "local_mcp_l0_p95_ms": 0.631576,
+    "noise_ratio": 0.0,
+    "required_anchor_recall": 1.0,
+    "warm_miss_p95_ms": 26.885595000000002
+  }
+}

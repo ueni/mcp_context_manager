@@ -1,0 +1,463 @@
+{
+  "imported_count": 120,
+  "phase": "final_after_python_shutdown",
+  "project_count": 30,
+  "projects": [
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "1-1-6-7b5fc53a6c15"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "1-1-6-d717b0013fc6"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "ai-agent-24123b0fb858"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 2,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 2,
+        "skipped_invalid_count": 0,
+        "source_count": 2
+      },
+      "project_id": "akkodis-conan-center-index-28df60cca914"
+    },
+    {
+      "manifest": {
+        "digest": "f6f1c2b804548291de6ed13bb8f8d1669209a653a7754ddc6412dd93e0bf7a49",
+        "imported_count": 2,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 2,
+        "reference_source_count": 226,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 224,
+        "skipped_invalid_count": 0,
+        "source_count": 226
+      },
+      "project_id": "akkodis-libc-mcu-framework-e321be55c850"
+    },
+    {
+      "manifest": {
+        "digest": "e242bb27176cba15ac33e96bb80077cd77e10010ec7167547938a7890f5f820c",
+        "imported_count": 38,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 38,
+        "reference_source_count": 42,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 4,
+        "skipped_invalid_count": 0,
+        "source_count": 42
+      },
+      "project_id": "akkodis-libc-ota-framework-c052b7abf8b3"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "akkodis-mcu-commons-6e3444de3f22"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "akkodis-mcu-project-template-d0448920cd93"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "azure-pipelines-agent-4c8c972c671c"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "container-38dab98545d3"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "container-5081130e3701"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "cop-flip-52d4264644b2"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "cop-flip-wiki-5f692b50998c"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "docker-harden-5b98cc4d8449"
+    },
+    {
+      "manifest": {
+        "digest": "75c436b10641dad4fe41d79120f0afe8a9703b161fd724dc396a13deefbec294",
+        "imported_count": 10,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 10,
+        "reference_source_count": 24,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 14,
+        "skipped_invalid_count": 0,
+        "source_count": 24
+      },
+      "project_id": "feso-b5a11ff04102"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "foss-legacy-scan-tool-83d1e2935e8e"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "frauenhofer-laserpositionunit-1433ebd591f2"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "frida-ipfm-legacy-code-ab599167eff7"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "gaz-easycontrol-a44c79334023"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "jabil-seadevil-0e17253f671d"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "kla-laserhead-c8cd64bcb767"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "mcp-coding-experiment-6e0da88cb02e"
+    },
+    {
+      "manifest": {
+        "digest": "1aae390b4dbe323a8281fbb63b9c4362f74afad72cb49229576e6f9997a74e09",
+        "imported_count": 48,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 48,
+        "reference_source_count": 174,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 126,
+        "skipped_invalid_count": 0,
+        "source_count": 174
+      },
+      "project_id": "mcp-context-manager-93792c7d8071"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "monitoring-recoder-ddc0dc28197f"
+    },
+    {
+      "manifest": {
+        "digest": "1050a6cdd77896af1090fc6906e078efe24f43785ea32700906e141cee3f8d4c",
+        "imported_count": 22,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 22,
+        "reference_source_count": 30,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 8,
+        "skipped_invalid_count": 0,
+        "source_count": 30
+      },
+      "project_id": "otax-updater-5379788e85c4"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "platform-templates-189d48c0f631"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "scancontrol-os-cbd0e0a622cf"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "workspace-roots-fc4465d4643d"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 2,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 2,
+        "skipped_invalid_count": 0,
+        "source_count": 2
+      },
+      "project_id": "zeiss-conan-center-index-c00c7f9401fa"
+    },
+    {
+      "manifest": {
+        "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "imported_count": 0,
+        "memory_imported_count": 0,
+        "memory_source_count": 0,
+        "reference_imported_count": 0,
+        "reference_source_count": 0,
+        "schema": "context_store.v1_import_manifest.v1",
+        "skipped_expired_count": 0,
+        "skipped_invalid_count": 0,
+        "source_count": 0
+      },
+      "project_id": "zeiss-f-akf-d483c2cb8ba0"
+    }
+  ],
+  "schema": "context_cutover_state_import.v1",
+  "skipped_expired_count": 380,
+  "skipped_invalid_count": 0,
+  "source_access": "read_only_no_lock",
+  "source_count": 500,
+  "target": "isolated per-project rust-v2 overlays"
+}

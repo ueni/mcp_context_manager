@@ -13,8 +13,12 @@ services:
       MCP_CONTEXT_ROOT_MAPPINGS: ${MCP_CONTEXT_ROOT_MAPPINGS:-${MCP_CONTEXT_HOST_ROOT:-${PWD}}=/workspace-roots}
       MCP_CONTEXT_STATE_DIR: /state
       MCP_TRANSPORT: streamable-http
+      MCP_HTTP_ALLOWED_HOSTS: ${MCP_HTTP_ALLOWED_HOSTS:-localhost,localhost:8000,127.0.0.1,127.0.0.1:8000,mcp-context-manager,mcp-context-manager:8000,mcp-context-manager-mcp-context-manager-1,mcp-context-manager-mcp-context-manager-1:8000}
+      MCP_HTTP_ALLOWED_ORIGINS: ${MCP_HTTP_ALLOWED_ORIGINS:-}
+      MCP_HTTP_BEARER_TOKEN: ${MCP_HTTP_BEARER_TOKEN:-}
       PORT: 8000
-      REPO_PATH: /workspace-roots
+      REPO_PATH: ${MCP_CONTEXT_REPO_PATH:-/workspace-roots}
+      MCP_CONTEXT_RETRIEVAL_WORKERS: ${MCP_CONTEXT_RETRIEVAL_WORKERS:-4}
     ports:
       - "127.0.0.1:8000:8000"
     restart: always

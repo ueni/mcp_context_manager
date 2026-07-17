@@ -1,6 +1,7 @@
 .git
 .downloads
 .cmake-build
+/target
 .mcp-context-manager
 .pytest_cache
 .ruff_cache

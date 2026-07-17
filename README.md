@@ -1,228 +1,88 @@
-# <img align="left" src="doc/assets/agenttonic-banner.svg" alt="AgentTonic" width="100%" hspace="0" vspace="10">
+# AgentTonic / mcp-context-manager
 
 [![Build](https://github.com/ueni/mcp_context_manager/actions/workflows/build.yml/badge.svg)](https://github.com/ueni/mcp_context_manager/actions/workflows/build.yml)
 
-`AgentTonic` (mcp-context-manager) is a focused Model Context Protocol (MCP)
-server for context management. It builds small, task-specific context packets
-from the sources you expose, such as files, symbols, snippets, memory, metrics,
-and references, so an agent can start from relevant signal instead of spending
-tokens on broad discovery and repeated reads.
+`mcp-context-manager` is a native Rust Model Context Protocol server that builds
+small, task-specific repository context packs. It exposes source files read-only
+and writes only generated indexes, caches, memory, metrics, and result references
+under the configured state directory.
 
-The server is read-only for source files. It writes only generated state such as
-indexes, cache entries, metrics, memory, and result references under the
-configured state directory.
+Version 2 is a clean break for `context_pack`. The other public tools retain
+their stable request and response schemas:
 
-## What It Is
+- `context_lookup`
+- `context_memory`
+- `context_admin`
+- `result_reference_resolve`
 
-The project is a compact context authority for one or more workspaces,
-repositories, or project scopes exposed through MCP roots or explicit `root_uri`
-/ `project_id` selection.
+The production server has no Python runtime dependency. Releases contain a
+dynamic glibc executable, a static musl executable, a Docker image archive, a
+CycloneDX SBOM, checksums, and a Sigstore signature bundle.
 
-It provides:
+Implementation details are in [doc/technical-paper.md](doc/technical-paper.md).
 
-- Bounded context packs for coding, review, debug, test, docs, security, and
-  general context-heavy tasks.
-- Targeted lookup for search hits, snippets, trees, symbols, references,
-  related symbols, test owners, chunks, and cache explanation.
-- Project-scoped generated state for indexes, caches, memory, references, and
-  metrics.
-- Stable local result references for omitted or bulky evidence.
-- Tools-only fallbacks for MCP clients that do not support resources or prompts.
+## Context Pack v2
 
-The implementation details are described in
-[`doc/technical-paper.md`](doc/technical-paper.md).
+The default request uses balanced evidence and the fast cache strategy:
 
-## Why Use It
+```json
+{
+  "prompt": "Review bearer authentication and its tests",
+  "changed_files": ["src/contextd/src/lib.rs"],
+  "focus_paths": ["scripts/smoke_native_mcp.py"],
+  "client_profile": "codex"
+}
+```
 
-Modern coding agents are powerful, but context discovery is still expensive.
-Without a context layer, every turn can become another round of broad search,
-tree walking, repeated reads, and repeated explanations of the same project
-facts. `AgentTonic` turns that scattered discovery work into one fast,
-bounded, evidence-backed context packet.
+Supported fields are:
 
-Use it when you want agents to:
-
-- Start with signal, not noise. The first tool call returns the files, symbols,
-  snippets, tests, memory, and references most likely to matter for the task.
-- Spend tokens on reasoning instead of context archaeology. Compact packs
-  summarize and rank evidence while keeping full details available on demand.
-- Stay fast across follow-up turns. Incremental indexing, fragment caches for
-  retrieval, prompt-aware background warmup, and chunk reuse keep unchanged
-  context work from being repeated without serving stale evidence.
-- Review and debug with traceable evidence. Every selected item carries path,
-  line hints, reasons, confidence, provenance, and a `detail_lookup` route back
-  to raw snippets.
-- Keep large evidence out of the prompt until it is actually needed. Omitted
-  candidates and diagnostics stay behind local references that can be resolved
-  later.
-- Work cleanly across many workspaces or repositories. MCP roots, explicit
-  `root_uri`, and `project_id` keep indexes, cache, memory, metrics, and
-  references isolated per project.
-- Optimize without guessing. Metrics, benchmark runs, and gold-anchor fixtures
-  show whether token savings, latency, cache reuse, and retrieval recall are
-  actually improving.
-
-The result is a tighter agent loop: less context churn, fewer repeated local
-reads, smaller prompts, and better evidence discipline before code changes.
-
-## Implemented Techniques
-
-`mcp-context-manager` combines several token, latency, and safety techniques:
-
-- Evidence-first `context_pack` output with `lean`, `minimal`, `compact`, `normal`, and
-  `verbose` profiles.
-- Client profiles for Codex, Claude, Copilot, and generic MCP hosts.
-- Prompt echo and volatile runtime metadata disabled by default.
-- Diagnostics and omitted evidence moved behind `diagnostics_ref` and
-  `omitted_ref`.
-- Deterministic public JSON fields and confidence buckets for compact output.
-- Incremental indexing by file metadata, content digest, symbols, imports, and
-  search terms.
-- Git or file-metadata refresh signatures to skip unchanged repository scans.
-- Chunk-addressed summary metadata by chunk id, line range, content digest,
-  extractor version, and redaction version.
-- Fragment caches for search terms and file summaries.
-- Optional skill guidance compiled from non-secret `context_memory` records in
-  `skills/<provider>` namespaces, cached as compact cards and returned by
-  `context_pack` only when relevant.
-- Route-aware candidate ranking using task terms, explicit paths, changed files,
-  symbol matches, related symbols, likely tests, and diversity limits.
-- Budget planning before final serialization, with low-value or bulky evidence
-  deferred to references.
-- Repository-local structured memory with facts, summaries, decisions, TTLs,
-  validation, and compaction.
-- Prompt-injection signal detection on returned repository text.
-- Secret and host-path redaction before generated-state storage.
-- Gold-anchor retrieval-quality fixtures and measurement-matrix benchmarks.
-
-## Skill Guidance Convention
-
-Agents can share reusable, non-secret skill material without adding tools or
-parameters. Store raw skill records through `context_memory(mode="upsert")`
-under namespaces such as `skills/codex`, `skills/claude`, `skills/copilot`, or
-`skills/custom`. Use stable keys for skill ids and values with fields such as
-`name`, `description`, `triggers`, `body` or `instructions`, `source`, and
-optional `version`.
-
-Pre-summarized skill records can use `context_memory(mode="summary_upsert")` in
-the same namespaces. The next relevant `context_pack` ranks matching records,
-compiles compact deterministic skill cards, caches them internally under
-`skill.compiled`, and returns an optional `skill_guidance` field. Raw skill
-bodies are not returned.
-
-## Why LMDB Instead Of SQLite
-
-The generated-state workload is closer to a local key-value cache than a
-relational application database. `mcp-context-manager` stores indexes, term
-rows, cache fragments, memory rows, metrics, and reference metadata as small
-JSON documents behind stable key prefixes. LMDB fits that shape directly.
-
-Why that matters for coding agents:
-
-- Fast read-heavy access: context packs repeatedly scan prefix ranges such as
-  indexed files, symbols, terms, cache entries, and metrics.
-- Fewer moving parts on the hot path: lookup code reads JSON rows by key or
-  prefix instead of planning SQL queries, joining tables, or maintaining a
-  relational schema for every cache variant.
-- Low operational overhead: LMDB is embedded, local, and does not need schema
-  migrations for every new diagnostic or cache payload.
-- Transactional generated state: index refreshes can update file, symbol,
-  import, and term rows together.
-- Batched refresh writes: a changed file can replace its `index:file`,
-  `index:symbol`, `index:import`, and `index:term` rows in one write
-  transaction, keeping the index consistent without extra coordination.
-- Deterministic storage model: sorted JSON values plus stable key prefixes make
-  cache entries and diagnostics easy to inspect and compare.
-- Good fit for disposable state: generated indexes and caches can be pruned,
-  rebuilt, or isolated per project without treating them as authoritative
-  source data.
-
-That shape is why the context-pack hot path stays small: the server can refresh
-only changed paths, iterate contiguous key ranges for search and metrics, reuse
-cached fragments, and write reference metadata without paying for relational
-query planning or schema evolution. SQLite would work, but most of its strength
-would sit unused because the server does not need joins, foreign keys, or ad hoc
-analytics to build a compact context pack.
-
-SQLite is excellent when the data model is relational and ad hoc SQL queries
-are the product. This server mostly needs bounded prefix lookup, fast local
-reuse, and simple project-scoped cache state, so LMDB keeps the hot path small.
-
-## MCP Tools
-
-The public tool surface is intentionally small:
-
-| Tool | Purpose |
+| Field | Contract |
 | --- | --- |
-| `context_pack` | Build a task-focused context pack with ranked evidence and references. |
-| `context_lookup` | Search, snippet, tree, symbols, references, impact, related symbols, test owners, chunk, or cache explanation. |
-| `context_memory` | Store, retrieve, validate, and compact structured repository-local memory. |
-| `context_admin` | Health, projects, index, cache/warmup, budget, contracts, metrics, measurement matrix, benchmark, generated-state browsing, quality evaluation, cache planning, profile calibration, instructions, resource proxy, and schema minification. |
-| `result_reference_resolve` | Resolve local result references after boundary, expiry, and hash checks. |
+| `prompt` | Required task text. |
+| `changed_files`, `focus_paths` | Repository-relative paths ranked first. |
+| `memory_session` | Optional task-scoped memory key. |
+| `client_profile`, `model_profile` | Client/provider hints. |
+| `project_id`, `root_uri` | Explicit project selection. |
+| `max_items` | Default `8`, range `1..32`. |
+| `max_source_tokens` | Default `512`, range `0..4096`. |
+| `evidence_policy` | `reference`, `balanced`, or `source`. |
+| `cache_strategy` | `fast`, `stable`, or `fresh`. |
+| `base_pack`, `known_evidence` | Optional session delta inputs. |
 
-Project-aware tools accept optional `project_id` or `root_uri`. If omitted, the
-server uses MCP roots from the client. If multiple roots are visible and the
-project cannot be inferred from path hints, the request is rejected as
-ambiguous.
-
-## MCP Resources And Prompts
-
-Resources mirror bounded repository data for hosts that support them:
-
-- `repo://summary`
-- `repo://file/{path}`
-- `repo://tree/{path}`
-- `repo://context/{reference_id}`
-- `repo://metrics`
-- `repo://instructions/codex-context-pack-first`
-- `repo://project/{project_id}/summary`
-- `repo://project/{project_id}/file/{path}`
-- `repo://project/{project_id}/tree/{path}`
-- `repo://project/{project_id}/context/{reference_id}`
-- `repo://project/{project_id}/metrics`
-- `repo://project/{project_id}/instructions/codex-context-pack-first`
-
-For tools-only clients, use:
+The MCP tool returns one raw JSON text item. The direct REST endpoint returns
+the same UTF-8 bytes:
 
 ```json
-{"mode": "instructions"}
+{
+  "v": 2,
+  "id": "pk_0123456789abcdef",
+  "route": "debug",
+  "paths": ["src/contextd/src/lib.rs"],
+  "evidence": [
+    ["ev_0123456789abcdef", 1, 301, 303, "run_http", "sig: async fn run_http(...)", 13]
+  ],
+  "more": "ctxref-0123456789abcdef"
+}
 ```
 
-or:
+The compact evidence tuple contains the evidence id, policy/delta opcode,
+inclusive line interval, symbol, evidence card, and estimated source tokens.
+Diagnostics, metrics, and token accounting are available through
+`context_admin` rather than being repeated in every pack.
 
-```json
-{"mode": "resource_proxy", "path": "repo://summary"}
-```
+## MCP-first workflow
 
-with `context_admin`.
+Use `repo://instructions/codex-context-pack-first` as the portable source of
+truth:
 
-## Agent Onboarding
-
-Repository-side MCP configuration can make this server available and provide
-server instructions, but it cannot force a model to call a tool on every turn.
-Pair MCP configuration with global or project agent instructions.
-
-Use this prompt when onboarding an agent or MCP host:
-
-```text
-Adopt the mcp-context-manager MCP instructions into your global agent
-instructions outside this repository. Use
-repo://instructions/codex-context-pack-first as the source of truth for
-repository tasks. Keep context_pack first, set client_profile per request, and
-pass output_profile only when intentionally overriding the client/default
-profile.
-```
-
-Use this prompt when creating or updating an `AGENTS.md` file:
-
-```text
-Create or update AGENTS.md for this repository. Preserve existing project
-instructions, and add the mcp-context-manager MCP-first workflow: use
-repo://instructions/codex-context-pack-first as the source of truth, call
-context_pack before broad repository inspection, set client_profile per
-request, and pass output_profile only when intentionally overriding the
-client/default profile.
-```
+1. Call `context_pack` first for repository tasks.
+2. Use `context_lookup` for targeted follow-up snippets, search, trees, symbols,
+   references, impact, test ownership, chunks, and cache explanation.
+3. Resolve raw referenced evidence before destructive changes, release claims,
+   or security conclusions.
+4. Use `context_admin` for health, projects, index, cache, metrics, contracts,
+   benchmarks, quality, warmup, and generated-state inspection.
+5. Store only structured, non-secret repository facts through `context_memory`.
 
 Recommended Codex configuration:
 
@@ -240,404 +100,216 @@ enabled_tools = [
 default_tools_approval_mode = "auto"
 ```
 
-`required = true` fails startup or resume when the enabled server cannot
-initialize. It does not guarantee a tool call on every turn.
+## Run with Docker Compose
 
-## Profiles
-
-`context_pack` is summary-first. The fastest profile is `minimal`; `compact`,
-`normal`, and `verbose` progressively expose more inline diagnostics. Raw prompt
-echo and volatile runtime metadata are opt-in.
-
-Client profiles tune defaults without changing the public tool surface:
-
-| Profile | Default intent |
-| --- | --- |
-| `codex` | Prefer fast minimal packs for MCP-first agent loops. |
-| `claude` | Prefer compact summaries plus stable references for compaction-friendly sessions. |
-| `copilot` | Keep a tools-only path through `context_admin(mode="instructions")` and `context_admin(mode="resource_proxy")`. |
-| `generic` | Use the configured default output profile. |
-
-Profiles are selected by the MCP caller on each `context_pack` request. The
-server does not auto-detect the host client. Explicit `output_profile` wins over
-`client_profile`; if `output_profile` is omitted, `client_profile="codex"` uses
-`minimal`, and other clients use the configured default output profile.
-`model_profile` is a provider hint, so use `client_profile="claude"` with
-`model_profile="anthropic"` for Claude and `client_profile="copilot"` with
-`model_profile="github"` for GitHub Copilot. `context_admin(mode="profile_calibrate")`
-reports recommendations only; it does not mutate server or session state.
-
-## Run With Docker Compose
-
-Single-repo default from this checkout:
+Build the locked musl artifact and image, then start the service:
 
 ```bash
+cmake --preset local
+cmake --build --preset standalone
 docker compose up --build
 ```
 
-Global parent mode for multiple repositories under one host directory:
+For several repositories under one host parent, keep that parent mounted and
+select a narrow default repository so startup does not index the whole parent:
 
 ```bash
-MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up --build
+MCP_CONTEXT_HOST_ROOT=/home/user/source \
+MCP_CONTEXT_REPO_PATH=/workspace-roots/mcp-context-manager \
+docker compose up --build
 ```
 
-The image runs as non-root UID/GID `1000` by default. If your repository is
-owned by another user, build with matching IDs:
-
-```bash
-MCP_CONTEXT_UID=$(id -u) MCP_CONTEXT_GID=$(id -g) docker compose up --build
-```
-
-If an existing named state volume was created with a different UID/GID, recreate
-it after changing these build args:
-
-```bash
-docker compose down -v
-MCP_CONTEXT_UID=$(id -u) MCP_CONTEXT_GID=$(id -g) docker compose up --build
-```
-
-Compose mounts the host parent read-only:
+The mapping is then:
 
 ```text
-Host:      /home/user/source
-Container: /workspace-roots
-Mapping:   /home/user/source=/workspace-roots
-Allowed:   /home/user/source
+host allowed root:  /home/user/source
+container mount:    /workspace-roots
+default repository: /workspace-roots/mcp-context-manager
 ```
 
-An MCP root URI such as `file:///home/user/source/my-repo` is resolved inside
-the container as `/workspace-roots/my-repo`.
+Clients continue to send host-side URIs such as
+`file:///home/user/source/my-repo`; `MCP_CONTEXT_ROOT_MAPPINGS` maps them into
+the read-only container mount.
 
-The service image is immutable at runtime. Releases publish a pinned Docker
-image archive and a standalone executable; updating production means deploying a
-new release artifact.
-
-## Non-Docker Run
-
-Install the package in your Python environment, then run:
+The image runs as UID/GID `1000` by default. Override the build args when the
+state volume is owned by another user:
 
 ```bash
-MCP_CONTEXT_ALLOWED_ROOTS=/home/user/source \
-MCP_CONTEXT_STATE_DIR=/home/user/.local/state/mcp-context-manager \
-mcp-context-manager
+MCP_CONTEXT_UID=$(id -u) MCP_CONTEXT_GID=$(id -g) docker compose up --build
 ```
 
-For HTTP transport:
+Do not remove the named state volume during an upgrade or rollback. Native Rust
+state is isolated beside the Python v1 layout under each project:
+
+```text
+<project-state>/
+  store/                    # untouched Python v1 LMDB, when present
+  references/               # untouched Python v1 external references
+  rust-v2/
+    state.lmdb/
+    index/
+    server.lock
+```
+
+## Run a standalone executable
+
+Dynamic glibc:
 
 ```bash
+chmod +x mcp-context-manager-2.0.0-linux-x86_64-glibc
 MCP_TRANSPORT=streamable-http \
 HOST=127.0.0.1 \
 PORT=8000 \
-MCP_CONTEXT_ALLOWED_ROOTS=/home/user/source \
-MCP_CONTEXT_STATE_DIR=/home/user/.local/state/mcp-context-manager \
+REPO_PATH="$PWD" \
+MCP_CONTEXT_ALLOWED_ROOTS="$PWD" \
+MCP_CONTEXT_STATE_DIR="$HOME/.local/state/mcp-context-manager" \
+./mcp-context-manager-2.0.0-linux-x86_64-glibc
+```
+
+Static musl:
+
+```bash
+chmod +x mcp-context-manager-2.0.0-linux-x86_64-musl
+MCP_TRANSPORT=streamable-http \
+HOST=127.0.0.1 \
+PORT=8000 \
+REPO_PATH="$PWD" \
+MCP_CONTEXT_ALLOWED_ROOTS="$PWD" \
+MCP_CONTEXT_STATE_DIR="$HOME/.local/state/mcp-context-manager" \
+./mcp-context-manager-2.0.0-linux-x86_64-musl
+```
+
+Use `--version` to inspect the embedded release version.
+
+## HTTP transport and security
+
+Streamable HTTP clients connect to `http://localhost:8000/mcp`. Existing
+legacy SSE clients can continue using `http://localhost:8000/legacy/sse`; the
+server sends the per-session message endpoint as the initial `endpoint` SSE
+event. `/mcp` remains the primary transport. All HTTP routes enforce exact Host
+validation. Browser requests with an `Origin` header also require an exact
+allowed origin. Optional bearer authentication applies to every route,
+including health:
+
+```bash
+MCP_HTTP_BEARER_TOKEN='replace-me' \
+MCP_HTTP_ALLOWED_HOSTS='context.example,context.example:443' \
+MCP_HTTP_ALLOWED_ORIGINS='https://context.example' \
+MCP_TRANSPORT=streamable-http \
 mcp-context-manager
 ```
 
-Streamable HTTP clients should point at:
+Bearer tokens are compared in constant time. Do not place bearer tokens in
+repository files or generated context memory.
 
-```yaml
-mcpServers:
-  - name: context-manager
-    type: streamable-http
-    url: http://localhost:8000/mcp
-```
-
-The legacy SSE compatibility endpoint is available at
-`http://localhost:8000/legacy/sse`.
-
-Useful HTTP endpoints:
+HTTP routes:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /healthz` | Health and index status. |
-| `GET /mcp/healthz` | Health and index status for clients or proxies scoped to the MCP base path. |
-| `GET /v1/mcp/tools` | Diagnostic list of advertised MCP tool names and transport endpoints. |
-| `POST /v1/context/pack` | Direct HTTP fallback for context packs. Accepts `prompt` or `task`. |
-| `GET /v1/context/references/{reference_id}` | Direct HTTP fallback for resolving result references. |
-| `POST /mcp` | MCP Streamable HTTP endpoint. |
-| `GET /legacy/sse` | MCP legacy SSE compatibility endpoint. |
+| `GET /healthz` | Native process health and version. |
+| `GET /mcp/healthz` | Health under the MCP base path. |
+| `POST /mcp` | Stateful Streamable HTTP MCP endpoint. Sessions expire after 30 idle minutes. |
+| `GET /legacy/sse` | Backward-compatible SSE MCP endpoint; sends the per-session `POST` endpoint. |
+| `POST /legacy/messages?session_id=...` | Legacy SSE client message endpoint, issued by `/legacy/sse`. |
+| `GET /v1/mcp/tools` | Diagnostic list of public context tool names. |
+| `POST /v1/context/pack` | Direct `context_pack.v2`; accepts `prompt` or the REST-only alias `task`. |
+| `GET /v1/context/references/{reference_id}` | Direct reference resolution. |
 
-The stable `version` field in `context_admin(mode="health")` and both health
-endpoints matches `serverInfo.version` from MCP initialization.
-
-## Multiple Roots
-
-Multiple roots come from the MCP client through the MCP Roots protocol. Compose
-only mounts and maps the allowed parent directory.
-
-Selection order for a request:
-
-1. explicit `root_uri`
-2. explicit `project_id`
-3. the only visible MCP root
-4. path hints such as `focus_paths`, `changed_files`, or `path`
-5. legacy `REPO_PATH` fallback only in safe single-project configurations
-
-Example explicit request payload:
-
-```json
-{
-  "root_uri": "file:///home/user/source/my-repo",
-  "prompt": "review auth handling",
-  "focus_paths": ["src/auth.py"]
-}
-```
-
-If a client exposes `/home/user/source` as one MCP root, request selection treats
-that whole directory as the visible project. `context_admin(mode="projects")`
-also discovers independent projects recursively under allowed roots, up to the
-configured depth. Once a project root is discovered, nested repositories,
-submodules, or marker directories under it stay owned by the parent project
-unless a caller explicitly passes the nested `root_uri`.
+Stdio remains the default transport when `MCP_TRANSPORT` is omitted.
 
 ## Configuration
 
 | Variable | Purpose |
 | --- | --- |
-| `REPO_PATH` | Legacy single-project fallback root. |
-| `MCP_CONTEXT_STATE_DIR` | Generated state directory. |
-| `MCP_CONTEXT_ALLOWED_ROOTS` | Host paths allowed for MCP root URIs. Required for global roots outside `REPO_PATH`. |
-| `MCP_CONTEXT_ROOT_MAPPINGS` | Host-to-container path mappings, such as `/home/user/source=/workspace-roots`. |
-| `MCP_CONTEXT_PROJECT_DISCOVERY_MAX_DEPTH` | Recursive discovery depth under allowed roots. Defaults to `4`. |
-| `MCP_CONTEXT_PROJECT_MARKERS` | Comma- or path-separator-delimited marker filenames for non-Git project discovery. Defaults to `.git`, `pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`, `pom.xml`, and `CMakeLists.txt`. |
-| `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host parent mounted at `/workspace-roots`. |
-| `MCP_CONTEXT_UID` / `MCP_CONTEXT_GID` | Compose build args for the non-root container user. Defaults to `1000:1000`. |
-| `MCP_TRANSPORT` | `stdio` by default, or `streamable-http`. |
-| `HOST` / `PORT` | HTTP bind settings. Compose binds the published port to localhost. |
-| `MAX_READ_BYTES` | Maximum file bytes read for snippets/indexing. |
-| `MAX_OUTPUT_CHARS` | Default output budget. |
-| `MCP_CONTEXT_OUTPUT_PROFILE` | Default profile: `lean`, `minimal`, `compact`, `normal`, or `verbose`. |
-| `MCP_CONTEXT_LMDB_MAP_SIZE` | LMDB map size in bytes. Defaults to `1073741824` and is clamped to at least `16777216`. |
-| `MCP_CONTEXT_TOKEN_COUNTER` | `estimate` by default, or `target` to try an optional target tokenizer. |
-| `MCP_CONTEXT_TARGET_TOKENIZER` | Target tokenizer name for `target` mode, defaulting to `cl100k_base`. |
+| `REPO_PATH` | Default repository root. |
+| `MCP_CONTEXT_STATE_DIR` | Project-state root; Rust creates an isolated `rust-v2` overlay. |
+| `MCP_CONTEXT_PROJECT_ID` | Optional explicit id for the default project. |
+| `MCP_CONTEXT_ALLOWED_ROOTS` | Host roots allowed for `root_uri` project selection. |
+| `MCP_CONTEXT_ROOT_MAPPINGS` | Comma-separated host-to-container mappings such as `/home/user/source=/workspace-roots`. |
+| `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host directory mounted at `/workspace-roots`. |
+| `MCP_CONTEXT_REPO_PATH` | Compose helper for a narrow default path below `/workspace-roots`. |
+| `MCP_CONTEXT_UID`, `MCP_CONTEXT_GID` | Compose image user ids, default `1000:1000`. |
+| `MCP_TRANSPORT` | `stdio` or `streamable-http`. |
+| `HOST`, `PORT` | HTTP bind address and port. |
+| `MCP_HTTP_BEARER_TOKEN` | Optional bearer token for all HTTP routes. |
+| `MCP_HTTP_ALLOWED_HOSTS` | Comma-separated exact Host values. |
+| `MCP_HTTP_ALLOWED_ORIGINS` | Comma-separated exact browser origins. |
 
-## Metrics And Evaluation
+Public request paths must be repository-relative. Traversal, host absolute
+paths, symlink roots, and roots outside the configured boundary are rejected.
+Repository content is treated as untrusted: prompt-injection signals are
+reported, while secrets and absolute host paths are redacted before output or
+persistence.
 
-Use `context_admin(mode="measurement_matrix")` to get the pass/fail target
-matrix for context-pack speed and token economy. Current metrics include
-context-pack latency, index-refresh latency, candidate compression, compression
-ratio, candidate-to-selected ratio, cache hit ratios, external calls saved, and
-reference bytes deferred.
+## Native architecture
 
-Per-pack candidate compression is estimated as:
+The Cargo workspace is split by responsibility:
 
-```text
-tokens_spared_by_mcp_est =
-estimated_input_tokens_saved =
-  max(0, baseline_input_tokens_est - output_tokens_est)
-```
+| Crate | Responsibility |
+| --- | --- |
+| `contextd` | RMCP stdio/HTTP transport, Axum REST routes, lifecycle, project registry, and HTTP security. |
+| `context-core` | Contracts, routing, ranking, deterministic selection, compression, caches, deltas, and encoding. |
+| `context-index` | Repository scanning, generic and Tree-sitter chunking, Tantivy search, and freshness watching. |
+| `context-store` | Versioned Postcard/LMDB records, memory, references, import manifests, frontiers, and telemetry. |
+| `context-testkit` | Native benchmark and synthetic test support. |
+| `xtask` | Release versioning, license policy, and CycloneDX SBOM generation. |
 
-`baseline_input_tokens_est` estimates the ranked candidate evidence before
-selection. `output_tokens_est` counts the complete context-pack response. This
-is not an MCP-versus-no-MCP measurement. The built-in benchmark separately
-executes a matched manual search/read workload for that comparison.
-`tokens_spared_by_mcp_est` remains a compatibility alias for this candidate
-compression estimate.
+The index accepts every regular UTF-8 file, rejects NUL/non-UTF-8 binary data,
+does not follow symlinks, and skips generated directories. Supported languages
+use Tree-sitter symbol chunks; all other text uses deterministic 80-line
+windows with eight-line overlap. Tantivy readers persist across requests and
+reload only after committed generations.
 
-Use `context_admin(mode="quality_eval")` to run retrieval-quality fixtures from
-`benchmarks/gold_anchors/*.json`. The report includes anchor recall@3/5, first
-anchor rank, noise ratio, required-anchor omissions, detail-lookup resolution,
-stale-context rate, and regression rows.
+The fast path uses:
 
-Run the built-in offline benchmark:
+- a 64 MiB Moka L0 cache of immutable encoded response bytes;
+- a 128 MiB in-memory and 256 MiB LMDB frontier cache;
+- deterministic reranking after approximate frontier reuse;
+- a 50 ms coalescing filesystem watcher plus polling fallback;
+- synchronous refresh for `changed_files` and `cache_strategy="fresh"`;
+- direct serialization into a preallocated byte buffer.
 
-```bash
-python3 benchmarks/context_pack_benchmark.py --repo .
-```
+## Build, test, and release
 
-The benchmark covers forced cold refresh, warm cache reuse, repeated prompt
-reuse, prompt-variation fragment reuse, and compact focused retrieval.
-
-Run the isolated prompt-aware warmup benchmark:
+Run validation inside the repository devcontainer:
 
 ```bash
-python3 benchmarks/cache_prompt_warmup_benchmark.py --repo .
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo xtask license-check
+cargo audit --deny warnings
+cargo xtask sbom dist/mcp-context-manager.cdx.json
 ```
 
-It executes a matched empty-fragment baseline and the sequence cold pack,
-background-warmup completion, then related prompt. The command fails unless the
-warm runs reach a 60% fragment hit ratio, improve median latency by at least
-30%, preserve selected order and anchors, and retain all required fixture
-anchors. Temporary generated state is used by default.
-
-Reuse `benchmarks/cache_hit_prompts.json` for realistic cache-hit benchmark prompts
-covering mcp-context-manager and feso paths. The suite is designed for:
-
-- cold run: execute each prompt once from a cold cache,
-- warm run: repeat unchanged prompts to measure hit behavior,
-- variant run: execute wording-variant prompts (`mcp_retrieval_variant`) to test fragment reuse,
-- explicit-path stress: run prompts with explicit file/directory focus (`mcp_test_owner`, `mcp_dir_focus`, `mcp_docs`) on a clean run.
-
-Track: `fragment_hits`, `fragment_misses`, `fragment_hit_ratio`,
-`search_fragment_ms`, `search_summary_ms`, `test_owner_summary_ms`, and
-`file_summary_memo_hits`. Per-namespace hit ratios are reported for
-`retrieval.search_term`, `retrieval.file_summary`, and
-`retrieval.test_owner_paths`; whole-pack cache figures remain diagnostic.
-
-## Live Metrics Monitor
-
-`monitor-metrics.py` is a terminal dashboard that queries `context_admin(mode="projects")`,
-then fetches `context_admin(mode="metrics")` and
-`context_admin(mode="measurement_matrix")` for each selected project.
-
-Run it interactively against a local server:
-
-```bash
-python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp
-```
-
-Render one snapshot and exit:
-
-```bash
-python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp --once
-```
-
-Monitor one known project or root URI:
-
-```bash
-python3 monitor-metrics.py --project-id my-repo-123abc
-python3 monitor-metrics.py --root-uri file:///home/user/source/my-repo
-```
-
-Run a pinned remote version in one line:
-
-```bash
-VER="RELEASE_VERSION"; curl -fsSL "https://raw.githubusercontent.com/ueni/mcp_context_manager/v${VER}/monitor-metrics.py" | python3 - --url http://127.0.0.1:8000/mcp --once
-```
-
-The dashboard shows request volume, `context_pack` latency, cache hit bars,
-candidate compression, deferred reference bytes, measurement-matrix
-status, and bounded generated-state rows. It shows a yellow warning when the
-connected MCP server version differs from the version expected by the monitor.
-
-## Generated State
-
-In global mode, each selected project gets isolated state:
-
-```text
-<state_dir>/projects/<slug>-<root_hash>/store/
-<state_dir>/projects/<slug>-<root_hash>/references/
-```
-
-Generated state holds the repository index, search term index, cache, metrics,
-memory, budgets, and result-reference metadata. Large result references may use
-the project `references/` area while public responses keep only stable
-identifiers, hashes, TTLs, and resolver URIs.
-
-Generated state should not be committed unless it is an intentional fixture or
-documented sample.
-
-## Release Packaging
-
-The production `Dockerfile` builds an Alpine-based runtime image around a
-prebuilt standalone server executable. It does not build the Python package from
-source inside the runtime image.
-
-Local build tasks are orchestrated through CMake presets. Container package
-manager and pip downloads are cached under `.downloads/`, so repeated builds do
-not fetch the same apt, apk, and pip artifacts every time.
-When running inside the devcontainer, the presets use `HOST_WORKSPACE_FOLDER`
-as the host-visible Docker bind mount path.
+Build and smoke both standalone targets and the image:
 
 ```bash
 cmake --preset local
 cmake --build --preset standalone
-cmake --build --preset docker-image
+python3 scripts/smoke_native_mcp.py dist/mcp-context-manager-linux-x86_64-glibc
+python3 scripts/smoke_native_mcp.py dist/mcp-context-manager-linux-x86_64-musl
 cmake --build --preset docker-image-archive
+python3 scripts/smoke_native_image.py mcp-context-manager:local
 ```
 
-If Docker requires sudo on the host, use the matching presets:
+Record a release version with the Rust task runner:
 
 ```bash
-cmake --preset local-sudo-docker
-cmake --build --preset standalone-sudo-docker
+cargo xtask release-version 2.0.0
 ```
 
-The Docker image target uses `dist/mcp-context-manager-linux-x86_64-musl` as
-`SERVER_BINARY`. The Dockerfile checks that the binary is musl-linked because
-the runtime base image is Alpine.
+The release workflow builds locked glibc and musl executables, validates target
+and linkage, emits the Docker archive and SBOM, runs advisory and license checks,
+creates checksums, signs them, and publishes the versioned artifacts.
 
-GitHub Actions owns release artifacts:
+## Cutover evidence
 
-- `Build glibc and musl executables` runs the CMake `standalone-ci` preset and
-  caches `.downloads/` between runs.
-- `Build docker image archive` runs the CMake `docker-image-archive-ci` preset.
-- `Smoke test glibc executable` and `Smoke test musl executable` verify the
-  standalone servers before packaging.
-- `Release` is manually dispatched from a branch with a version such as
-  `1.2.0`. It updates `pyproject.toml` and the standalone monitor's expected
-  server version; creates a `Release v1.2.0` commit and annotated tag; builds
-  with the CMake `release-ci` preset; verifies that both executables report the
-  requested version; writes and signs `SHA256SUMS`; atomically pushes the commit
-  and tag; and publishes all artifacts on the GitHub release.
+Frozen Python v1 contracts and baselines remain under `tests/golden/python-v1`
+and `benchmarks/baselines`. Native contract, differential, latency, token,
+quality, freshness, state-import, cutover, and rollback evidence is under
+`tests/golden/rust-v2` and `benchmarks/results`.
 
-Verify downloaded release artifacts:
-
-```bash
-sha256sum -c SHA256SUMS
-```
-
-Use the Docker image archive:
-
-```bash
-gzip -dc mcp-context-manager-0.2.0-linux-x86_64-musl-image.tar.gz | docker load
-docker run --rm \
-  -p 127.0.0.1:8000:8000 \
-  -e MCP_CONTEXT_ALLOWED_ROOTS=/workspace-roots \
-  -e MCP_CONTEXT_ROOT_MAPPINGS="$PWD=/workspace-roots" \
-  -e MCP_CONTEXT_STATE_DIR=/state \
-  -v "$PWD:/workspace-roots:ro" \
-  -v mcp-context-state:/state \
-  mcp-context-manager:0.2.0
-```
-
-Use the glibc standalone server executable:
-
-```bash
-chmod +x mcp-context-manager-0.2.0-linux-x86_64-glibc
-MCP_TRANSPORT=streamable-http \
-HOST=127.0.0.1 \
-PORT=8000 \
-MCP_CONTEXT_ALLOWED_ROOTS="$PWD" \
-MCP_CONTEXT_STATE_DIR="$HOME/.local/state/mcp-context-manager" \
-./mcp-context-manager-0.2.0-linux-x86_64-glibc
-```
-
-Run a self-update from the standalone executable (auto-updates and relaunches):
-
-```bash
-./mcp-context-manager-0.2.0-linux-x86_64-glibc --update
-```
-
-Use the musl standalone server executable on Alpine-compatible hosts:
-
-```bash
-chmod +x mcp-context-manager-0.2.0-linux-x86_64-musl
-MCP_TRANSPORT=streamable-http \
-HOST=127.0.0.1 \
-PORT=8000 \
-MCP_CONTEXT_ALLOWED_ROOTS="$PWD" \
-MCP_CONTEXT_STATE_DIR="$HOME/.local/state/mcp-context-manager" \
-./mcp-context-manager-0.2.0-linux-x86_64-musl --update
-``` 
-
-The updater defaults to `ueni/mcp_context_manager` when `--update-repo` or
-`MCP_CONTEXT_UPDATE_REPO` is not provided and uses `--update` without extra
-input to fetch the latest release.
-It replaces the running executable and restarts it using the same non-update
-arguments so it continues as the same invocation.
-You can still override with `--update-repo`/`MCP_CONTEXT_UPDATE_REPO` and
-`--update-target`/`MCP_CONTEXT_UPDATE_TARGET`.
-
-Use `--update-version` only when you want to install a specific version.
-
-## Development
-
-Run tests and lint:
-
-```bash
-python3 -m pytest
-python3 -m ruff check .
-```
-
-The test suite is offline by default and uses temporary sample repositories.
+The pre-migration dirty worktree patch is retained as
+`benchmarks/baselines/python-v1-pre-rust-dirty-worktree.patch`; it is not part
+of the production runtime.

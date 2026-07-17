@@ -1,0 +1,153 @@
+{
+  "cases": [
+    {
+      "evidence_count": 2,
+      "name": "context_pack_latency",
+      "noise_ratio": 0.0,
+      "paths": [
+        "src/mcp_context_manager/context.py",
+        "src/mcp_context_manager/metrics.py"
+      ],
+      "required_paths": [
+        "src/mcp_context_manager/context.py"
+      ],
+      "required_recall": 1.0,
+      "v": 2
+    },
+    {
+      "evidence_count": 2,
+      "name": "lmdb_references",
+      "noise_ratio": 0.0,
+      "paths": [
+        "src/mcp_context_manager/store.py",
+        "src/mcp_context_manager/references.py"
+      ],
+      "required_paths": [
+        "src/mcp_context_manager/store.py",
+        "src/mcp_context_manager/references.py"
+      ],
+      "required_recall": 1.0,
+      "v": 2
+    },
+    {
+      "evidence_count": 2,
+      "name": "http_contract",
+      "noise_ratio": 0.0,
+      "paths": [
+        "src/mcp_context_manager/server.py",
+        "tests/test_http_payload.py"
+      ],
+      "required_paths": [
+        "src/mcp_context_manager/server.py",
+        "tests/test_http_payload.py"
+      ],
+      "required_recall": 1.0,
+      "v": 2
+    },
+    {
+      "evidence_count": 2,
+      "name": "tantivy_ranking",
+      "noise_ratio": 0.0,
+      "paths": [
+        "src/mcp_context_manager/tantivy_index.py",
+        "src/mcp_context_manager/context.py"
+      ],
+      "required_paths": [
+        "src/mcp_context_manager/tantivy_index.py",
+        "src/mcp_context_manager/context.py"
+      ],
+      "required_recall": 1.0,
+      "v": 2
+    },
+    {
+      "evidence_count": 1,
+      "name": "memory_compaction",
+      "noise_ratio": 0.0,
+      "paths": [
+        "src/mcp_context_manager/memory.py"
+      ],
+      "required_paths": [
+        "src/mcp_context_manager/memory.py"
+      ],
+      "required_recall": 1.0,
+      "v": 2
+    },
+    {
+      "evidence_count": 2,
+      "name": "project_routing",
+      "noise_ratio": 0.0,
+      "paths": [
+        "src/mcp_context_manager/projects.py",
+        "src/mcp_context_manager/manager.py"
+      ],
+      "required_paths": [
+        "src/mcp_context_manager/projects.py",
+        "src/mcp_context_manager/manager.py"
+      ],
+      "required_recall": 1.0,
+      "v": 2
+    },
+    {
+      "evidence_count": 3,
+      "name": "artifact_build",
+      "noise_ratio": 0.0,
+      "paths": [
+        "cmake/BuildArtifacts.cmake",
+        "cmake/BuildStandalone.cmake",
+        "Dockerfile"
+      ],
+      "required_paths": [
+        "cmake/BuildArtifacts.cmake",
+        "cmake/BuildStandalone.cmake"
+      ],
+      "required_recall": 1.0,
+      "v": 2
+    },
+    {
+      "evidence_count": 2,
+      "name": "tool_schemas",
+      "noise_ratio": 0.0,
+      "paths": [
+        "src/mcp_context_manager/schemas.py",
+        "src/mcp_context_manager/server.py"
+      ],
+      "required_paths": [
+        "src/mcp_context_manager/schemas.py"
+      ],
+      "required_recall": 1.0,
+      "v": 2
+    }
+  ],
+  "gates": {
+    "balanced_pack_median_lte_450_tokens": true,
+    "context_py_retrievable": true,
+    "noise_ratio_lte_30pct": true,
+    "required_anchor_recall_100pct": true,
+    "rust_at_least_3x_faster": true,
+    "warm_miss_p95_lte_75ms": true
+  },
+  "method": {
+    "cache": "none; every request runs native Tantivy retrieval and deterministic selection",
+    "index": "built before MCP initialization and excluded from timing",
+    "iterations_per_case": 7,
+    "transport": "persistent MCP stdio"
+  },
+  "schema": "rust_native_milestone_1.v1",
+  "source": {
+    "binary": "target/release/mcp-context-manager",
+    "python_baseline": "benchmarks/baselines/python-v1-current-repo.json",
+    "python_baseline_sha256": "8148187a7b5c8dcf6f293ca72be1464d1fe5b6226ee66f3d725710b3a84114f6"
+  },
+  "summary": {
+    "balanced_pack_tokens_median": 141.0,
+    "context_lookup_ms": 2.882,
+    "context_py_retrievable": true,
+    "noise_ratio": 0.0,
+    "python_warm_miss_p95_ms": 1273.328,
+    "request_count": 56,
+    "required_anchor_recall": 1.0,
+    "rust_speedup_vs_python": 264.455,
+    "warm_miss_median_ms": 3.137,
+    "warm_miss_p95_ms": 4.815
+  }
+}

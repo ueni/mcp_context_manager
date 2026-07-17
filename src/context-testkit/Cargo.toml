@@ -1,0 +1,14 @@
+[package]
+name = "context-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+context-core = { path = "../context-core" }
+serde_json.workspace = true
+tempfile = "3.27.0"
+tokio.workspace = true

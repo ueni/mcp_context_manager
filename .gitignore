@@ -1,4 +1,5 @@
 .mcp-context-manager/
+.devcontainer/.host-ca/
 .downloads/
 .cmake-build/
 .continue/
@@ -11,3 +12,4 @@ __pycache__/
 dist/
 build/
 wheelhouse/
+target/

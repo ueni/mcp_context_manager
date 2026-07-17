@@ -1,0 +1,1329 @@
+//! Native repository scanning, deterministic chunking, and Tantivy retrieval.
+
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fs,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tantivy::{
+    Index, IndexReader, ReloadPolicy, TantivyDocument,
+    collector::TopDocs,
+    doc,
+    query::{AllQuery, Query, QueryParser},
+    schema::{Field, STORED, STRING, Schema, TEXT, Value},
+};
+use tree_sitter::{Node, Parser};
+use walkdir::{DirEntry, WalkDir};
+
+pub const GENERIC_CHUNK_LINES: usize = 80;
+pub const GENERIC_CHUNK_OVERLAP_LINES: usize = 8;
+pub const MAX_SYMBOL_CHUNK_BYTES: usize = 32 * 1024;
+pub const MIN_SYMBOL_CHUNK_BYTES: usize = 8 * 1024;
+/// Maximum source file size admitted to indexing or public file resources.
+///
+/// The limit is checked from metadata before allocating a read buffer so a
+/// minified or text-like binary file cannot make indexing unbounded.
+pub const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
+
+const IGNORED_DIRECTORIES: &[&str] = &[
+    ".git",
+    ".mcp-context-manager",
+    ".cmake-build",
+    ".downloads",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+    "wheelhouse",
+];
+
+const STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "build", "by", "for", "from", "how", "in", "into",
+    "is", "it", "of", "on", "or", "the", "this", "to", "update", "with",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Chunk {
+    pub id: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub symbol: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SearchHit {
+    pub id: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub symbol: String,
+    pub content: String,
+    pub score: f32,
+    pub explicit: bool,
+}
+
+impl SearchHit {
+    pub fn evidence_excerpt(&self, terms: &[String], max_chars: usize) -> (u32, u32, String) {
+        let lines: Vec<&str> = self.content.lines().collect();
+        if lines.is_empty() {
+            return (self.start_line, self.end_line, String::new());
+        }
+        let match_index = lines
+            .iter()
+            .position(|line| {
+                let lowered = line.to_ascii_lowercase();
+                terms.iter().any(|term| lowered.contains(term))
+            })
+            .unwrap_or(0);
+        let excerpt_start = match_index.saturating_sub(2);
+        let excerpt_end = (match_index + 3).min(lines.len());
+        let mut excerpt = lines[excerpt_start..excerpt_end].join("\n");
+        truncate_utf8(&mut excerpt, max_chars);
+        (
+            self.start_line + excerpt_start as u32,
+            self.start_line + excerpt_end.saturating_sub(1) as u32,
+            excerpt,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct IndexStats {
+    pub schema: &'static str,
+    pub file_count: usize,
+    pub chunk_count: usize,
+    pub symbol_chunks: usize,
+    pub python_symbol_chunks: usize,
+    pub generic_chunks: usize,
+    pub skipped_binary: usize,
+    pub skipped_symlink: usize,
+    pub refresh_signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TreeEntry {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub entry_type: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SymbolRecord {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub signature: String,
+}
+
+#[derive(Clone, Copy)]
+struct Fields {
+    id: Field,
+    path: Field,
+    path_text: Field,
+    start_line: Field,
+    end_line: Field,
+    symbol: Field,
+    body: Field,
+}
+
+pub struct ProjectIndex {
+    root: PathBuf,
+    index: Index,
+    reader: IndexReader,
+    fields: Fields,
+    chunks: Arc<Vec<Chunk>>,
+    chunks_by_path: Arc<HashMap<String, Vec<usize>>>,
+    chunks_by_id: Arc<HashMap<String, usize>>,
+    stats: IndexStats,
+}
+
+impl ProjectIndex {
+    pub fn build(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref().canonicalize().with_context(|| {
+            format!(
+                "repository root does not exist: {}",
+                root.as_ref().display()
+            )
+        })?;
+        if !root.is_dir() {
+            bail!("repository root is not a directory: {}", root.display());
+        }
+
+        let (chunks, stats) = scan_repository(&root)?;
+        let mut schema_builder = Schema::builder();
+        let fields = Fields {
+            id: schema_builder.add_text_field("id", STRING | STORED),
+            path: schema_builder.add_text_field("path", STRING | STORED),
+            path_text: schema_builder.add_text_field("path_text", TEXT),
+            start_line: schema_builder.add_u64_field("start_line", STORED),
+            end_line: schema_builder.add_u64_field("end_line", STORED),
+            symbol: schema_builder.add_text_field("symbol", TEXT | STORED),
+            body: schema_builder.add_text_field("body", TEXT | STORED),
+        };
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer(50_000_000)?;
+        for chunk in &chunks {
+            writer.add_document(doc!(
+                fields.id => chunk.id.clone(),
+                fields.path => chunk.path.clone(),
+                fields.path_text => chunk.path.clone(),
+                fields.start_line => u64::from(chunk.start_line),
+                fields.end_line => u64::from(chunk.end_line),
+                fields.symbol => chunk.symbol.clone(),
+                fields.body => chunk.content.clone(),
+            ))?;
+        }
+        writer.commit()?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        reader.reload()?;
+
+        let mut chunks_by_path: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut chunks_by_id = HashMap::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            chunks_by_path
+                .entry(chunk.path.clone())
+                .or_default()
+                .push(index);
+            chunks_by_id.insert(chunk.id.clone(), index);
+        }
+
+        Ok(Self {
+            root,
+            index,
+            reader,
+            fields,
+            chunks: Arc::new(chunks),
+            chunks_by_path: Arc::new(chunks_by_path),
+            chunks_by_id: Arc::new(chunks_by_id),
+            stats,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn stats(&self) -> &IndexStats {
+        &self.stats
+    }
+
+    pub fn all_paths(&self) -> Vec<String> {
+        let mut paths = self.chunks_by_path.keys().cloned().collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    pub fn tree(
+        &self,
+        raw_path: &str,
+        max_entries: usize,
+        max_depth: usize,
+    ) -> Result<Vec<TreeEntry>> {
+        let path = validate_relative_path(raw_path)?;
+        let base = self.root.join(&path);
+        let metadata =
+            fs::symlink_metadata(&base).with_context(|| format!("path does not exist: {path}"))?;
+        if metadata.file_type().is_symlink() {
+            bail!("symlink paths are not allowed: {path}");
+        }
+        if !metadata.is_dir() {
+            bail!("tree path is not a directory: {path}");
+        }
+        let mut entries = Vec::new();
+        for entry in WalkDir::new(&base)
+            .follow_links(false)
+            .min_depth(1)
+            .max_depth(max_depth)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(should_visit)
+        {
+            let entry = entry?;
+            if entry.file_type().is_symlink() {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&self.root)
+                .expect("tree paths stay under repository root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            entries.push(TreeEntry {
+                path: relative,
+                entry_type: if entry.file_type().is_dir() {
+                    "dir".to_owned()
+                } else {
+                    "file".to_owned()
+                },
+                size: if entry.file_type().is_file() {
+                    entry.metadata()?.len()
+                } else {
+                    0
+                },
+            });
+            if entries.len() == max_entries {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn symbols(&self, query: &str, limit: usize) -> Vec<SymbolRecord> {
+        let query = query.to_ascii_lowercase();
+        let mut symbols = self
+            .chunks
+            .iter()
+            .filter(|chunk| {
+                !chunk.symbol.is_empty()
+                    && (query.is_empty()
+                        || chunk.symbol.to_ascii_lowercase().contains(query.as_str()))
+            })
+            .map(|chunk| SymbolRecord {
+                path: chunk.path.clone(),
+                name: chunk.symbol.clone(),
+                kind: symbol_kind(chunk),
+                line_start: chunk.start_line,
+                line_end: chunk.end_line,
+                signature: symbol_signature(chunk),
+            })
+            .collect::<Vec<_>>();
+        symbols.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.line_start.cmp(&right.line_start))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        symbols.dedup_by(|left, right| {
+            left.path == right.path
+                && left.line_start == right.line_start
+                && left.name == right.name
+        });
+        symbols.truncate(limit);
+        symbols
+    }
+
+    pub fn chunks_for_path(&self, raw_path: &str) -> Result<Vec<Chunk>> {
+        let path = validate_relative_path(raw_path)?;
+        Ok(self
+            .chunks_by_path
+            .get(&path)
+            .into_iter()
+            .flatten()
+            .map(|index| self.chunks[*index].clone())
+            .collect())
+    }
+
+    pub fn file_line_count(&self, raw_path: &str) -> Result<usize> {
+        let path = validate_relative_path(raw_path)?;
+        let absolute = self.root.join(&path);
+        let metadata = fs::symlink_metadata(&absolute)
+            .with_context(|| format!("path does not exist: {path}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("path is not a regular repository file: {path}");
+        }
+        let text = read_text(&absolute)?
+            .ok_or_else(|| anyhow::anyhow!("file is not UTF-8 text: {path}"))?;
+        Ok(text.lines().count())
+    }
+
+    pub fn file_content(&self, raw_path: &str, max_bytes: usize) -> Result<(String, bool)> {
+        let path = validate_relative_path(raw_path)?;
+        let absolute = self.root.join(&path);
+        let metadata = fs::symlink_metadata(&absolute)
+            .with_context(|| format!("path does not exist: {path}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("path is not a regular repository file: {path}");
+        }
+        let mut text = read_text(&absolute)?
+            .ok_or_else(|| anyhow::anyhow!("file is not UTF-8 text: {path}"))?;
+        let truncated = text.len() > max_bytes;
+        truncate_utf8(&mut text, max_bytes);
+        Ok((text, truncated))
+    }
+
+    pub fn search(
+        &self,
+        prompt: &str,
+        explicit_paths: &[String],
+        max_items: usize,
+    ) -> Result<(Vec<SearchHit>, Vec<String>)> {
+        self.search_scoped(prompt, explicit_paths, max_items, None)
+    }
+
+    pub fn search_scoped(
+        &self,
+        prompt: &str,
+        explicit_paths: &[String],
+        max_items: usize,
+        allowed_paths: Option<&HashSet<String>>,
+    ) -> Result<(Vec<SearchHit>, Vec<String>)> {
+        let terms = normalize_terms(prompt, 8);
+        let candidate_count = (max_items.saturating_mul(8)).clamp(64, 256);
+        let mut hits = if let Some(allowed_paths) = allowed_paths {
+            self.chunks
+                .iter()
+                .filter(|chunk| allowed_paths.contains(&chunk.path))
+                .filter(|chunk| terms.is_empty() || term_match_count(chunk, &terms) > 0)
+                .map(|chunk| SearchHit {
+                    id: chunk.id.clone(),
+                    path: chunk.path.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    symbol: chunk.symbol.clone(),
+                    content: chunk.content.clone(),
+                    score: 0.0,
+                    explicit: false,
+                })
+                .collect()
+        } else {
+            self.tantivy_search(&terms, candidate_count)?
+        };
+        let mut seen: HashSet<String> = hits.iter().map(|hit| hit.id.clone()).collect();
+
+        for raw_path in explicit_paths {
+            let path = validate_relative_path(raw_path)?;
+            if allowed_paths.is_some_and(|allowed| !allowed.contains(&path)) {
+                continue;
+            }
+            let Some(indices) = self.chunks_by_path.get(&path) else {
+                continue;
+            };
+            let best = indices
+                .iter()
+                .map(|index| &self.chunks[*index])
+                .max_by_key(|chunk| {
+                    (
+                        term_match_count(chunk, &terms),
+                        usize::MAX - chunk.start_line as usize,
+                    )
+                });
+            if let Some(chunk) = best
+                && seen.insert(chunk.id.clone())
+            {
+                hits.push(SearchHit {
+                    id: chunk.id.clone(),
+                    path: chunk.path.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    symbol: chunk.symbol.clone(),
+                    content: chunk.content.clone(),
+                    score: 1_000_000.0 + term_match_count(chunk, &terms) as f32,
+                    explicit: true,
+                });
+            }
+        }
+
+        let explicit: HashSet<String> = explicit_paths
+            .iter()
+            .filter_map(|path| validate_relative_path(path).ok())
+            .collect();
+        for hit in &mut hits {
+            if explicit.contains(hit.path.as_str()) {
+                hit.explicit = true;
+            }
+            hit.score = deterministic_rank_score(hit, &terms)
+                + if hit.explicit { 1_000_000.0 } else { 0.0 };
+        }
+        hits.sort_by(|left, right| {
+            right
+                .explicit
+                .cmp(&left.explicit)
+                .then_with(|| right.score.total_cmp(&left.score))
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.start_line.cmp(&right.start_line))
+        });
+        hits.truncate(candidate_count);
+        Ok((hits, terms))
+    }
+
+    pub fn rerank(
+        &self,
+        prompt: &str,
+        explicit_paths: &[String],
+        candidate_ids: &[String],
+        max_items: usize,
+    ) -> Result<(Vec<SearchHit>, Vec<String>)> {
+        let terms = normalize_terms(prompt, 8);
+        let explicit = explicit_paths
+            .iter()
+            .map(|path| validate_relative_path(path))
+            .collect::<Result<HashSet<_>>>()?;
+        let mut hits = candidate_ids
+            .iter()
+            .filter_map(|id| self.chunks_by_id.get(id))
+            .map(|index| &self.chunks[*index])
+            .map(|chunk| {
+                let is_explicit = explicit.contains(&chunk.path);
+                SearchHit {
+                    id: chunk.id.clone(),
+                    path: chunk.path.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    symbol: chunk.symbol.clone(),
+                    content: chunk.content.clone(),
+                    score: 0.0,
+                    explicit: is_explicit,
+                }
+            })
+            .collect::<Vec<_>>();
+        for hit in &mut hits {
+            hit.score = deterministic_rank_score(hit, &terms)
+                + if hit.explicit { 1_000_000.0 } else { 0.0 };
+        }
+        hits.sort_by(|left, right| {
+            right
+                .explicit
+                .cmp(&left.explicit)
+                .then_with(|| right.score.total_cmp(&left.score))
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.start_line.cmp(&right.start_line))
+        });
+        hits.truncate((max_items.saturating_mul(8)).clamp(64, 256));
+        Ok((hits, terms))
+    }
+
+    pub fn snippet(&self, raw_path: &str, start_line: u32, end_line: Option<u32>) -> Result<Chunk> {
+        let path = validate_relative_path(raw_path)?;
+        let absolute = self.root.join(&path);
+        let metadata = fs::symlink_metadata(&absolute)
+            .with_context(|| format!("path does not exist: {path}"))?;
+        if metadata.file_type().is_symlink() {
+            bail!("symlink paths are not allowed: {path}");
+        }
+        if !metadata.is_file() {
+            bail!("path is not a file: {path}");
+        }
+        let text = read_text(&absolute)?
+            .ok_or_else(|| anyhow::anyhow!("file is not UTF-8 text: {path}"))?;
+        let lines: Vec<&str> = text.lines().collect();
+        let start = start_line.max(1) as usize;
+        let end = end_line
+            .unwrap_or_else(|| start_line.saturating_add(19))
+            .max(start_line) as usize;
+        let bounded_end = end.min(lines.len());
+        let content = if start > bounded_end || start > lines.len() {
+            String::new()
+        } else {
+            lines[start - 1..bounded_end].join("\n")
+        };
+        Ok(Chunk {
+            id: chunk_id(&path, start as u32, bounded_end as u32, ""),
+            path,
+            start_line: start as u32,
+            end_line: bounded_end as u32,
+            symbol: String::new(),
+            content,
+        })
+    }
+
+    fn tantivy_search(&self, terms: &[String], limit: usize) -> Result<Vec<SearchHit>> {
+        let searcher = self.reader.searcher();
+        let query: Box<dyn Query> = if terms.is_empty() {
+            Box::new(AllQuery)
+        } else {
+            let parser = QueryParser::for_index(
+                &self.index,
+                vec![self.fields.body, self.fields.symbol, self.fields.path_text],
+            );
+            parser.parse_query(&terms.join(" OR "))?
+        };
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())?;
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (score, address) in top_docs {
+            let document: TantivyDocument = searcher.doc(address)?;
+            let text = |field: Field| {
+                document
+                    .get_first(field)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let number = |field: Field| {
+                document
+                    .get_first(field)
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or_default() as u32
+            };
+            hits.push(SearchHit {
+                id: text(self.fields.id),
+                path: text(self.fields.path),
+                start_line: number(self.fields.start_line),
+                end_line: number(self.fields.end_line),
+                symbol: text(self.fields.symbol),
+                content: text(self.fields.body),
+                score,
+                explicit: false,
+            });
+        }
+        Ok(hits)
+    }
+}
+
+pub fn repository_signature(root: impl AsRef<Path>) -> Result<String> {
+    let root = root.as_ref().canonicalize()?;
+    let mut digest = Sha256::new();
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(should_visit)
+    {
+        let entry = entry?;
+        if entry.file_type().is_symlink() || !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(text) = read_text(entry.path())? else {
+            continue;
+        };
+        let path = entry
+            .path()
+            .strip_prefix(&root)
+            .expect("signature paths stay under root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        update_source_signature(&mut digest, &path, &text);
+    }
+    Ok(format!("files:{}", digest_hex(digest)))
+}
+
+pub fn normalize_terms(text: &str, max_terms: usize) -> Vec<String> {
+    let stop_words: HashSet<&str> = STOP_WORDS.iter().copied().collect();
+    let mut seen = BTreeSet::new();
+    let mut terms = Vec::new();
+    for term in text
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .map(str::to_ascii_lowercase)
+        .filter(|term| term.len() > 1)
+    {
+        if stop_words.contains(term.as_str()) || !seen.insert(term.clone()) {
+            continue;
+        }
+        terms.push(term);
+        if terms.len() == max_terms {
+            break;
+        }
+    }
+    terms
+}
+
+pub fn validate_relative_path(raw: &str) -> Result<String> {
+    if raw.trim().is_empty() || raw == "." {
+        return Ok(".".to_owned());
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        bail!("absolute paths are not allowed: {raw}");
+    }
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => clean.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("path traversal is not allowed: {raw}")
+            }
+        }
+    }
+    let normalized = clean.to_string_lossy().replace('\\', "/");
+    if normalized.is_empty() {
+        Ok(".".to_owned())
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn scan_repository(root: &Path) -> Result<(Vec<Chunk>, IndexStats)> {
+    let mut chunks = Vec::new();
+    let mut source_digest = Sha256::new();
+    let mut file_count = 0;
+    let mut python_symbol_chunks = 0;
+    let mut symbol_chunks = 0;
+    let mut generic_chunks = 0;
+    let mut skipped_binary = 0;
+    let mut skipped_symlink = 0;
+
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(should_visit)
+    {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            skipped_symlink += 1;
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(text) = read_text(entry.path())? else {
+            skipped_binary += 1;
+            continue;
+        };
+        let path = entry
+            .path()
+            .strip_prefix(root)
+            .expect("walked paths stay under root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        update_source_signature(&mut source_digest, &path, &text);
+        file_count += 1;
+        let extractor = extractor_for_path(entry.path());
+        let mut file_chunks = if let Some(extractor) = extractor.as_deref() {
+            language_chunks(&path, &text, extractor)?
+        } else {
+            generic_chunks_for_range(
+                &path,
+                &text.lines().collect::<Vec<_>>(),
+                1,
+                text.lines().count(),
+                "",
+            )
+        };
+        symbol_chunks += file_chunks
+            .iter()
+            .filter(|chunk| !chunk.symbol.is_empty())
+            .count();
+        if entry.path().extension().and_then(|value| value.to_str()) == Some("py") {
+            python_symbol_chunks += file_chunks
+                .iter()
+                .filter(|chunk| !chunk.symbol.is_empty())
+                .count();
+        }
+        generic_chunks += file_chunks
+            .iter()
+            .filter(|chunk| chunk.symbol.is_empty())
+            .count();
+        chunks.append(&mut file_chunks);
+    }
+
+    chunks.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+            .then_with(|| left.end_line.cmp(&right.end_line))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    Ok((
+        chunks,
+        IndexStats {
+            schema: "context_index.native.v1",
+            file_count,
+            chunk_count: symbol_chunks + generic_chunks,
+            symbol_chunks,
+            python_symbol_chunks,
+            generic_chunks,
+            skipped_binary,
+            skipped_symlink,
+            refresh_signature: format!("files:{}", digest_hex(source_digest)),
+        },
+    ))
+}
+
+fn update_source_signature(digest: &mut Sha256, path: &str, text: &str) {
+    digest.update((path.len() as u64).to_be_bytes());
+    digest.update(path.as_bytes());
+    digest.update((text.len() as u64).to_be_bytes());
+    digest.update(Sha256::digest(text.as_bytes()));
+}
+
+fn digest_hex(digest: Sha256) -> String {
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn should_visit(entry: &DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    if entry.file_type().is_symlink() {
+        return false;
+    }
+    !entry.file_type().is_dir()
+        || !IGNORED_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref())
+}
+
+fn read_text(path: &Path) -> Result<Option<String>> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > MAX_READ_BYTES as u64 {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.contains(&0) {
+        return Ok(None);
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(Some(text)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Language-specific syntax selection is deliberately isolated from chunking;
+/// unsupported files always retain the generic deterministic window path.
+pub trait LanguageExtractor: Send + Sync {
+    fn language(&self) -> tree_sitter::Language;
+    fn declaration_kinds(&self) -> &'static [&'static str];
+    fn wrapper_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+macro_rules! extractor {
+    ($name:ident, $language:expr, [$($kind:literal),+ $(,)?]) => {
+        struct $name;
+
+        impl LanguageExtractor for $name {
+            fn language(&self) -> tree_sitter::Language {
+                $language.into()
+            }
+
+            fn declaration_kinds(&self) -> &'static [&'static str] {
+                &[$($kind),+]
+            }
+        }
+    };
+}
+
+struct PythonExtractor;
+
+impl LanguageExtractor for PythonExtractor {
+    fn language(&self) -> tree_sitter::Language {
+        tree_sitter_python::LANGUAGE.into()
+    }
+
+    fn declaration_kinds(&self) -> &'static [&'static str] {
+        &["class_definition", "function_definition"]
+    }
+
+    fn wrapper_kinds(&self) -> &'static [&'static str] {
+        &["decorated_definition"]
+    }
+}
+
+extractor!(
+    RustExtractor,
+    tree_sitter_rust::LANGUAGE,
+    [
+        "const_item",
+        "enum_item",
+        "function_item",
+        "impl_item",
+        "macro_definition",
+        "mod_item",
+        "static_item",
+        "struct_item",
+        "trait_item",
+        "type_item",
+        "union_item",
+    ]
+);
+extractor!(
+    CExtractor,
+    tree_sitter_c::LANGUAGE,
+    [
+        "declaration",
+        "enum_specifier",
+        "function_definition",
+        "struct_specifier",
+        "type_definition"
+    ]
+);
+extractor!(
+    CppExtractor,
+    tree_sitter_cpp::LANGUAGE,
+    [
+        "alias_declaration",
+        "class_specifier",
+        "declaration",
+        "enum_specifier",
+        "function_definition",
+        "namespace_definition",
+        "struct_specifier",
+        "template_declaration",
+        "type_definition",
+    ]
+);
+struct JavaScriptExtractor;
+
+impl LanguageExtractor for JavaScriptExtractor {
+    fn language(&self) -> tree_sitter::Language {
+        tree_sitter_javascript::LANGUAGE.into()
+    }
+
+    fn declaration_kinds(&self) -> &'static [&'static str] {
+        &[
+            "class_declaration",
+            "function_declaration",
+            "generator_function_declaration",
+            "lexical_declaration",
+            "variable_declaration",
+        ]
+    }
+
+    fn wrapper_kinds(&self) -> &'static [&'static str] {
+        &["export_statement"]
+    }
+}
+
+struct TypeScriptExtractor {
+    tsx: bool,
+}
+
+impl LanguageExtractor for TypeScriptExtractor {
+    fn language(&self) -> tree_sitter::Language {
+        if self.tsx {
+            tree_sitter_typescript::LANGUAGE_TSX.into()
+        } else {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        }
+    }
+
+    fn declaration_kinds(&self) -> &'static [&'static str] {
+        &[
+            "abstract_class_declaration",
+            "class_declaration",
+            "enum_declaration",
+            "function_declaration",
+            "generator_function_declaration",
+            "interface_declaration",
+            "internal_module",
+            "lexical_declaration",
+            "type_alias_declaration",
+            "variable_declaration",
+        ]
+    }
+
+    fn wrapper_kinds(&self) -> &'static [&'static str] {
+        &["export_statement"]
+    }
+}
+
+extractor!(
+    GoExtractor,
+    tree_sitter_go::LANGUAGE,
+    [
+        "const_declaration",
+        "function_declaration",
+        "method_declaration",
+        "type_declaration",
+        "var_declaration",
+    ]
+);
+extractor!(
+    JavaExtractor,
+    tree_sitter_java::LANGUAGE,
+    [
+        "annotation_type_declaration",
+        "class_declaration",
+        "enum_declaration",
+        "interface_declaration",
+        "record_declaration",
+    ]
+);
+
+fn extractor_for_path(path: &Path) -> Option<Box<dyn LanguageExtractor>> {
+    match path.extension().and_then(|value| value.to_str())? {
+        "py" => Some(Box::new(PythonExtractor)),
+        "rs" => Some(Box::new(RustExtractor)),
+        "c" | "h" => Some(Box::new(CExtractor)),
+        "cc" | "cpp" | "hpp" => Some(Box::new(CppExtractor)),
+        "js" => Some(Box::new(JavaScriptExtractor)),
+        "ts" => Some(Box::new(TypeScriptExtractor { tsx: false })),
+        "tsx" => Some(Box::new(TypeScriptExtractor { tsx: true })),
+        "go" => Some(Box::new(GoExtractor)),
+        "java" => Some(Box::new(JavaExtractor)),
+        _ => None,
+    }
+}
+
+fn language_chunks(
+    path: &str,
+    text: &str,
+    extractor: &dyn LanguageExtractor,
+) -> Result<Vec<Chunk>> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut parser = Parser::new();
+    let language = extractor.language();
+    parser.set_language(&language)?;
+    let Some(tree) = parser.parse(text, None) else {
+        return Ok(generic_chunks_for_range(path, &lines, 1, lines.len(), ""));
+    };
+    let root = tree.root_node();
+    let mut symbols = Vec::new();
+    collect_language_symbols(root, text, extractor, &mut symbols);
+    symbols.sort_by_key(|(start, end, symbol)| (*start, *end, symbol.clone()));
+    symbols.dedup();
+    if symbols.is_empty() {
+        return Ok(generic_chunks_for_range(path, &lines, 1, lines.len(), ""));
+    }
+
+    let mut chunks = Vec::new();
+    let mut next_uncovered = 1;
+    for (start, end, symbol) in symbols {
+        if start > next_uncovered {
+            chunks.extend(generic_chunks_for_range(
+                path,
+                &lines,
+                next_uncovered,
+                start - 1,
+                "",
+            ));
+        }
+        chunks.extend(symbol_chunks_for_range(path, &lines, start, end, &symbol));
+        next_uncovered = next_uncovered.max(end.saturating_add(1));
+    }
+    if next_uncovered <= lines.len() {
+        chunks.extend(generic_chunks_for_range(
+            path,
+            &lines,
+            next_uncovered,
+            lines.len(),
+            "",
+        ));
+    }
+    Ok(chunks)
+}
+
+fn collect_language_symbols(
+    node: Node<'_>,
+    source: &str,
+    extractor: &dyn LanguageExtractor,
+    symbols: &mut Vec<(usize, usize, String)>,
+) {
+    if let Some(symbol) = language_symbol(node, source, extractor) {
+        symbols.push(symbol);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_language_symbols(child, source, extractor, symbols);
+    }
+}
+
+fn language_symbol(
+    node: Node<'_>,
+    source: &str,
+    extractor: &dyn LanguageExtractor,
+) -> Option<(usize, usize, String)> {
+    let definition = if extractor.declaration_kinds().contains(&node.kind()) {
+        node
+    } else if extractor.wrapper_kinds().contains(&node.kind()) {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| extractor.declaration_kinds().contains(&child.kind()))?
+    } else {
+        return None;
+    };
+    let name = symbol_name(definition, source)?;
+    let start = node.start_position().row + 1;
+    let end = (node.end_position().row + 1).max(start);
+    Some((start, end, name))
+}
+
+fn symbol_name(node: Node<'_>, source: &str) -> Option<String> {
+    if let Some(name) = node.child_by_field_name("name") {
+        return name.utf8_text(source.as_bytes()).ok().map(str::to_owned);
+    }
+    if matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) {
+        return node.utf8_text(source.as_bytes()).ok().map(str::to_owned);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| symbol_name(child, source))
+}
+
+fn generic_chunks_for_range(
+    path: &str,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    symbol: &str,
+) -> Vec<Chunk> {
+    if start == 0 || start > end || start > lines.len() {
+        return Vec::new();
+    }
+    let bounded_end = end.min(lines.len());
+    let mut chunks = Vec::new();
+    let mut chunk_start = start;
+    while chunk_start <= bounded_end {
+        let chunk_end = (chunk_start + GENERIC_CHUNK_LINES - 1).min(bounded_end);
+        chunks.push(make_chunk(path, lines, chunk_start, chunk_end, symbol));
+        if chunk_end == bounded_end {
+            break;
+        }
+        chunk_start = chunk_end + 1 - GENERIC_CHUNK_OVERLAP_LINES;
+    }
+    chunks
+}
+
+fn symbol_chunks_for_range(
+    path: &str,
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    symbol: &str,
+) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    let mut chunk_start = start;
+    let bounded_end = end.min(lines.len());
+    while chunk_start <= bounded_end {
+        let mut chunk_end = chunk_start;
+        let mut bytes = 0;
+        while chunk_end <= bounded_end {
+            let next = lines[chunk_end - 1].len() + 1;
+            if bytes >= MIN_SYMBOL_CHUNK_BYTES && bytes + next > MAX_SYMBOL_CHUNK_BYTES {
+                break;
+            }
+            bytes += next;
+            chunk_end += 1;
+        }
+        let inclusive_end = chunk_end.saturating_sub(1).max(chunk_start);
+        chunks.push(make_chunk(path, lines, chunk_start, inclusive_end, symbol));
+        chunk_start = inclusive_end.saturating_add(1);
+    }
+    chunks
+}
+
+fn make_chunk(path: &str, lines: &[&str], start: usize, end: usize, symbol: &str) -> Chunk {
+    let mut content = lines[start - 1..end].join("\n");
+    truncate_utf8(&mut content, MAX_SYMBOL_CHUNK_BYTES);
+    let content_digest = Sha256::digest(content.as_bytes());
+    let content_suffix = content_digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Chunk {
+        id: format!(
+            "{}:{content_suffix}",
+            chunk_id(path, start as u32, end as u32, symbol)
+        ),
+        path: path.to_owned(),
+        start_line: start as u32,
+        end_line: end as u32,
+        symbol: symbol.to_owned(),
+        content,
+    }
+}
+
+fn chunk_id(path: &str, start: u32, end: u32, symbol: &str) -> String {
+    format!("{path}:{start}:{end}:{symbol}")
+}
+
+fn symbol_kind(chunk: &Chunk) -> String {
+    let signature = chunk.content.lines().next().unwrap_or_default().trim();
+    if [
+        "class ",
+        "struct ",
+        "interface ",
+        "trait ",
+        "enum ",
+        "record ",
+    ]
+    .iter()
+    .any(|prefix| signature.starts_with(prefix))
+    {
+        "class".to_owned()
+    } else {
+        "function".to_owned()
+    }
+}
+
+fn symbol_signature(chunk: &Chunk) -> String {
+    let line = chunk
+        .content
+        .lines()
+        .find(|line| !line.trim_start().starts_with('@'))
+        .unwrap_or_default()
+        .trim();
+    let line = line
+        .strip_prefix("async def ")
+        .or_else(|| line.strip_prefix("def "))
+        .or_else(|| line.strip_prefix("fn "))
+        .or_else(|| line.strip_prefix("function "))
+        .unwrap_or(line);
+    line.trim_end_matches([':', '{', ';']).trim().to_owned()
+}
+
+fn term_match_count(chunk: &Chunk, terms: &[String]) -> usize {
+    let haystack =
+        format!("{}\n{}\n{}", chunk.path, chunk.symbol, chunk.content).to_ascii_lowercase();
+    terms
+        .iter()
+        .filter(|term| haystack.contains((*term).as_str()))
+        .count()
+}
+
+fn deterministic_rank_score(hit: &SearchHit, terms: &[String]) -> f32 {
+    let path = hit.path.to_ascii_lowercase();
+    let symbol = hit.symbol.to_ascii_lowercase();
+    let content = hit.content.to_ascii_lowercase();
+    terms
+        .iter()
+        .map(|term| {
+            let mut score = 0.0;
+            if path.contains(term) {
+                score += 3.0;
+            }
+            if symbol.contains(term) {
+                score += 8.0;
+            }
+            if content.contains(term) {
+                score += 1.0;
+            }
+            score
+        })
+        .sum()
+}
+
+fn truncate_utf8(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_reject_absolute_and_parent_traversal() {
+        assert!(validate_relative_path("/etc/passwd").is_err());
+        assert!(validate_relative_path("src/../../secret").is_err());
+        assert_eq!(
+            validate_relative_path("./src/auth.py").unwrap(),
+            "src/auth.py"
+        );
+    }
+
+    #[test]
+    fn generic_windows_overlap_by_eight_lines() {
+        let owned: Vec<String> = (1..=100).map(|line| format!("line {line}")).collect();
+        let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let chunks = generic_chunks_for_range("notes.txt", &lines, 1, 100, "");
+        assert_eq!((chunks[0].start_line, chunks[0].end_line), (1, 80));
+        assert_eq!((chunks[1].start_line, chunks[1].end_line), (73, 100));
+    }
+
+    #[test]
+    fn scanner_chunks_unfamiliar_utf8_files_and_skips_binary_data() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        fs::write(
+            root.path().join("Cargo.lock"),
+            "[[package]]\nname = \"scanner-marker\"\nversion = \"1.0.0\"\n",
+        )
+        .expect("write UTF-8 fixture");
+        fs::write(root.path().join("artifact.bin"), b"binary\0payload")
+            .expect("write binary fixture");
+
+        let (chunks, stats) = scan_repository(root.path()).expect("scan repository");
+
+        assert!(chunks.iter().any(|chunk| chunk.path == "Cargo.lock"));
+        assert!(!chunks.iter().any(|chunk| chunk.path == "artifact.bin"));
+        assert_eq!(stats.file_count, 1);
+        assert_eq!(stats.skipped_binary, 1);
+    }
+
+    #[test]
+    fn scanner_and_file_resources_reject_oversized_text_before_reading() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        let large = root.path().join("generated.min.js");
+        fs::write(&large, vec![b'x'; MAX_READ_BYTES + 1]).expect("write oversized fixture");
+
+        let (chunks, _) = scan_repository(root.path()).expect("scan repository");
+        assert!(!chunks.iter().any(|chunk| chunk.path == "generated.min.js"));
+
+        let index = ProjectIndex::build(root.path()).expect("build index");
+        assert!(index.file_content("generated.min.js", 1024).is_err());
+        assert!(index.file_line_count("generated.min.js").is_err());
+    }
+
+    #[test]
+    fn python_top_level_symbols_are_named() {
+        let chunks = language_chunks(
+            "src/auth.py",
+            "class Auth:\n    def login(self):\n        return True\n\ndef issue_token():\n    return 'x'\n",
+            &PythonExtractor,
+        )
+        .unwrap();
+        assert!(chunks.iter().any(|chunk| chunk.symbol == "Auth"));
+        assert!(chunks.iter().any(|chunk| chunk.symbol == "issue_token"));
+    }
+
+    #[test]
+    fn supported_language_extractors_produce_searchable_symbols() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        let fixtures = [
+            ("marker.py", "def pymarker():\n    return 1\n"),
+            ("marker.rs", "fn rustmarker() {}\n"),
+            ("marker.c", "int cmarker(void) { return 1; }\n"),
+            ("marker.cpp", "class cppmarker {};\n"),
+            ("marker.js", "function jsmarker() { return 1; }\n"),
+            ("marker.ts", "interface tsmarker { value: number }\n"),
+            ("marker.tsx", "function tsxmarker() { return <div />; }\n"),
+            ("marker.go", "package marker\nfunc gomarker() {}\n"),
+            ("marker.java", "class javamarker {}\n"),
+        ];
+        for (path, source) in fixtures {
+            fs::write(root.path().join(path), source).expect("write fixture");
+        }
+        let index = ProjectIndex::build(root.path()).expect("build multilingual index");
+        assert!(index.stats().symbol_chunks >= fixtures.len());
+        for (path, _) in fixtures {
+            let query = path.split('.').next().expect("fixture stem");
+            let marker = match query {
+                "marker" => path
+                    .split('.')
+                    .nth(1)
+                    .map(|extension| format!("{extension}marker"))
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            let marker = if path == "marker.cpp" {
+                "cppmarker".to_owned()
+            } else if path == "marker.java" {
+                "javamarker".to_owned()
+            } else if path == "marker.py" {
+                "pymarker".to_owned()
+            } else if path == "marker.rs" {
+                "rustmarker".to_owned()
+            } else if path == "marker.tsx" {
+                "tsxmarker".to_owned()
+            } else {
+                marker
+            };
+            let (hits, _) = index.search(&marker, &[], 1).expect("search symbol");
+            assert_eq!(hits.first().map(|hit| hit.path.as_str()), Some(path));
+        }
+    }
+}

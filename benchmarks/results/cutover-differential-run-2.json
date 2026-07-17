@@ -1,0 +1,889 @@
+{
+  "corpus": {
+    "balanced_pack_tokens_median": 117.5,
+    "case_count": 30,
+    "noise_ratio": 0.0,
+    "python_corpus_p95_ms": 551.800698,
+    "python_reference_resolved": true,
+    "python_required_anchor_recall": 0.0,
+    "required_anchor_recall": 1.0,
+    "route_match_ratio": 0.36666666666666664,
+    "rows": [
+      {
+        "name": "pack_contract",
+        "python_evidence_valid": true,
+        "python_ms": 380.151625,
+        "python_paths": [
+          "crates/context-core/src/lib.rs",
+          "benchmarks/corpora/cutover-v2.json",
+          "tests/test_context_pack.py",
+          "benchmarks/results/cutover-contract-run-1.json"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-core/src/lib.rs"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 18.266706,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-core/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 101,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "pack_ranking",
+        "python_evidence_valid": true,
+        "python_ms": 431.503142,
+        "python_paths": [
+          "crates/context-core/src/lib.rs",
+          "tests/test_context_pack.py",
+          "benchmarks/corpora/cutover-v2.json",
+          "benchmarks/context_pack_benchmark.py"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          "crates/context-core/src/lib.rs",
+          "crates/context-index/src/lib.rs"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 11.855304,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-core/src/lib.rs",
+          "crates/context-index/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 129,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "l0_cache",
+        "python_evidence_valid": true,
+        "python_ms": 241.059179,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          "crates/context-core/src/lib.rs",
+          "crates/context-store/src/bin/inspect-v1.rs",
+          "crates/context-store/src/lib.rs"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-core/src/lib.rs"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 14.134505,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-core/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 110,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "l1_frontier",
+        "python_evidence_valid": true,
+        "python_ms": 282.057992,
+        "python_paths": [
+          "crates/context-core/src/lib.rs",
+          "benchmarks/corpora/cutover-v2.json",
+          "benchmarks/results/cutover-contract-run-1.json",
+          "benchmarks/results/cutover-contract-run-2.json"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          "crates/context-core/src/lib.rs",
+          "crates/context-store/src/lib.rs"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 13.053605,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-core/src/lib.rs",
+          "crates/context-store/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 149,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "delta_encoding",
+        "python_evidence_valid": true,
+        "python_ms": 330.144308,
+        "python_paths": [
+          "crates/context-core/src/lib.rs",
+          "benchmarks/corpora/cutover-v2.json",
+          "scripts/capture_python_current_baseline.py",
+          "scripts/export_python_oracle.py"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-core/src/lib.rs"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 14.730605,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-core/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 109,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "scanner_chunking",
+        "python_evidence_valid": true,
+        "python_ms": 319.579205,
+        "python_paths": [
+          "crates/context-index/src/lib.rs",
+          "benchmarks/corpora/cutover-v2.json",
+          "doc/technical-paper.md",
+          "tests/test_boundaries_and_index.py"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-index/src/lib.rs"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 16.265205,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-index/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 111,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "language_extractors",
+        "python_evidence_valid": true,
+        "python_ms": 265.701987,
+        "python_paths": [
+          "crates/context-index/src/lib.rs",
+          "benchmarks/corpora/cutover-v2.json",
+          "src/mcp_context_manager/util.py",
+          "crates/context-store/src/bin/inspect-v1.rs"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-index/src/lib.rs"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 14.196805,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-index/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 111,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "tantivy_index",
+        "python_evidence_valid": true,
+        "python_ms": 341.197271,
+        "python_paths": [
+          "crates/context-index/src/lib.rs",
+          "benchmarks/corpora/cutover-v2.json",
+          "src/mcp_context_manager/tantivy_index.py",
+          "tests/test_boundaries_and_index.py"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-index/src/lib.rs"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 14.516246,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-index/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 99,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "state_codec",
+        "python_evidence_valid": true,
+        "python_ms": 281.214084,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          "crates/context-store/src/lib.rs",
+          "README.md",
+          "doc/technical-paper.md"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-store/src/lib.rs"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 12.955163,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-store/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 108,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "v1_import",
+        "python_evidence_valid": true,
+        "python_ms": 480.314333,
+        "python_paths": [
+          "crates/context-store/src/lib.rs",
+          "crates/context-store/src/bin/import-v1.rs",
+          "tests/golden/python-v1/contracts.json",
+          "benchmarks/corpora/cutover-v2.json"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-store/src/bin/import-v1.rs",
+          "crates/context-store/src/lib.rs"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 16.649239,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-store/src/lib.rs",
+          "crates/context-store/src/bin/import-v1.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 177,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "active_references",
+        "python_evidence_valid": true,
+        "python_ms": 356.4014,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          "crates/context-core/src/lib.rs",
+          "tests/test_memory_and_references.py",
+          "tests/test_admin_and_regression.py"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          "crates/context-core/src/lib.rs",
+          "crates/context-store/src/lib.rs"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 17.746214,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-store/src/lib.rs",
+          "crates/context-core/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 169,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "project_registry",
+        "python_evidence_valid": true,
+        "python_ms": 311.456761,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          "crates/contextd/src/registry.rs",
+          "tests/test_projects.py",
+          "doc/technical-paper.md"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/contextd/src/registry.rs"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 13.885396,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/contextd/src/registry.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 100,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "http_security",
+        "python_evidence_valid": true,
+        "python_ms": 322.964414,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          "crates/contextd/src/lib.rs",
+          "README.md",
+          "tests/test_memory_and_references.py"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/contextd/src/lib.rs"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 13.645229,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/contextd/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 98,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "mcp_transport",
+        "python_evidence_valid": true,
+        "python_ms": 320.032638,
+        "python_paths": [
+          "crates/contextd/src/lib.rs",
+          "benchmarks/corpora/cutover-v2.json",
+          "tests/test_http_payload.py",
+          "scripts/smoke_native_image.py"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          "crates/contextd/src/lib.rs",
+          "crates/contextd/src/main.rs"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 16.503214,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/contextd/src/lib.rs",
+          "crates/contextd/src/main.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 111,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "rest_routes",
+        "python_evidence_valid": true,
+        "python_ms": 557.759491,
+        "python_paths": [
+          "crates/contextd/src/lib.rs",
+          "scripts/smoke_native_mcp.py",
+          "src/mcp_context_manager/server.py",
+          "tests/test_context_pack.py"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/contextd/src/lib.rs",
+          "scripts/smoke_native_mcp.py"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 16.975114,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/contextd/src/lib.rs",
+          "scripts/smoke_native_mcp.py"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 139,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "docker_runtime",
+        "python_evidence_valid": true,
+        "python_ms": 372.194564,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          "README.md",
+          "scripts/smoke_native_image.py",
+          "scripts/capture_python_current_baseline.py"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          "Dockerfile",
+          "scripts/smoke_native_image.py"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 17.183839,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "Dockerfile",
+          "scripts/smoke_native_image.py"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 120,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "standalone_build",
+        "python_evidence_valid": true,
+        "python_ms": 273.143839,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          ".github/workflows/build.yml",
+          "README.md",
+          ".github/workflows/release.yml"
+        ],
+        "python_required_recall": 0.0,
+        "required_paths": [
+          "cmake/BuildArtifacts.cmake",
+          "cmake/BuildStandalone.cmake"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 16.39138,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "cmake/BuildStandalone.cmake",
+          "cmake/BuildArtifacts.cmake"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 123,
+        "shared_required_recall": 0.0
+      },
+      {
+        "name": "build_workflow",
+        "python_evidence_valid": true,
+        "python_ms": 357.074233,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          ".github/workflows/build.yml",
+          "tests/golden/rust-v2/contracts.json",
+          ".github/workflows/release.yml"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          ".github/workflows/build.yml"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 19.163748,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          ".github/workflows/build.yml"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 94,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "release_workflow",
+        "python_evidence_valid": true,
+        "python_ms": 442.819721,
+        "python_paths": [
+          ".github/workflows/release.yml",
+          "benchmarks/corpora/cutover-v2.json",
+          "scripts/smoke_native_image.py",
+          "tests/test_release_version.py"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          ".github/workflows/release.yml",
+          "xtask/src/main.rs"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 14.420729,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          ".github/workflows/release.yml",
+          "xtask/src/main.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 125,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "toolchain_pin",
+        "python_evidence_valid": true,
+        "python_ms": 294.592472,
+        "python_paths": [
+          "rust-toolchain.toml",
+          "benchmarks/corpora/cutover-v2.json",
+          "tests/golden/rust-v2/contracts.json",
+          ".github/workflows/build.yml"
+        ],
+        "python_required_recall": 0.3333333333333333,
+        "required_paths": [
+          "Cargo.lock",
+          "Cargo.toml",
+          "rust-toolchain.toml"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 18.123239,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "rust-toolchain.toml",
+          "Cargo.toml",
+          "Cargo.lock"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 115,
+        "shared_required_recall": 0.3333333333333333
+      },
+      {
+        "name": "native_oracle",
+        "python_evidence_valid": true,
+        "python_ms": 332.383717,
+        "python_paths": [
+          "scripts/export_rust_oracle.py",
+          "benchmarks/corpora/cutover-v2.json",
+          "benchmarks/results/cutover-differential-run-1.json",
+          "tests/golden/rust-v2/contracts.json"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          "scripts/export_rust_oracle.py",
+          "tests/golden/python-v1/contracts.json"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 14.891164,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "scripts/export_rust_oracle.py",
+          "tests/golden/python-v1/contracts.json"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 162,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "performance_harness",
+        "python_evidence_valid": true,
+        "python_ms": 501.36174,
+        "python_paths": [
+          "scripts/benchmark_native_m3.py",
+          "crates/context-testkit/src/bin/benchmark-m3.rs",
+          "benchmarks/corpora/cutover-v2.json",
+          "crates/context-core/src/lib.rs"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-testkit/src/bin/benchmark-m3.rs",
+          "scripts/benchmark_native_m3.py"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 18.112056,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "crates/context-testkit/src/bin/benchmark-m3.rs",
+          "scripts/benchmark_native_m3.py"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 131,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "python_pack_oracle",
+        "python_evidence_valid": true,
+        "python_ms": 505.935816,
+        "python_paths": [
+          "tests/test_context_pack.py",
+          "benchmarks/corpora/cutover-v2.json",
+          "scripts/capture_python_current_baseline.py",
+          "benchmarks/baselines/python-v1-current-repo.json"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          "src/mcp_context_manager/context.py",
+          "tests/test_context_pack.py"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 16.38753,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "src/mcp_context_manager/context.py",
+          "tests/test_context_pack.py"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 181,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "python_http_oracle",
+        "python_evidence_valid": true,
+        "python_ms": 551.800698,
+        "python_paths": [
+          "tests/test_http_payload.py",
+          "benchmarks/corpora/cutover-v2.json",
+          "src/mcp_context_manager/server.py",
+          "README.md"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "src/mcp_context_manager/server.py",
+          "tests/test_http_payload.py"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 25.370867,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "src/mcp_context_manager/server.py",
+          "tests/test_http_payload.py"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 167,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "python_memory_oracle",
+        "python_evidence_valid": true,
+        "python_ms": 504.444124,
+        "python_paths": [
+          "tests/test_memory_and_references.py",
+          "benchmarks/corpora/cutover-v2.json",
+          "src/mcp_context_manager/memory.py",
+          "README.md"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "src/mcp_context_manager/memory.py"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 16.193564,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "src/mcp_context_manager/memory.py"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 94,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "python_reference_oracle",
+        "python_evidence_valid": true,
+        "python_ms": 478.762416,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          "README.md",
+          "doc/technical-paper.md",
+          "src/mcp_context_manager/server.py"
+        ],
+        "python_required_recall": 0.0,
+        "required_paths": [
+          "src/mcp_context_manager/references.py",
+          "src/mcp_context_manager/store.py"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 18.802031,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "src/mcp_context_manager/references.py",
+          "src/mcp_context_manager/store.py"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 129,
+        "shared_required_recall": 0.0
+      },
+      {
+        "name": "python_project_oracle",
+        "python_evidence_valid": true,
+        "python_ms": 527.176141,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          "src/mcp_context_manager/projects.py",
+          "tests/test_projects.py",
+          "README.md"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          "src/mcp_context_manager/manager.py",
+          "src/mcp_context_manager/projects.py"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 16.873272,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "src/mcp_context_manager/projects.py",
+          "src/mcp_context_manager/manager.py"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 158,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "python_redaction_oracle",
+        "python_evidence_valid": true,
+        "python_ms": 471.58473,
+        "python_paths": [
+          "benchmarks/corpora/cutover-v2.json",
+          "src/mcp_context_manager/util.py",
+          "crates/context-core/src/lib.rs",
+          "README.md"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "crates/context-core/src/lib.rs",
+          "src/mcp_context_manager/util.py"
+        ],
+        "route_equal": false,
+        "rust_evidence_valid": true,
+        "rust_ms": 15.782622,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "src/mcp_context_manager/util.py",
+          "crates/context-core/src/lib.rs"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 182,
+        "shared_required_recall": 1.0
+      },
+      {
+        "name": "configuration_docs",
+        "python_evidence_valid": true,
+        "python_ms": 483.480134,
+        "python_paths": [
+          "README.md",
+          "benchmarks/corpora/cutover-v2.json",
+          "scripts/smoke_native_mcp.py",
+          "tests/test_http_payload.py"
+        ],
+        "python_required_recall": 0.5,
+        "required_paths": [
+          "README.md",
+          "compose.yaml"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 16.622472,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "README.md",
+          "compose.yaml"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 111,
+        "shared_required_recall": 0.5
+      },
+      {
+        "name": "repository_contract",
+        "python_evidence_valid": true,
+        "python_ms": 460.337777,
+        "python_paths": [
+          "AGENTS.md",
+          "benchmarks/corpora/cutover-v2.json",
+          ".continue/rules/mcp-first-workflow-global.md",
+          "src/mcp_context_manager/server.py"
+        ],
+        "python_required_recall": 1.0,
+        "required_paths": [
+          "AGENTS.md"
+        ],
+        "route_equal": true,
+        "rust_evidence_valid": true,
+        "rust_ms": 18.768481,
+        "rust_noise_ratio": 0.0,
+        "rust_paths": [
+          "AGENTS.md"
+        ],
+        "rust_required_recall": 1.0,
+        "rust_tokens": 64,
+        "shared_required_recall": 1.0
+      }
+    ],
+    "rust_corpus_p95_ms": 19.163748,
+    "rust_reference_resolved": true,
+    "shared_required_anchor_recall": 0.0,
+    "source_intervals_and_reasons_valid": true
+  },
+  "gates": {
+    "balanced_pack_median_lte_400_tokens": true,
+    "corpus_has_30_prompts": true,
+    "deferred_evidence_resolves": true,
+    "mutation_freshness_lte_2s": true,
+    "noise_ratio_lte_30pct": true,
+    "randomized_mutations_visible": true,
+    "required_anchor_recall_100pct": true,
+    "source_intervals_and_reasons_valid": true
+  },
+  "method": {
+    "corpus": "benchmarks/corpora/cutover-v2.json",
+    "environment": "devcontainer",
+    "mutation_seed": 788450,
+    "python_state": "isolated temporary v1 state",
+    "rust_state": "isolated temporary rust-v2 overlay"
+  },
+  "mutations": {
+    "all_python_mutations_visible": true,
+    "all_rust_mutations_visible": true,
+    "case_count": 8,
+    "max_rust_freshness_ms": 17.019572,
+    "rows": [
+      {
+        "marker": "mutation_changed_2_3",
+        "path": "src/mutation_3.py",
+        "python_changed": true,
+        "rust_changed": true,
+        "rust_freshness_ms": 17.019572
+      },
+      {
+        "marker": "mutation_changed_2_6",
+        "path": "src/mutation_6.py",
+        "python_changed": true,
+        "rust_changed": true,
+        "rust_freshness_ms": 16.321163
+      },
+      {
+        "marker": "mutation_changed_2_7",
+        "path": "src/mutation_7.py",
+        "python_changed": true,
+        "rust_changed": true,
+        "rust_freshness_ms": 14.490763
+      },
+      {
+        "marker": "mutation_changed_2_5",
+        "path": "src/mutation_5.py",
+        "python_changed": true,
+        "rust_changed": true,
+        "rust_freshness_ms": 14.26123
+      },
+      {
+        "marker": "mutation_changed_2_2",
+        "path": "src/mutation_2.py",
+        "python_changed": true,
+        "rust_changed": true,
+        "rust_freshness_ms": 16.251405
+      },
+      {
+        "marker": "mutation_changed_2_4",
+        "path": "src/mutation_4.py",
+        "python_changed": true,
+        "rust_changed": true,
+        "rust_freshness_ms": 15.915447
+      },
+      {
+        "marker": "mutation_changed_2_0",
+        "path": "src/mutation_0.py",
+        "python_changed": true,
+        "rust_changed": true,
+        "rust_freshness_ms": 13.563829
+      },
+      {
+        "marker": "mutation_changed_2_1",
+        "path": "src/mutation_1.py",
+        "python_changed": true,
+        "rust_changed": true,
+        "rust_freshness_ms": 15.703513
+      }
+    ]
+  },
+  "run": 2,
+  "schema": "rust_native_cutover_differential.v1"
+}

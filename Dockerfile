@@ -1,17 +1,24 @@
 # syntax=docker/dockerfile:1.7
+FROM alpine:3.21 AS verify
+
+ARG SERVER_BINARY=dist/mcp-context-manager-linux-x86_64-musl
+
+RUN apk add --no-cache binutils file
+COPY ${SERVER_BINARY} /mcp-context-manager
+RUN chmod 0755 /mcp-context-manager \
+    && file /mcp-context-manager | grep -Eq 'ELF 64-bit.*static' \
+    && ! readelf -l /mcp-context-manager | grep -q 'INTERP' \
+    && /mcp-context-manager --version | grep -q '^mcp-context-manager '
+
 FROM alpine:3.21
 
 ARG MCP_CONTEXT_UID=1000
 ARG MCP_CONTEXT_GID=1000
-ARG SERVER_BINARY=dist/mcp-context-manager
-
 ENV HOME=/tmp \
     HOST=0.0.0.0 \
     MCP_CONTEXT_STATE_DIR=/state \
     MCP_TRANSPORT=streamable-http \
     PORT=8000 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
     REPO_PATH=/workspace-roots
 
 WORKDIR /app
@@ -22,11 +29,9 @@ RUN apk add --no-cache ca-certificates curl zlib \
     && mkdir -p /workspace-roots /state \
     && chown -R mcp:mcp /workspace-roots /state
 
-COPY ${SERVER_BINARY} /usr/local/bin/mcp-context-manager
+COPY --from=verify /mcp-context-manager /usr/local/bin/mcp-context-manager
 RUN chmod +x /usr/local/bin/mcp-context-manager \
     && chown mcp:mcp /usr/local/bin/mcp-context-manager
-RUN strings /usr/local/bin/mcp-context-manager | grep -q '/lib/ld-musl-x86_64.so.1' \
-    || { echo "Dockerfile requires a musl-linked server binary for alpine runtime" >&2; exit 1; }
 
 USER mcp
 

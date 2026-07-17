@@ -1,0 +1,33 @@
+{
+  "schema": "context_native_cutover_live_proof.v1",
+  "environment": "devcontainer black-box client over the Compose network",
+  "project_id": "mcp-context-manager-93792c7d8071",
+  "reference": {
+    "reference_id": "ctxref-8b525476916c416c",
+    "sha256": "4646c7d9494bfb08eda1492e41a8dfe864fc625a0cbd20b0081932c9d354986e"
+  },
+  "sequence": [
+    {
+      "phase": "native_cutover",
+      "health": "ok",
+      "mcp": "ok",
+      "context_pack_v2": "ok",
+      "imported_reference": "resolved"
+    },
+    {
+      "phase": "python_v1_rollback",
+      "image": "mcp-context-manager:python-v1-rollback",
+      "health_schema": "context_admin.health.v1",
+      "mcp": "ok",
+      "untouched_python_reference": "resolved"
+    },
+    {
+      "phase": "native_restored",
+      "health": "ok",
+      "mcp": "ok",
+      "context_pack_v2": "ok",
+      "imported_reference": "resolved"
+    }
+  ],
+  "passed": true
+}

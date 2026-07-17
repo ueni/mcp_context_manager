@@ -7,16 +7,29 @@ SPDX-PackageSupplier = "Nico Ueberfeldt - ueni"
 
 [[annotations]]
 path = [
+  ".cargo/**",
+  ".devcontainer/**",
   ".dockerignore",
+  ".github/**",
   ".gitignore",
+  ".vscode/**",
   "AGENTS.md",
+  "Cargo.lock",
+  "Cargo.toml",
+  "CMakeLists.txt",
+  "CMakePresets.json",
   "Dockerfile",
   "README.md",
+  "benchmarks/**",
+  "cmake/**",
   "compose.yaml",
-  "doc/**",
-  "pyproject.toml",
   "src/**",
+  "doc/**",
+  "monitor-metrics.py",
+  "rust-toolchain.toml",
+  "scripts/**",
   "tests/**",
+  "xtask/**",
 ]
 SPDX-FileCopyrightText = "2026 Nico Ueberfeldt - ueni"
 SPDX-License-Identifier = "MIT"

@@ -23,16 +23,24 @@ set(MCP_IMAGE_ARCHIVE
     CACHE FILEPATH "Path for the local Docker image archive"
 )
 
-function(mcp_collect_python_sources out_var)
+function(mcp_collect_rust_sources out_var)
     file(GLOB_RECURSE _sources CONFIGURE_DEPENDS
-        "${CMAKE_SOURCE_DIR}/src/*.py"
-        "${CMAKE_SOURCE_DIR}/pyproject.toml"
+        "${CMAKE_SOURCE_DIR}/src/*.rs"
+        "${CMAKE_SOURCE_DIR}/src/*/*.rs"
+        "${CMAKE_SOURCE_DIR}/src/*/*/*.rs"
+        "${CMAKE_SOURCE_DIR}/xtask/*.rs"
+        "${CMAKE_SOURCE_DIR}/xtask/*/*.rs"
+        "${CMAKE_SOURCE_DIR}/Cargo.toml"
+        "${CMAKE_SOURCE_DIR}/src/*/Cargo.toml"
+        "${CMAKE_SOURCE_DIR}/xtask/Cargo.toml"
+        "${CMAKE_SOURCE_DIR}/Cargo.lock"
+        "${CMAKE_SOURCE_DIR}/rust-toolchain.toml"
     )
     set(${out_var} ${_sources} PARENT_SCOPE)
 endfunction()
 
 function(mcp_add_standalone_binary runtime image output_name)
-    mcp_collect_python_sources(_python_sources)
+    mcp_collect_rust_sources(_rust_sources)
     set(_output "${MCP_DIST_DIR}/${output_name}")
     add_custom_command(
         OUTPUT "${_output}"
@@ -47,7 +55,7 @@ function(mcp_add_standalone_binary runtime image output_name)
             "-DMCP_CONTAINER_IMAGE=${image}"
             "-DMCP_OUTPUT_NAME=${output_name}"
             -P "${CMAKE_SOURCE_DIR}/cmake/BuildStandalone.cmake"
-        DEPENDS ${_python_sources}
+        DEPENDS ${_rust_sources}
             "${CMAKE_SOURCE_DIR}/cmake/BuildStandalone.cmake"
             "${CMAKE_SOURCE_DIR}/cmake/DownloadCache.cmake"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
@@ -65,12 +73,12 @@ function(mcp_add_build_artifact_targets)
 
     mcp_add_standalone_binary(
         glibc
-        ubuntu:22.04
+        rust:1.97.1-bookworm
         mcp-context-manager-linux-x86_64-glibc
     )
     mcp_add_standalone_binary(
         musl
-        python:3.12-alpine
+        rust:1.97.1-alpine
         mcp-context-manager-linux-x86_64-musl
     )
 
@@ -112,8 +120,10 @@ function(mcp_add_build_artifact_targets)
     get_filename_component(_image_archive_name "${MCP_IMAGE_ARCHIVE}" NAME)
     add_custom_target(
         local-release-artifacts
+        COMMAND cargo xtask license-check
+        COMMAND cargo xtask sbom "${MCP_DIST_DIR}/mcp-context-manager.cdx.json"
         COMMAND bash -ec
-            "cd '${MCP_DIST_DIR}' && sha256sum mcp-context-manager-linux-x86_64-glibc mcp-context-manager-linux-x86_64-musl '${_image_archive_name}' > SHA256SUMS"
+            "cd '${MCP_DIST_DIR}' && sha256sum mcp-context-manager-linux-x86_64-glibc mcp-context-manager-linux-x86_64-musl mcp-context-manager.cdx.json '${_image_archive_name}' > SHA256SUMS"
         DEPENDS standalone-executable docker-image-archive
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "Creating local release checksums"

@@ -4,12 +4,13 @@ Monitor mcp-context-manager metrics directly through MCP tool calls.
 
 The tool talks to the Streamable HTTP MCP endpoint and calls:
 
-- context_admin(mode="projects")
+- context_admin(mode="cached_projects") when no project is selected
 - context_admin(mode="metrics", project_id=...)
 - context_admin(mode="measurement_matrix", project_id=...)
 - context_admin(mode="metrics_and_matrix", project_id=...)
 
-It renders an interactive terminal dashboard for one project or every known project.
+It renders an interactive terminal dashboard for the persisted project
+catalogue. Use one or more explicit selectors to restrict it to projects.
 No third-party dependencies are required.
 
 Usage:
@@ -50,8 +51,11 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 DEFAULT_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
 DEFAULT_TIMEOUT = 15.0
 DEFAULT_INTERVAL = 60.0
-DEFAULT_FETCH_WORKERS = 8
-MIN_INTERVAL = 5.0
+# Metrics polling is deliberately serialized. This keeps monitor refreshes
+# below one CPU core even when an operator explicitly selects many projects.
+DEFAULT_FETCH_WORKERS = 1
+MAX_MONITOR_PROJECTS = 32
+MIN_INTERVAL = 10.0
 MAX_INTERVAL = 3600.0
 INTERVAL_STEP = 1.0
 DEFAULT_TERMINAL_COLUMNS = 160
@@ -63,7 +67,7 @@ CRITICAL_MATRIX_KEYS = {
     "latency.context_pack.index_refresh_avg_ms",
     "latency.context_admin.warmup.avg_elapsed_ms",
 }
-EXPECTED_SERVER_VERSION = "1.3.1"
+EXPECTED_SERVER_VERSION = "2.0.0"
 EXPECTED_SERVER_VERSION = (
     os.environ.get("MCP_EXPECTED_SERVER_VERSION", "").strip() or EXPECTED_SERVER_VERSION
 )
@@ -331,29 +335,6 @@ def extract_tool_payload(result: dict[str, Any]) -> Any:
     return result
 
 
-def discover_projects(client: Any) -> list[ProjectTarget]:
-    payload = client.call_tool("context_admin", {"mode": "projects"})
-    projects = payload.get("projects") if isinstance(payload, dict) else None
-    if not isinstance(projects, list):
-        return []
-    targets: list[ProjectTarget] = []
-    for row in projects:
-        if not isinstance(row, dict):
-            continue
-        project_id = str(row.get("project_id") or "").strip()
-        if not project_id:
-            continue
-        targets.append(
-            ProjectTarget(
-                project_id=project_id,
-                name=str(row.get("name") or ""),
-                source=str(row.get("source") or ""),
-            )
-        )
-    targets.sort(key=lambda item: (item.name.lower(), item.project_id))
-    return targets
-
-
 def collect_snapshots(
     client: Any,
     project_ids: list[str],
@@ -369,16 +350,14 @@ def collect_snapshots(
             )
         ]
 
-    known_projects = _safe_discover_projects(client)
-    known_by_id = {target.project_id: target for target in known_projects}
-
-    targets = [
-        known_by_id.get(pid, ProjectTarget(project_id=pid)) for pid in project_ids
-    ]
-    if not targets:
-        targets = known_projects
-    if not targets:
-        targets = [ProjectTarget(project_id="", name="default", source="fallback")]
+    # Never discover projects from the monitor. The server's cached catalogue
+    # is a bounded v2-state directory list, not a recursive workspace walk.
+    if project_ids:
+        targets = [ProjectTarget(project_id=pid) for pid in project_ids[:MAX_MONITOR_PROJECTS]]
+    else:
+        targets = _safe_cached_projects(client)
+        if not targets:
+            targets = [ProjectTarget(project_id="", name="default", source="default")]
     return _collect_targets(
         client,
         targets,
@@ -386,6 +365,28 @@ def collect_snapshots(
         include_matrix=include_matrix,
         max_workers=max_workers,
     )
+
+
+def _safe_cached_projects(client: Any) -> list[ProjectTarget]:
+    try:
+        payload = client.call_tool("context_admin", {"mode": "cached_projects"})
+    except Exception:
+        return []
+    projects = payload.get("projects") if isinstance(payload, dict) else None
+    if not isinstance(projects, list):
+        return []
+    targets = [
+        ProjectTarget(
+            project_id=str(row.get("project_id") or "").strip(),
+            name=str(row.get("name") or ""),
+            source=str(row.get("source") or ""),
+        )
+        for row in projects
+        if isinstance(row, dict) and str(row.get("project_id") or "").strip()
+    ]
+    return sorted(targets, key=lambda item: (item.name.lower(), item.project_id))[
+        :MAX_MONITOR_PROJECTS
+    ]
 
 
 def _collect_targets(
@@ -402,6 +403,11 @@ def _collect_targets(
             )
         ]
     worker_count = min(max(1, max_workers), len(targets))
+    if worker_count == 1:
+        return [
+            _collect_one(client, target, root_uri=root_uri, include_matrix=include_matrix)
+            for target in targets
+        ]
     with ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="monitor-fetch"
     ) as executor:
@@ -496,13 +502,6 @@ def friendly_mcp_error(exc: Exception) -> str:
             "MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up -d --build"
         )
     return message
-
-
-def _safe_discover_projects(client: Any) -> list[ProjectTarget]:
-    try:
-        return discover_projects(client)
-    except Exception:
-        return []
 
 
 def _collect_one(
@@ -638,10 +637,56 @@ def render_project_detail(
         ).columns
     )
     metrics = snapshot.metrics or {}
+    if _is_native_metrics(metrics):
+        details = _native_project_details(metrics, snapshot, url, state)
+    else:
+        details = _legacy_project_details(metrics, snapshot, url, state)
+    lines = [
+        _style("mcp-context-manager project details", color, Ansi.BOLD + Ansi.CYAN),
+        "",
+    ]
+    lines.extend(_render_table(("field", "value"), details, aligns=("left", "left")))
+    if snapshot.error:
+        lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
+    check_rows = _measurement_check_rows(snapshot.matrix or {}, color)
+    if check_rows:
+        key_width = max(
+            24, min(max(_visible_len(row[0]) for row in check_rows), width - 64)
+        )
+        description_width = max(14, max(_visible_len(row[4]) for row in check_rows))
+        lines.extend(
+            [
+                "",
+                *_render_table(
+                    ("check", "status", "current", "target", "description"),
+                    check_rows,
+                    widths=(key_width, 12, 10, 10, description_width),
+                    aligns=("left", "right", "right", "right", "left"),
+                ),
+            ]
+        )
+    lines.append(
+        _controls(
+            state.refresh_interval,
+            color,
+            status_line=_mcp_status_line(state, color),
+        )
+    )
+    return "\n".join(lines)
+
+
+def _legacy_project_details(
+    metrics: dict[str, Any],
+    snapshot: ProjectSnapshot,
+    url: str,
+    state: MonitorState,
+) -> list[tuple[str, str]]:
+    """Keep the historical Python monitor details readable during rollout."""
+
     fragment_hits = _int_at(metrics, ("cache", "context_pack_fragment_hits"))
     fragment_misses = _int_at(metrics, ("cache", "context_pack_fragment_misses"))
     fragment_ratio = _fragment_cache_ratio(metrics)
-    details = [
+    return [
         ("project", _project_name(snapshot.target)),
         ("project id", _project_identifier(snapshot.target)),
         ("endpoint", url),
@@ -678,38 +723,73 @@ def render_project_detail(
             fmt_bytes(_int_at(metrics, ("references", "bytes_deferred_est"))),
         ),
     ]
-    lines = [
-        _style("mcp-context-manager project details", color, Ansi.BOLD + Ansi.CYAN),
-        "",
+
+
+def _native_project_details(
+    metrics: dict[str, Any],
+    snapshot: ProjectSnapshot,
+    url: str,
+    state: MonitorState,
+) -> list[tuple[str, str]]:
+    """Render native v2 counters rather than obsolete fragment-cache fields."""
+
+    l0 = _cache_l0(metrics)
+    l1 = _cache_l1(metrics)
+    retrieval = _mapping_at(metrics, ("retrieval",))
+    freshness = _mapping_at(metrics, ("index_freshness",))
+    references = _mapping_at(metrics, ("references",))
+    pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
+    return [
+        ("project", _project_name(snapshot.target)),
+        ("project id", _project_identifier(snapshot.target)),
+        ("endpoint", url),
+        ("updated", state.last_updated or "-"),
+        ("engine", _native_engine_status(metrics)),
+        ("requests", fmt_int(_int_at(metrics, ("requests", "total")))),
+        ("context_pack", fmt_int(_context_pack_count(metrics))),
+        ("avg pack ms", fmt_ms(_context_pack_avg_ms(metrics))),
+        ("L0 pack cache", _cache_hit_summary(l0)),
+        ("L0 miss causes", _l0_miss_reason_summary(l0)),
+        (
+            "L0 storage",
+            f"{fmt_int(l0.get('entries', 0))} entries, {fmt_bytes(l0.get('weighted_bytes', 0))}",
+        ),
+        (
+            "L1 frontier",
+            f"{fmt_int(l1.get('exact_hits', 0))} exact / "
+            f"{fmt_int(l1.get('approximate_hits', 0))} approximate hits",
+        ),
+        ("retrieval misses", fmt_int(_native_retrieval_misses(metrics))),
+        (
+            "index",
+            f"{retrieval.get('backend', '-')}, {fmt_int(retrieval.get('doc_count', 0))} chunks",
+        ),
+        (
+            "freshness",
+            f"gen {fmt_int(freshness.get('generation', 0))}, "
+            f"{'dirty' if freshness.get('dirty') else 'clean'}, "
+            f"{fmt_int(freshness.get('refreshes', 0))} refreshes",
+        ),
+        (
+            "references",
+            f"{fmt_int(references.get('active_count', 0))} active / "
+            f"{fmt_int(references.get('total_count', 0))} total",
+        ),
+        ("compression", _compression_factor_summary(pack_tokens)),
+        (
+            "tokens saved est.",
+            f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire / "
+            f"{fmt_int(pack_tokens.get('delta_tokens_saved_est', 0))} delta",
+        ),
+        (
+            "token estimates",
+            f"{fmt_int(pack_tokens.get('selected_source_tokens_est', 0))} source / "
+            f"{fmt_int(pack_tokens.get('evidence_card_tokens_est', 0))} cards / "
+            f"{fmt_int(pack_tokens.get('returned_evidence_tokens_est', 0))} returned / "
+            f"{fmt_int(pack_tokens.get('wire_tokens_est', 0))} wire "
+            f"({fmt_bytes(pack_tokens.get('wire_bytes', 0))})",
+        ),
     ]
-    lines.extend(_render_table(("field", "value"), details, aligns=("left", "left")))
-    if snapshot.error:
-        lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
-    check_rows = _measurement_check_rows(snapshot.matrix or {}, color)
-    if check_rows:
-        key_width = max(
-            24, min(max(_visible_len(row[0]) for row in check_rows), width - 64)
-        )
-        description_width = max(14, max(_visible_len(row[4]) for row in check_rows))
-        lines.extend(
-            [
-                "",
-                *_render_table(
-                    ("check", "status", "current", "target", "description"),
-                    check_rows,
-                    widths=(key_width, 12, 10, 10, description_width),
-                    aligns=("left", "right", "right", "right", "left"),
-                ),
-            ]
-        )
-    lines.append(
-        _controls(
-            state.refresh_interval,
-            color,
-            status_line=_mcp_status_line(state, color),
-        )
-    )
-    return "\n".join(lines)
 
 
 def render_performance_view(
@@ -730,24 +810,34 @@ def render_performance_view(
     freshness = freshness if isinstance(freshness, dict) else {}
     background = metrics.get("background", {})
     background = background if isinstance(background, dict) else {}
-    stage_column_overhead = 4 * 10 + 5 * 3 + 1
+    native_metrics = _is_native_metrics(metrics)
+    stage_column_overhead = (6 if native_metrics else 4) * 10 + (7 if native_metrics else 5) * 3 + 1
     stage_column_width = max(
         24,
         min(48, width - stage_column_overhead),
     )
     stage_rows = _performance_stage_rows(metrics)
     cache_rows = _performance_cache_rows(metrics, background, freshness)
+    if native_metrics:
+        stage_table = _render_table(
+            ("operation", "avg ms", "p50 ms", "p95 ms", "min ms", "max ms", "last ms"),
+            stage_rows,
+            widths=(stage_column_width, 9, 9, 9, 9, 9, 9),
+            aligns=("left", "right", "right", "right", "right", "right", "right"),
+        )
+    else:
+        stage_table = _render_table(
+            ("stage", "avg ms", "min ms", "max ms", "last ms"),
+            stage_rows,
+            widths=(stage_column_width, 10, 10, 10, 10),
+            aligns=("left", "right", "right", "right", "right"),
+        )
     lines = [
         _style("mcp-context-manager performance", color, Ansi.BOLD + Ansi.CYAN),
         f"endpoint: {url}",
         f"project:  {_project_name(snapshot.target)}",
         "",
-        *_render_table(
-            ("stage", "avg ms", "min ms", "max ms", "last ms"),
-            stage_rows,
-            widths=(stage_column_width, 10, 10, 10, 10),
-            aligns=("left", "right", "right", "right", "right"),
-        ),
+        *stage_table,
         "",
         *_render_table(
             ("signal", "value"),
@@ -927,19 +1017,47 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
         "packs": 0,
         "cache_hits": 0,
         "cache_misses": 0,
+        "l1_exact_hits": 0,
+        "l1_approximate_hits": 0,
+        "retrieval_misses": 0,
+        "active_references": 0,
+        "total_references": 0,
+        "pack_elapsed_ms": 0.0,
+        "source_tokens_est": 0,
+        "wire_tokens_est": 0,
+        "saved_tokens_est": 0,
         "fragment_hits": 0,
         "fragment_misses": 0,
         "tokens_spared_by_mcp": 0,
         "bytes_deferred": 0,
+        "native_rows": 0,
     }
     for row in rows:
         metrics = row.metrics or {}
+        if _is_native_metrics(metrics):
+            totals["native_rows"] += 1
         totals["requests"] += _int_at(metrics, ("requests", "total"))
         totals["packs"] += _int_at(
             metrics, ("requests", "by_operation", "context_pack", "count")
         )
         totals["cache_hits"] += _int_at(metrics, ("cache", "hits"))
         totals["cache_misses"] += _int_at(metrics, ("cache", "misses"))
+        totals["l1_exact_hits"] += _int_at(
+            metrics, ("cache", "l1", "exact_hits")
+        )
+        totals["l1_approximate_hits"] += _int_at(
+            metrics, ("cache", "l1", "approximate_hits")
+        )
+        totals["retrieval_misses"] += _native_retrieval_misses(metrics)
+        totals["active_references"] += _int_at(metrics, ("references", "active_count"))
+        totals["total_references"] += _int_at(metrics, ("references", "total_count"))
+        totals["pack_elapsed_ms"] += _context_pack_count(metrics) * _context_pack_avg_ms(metrics)
+        pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
+        totals["source_tokens_est"] += _int_at(
+            pack_tokens, ("selected_source_tokens_est",)
+        )
+        totals["wire_tokens_est"] += _int_at(pack_tokens, ("wire_tokens_est",))
+        totals["saved_tokens_est"] += _int_at(pack_tokens, ("saved_tokens_est",))
         totals["fragment_hits"] += _int_at(
             metrics, ("cache", "context_pack_fragment_hits")
         )
@@ -954,6 +1072,51 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
 
 
 def _summary_table(
+    totals: dict[str, Any],
+    snapshots: list[ProjectSnapshot],
+    ok_rows: list[ProjectSnapshot],
+    color: bool,
+) -> list[str]:
+    if not totals["native_rows"]:
+        return _legacy_summary_table(totals, snapshots, ok_rows, color)
+    cache_total = int(totals["cache_hits"]) + int(totals["cache_misses"])
+    cache_ratio = (
+        int(totals["cache_hits"]) / cache_total if cache_total else 0.0
+    )
+    packs = int(totals["packs"])
+    average_pack_ms = float(totals["pack_elapsed_ms"]) / packs if packs else 0.0
+    source_tokens = int(totals["source_tokens_est"])
+    wire_tokens = int(totals["wire_tokens_est"])
+    compression_factor = source_tokens / wire_tokens if wire_tokens else 0.0
+    rows = [
+        ("projects", f"{len(snapshots)} total / {len(ok_rows)} ok"),
+        ("requests", fmt_int(totals["requests"])),
+        ("context_pack", fmt_int(totals["packs"])),
+        ("avg pack ms", fmt_ms(average_pack_ms)),
+        (
+            "L0 pack cache",
+            f"{_bar(cache_ratio, 18, color)} {cache_ratio * 100:5.1f}%",
+        ),
+        (
+            "L1 frontier",
+            f"{fmt_int(totals['l1_exact_hits'])} exact / "
+            f"{fmt_int(totals['l1_approximate_hits'])} approximate",
+        ),
+        ("retrieval misses", fmt_int(totals["retrieval_misses"])),
+        (
+            "compression",
+            f"{compression_factor:.2f}x source-to-wire" if compression_factor else "not observed",
+        ),
+        ("tokens saved est.", fmt_int(totals["saved_tokens_est"])),
+        (
+            "refs active",
+            f"{fmt_int(totals['active_references'])} / {fmt_int(totals['total_references'])}",
+        ),
+    ]
+    return _render_table(("metric", "value"), rows, aligns=("left", "right"))
+
+
+def _legacy_summary_table(
     totals: dict[str, Any],
     snapshots: list[ProjectSnapshot],
     ok_rows: list[ProjectSnapshot],
@@ -984,6 +1147,7 @@ def _project_table(
     selected_index: int | None = None,
 ) -> list[str]:
     widths = _project_column_widths(width)
+    native = any(_is_native_metrics(snapshot.metrics or {}) for snapshot in snapshots)
     rows = [
         _project_cells(snapshot, color, widths, selected=index == selected_index)
         for index, snapshot in enumerate(snapshots)
@@ -996,8 +1160,8 @@ def _project_table(
             "req",
             "pack",
             "avg ms",
-            "cache",
-            "cand tok",
+            "L0 cache" if native else "cache",
+            "L1 reuse" if native else "cand tok",
             "checks",
         ),
         rows,
@@ -1009,7 +1173,7 @@ def _project_table(
             widths["pack"],
             widths["avg_ms"],
             widths["cache"],
-            widths["tokens"],
+            widths["l1"],
             widths["checks"],
         ),
         aligns=(
@@ -1043,8 +1207,8 @@ def _project_column_widths(width: int) -> dict[str, int]:
         "pack": 4,
         "avg_ms": 6,
         "cache": 16,
-        "tokens": 8,
-        "checks": 6,
+        "l1": 9,
+        "checks": 9,
     }
     target_width = min(DEFAULT_TERMINAL_COLUMNS, max(100, width))
     overhead = len(widths) * 3 + 1
@@ -1080,6 +1244,7 @@ def _project_cells(
             "-",
             "-",
             "-",
+            "-",
             _style("error", color, Ansi.RED),
         )
     metrics = snapshot.metrics or {}
@@ -1088,10 +1253,15 @@ def _project_cells(
     avg_ms = _float_at(
         metrics, ("requests", "by_operation", "context_pack", "avg_elapsed_ms")
     )
-    fragment_ratio = _fragment_cache_ratio(metrics)
-    tokens_spared_by_mcp = _tokens_spared_by_mcp(metrics)
     checks = _matrix_status(snapshot.matrix or {}, color)
     cache_bar_width = max(6, widths["cache"] - 9)
+    if _is_native_metrics(metrics):
+        cache_ratio = _cache_hit_ratio(metrics)
+        l1 = _cache_l1(metrics)
+        l1_reuse = f"{fmt_int(l1.get('exact_hits', 0))}/{fmt_int(l1.get('approximate_hits', 0))}"
+    else:
+        cache_ratio = _fragment_cache_ratio(metrics)
+        l1_reuse = fmt_int(_tokens_spared_by_mcp(metrics))
     return (
         selector,
         project,
@@ -1099,8 +1269,8 @@ def _project_cells(
         fmt_int(requests),
         fmt_int(packs),
         fmt_ms(avg_ms),
-        f"{_bar(fragment_ratio, cache_bar_width, color)} {fragment_ratio * 100:5.1f}%",
-        fmt_int(tokens_spared_by_mcp),
+        f"{_bar(cache_ratio, cache_bar_width, color)} {cache_ratio * 100:5.1f}%",
+        l1_reuse,
         checks,
     )
 
@@ -1187,6 +1357,13 @@ def _measurement_check_rows(
         "tokens.context_pack.avg_candidate_compression_per_pack": "Average candidate compression per context pack",
         "tokens.context_pack.compression_ratio": "Output tokens as a share of baseline tokens",
     }
+    table_descriptions = {
+        "telemetry.context_pack.samples": "Observed context-pack requests",
+        "tokens.context_pack.compression_factor_est": "Estimated source-to-wire factor",
+        "tokens.context_pack.saved_est": "Estimated tokens kept off wire",
+        "quality.required_anchor_recall": "Benchmark required-anchor recall",
+        "quality.noise_ratio": "Benchmark retrieval noise",
+    }
 
     checks = matrix.get("checks") if isinstance(matrix, dict) else None
     if not isinstance(checks, list):
@@ -1210,11 +1387,13 @@ def _measurement_check_rows(
             continue
         check_key = str(check.get("key") or "-")
         status = _check_status_label(check)
-        description = check.get("description")
+        description = table_descriptions.get(check_key.strip().lower())
         if description is None:
-            description = check.get("desc")
+            description = check.get("description")
             if description is None:
-                description = _fallback_description(check_key)
+                description = check.get("desc")
+                if description is None:
+                    description = _fallback_description(check_key)
         if not isinstance(description, str):
             description = str(description)
         operator = check.get("operator")
@@ -1301,7 +1480,27 @@ def _performance_retrieval_bottleneck(metrics: dict[str, Any]) -> str:
 
 def _performance_stage_rows(
     metrics: dict[str, Any],
-) -> list[tuple[str, str, str, str, str]]:
+) -> list[tuple[str, ...]]:
+    if _is_native_metrics(metrics):
+        operations = _mapping_at(metrics, ("requests", "by_operation"))
+        rows = []
+        for operation, stats in sorted(
+            operations.items(), key=lambda row: (row[0] != "context_pack", row[0])
+        ):
+            if not isinstance(stats, dict):
+                continue
+            rows.append(
+                (
+                    operation,
+                    fmt_ms(stats.get("avg_elapsed_ms", 0.0)),
+                    fmt_ms(stats.get("p50_recent_ms", 0.0)),
+                    fmt_ms(stats.get("p95_recent_ms", 0.0)),
+                    fmt_ms(stats.get("min_elapsed_ms", 0.0)),
+                    fmt_ms(stats.get("max_elapsed_ms", 0.0)),
+                    fmt_ms(stats.get("last_elapsed_ms", 0.0)),
+                )
+            )
+        return rows or [("context_pack", "-", "-", "-", "-", "-", "-")]
     rows: list[tuple[str, str, str, str, str]] = []
     for name in (
         "total_ms",
@@ -1335,6 +1534,64 @@ def _performance_cache_rows(
     background: dict[str, Any],
     freshness: dict[str, Any],
 ) -> list[tuple[str, str]]:
+    if _is_native_metrics(metrics):
+        l0 = _cache_l0(metrics)
+        l1 = _cache_l1(metrics)
+        retrieval = _mapping_at(metrics, ("retrieval",))
+        references = _mapping_at(metrics, ("references",))
+        pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
+        freshness_state = "dirty" if freshness.get("dirty") else "clean"
+        return [
+            ("engine", _native_engine_status(metrics)),
+            (
+                "L0 pack cache",
+                _cache_hit_summary(l0),
+            ),
+            ("L0 miss causes", _l0_miss_reason_summary(l0)),
+            (
+                "L0 storage",
+                f"{fmt_int(l0.get('entries', 0))} entries / "
+                f"{fmt_bytes(l0.get('weighted_bytes', 0))}",
+            ),
+            (
+                "L1 frontier",
+                f"{fmt_int(l1.get('exact_hits', 0))} exact, "
+                f"{fmt_int(l1.get('approximate_hits', 0))} approximate hits",
+            ),
+            ("retrieval misses", fmt_int(_native_retrieval_misses(metrics))),
+            (
+                "index",
+                f"{retrieval.get('backend', '-')}, "
+                f"{fmt_int(retrieval.get('doc_count', 0))} chunks",
+            ),
+            (
+                "freshness",
+                f"{freshness_state}, gen {fmt_int(freshness.get('generation', 0))}, "
+                f"{fmt_int(freshness.get('refreshes', 0))} refreshes",
+            ),
+            (
+                "references",
+                f"{fmt_int(references.get('active_count', 0))} active / "
+                f"{fmt_int(references.get('total_count', 0))} total",
+            ),
+            (
+                "compression",
+                _compression_factor_summary(pack_tokens),
+            ),
+            (
+                "tokens saved est.",
+                f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire, "
+                f"{fmt_int(pack_tokens.get('delta_tokens_saved_est', 0))} delta",
+            ),
+            (
+                "token estimates",
+                f"{fmt_int(pack_tokens.get('selected_source_tokens_est', 0))} source / "
+                f"{fmt_int(pack_tokens.get('evidence_card_tokens_est', 0))} cards / "
+                f"{fmt_int(pack_tokens.get('wire_tokens_est', 0))} wire "
+                f"({fmt_bytes(pack_tokens.get('wire_bytes', 0))})",
+            ),
+            ("background", str(background.get("status") or "-")),
+        ]
     index_job = (
         background.get("index_refresh", {})
         if isinstance(background.get("index_refresh"), dict)
@@ -1721,7 +1978,10 @@ def _matrix_status(matrix: dict[str, Any], color: bool) -> str:
     if counts["fail"]:
         return _style(f"{counts['fail']} fail", color, Ansi.RED)
     if counts["insufficient"]:
-        return _style(f"{counts['pass']} pass", color, Ansi.YELLOW)
+        pending = f"{counts['insufficient']} pending"
+        if counts["pass"]:
+            pending = f"{counts['pass']} pass, {pending}"
+        return _style(pending, color, Ansi.YELLOW)
     return _style(f"{counts['pass']} pass", color, Ansi.GREEN)
 
 
@@ -1760,8 +2020,8 @@ def _bar(ratio: float, width: int, color: bool) -> str:
 def _legend(color: bool) -> str:
     return (
         f"{_style('checks', color, Ansi.BOLD)} come from "
-        "context_admin(mode='metrics_and_matrix') checks; cache bars show "
-        "context-pack fragment hit ratios."
+        "context_admin(mode='metrics_and_matrix'); pending means the project "
+        "has not been opened for a quality run. Cache bars show L0 pack-cache hits."
     )
 
 
@@ -1795,6 +2055,102 @@ def _tokens_spared_by_mcp(metrics: dict[str, Any]) -> int:
     if isinstance(tokens, dict) and "tokens_spared_by_mcp_est" in tokens:
         return _int_at(metrics, ("tokens", "tokens_spared_by_mcp_est"))
     return _int_at(metrics, ("tokens", "estimated_input_tokens_saved"))
+
+
+def _mapping_at(payload: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]:
+    value: Any = payload
+    for key in path:
+        if not isinstance(value, dict):
+            return {}
+        value = value.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _is_native_metrics(metrics: dict[str, Any]) -> bool:
+    """Recognize the native server without relying on its version string."""
+
+    return bool(_mapping_at(metrics, ("cache", "l0"))) or (
+        _mapping_at(metrics, ("retrieval",)).get("backend") == "tantivy"
+    )
+
+
+def _cache_l0(metrics: dict[str, Any]) -> dict[str, Any]:
+    l0 = _mapping_at(metrics, ("cache", "l0"))
+    if l0:
+        return l0
+    cache = _mapping_at(metrics, ("cache",))
+    return {"hits": cache.get("hits", 0), "misses": cache.get("misses", 0)}
+
+
+def _cache_l1(metrics: dict[str, Any]) -> dict[str, Any]:
+    return _mapping_at(metrics, ("cache", "l1"))
+
+
+def _cache_hit_ratio(metrics: dict[str, Any]) -> float:
+    cache = _mapping_at(metrics, ("cache",))
+    ratio = cache.get("hit_ratio")
+    if isinstance(ratio, (int, float)):
+        return max(0.0, min(1.0, float(ratio)))
+    if _is_native_metrics(metrics):
+        l0 = _cache_l0(metrics)
+        hits = _int_at(l0, ("hits",))
+        misses = _int_at(l0, ("misses",))
+        total = hits + misses
+        return hits / total if total else 0.0
+    return _fragment_cache_ratio(metrics)
+
+
+def _cache_hit_summary(cache: dict[str, Any]) -> str:
+    hits = _int_at(cache, ("hits",))
+    misses = _int_at(cache, ("misses",))
+    total = hits + misses
+    ratio = hits / total if total else 0.0
+    return f"{fmt_int(hits)}/{fmt_int(misses)} h/m  {ratio * 100:5.1f}%"
+
+
+def _l0_miss_reason_summary(cache: dict[str, Any]) -> str:
+    reasons = _mapping_at(cache, ("miss_reasons",))
+    cold = _int_at(reasons, ("cold_or_invalidated",))
+    variants = _int_at(reasons, ("request_variant",))
+    invalidations = _int_at(cache, ("invalidations",))
+    coalesced = _int_at(cache, ("singleflight_hits",))
+    return (
+        f"cold {fmt_int(cold)}, variant {fmt_int(variants)}, "
+        f"invalidations {fmt_int(invalidations)}, coalesced {fmt_int(coalesced)}"
+    )
+
+
+def _compression_factor_summary(pack_tokens: dict[str, Any]) -> str:
+    factor = pack_tokens.get("compression_factor_est")
+    ratio = pack_tokens.get("compression_ratio_est")
+    if not isinstance(factor, (int, float)) or float(factor) <= 0:
+        return "not observed"
+    ratio_text = (
+        f" ({float(ratio) * 100:.1f}% returned)"
+        if isinstance(ratio, (int, float))
+        else ""
+    )
+    return f"{float(factor):.2f}x source-to-wire{ratio_text}"
+
+
+def _context_pack_count(metrics: dict[str, Any]) -> int:
+    return _int_at(metrics, ("requests", "by_operation", "context_pack", "count"))
+
+
+def _context_pack_avg_ms(metrics: dict[str, Any]) -> float:
+    return _float_at(
+        metrics, ("requests", "by_operation", "context_pack", "avg_elapsed_ms")
+    )
+
+
+def _native_retrieval_misses(metrics: dict[str, Any]) -> int:
+    misses = _int_at(metrics, ("cache", "l1", "retrieval_misses"))
+    return misses if misses else _int_at(metrics, ("retrieval", "misses"))
+
+
+def _native_engine_status(metrics: dict[str, Any]) -> str:
+    background = _mapping_at(metrics, ("background",))
+    return str(background.get("status") or "active")
 
 
 def _fragment_cache_ratio(metrics: dict[str, Any]) -> float:

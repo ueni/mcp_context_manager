@@ -18,19 +18,28 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Rust 1.97.1
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
-          python-version: "3.12"
-          cache: pip
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
 
       - name: Cache build downloads
         uses: actions/cache@v4
         with:
           path: .downloads
-          key: ${{ runner.os }}-build-downloads-${{ hashFiles('pyproject.toml', 'CMakeLists.txt', 'CMakePresets.json', 'cmake/**/*.cmake') }}
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'src/**/Cargo.toml', 'CMakeLists.txt', 'CMakePresets.json', 'cmake/**/*.cmake') }}
           restore-keys: |
-            ${{ runner.os }}-build-downloads-
+            ${{ runner.os }}-cargo-build-
+
+      - name: Validate Rust workspace and dependency policy
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+          cargo xtask license-check
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings
+          cargo xtask sbom dist/mcp-context-manager.cdx.json
 
       - name: Build glibc and musl executables
         run: |
@@ -38,55 +47,18 @@ jobs:
           cmake --build --preset standalone-ci
 
       - name: Smoke test glibc executable
-        run: |
-          state_dir="$(mktemp -d)"
-          MCP_TRANSPORT=streamable-http \
-          HOST=127.0.0.1 \
-          PORT=18080 \
-          REPO_PATH="$PWD" \
-          MCP_CONTEXT_STATE_DIR="$state_dir" \
-          ./dist/mcp-context-manager-linux-x86_64-glibc &
-          pid="$!"
-          trap 'kill "$pid" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
-          for _ in $(seq 1 30); do
-            if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
-            then
-              exit 0
-            fi
-            sleep 1
-          done
-          exit 1
+        run: python3 scripts/smoke_native_mcp.py dist/mcp-context-manager-linux-x86_64-glibc
 
       - name: Smoke test musl executable
-        run: |
-          state_dir="$(mktemp -d)"
-          container="mcp-context-manager-musl-smoke"
-          docker run --rm -d \
-            --name "$container" \
-            -p 18080:18080 \
-            -e MCP_TRANSPORT=streamable-http \
-            -e HOST=0.0.0.0 \
-            -e PORT=18080 \
-            -e REPO_PATH=/workspace-roots \
-            -e MCP_CONTEXT_STATE_DIR=/state \
-            -v "$PWD:/workspace-roots" \
-            -v "$state_dir:/state" \
-            python:3.12-alpine \
-            /workspace-roots/dist/mcp-context-manager-linux-x86_64-musl
-          trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$state_dir"' EXIT
-          for _ in $(seq 1 30); do
-            if python -c 'import json, urllib.request; payload = json.load(urllib.request.urlopen("http://127.0.0.1:18080/healthz", timeout=2)); raise SystemExit(0 if payload.get("ok") is True else 1)'
-            then
-              exit 0
-            fi
-            sleep 1
-          done
-          exit 1
+        run: python3 scripts/smoke_native_mcp.py dist/mcp-context-manager-linux-x86_64-musl
 
       - name: Build docker image archive
         run: |
           cmake --preset ci
           cmake --build --preset docker-image-archive-ci
+
+      - name: Smoke test Docker image
+        run: python3 scripts/smoke_native_image.py mcp-context-manager:linux-x86_64
 
       - name: Upload glibc executable
         uses: actions/upload-artifact@v4
@@ -107,4 +79,11 @@ jobs:
         with:
           name: mcp-context-manager-linux-x86_64-musl-image
           path: mcp-context-manager-linux-x86_64-musl-image.tar.gz
+          if-no-files-found: error
+
+      - name: Upload CycloneDX SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-context-manager-cyclonedx-sbom
+          path: dist/mcp-context-manager.cdx.json
           if-no-files-found: error

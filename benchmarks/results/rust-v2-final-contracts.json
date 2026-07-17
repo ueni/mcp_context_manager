@@ -1,0 +1,2109 @@
+{
+  "captures": {
+    "context_admin.benchmark": {
+      "compact_contract_sample": {
+        "contract_version": 2,
+        "contracts": {
+          "context_admin": {
+            "contract_version": 2,
+            "description": "Inspect health, index, cache, contracts, metrics, quality, and generated state.",
+            "metrics": {
+              "schema": "tool_contract_metrics.v1",
+              "tool_name": "context_admin"
+            },
+            "output_schema_names": [
+              "context_admin.health.v1",
+              "context_index.refresh.v1",
+              "context_index.status.v1",
+              "context_cache.stats.v1",
+              "context_cache.prune.v1",
+              "context_cache.warmup.v1",
+              "context_budget.v1",
+              "tool_output_contracts.v1",
+              "context_metrics.v1",
+              "context_metrics_and_matrix.v1",
+              "context_measurement_matrix.v1",
+              "context_benchmark.v1",
+              "context_state_browser.v1",
+              "context_quality_eval.v1",
+              "context_budget_plan.v1",
+              "context_profile_calibration.v1",
+              "context_resource_proxy.v1"
+            ],
+            "parameters": {
+              "contract_profile": "compact or verbose.",
+              "default_output_profile": "Budget profile.",
+              "max_age_minutes": "Cache prune age.",
+              "max_entries": "Maximum rows.",
+              "max_files": "Index file cap.",
+              "max_output_chars": "Budget override.",
+              "mode": "health, projects, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, metrics_and_matrix, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
+              "path": "Repository-relative path or resource URI.",
+              "project_id": "Project selector.",
+              "root_uri": "Repository file URI.",
+              "state_key": "Exact generated state key.",
+              "state_prefix": "Generated state prefix.",
+              "tool_name": "Filter to one tool."
+            },
+            "profile": "compact",
+            "schema": "tool_output_contract.compact.v1",
+            "stability": "stable",
+            "tool_name": "context_admin"
+          },
+          "context_lookup": {
+            "contract_version": 2,
+            "description": "Search, snippet, tree, symbols, relationships, chunks, cache, or references.",
+            "metrics": {
+              "schema": "tool_contract_metrics.v1",
+              "tool_name": "context_lookup"
+            },
+            "output_schema_names": [
+              "context_search.v1",
+              "context_snippet.v1",
+              "context_tree.v1",
+              "context_symbols.v1",
+              "context_references.list.v1",
+              "context_lookup.impact.v1",
+              "context_lookup.related_symbols.v1",
+              "context_lookup.test_owners.v1",
+              "context_lookup.chunk.v1",
+              "context_lookup.explain_cache.v1"
+            ],
+            "parameters": {
+              "end_line": "Snippet end line.",
+              "include_globs": "Result glob filters.",
+              "max_depth": "Tree depth.",
+              "max_entries": "Maximum tree rows.",
+              "max_results": "Maximum result rows.",
+              "mode": "search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, explain_cache.",
+              "path": "Repository-relative path.",
+              "project_id": "Project selector.",
+              "query": "Search or symbol terms.",
+              "root_uri": "Repository file URI.",
+              "start_line": "Snippet start line."
+            },
+            "profile": "compact",
+            "schema": "tool_output_contract.compact.v1",
+            "stability": "stable",
+            "tool_name": "context_lookup"
+          },
+          "context_memory": {
+            "contract_version": 2,
+            "description": "Read and manage compact repository memory.",
+            "metrics": {
+              "schema": "tool_contract_metrics.v1",
+              "tool_name": "context_memory"
+            },
+            "output_schema_names": [
+              "context_memory.get.v1",
+              "context_memory.upsert.v1",
+              "context_memory.summary_upsert.v1",
+              "context_memory.decision_record.v1",
+              "context_memory.validate.v1",
+              "context_memory.compact.v1"
+            ],
+            "parameters": {
+              "confidence": "Range 0 to 1.",
+              "decided_by": "human or llm.",
+              "decision": "Decision payload.",
+              "focus": "Summary focus.",
+              "include_expired": "Include expired rows.",
+              "key": "Entry key.",
+              "max_entries": "Maximum rows.",
+              "mode": "get, upsert, summary_upsert, decision_record, validate, compact.",
+              "namespace": "Memory namespace.",
+              "project_id": "Project selector.",
+              "rationale": "Decision rationale.",
+              "root_uri": "Repository file URI.",
+              "source": "Provenance label.",
+              "summary": "Compact summary text.",
+              "tags": "Search tags.",
+              "topic": "Decision topic.",
+              "ttl_days": "Optional TTL.",
+              "value": "Structured value."
+            },
+            "profile": "compact",
+            "schema": "tool_output_contract.compact.v1",
+            "stability": "stable",
+            "tool_name": "context_memory"
+          },
+          "context_pack": {
+            "contract_version": 2,
+            "description": "Build compact cited repository context using the clean-break v2 contract.",
+            "metrics": {
+              "schema": "tool_contract_metrics.v1",
+              "tool_name": "context_pack"
+            },
+            "output_schema_names": [
+              "context_pack.v2"
+            ],
+            "parameters": {
+              "base_pack": "Previous pack id for delta generation.",
+              "cache_strategy": "fast, stable, fresh.",
+              "changed_files": "Changed repository paths.",
+              "client_profile": "codex, claude, copilot, generic.",
+              "evidence_policy": "reference, balanced, source.",
+              "focus_paths": "Paths to prioritize.",
+              "known_evidence": "Evidence ids already held by the client.",
+              "max_items": "Range 1 to 32, default 8.",
+              "max_source_tokens": "Range 0 to 4096, default 512.",
+              "memory_session": "Memory session key.",
+              "model_profile": "openai, anthropic, github, unknown.",
+              "project_id": "Project selector.",
+              "prompt": "Task text.",
+              "root_uri": "Repository file URI."
+            },
+            "profile": "compact",
+            "schema": "tool_output_contract.compact.v1",
+            "stability": "stable",
+            "tool_name": "context_pack"
+          },
+          "result_reference_resolve": {
+            "contract_version": 2,
+            "description": "Resolve a stored local evidence reference.",
+            "metrics": {
+              "schema": "tool_contract_metrics.v1",
+              "tool_name": "result_reference_resolve"
+            },
+            "output_schema_names": [
+              "mcp_result_reference.resolve.v1"
+            ],
+            "parameters": {
+              "expected_hash": "Expected sha256.",
+              "project_id": "Project selector.",
+              "reference": "Full reference object.",
+              "reference_id": "Reference id.",
+              "root_uri": "Repository file URI."
+            },
+            "profile": "compact",
+            "schema": "tool_output_contract.compact.v1",
+            "stability": "stable",
+            "tool_name": "result_reference_resolve"
+          }
+        },
+        "metrics": {
+          "contract_chars": 5244,
+          "contract_tokens_est": 1311,
+          "schema": "tool_contract_metrics.v1",
+          "token_count_source": "estimate",
+          "tokenizer": "offline_estimator",
+          "tokenizer_available": true,
+          "tool_name": ""
+        },
+        "profile": "compact",
+        "schema": "tool_output_contracts.compact.v1",
+        "stability": "stable"
+      },
+      "elapsed_ms": 0.13195500000000002,
+      "focus_paths": [],
+      "generated_at": "<timestamp>",
+      "measurement_matrix": {
+        "checks": [
+          {
+            "current": 1.0,
+            "key": "quality.required_anchor_recall",
+            "min_samples": 1,
+            "operator": ">=",
+            "samples": 1,
+            "status": "pass",
+            "target": 1.0,
+            "unit": "ratio"
+          },
+          {
+            "current": 0.0,
+            "key": "quality.noise_ratio",
+            "min_samples": 1,
+            "operator": "<=",
+            "samples": 1,
+            "status": "pass",
+            "target": 0.3,
+            "unit": "ratio"
+          }
+        ],
+        "generated_at": "<timestamp>",
+        "metric_sources": {
+          "benchmark_runner": "context_admin(mode='benchmark')",
+          "runtime_metrics": "context_admin(mode='metrics')"
+        },
+        "project_id": "python-v1-golden",
+        "schema": "context_measurement_matrix.v1"
+      },
+      "project_id": "python-v1-golden",
+      "prompt": "native context pack retrieval benchmark",
+      "run_count": 3,
+      "runs": [
+        {
+          "elapsed_ms": 0.070289,
+          "result_count": 0,
+          "run": 1
+        },
+        {
+          "elapsed_ms": 0.031065000000000002,
+          "result_count": 0,
+          "run": 2
+        },
+        {
+          "elapsed_ms": 0.027912,
+          "result_count": 0,
+          "run": 3
+        }
+      ],
+      "schema": "context_benchmark.v1"
+    },
+    "context_admin.budget": {
+      "default_output_profile": "balanced",
+      "max_output_chars": 4096,
+      "schema": "context_budget.v1",
+      "updated_at": "<timestamp>"
+    },
+    "context_admin.cache_plan": {
+      "defer": {
+        "cache_details": true,
+        "metrics": true,
+        "raw_snippets": true,
+        "stage_timings": true
+      },
+      "items": {
+        "max_count": 8,
+        "max_tokens_each": 48,
+        "mode": "balanced"
+      },
+      "max_output_tokens": 1024,
+      "reserved": {
+        "diagnostics": 0,
+        "envelope": 80,
+        "references": 40
+      },
+      "schema": "context_budget_plan.v1"
+    },
+    "context_admin.cache_prune": {
+      "entry_count": 1,
+      "expired_removed": 0,
+      "removed_entries": 0,
+      "schema": "context_cache.prune.v1",
+      "stale_removed": 0
+    },
+    "context_admin.cache_stats": {
+      "auto_learn": {
+        "background": {
+          "pending": false,
+          "status": "idle"
+        },
+        "enabled": false,
+        "project_id": "python-v1-golden",
+        "schema": "warmup.auto_learn.v1"
+      },
+      "entry_count": 1,
+      "keys": [
+        "frontier:fr_<digest>"
+      ],
+      "namespaces": {
+        "l0.context_pack.wire": {
+          "entries": 0,
+          "idle_expiry_seconds": 1800,
+          "max_bytes": 67108864,
+          "weighted_bytes": 0
+        },
+        "l1.frontier.memory": {
+          "bytes": 1045,
+          "entries": 1,
+          "max_bytes": 134217728
+        },
+        "l1.frontier.persistent": {
+          "entries": 1,
+          "max_bytes": 268435456
+        }
+      },
+      "schema": "context_cache.stats.v1"
+    },
+    "context_admin.contracts": {
+      "contract_version": 2,
+      "contracts": {
+        "context_admin": {
+          "contract_version": 2,
+          "description": "Inspect health, index, cache, contracts, metrics, quality, and generated state.",
+          "metrics": {
+            "schema": "tool_contract_metrics.v1",
+            "tool_name": "context_admin"
+          },
+          "output_schema_names": [
+            "context_admin.health.v1",
+            "context_index.refresh.v1",
+            "context_index.status.v1",
+            "context_cache.stats.v1",
+            "context_cache.prune.v1",
+            "context_cache.warmup.v1",
+            "context_budget.v1",
+            "tool_output_contracts.v1",
+            "context_metrics.v1",
+            "context_metrics_and_matrix.v1",
+            "context_measurement_matrix.v1",
+            "context_benchmark.v1",
+            "context_state_browser.v1",
+            "context_quality_eval.v1",
+            "context_budget_plan.v1",
+            "context_profile_calibration.v1",
+            "context_resource_proxy.v1"
+          ],
+          "parameters": {
+            "contract_profile": "compact or verbose.",
+            "default_output_profile": "Budget profile.",
+            "max_age_minutes": "Cache prune age.",
+            "max_entries": "Maximum rows.",
+            "max_files": "Index file cap.",
+            "max_output_chars": "Budget override.",
+            "mode": "health, projects, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, metrics_and_matrix, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
+            "path": "Repository-relative path or resource URI.",
+            "project_id": "Project selector.",
+            "root_uri": "Repository file URI.",
+            "state_key": "Exact generated state key.",
+            "state_prefix": "Generated state prefix.",
+            "tool_name": "Filter to one tool."
+          },
+          "profile": "compact",
+          "schema": "tool_output_contract.compact.v1",
+          "stability": "stable",
+          "tool_name": "context_admin"
+        },
+        "context_lookup": {
+          "contract_version": 2,
+          "description": "Search, snippet, tree, symbols, relationships, chunks, cache, or references.",
+          "metrics": {
+            "schema": "tool_contract_metrics.v1",
+            "tool_name": "context_lookup"
+          },
+          "output_schema_names": [
+            "context_search.v1",
+            "context_snippet.v1",
+            "context_tree.v1",
+            "context_symbols.v1",
+            "context_references.list.v1",
+            "context_lookup.impact.v1",
+            "context_lookup.related_symbols.v1",
+            "context_lookup.test_owners.v1",
+            "context_lookup.chunk.v1",
+            "context_lookup.explain_cache.v1"
+          ],
+          "parameters": {
+            "end_line": "Snippet end line.",
+            "include_globs": "Result glob filters.",
+            "max_depth": "Tree depth.",
+            "max_entries": "Maximum tree rows.",
+            "max_results": "Maximum result rows.",
+            "mode": "search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, explain_cache.",
+            "path": "Repository-relative path.",
+            "project_id": "Project selector.",
+            "query": "Search or symbol terms.",
+            "root_uri": "Repository file URI.",
+            "start_line": "Snippet start line."
+          },
+          "profile": "compact",
+          "schema": "tool_output_contract.compact.v1",
+          "stability": "stable",
+          "tool_name": "context_lookup"
+        },
+        "context_memory": {
+          "contract_version": 2,
+          "description": "Read and manage compact repository memory.",
+          "metrics": {
+            "schema": "tool_contract_metrics.v1",
+            "tool_name": "context_memory"
+          },
+          "output_schema_names": [
+            "context_memory.get.v1",
+            "context_memory.upsert.v1",
+            "context_memory.summary_upsert.v1",
+            "context_memory.decision_record.v1",
+            "context_memory.validate.v1",
+            "context_memory.compact.v1"
+          ],
+          "parameters": {
+            "confidence": "Range 0 to 1.",
+            "decided_by": "human or llm.",
+            "decision": "Decision payload.",
+            "focus": "Summary focus.",
+            "include_expired": "Include expired rows.",
+            "key": "Entry key.",
+            "max_entries": "Maximum rows.",
+            "mode": "get, upsert, summary_upsert, decision_record, validate, compact.",
+            "namespace": "Memory namespace.",
+            "project_id": "Project selector.",
+            "rationale": "Decision rationale.",
+            "root_uri": "Repository file URI.",
+            "source": "Provenance label.",
+            "summary": "Compact summary text.",
+            "tags": "Search tags.",
+            "topic": "Decision topic.",
+            "ttl_days": "Optional TTL.",
+            "value": "Structured value."
+          },
+          "profile": "compact",
+          "schema": "tool_output_contract.compact.v1",
+          "stability": "stable",
+          "tool_name": "context_memory"
+        },
+        "context_pack": {
+          "contract_version": 2,
+          "description": "Build compact cited repository context using the clean-break v2 contract.",
+          "metrics": {
+            "schema": "tool_contract_metrics.v1",
+            "tool_name": "context_pack"
+          },
+          "output_schema_names": [
+            "context_pack.v2"
+          ],
+          "parameters": {
+            "base_pack": "Previous pack id for delta generation.",
+            "cache_strategy": "fast, stable, fresh.",
+            "changed_files": "Changed repository paths.",
+            "client_profile": "codex, claude, copilot, generic.",
+            "evidence_policy": "reference, balanced, source.",
+            "focus_paths": "Paths to prioritize.",
+            "known_evidence": "Evidence ids already held by the client.",
+            "max_items": "Range 1 to 32, default 8.",
+            "max_source_tokens": "Range 0 to 4096, default 512.",
+            "memory_session": "Memory session key.",
+            "model_profile": "openai, anthropic, github, unknown.",
+            "project_id": "Project selector.",
+            "prompt": "Task text.",
+            "root_uri": "Repository file URI."
+          },
+          "profile": "compact",
+          "schema": "tool_output_contract.compact.v1",
+          "stability": "stable",
+          "tool_name": "context_pack"
+        },
+        "result_reference_resolve": {
+          "contract_version": 2,
+          "description": "Resolve a stored local evidence reference.",
+          "metrics": {
+            "schema": "tool_contract_metrics.v1",
+            "tool_name": "result_reference_resolve"
+          },
+          "output_schema_names": [
+            "mcp_result_reference.resolve.v1"
+          ],
+          "parameters": {
+            "expected_hash": "Expected sha256.",
+            "project_id": "Project selector.",
+            "reference": "Full reference object.",
+            "reference_id": "Reference id.",
+            "root_uri": "Repository file URI."
+          },
+          "profile": "compact",
+          "schema": "tool_output_contract.compact.v1",
+          "stability": "stable",
+          "tool_name": "result_reference_resolve"
+        }
+      },
+      "metrics": {
+        "contract_chars": 5244,
+        "contract_tokens_est": 1311,
+        "schema": "tool_contract_metrics.v1",
+        "token_count_source": "estimate",
+        "tokenizer": "offline_estimator",
+        "tokenizer_available": true,
+        "tool_name": ""
+      },
+      "profile": "compact",
+      "schema": "tool_output_contracts.compact.v1",
+      "stability": "stable"
+    },
+    "context_admin.health": {
+      "index": {
+        "exists": true,
+        "file_count": 6,
+        "fts_enabled": true,
+        "generated_at": "<timestamp>",
+        "git_branch": "",
+        "git_changes_hash": "",
+        "git_head": "",
+        "git_status_hash": "",
+        "import_count": 12,
+        "index_available": true,
+        "refresh_signature": "files:<digest>",
+        "refresh_signature_available": true,
+        "schema": "context_index.status.v1",
+        "search_backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+        "search_mode": "tantivy",
+        "symbol_count": 5,
+        "tantivy": {
+          "backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+          "doc_count": 12,
+          "engine_version": "tantivy v0.26.1",
+          "package_version": "0.26.1",
+          "refresh_signature": "files:<digest>",
+          "schema_version": "mcp-context-manager.native.v2",
+          "sidecar_signature": "tantivy:<digest>"
+        }
+      },
+      "ok": true,
+      "project_id": "python-v1-golden",
+      "repo_path": ".",
+      "schema": "context_admin.health.v1",
+      "state_dir": ".mcp-context-manager/rust-v2",
+      "version": "2.0.0"
+    },
+    "context_admin.index_refresh": {
+      "file_count": 6,
+      "files_considered": 6,
+      "fts_enabled": true,
+      "generated_at": "<timestamp>",
+      "import_count": 12,
+      "index_available": true,
+      "reason": "native_generation_active",
+      "removed_count": 0,
+      "schema": "context_index.refresh.v1",
+      "search_mode": "tantivy",
+      "skipped": true,
+      "symbol_count": 5,
+      "unchanged_count": 6,
+      "updated_count": 0
+    },
+    "context_admin.index_status": {
+      "exists": true,
+      "file_count": 6,
+      "fts_enabled": true,
+      "generated_at": "<timestamp>",
+      "git_branch": "",
+      "git_changes_hash": "",
+      "git_head": "",
+      "git_status_hash": "",
+      "import_count": 12,
+      "index_available": true,
+      "refresh_signature": "files:<digest>",
+      "refresh_signature_available": true,
+      "schema": "context_index.status.v1",
+      "search_backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+      "search_mode": "tantivy",
+      "symbol_count": 5,
+      "tantivy": {
+        "backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+        "doc_count": 12,
+        "engine_version": "tantivy v0.26.1",
+        "package_version": "0.26.1",
+        "refresh_signature": "files:<digest>",
+        "schema_version": "mcp-context-manager.native.v2",
+        "sidecar_signature": "tantivy:<digest>"
+      }
+    },
+    "context_admin.instructions": {
+      "boundary": "Repository-side MCP configuration can require server initialization but cannot force a model to call a tool on every turn.",
+      "codex_config_example": {
+        "config_file": "~/.codex/config.toml or trusted-project .codex/config.toml",
+        "effect": "required=true fails startup if the enabled server cannot initialize.",
+        "toml": "[mcp_servers.mcp-context-manager]\nurl = \"http://localhost:8000/mcp\"\nrequired = true\n"
+      },
+      "enforcement_layers": [
+        "MCP server availability",
+        "MCP server instructions",
+        "AGENTS.md workflow",
+        "Review and CI checks"
+      ],
+      "instruction": "For repository coding, review, debug, test, docs, security, or general questions, call context_pack first with the user's task and client_profile. Pass changed_files and focus_paths when named. Use context_lookup for targeted follow-up before broad inspection, result_reference_resolve before relying on deferred raw evidence, context_admin for health and generated state, and context_memory only for structured non-secret repository facts.",
+      "preferred_tool_order": [
+        "context_pack",
+        "context_lookup",
+        "result_reference_resolve",
+        "context_admin",
+        "context_memory"
+      ],
+      "profile_selection": {
+        "auto_detection": false,
+        "calibration": "context_admin(mode=\"profile_calibrate\") reports recommendations only.",
+        "client_profiles": {
+          "claude": {
+            "model_profile": "anthropic",
+            "recommended_output_profile": "compact"
+          },
+          "codex": {
+            "model_profile": "openai",
+            "recommended_output_profile": "minimal"
+          },
+          "copilot": {
+            "model_profile": "github",
+            "recommended_output_profile": "compact",
+            "tools_only": true
+          },
+          "generic": {
+            "model_profile": "unknown",
+            "recommended_output_profile": "balanced"
+          }
+        },
+        "precedence": [
+          "explicit request fields",
+          "client profile defaults",
+          "server defaults"
+        ],
+        "set_by": "MCP caller per context_pack request"
+      },
+      "purpose": "Speed up coding agents with a first-pass context pack.",
+      "resource_uris": [
+        "repo://instructions/codex-context-pack-first",
+        "repo://project/{project_id}/instructions/codex-context-pack-first"
+      ],
+      "schema": "codex_context_pack_first.instructions.v1"
+    },
+    "context_admin.measurement_matrix": {
+      "checks": [
+        {
+          "current": 1.0,
+          "key": "quality.required_anchor_recall",
+          "min_samples": 1,
+          "operator": ">=",
+          "samples": 1,
+          "status": "pass",
+          "target": 1.0,
+          "unit": "ratio"
+        },
+        {
+          "current": 0.0,
+          "key": "quality.noise_ratio",
+          "min_samples": 1,
+          "operator": "<=",
+          "samples": 1,
+          "status": "pass",
+          "target": 0.3,
+          "unit": "ratio"
+        }
+      ],
+      "generated_at": "<timestamp>",
+      "metric_sources": {
+        "benchmark_runner": "context_admin(mode='benchmark')",
+        "runtime_metrics": "context_admin(mode='metrics')"
+      },
+      "project_id": "python-v1-golden",
+      "schema": "context_measurement_matrix.v1"
+    },
+    "context_admin.metrics": {
+      "background": {
+        "status": "change_pending"
+      },
+      "benchmarks": {},
+      "cache": {
+        "hit_ratio": 0.0,
+        "hits": 0,
+        "l0": {
+          "entries": 0,
+          "hits": 0,
+          "misses": 1,
+          "weighted_bytes": 0
+        },
+        "l1": {
+          "approximate_hits": 0,
+          "exact_hits": 0,
+          "retrieval_misses": 1
+        },
+        "misses": 1
+      },
+      "generated_at": "<timestamp>",
+      "index_freshness": {
+        "coalesce_ms": 50,
+        "dirty": true,
+        "generation": 0,
+        "poll_interval_ms": 2000,
+        "refreshes": 0,
+        "strategy": "notify_with_polling_fallback"
+      },
+      "project_id": "python-v1-golden",
+      "references": {
+        "active_count": 1,
+        "total_count": 1
+      },
+      "requests": {
+        "by_tool": {
+          "context_pack": 1
+        },
+        "total": 1
+      },
+      "retrieval": {
+        "backend": "tantivy",
+        "doc_count": 12,
+        "misses": 1
+      },
+      "retrieval_queue": {
+        "active": 0,
+        "pending": 0
+      },
+      "schema": "context_metrics.v1",
+      "since": "<timestamp>",
+      "tokens": {
+        "input_est": 0,
+        "output_est": 0,
+        "saved_est": 0
+      },
+      "tooling": {
+        "external_calls_saved_est": 0
+      },
+      "updated_at": "<timestamp>",
+      "warmup": {
+        "runs": 0
+      }
+    },
+    "context_admin.metrics_and_matrix": {
+      "matrix": {
+        "checks": [
+          {
+            "current": 1.0,
+            "key": "quality.required_anchor_recall",
+            "min_samples": 1,
+            "operator": ">=",
+            "samples": 1,
+            "status": "pass",
+            "target": 1.0,
+            "unit": "ratio"
+          },
+          {
+            "current": 0.0,
+            "key": "quality.noise_ratio",
+            "min_samples": 1,
+            "operator": "<=",
+            "samples": 1,
+            "status": "pass",
+            "target": 0.3,
+            "unit": "ratio"
+          }
+        ],
+        "generated_at": "<timestamp>",
+        "metric_sources": {
+          "benchmark_runner": "context_admin(mode='benchmark')",
+          "runtime_metrics": "context_admin(mode='metrics')"
+        },
+        "project_id": "python-v1-golden",
+        "schema": "context_measurement_matrix.v1"
+      },
+      "metrics": {
+        "background": {
+          "status": "change_pending"
+        },
+        "benchmarks": {},
+        "cache": {
+          "hit_ratio": 0.0,
+          "hits": 0,
+          "l0": {
+            "entries": 0,
+            "hits": 0,
+            "misses": 1,
+            "weighted_bytes": 0
+          },
+          "l1": {
+            "approximate_hits": 0,
+            "exact_hits": 0,
+            "retrieval_misses": 1
+          },
+          "misses": 1
+        },
+        "generated_at": "<timestamp>",
+        "index_freshness": {
+          "coalesce_ms": 50,
+          "dirty": true,
+          "generation": 0,
+          "poll_interval_ms": 2000,
+          "refreshes": 0,
+          "strategy": "notify_with_polling_fallback"
+        },
+        "project_id": "python-v1-golden",
+        "references": {
+          "active_count": 1,
+          "total_count": 1
+        },
+        "requests": {
+          "by_tool": {
+            "context_pack": 1
+          },
+          "total": 1
+        },
+        "retrieval": {
+          "backend": "tantivy",
+          "doc_count": 12,
+          "misses": 1
+        },
+        "retrieval_queue": {
+          "active": 0,
+          "pending": 0
+        },
+        "schema": "context_metrics.v1",
+        "since": "<timestamp>",
+        "tokens": {
+          "input_est": 0,
+          "output_est": 0,
+          "saved_est": 0
+        },
+        "tooling": {
+          "external_calls_saved_est": 0
+        },
+        "updated_at": "<timestamp>",
+        "warmup": {
+          "runs": 0
+        }
+      },
+      "schema": "context_metrics_and_matrix.v1"
+    },
+    "context_admin.profile_calibrate": {
+      "defaults": {
+        "cache_strategy": "fast",
+        "client_profile": "generic",
+        "evidence_policy": "balanced",
+        "model_profile": "unknown"
+      },
+      "profiles": {
+        "claude": {
+          "diagnostics": "admin_only",
+          "output_profile": "compact"
+        },
+        "codex": {
+          "diagnostics": "admin_only",
+          "output_profile": "minimal"
+        },
+        "copilot": {
+          "output_profile": "compact",
+          "tools_only": true
+        },
+        "generic": {
+          "output_profile": "balanced"
+        }
+      },
+      "schema": "context_profile_calibration.v1"
+    },
+    "context_admin.projects": {
+      "count": 1,
+      "projects": [
+        {
+          "git": {
+            "available": false,
+            "branch": "",
+            "changes_hash": "",
+            "dirty": false,
+            "head": "",
+            "is_repo": false,
+            "status_hash": ""
+          },
+          "name": "repo",
+          "project_id": "python-v1-golden",
+          "root": {
+            "mapped": false,
+            "scheme": "file",
+            "uri_hash": "<digest>"
+          },
+          "schema": "context_project.v1",
+          "source": "repo_path",
+          "state": {
+            "cache_exists": true,
+            "exists": true,
+            "index_exists": true,
+            "memory_exists": true,
+            "repo_boundary_enforced": true,
+            "state_key": "rust-v2",
+            "store_exists": true
+          }
+        }
+      ],
+      "schema": "context_projects.list.v1",
+      "selection": {
+        "ambiguous_without_project": false,
+        "default": "explicit_selector_or_legacy_repo_path",
+        "legacy_fallback": {
+          "reason": "configured_default_project",
+          "safe": true
+        },
+        "legacy_repo_path_fallback": true,
+        "project_selection_required": false
+      }
+    },
+    "context_admin.quality_eval": {
+      "fixtures": 0,
+      "metrics": {
+        "anchor_recall_at_3": 1.0,
+        "anchor_recall_at_5": 1.0,
+        "detail_lookup_resolution_rate": 1.0,
+        "first_anchor_rank_avg": 1.0,
+        "noise_ratio": 0.0,
+        "required_anchor_omitted_count": 0,
+        "stale_context_rate": 0.0
+      },
+      "regressions": [],
+      "schema": "context_quality_eval.v1"
+    },
+    "context_admin.resource_proxy": {
+      "payload": {
+        "file_count": 6,
+        "git_branch": "",
+        "git_head": "",
+        "has_readme": true,
+        "has_tests_dir": true,
+        "index": {
+          "exists": true,
+          "file_count": 6,
+          "fts_enabled": true,
+          "generated_at": "<timestamp>",
+          "git_branch": "",
+          "git_changes_hash": "",
+          "git_head": "",
+          "git_status_hash": "",
+          "import_count": 12,
+          "index_available": true,
+          "refresh_signature": "files:<digest>",
+          "refresh_signature_available": true,
+          "schema": "context_index.status.v1",
+          "search_backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+          "search_mode": "tantivy",
+          "symbol_count": 5,
+          "tantivy": {
+            "backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+            "doc_count": 12,
+            "engine_version": "tantivy v0.26.1",
+            "package_version": "0.26.1",
+            "refresh_signature": "files:<digest>",
+            "schema_version": "mcp-context-manager.native.v2",
+            "sidecar_signature": "tantivy:<digest>"
+          }
+        },
+        "is_git_repo": false,
+        "schema": "workspace_facts.v1",
+        "top_extensions": [
+          {
+            "count": 2,
+            "extension": "py"
+          },
+          {
+            "count": 1,
+            "extension": "json"
+          },
+          {
+            "count": 1,
+            "extension": "md"
+          },
+          {
+            "count": 1,
+            "extension": "toml"
+          },
+          {
+            "count": 1,
+            "extension": "txt"
+          }
+        ]
+      },
+      "resource": "repo://summary",
+      "schema": "context_resource_proxy.v1",
+      "tools_only": false
+    },
+    "context_admin.schema_minify": {
+      "contract_version": 2,
+      "description": "Search, snippet, tree, symbols, relationships, chunks, cache, or references.",
+      "metrics": {
+        "schema": "tool_contract_metrics.v1",
+        "tool_name": "context_lookup"
+      },
+      "output_schema_names": [
+        "context_search.v1",
+        "context_snippet.v1",
+        "context_tree.v1",
+        "context_symbols.v1",
+        "context_references.list.v1",
+        "context_lookup.impact.v1",
+        "context_lookup.related_symbols.v1",
+        "context_lookup.test_owners.v1",
+        "context_lookup.chunk.v1",
+        "context_lookup.explain_cache.v1"
+      ],
+      "parameters": {
+        "end_line": "Snippet end line.",
+        "include_globs": "Result glob filters.",
+        "max_depth": "Tree depth.",
+        "max_entries": "Maximum tree rows.",
+        "max_results": "Maximum result rows.",
+        "mode": "search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, explain_cache.",
+        "path": "Repository-relative path.",
+        "project_id": "Project selector.",
+        "query": "Search or symbol terms.",
+        "root_uri": "Repository file URI.",
+        "start_line": "Snippet start line."
+      },
+      "profile": "compact",
+      "schema": "tool_output_contract.compact.v1",
+      "stability": "stable",
+      "tool_name": "context_lookup"
+    },
+    "context_admin.state_browser": {
+      "entry_count": 6,
+      "generated_at": "<timestamp>",
+      "generated_state_only": true,
+      "max_entries": 10,
+      "mode": "list",
+      "prefix": "",
+      "prefix_counts": [],
+      "project_id": "python-v1-golden",
+      "repo_boundary_enforced": true,
+      "rows": [
+        {
+          "created_at": null,
+          "expires_at": null,
+          "key": "budget:default",
+          "namespace": null,
+          "preview": "{\"default_output_profile\":\"balanced\",\"max_output_chars\":4096,\"schema\":\"context_budget.v1\",\"updated_at\":\"2026-07-17T15:39:28.273123624Z\"}",
+          "schema": "context_budget.v1",
+          "size_chars": 136,
+          "status": null,
+          "updated_at": "<timestamp>",
+          "value_type": "dict"
+        },
+        {
+          "created_at": null,
+          "expires_at": "<timestamp>",
+          "key": "deferred:df_<digest>",
+          "namespace": null,
+          "preview": "{\"expires_at\":\"2026-07-18T15:39:28.2678244Z\",\"reference_id\":\"ctxref-<id>\",\"schema\":\"context_pack.deferred_cache.v1\"}",
+          "schema": "context_pack.deferred_cache.v1",
+          "size_chars": 128,
+          "status": null,
+          "updated_at": null,
+          "value_type": "dict"
+        },
+        {
+          "created_at": null,
+          "expires_at": null,
+          "key": "frontier:fr_<digest>",
+          "namespace": null,
+          "preview": "{\"candidate_ids\":[\"tests/test_auth.py:4:5:test_issue_token:<digest>\",\"src/auth.py:8:9:issue_token:<digest>\",\"src/auth.py:12:13:revoke_token:<digest>\",\"tests/test_auth.py:1:3::<digest>\",\"src/auth.py:1:5:AuthService:<digest>\",\"src/auth.py:2:5:login:<digest>\",\"benchmarks/gold_anchors/auth.json:1:16::<digest>\"],\"cumulative_token_costs\":[19,33,50,59,98,132,198],\"dependencies\":[\"benchmarks/gold_anchors/auth.json\",\"src/auth.py\",\"tests/test_auth.py\"],\"expires_at_ms\":0,\"key\":\"fr_<digest>\",\"negative\":false,\"refresh_signature\":\"files:<digest>\",\"route\":\"review\",\"schema\":\"context_frontier.v1\",\"scope\":[\"src/auth.py\",\"tests/test_auth.py\"],\"score_cutoff\":4.0,\"scores\":[1000012.0,1000009.0,1000009.0,1000004.0,1000001.0,1000001.0,4.0],\"simhash\":<digest>,\"terms\":[\"tm_<digest>\",\"tm_<digest>\",\"tm_<digest>\",\"tm_<digest>...[truncated]",
+          "schema": "context_frontier.v1",
+          "size_chars": 1045,
+          "status": null,
+          "updated_at": null,
+          "value_type": "dict"
+        },
+        {
+          "created_at": null,
+          "expires_at": null,
+          "key": "memory:store",
+          "namespace": null,
+          "preview": "{\"decisions\":[{\"confidence\":1.0,\"created_at\":\"2026-07-17T15:39:28.262602977Z\",\"decided_by\":\"human\",\"decision\":{\"prefix\":\"token-for-\"},\"expires_at\":null,\"id\":\"decision-1\",\"namespace\":\"decision/auth\",\"rationale\":\"fixture contract\",\"sensitivity\":{\"categories\":[],\"redacted\":false,\"redaction_count\":0},\"source\":\"golden\",\"tags\":[],\"topic\":\"token format\",\"updated_at\":\"2026-07-17T15:39:28.262602977Z\"}],\"entries\":[{\"confidence\":1.0,\"created_at\":\"2026-07-17T15:39:28.257909649Z\",\"expires_at\":null,\"key\":\"token-contract\",\"namespace\":\"component/auth\",\"sensitivity\":{\"categories\":[],\"redacted\":false,\"redaction_count\":0},\"source\":\"golden\",\"tags\":[],\"updated_at\":\"2026-07-17T15:39:28.257909649Z\",\"value\":{\"issuer\":\"issue_token\"}}],\"schema\":\"context_memory_store.v1\",\"summaries\":[{\"confidence\":1.0,\"created_at\":\"2026-07-17T15:39:28.260393414Z\",\"expires_at\":null,\"focus\":\"token flow\",\"namespace\":\"component/auth\",\"sensitivity\":{\"categories\":[],\"redacted\":false,\"redaction_count\":0},\"source\":\"golden\",\"summary\":\"is...[truncated]",
+          "schema": "context_memory_store.v1",
+          "size_chars": 1106,
+          "status": null,
+          "updated_at": null,
+          "value_type": "dict"
+        },
+        {
+          "created_at": null,
+          "expires_at": null,
+          "key": "pack:pk_<digest>",
+          "namespace": null,
+          "preview": "{\"evidence\":[{\"end_line\":9,\"id\":\"ev_<digest>\",\"path\":\"src/auth.py\",\"start_line\":8,\"symbol\":\"issue_token\"},{\"end_line\":5,\"id\":\"ev_<digest>\",\"path\":\"tests/test_auth.py\",\"start_line\":4,\"symbol\":\"test_issue_token\"}],\"pack_id\":\"pk_<digest>\",\"paths\":[\"src/auth.py\",\"tests/test_auth.py\"],\"refresh_signature\":\"files:<digest>\",\"route\":\"review\",\"schema\":\"context_pack.snapshot.v1\"}",
+          "schema": "context_pack.snapshot.v1",
+          "size_chars": 475,
+          "status": null,
+          "updated_at": null,
+          "value_type": "dict"
+        },
+        {
+          "created_at": "<timestamp>",
+          "expires_at": "<timestamp>",
+          "key": "reference:ctxref-<id>",
+          "namespace": null,
+          "preview": "{\"body\":\"{\\\"metadata\\\":{\\\"created_at\\\":\\\"2026-07-17T15:39:28.2678244Z\\\",\\\"expires_at\\\":\\\"2026-07-18T15:39:28.2678244Z\\\",\\\"producer_tool\\\":\\\"context_pack\\\",\\\"project_id\\\":\\\"python-v1-golden\\\",\\\"reference_id\\\":\\\"ctxref-<id>\\\"},\\\"payload\\\":{\\\"candidates\\\":[{\\\"content\\\":\\\"def test_issue_token():\\\\n    assert issue_token(\\\\\\\"alice\\\\\\\") == \\\\\\\"token-for-alice\\\\\\\"\\\",\\\"end_line\\\":5,\\\"id\\\":\\\"ev_<digest>\\\",\\\"path\\\":\\\"tests/test_auth.py\\\",\\\"start_line\\\":4,\\\"symbol\\\":\\\"test_issue_token\\\"},{\\\"content\\\":\\\"def issue_token(user):\\\\n    return f\\\\\\\"token-for-{user}\\\\\\\"\\\",\\\"end_line\\\":9,\\\"id\\\":\\\"ev_<digest>\\\",\\\"path\\\":\\\"src/auth.py\\\",\\\"start_line\\\":8,\\\"symbol\\\":\\\"issue_token\\\"},{\\\"content\\\":\\\"def revoke_token(token):\\\\n    return token.startswith(\\\\\\\"token-for-\\\\\\\")\\\",\\\"end_line\\\":13,\\\"id\\\":\\\"ev_<digest>\\\",\\\"path\\\":\\\"src/auth.py\\\",\\\"start_line\\\":12,\\\"symbol\\\":\\\"revoke_token\\\"},{\\\"content\\\":\\\"from src.auth import issue_token\\\\n\\\",\\\"end_line\\\":3,...[truncated]",
+          "schema": "mcp_result_reference.store.v1",
+          "size_chars": 2509,
+          "status": null,
+          "updated_at": null,
+          "value_type": "dict"
+        }
+      ],
+      "schema": "context_state_browser.v1",
+      "truncated": false
+    },
+    "context_admin.warmup": {
+      "cache": {
+        "entry_count_after": 0,
+        "entry_count_before": 0
+      },
+      "elapsed_ms": 0.0,
+      "file_summary_cache": {
+        "hits": 0,
+        "misses": 0,
+        "summary_count": 0
+      },
+      "generated_at": "<timestamp>",
+      "generated_state_only": true,
+      "hot_chunks": {
+        "target_count": 0,
+        "targets": []
+      },
+      "index": {
+        "file_count": 6,
+        "import_count": 12,
+        "reason": "native_reader_already_warm",
+        "schema": "context_index.refresh.v1",
+        "search_mode": "tantivy",
+        "skipped": true,
+        "symbol_count": 5
+      },
+      "manifest": {
+        "project_id": "python-v1-golden",
+        "schema": "warmup.manifest.v1"
+      },
+      "omitted": [],
+      "project_id": "python-v1-golden",
+      "repo_boundary_enforced": true,
+      "route_seeds": {
+        "routes": {}
+      },
+      "schema": "context_cache.warmup.v1",
+      "search_cache": {
+        "hits": 0,
+        "misses": 0
+      },
+      "stage_timings_ms": {},
+      "state": {
+        "overlay": "rust-v2"
+      },
+      "symbols": {
+        "count": 5
+      },
+      "term_stats": {},
+      "test_owner_targets": [],
+      "trigger": "manual",
+      "workspace": {
+        "file_count": 6
+      }
+    },
+    "context_lookup.chunk": {
+      "chunk": {
+        "chunk_id": "chk_<digest>",
+        "content_digest": "sha256:<digest>",
+        "end_line": 12,
+        "extractor_version": "chunk-lines-1",
+        "file_digest": "sha256:<digest>",
+        "path": "src/auth.py",
+        "redaction_version": "redact-1",
+        "schema": "context_chunk_metadata.v1",
+        "start_line": 1
+      },
+      "content": "class AuthService:\n    def login(self, user, password):\n        if not user:\n            raise ValueError(\"missing user\")\n        return issue_token(user)\n\n\ndef issue_token(user):\n    return f\"token-for-{user}\"\n\n\ndef revoke_token(token):",
+      "detail_lookup": {
+        "end_line": 12,
+        "mode": "snippet",
+        "path": "src/auth.py",
+        "start_line": 1,
+        "tool": "context_lookup"
+      },
+      "path": "src/auth.py",
+      "schema": "context_lookup.chunk.v1"
+    },
+    "context_lookup.explain_cache": {
+      "count": 0,
+      "path": "src/auth.py",
+      "rows": [],
+      "schema": "context_lookup.explain_cache.v1"
+    },
+    "context_lookup.impact": {
+      "count": 5,
+      "related": [
+        {
+          "confidence": "high",
+          "detail_lookup": {
+            "mode": "snippet",
+            "path": "tests/test_auth.py",
+            "start_line": 1,
+            "tool": "context_lookup"
+          },
+          "path": "tests/test_auth.py",
+          "relationship": "test_owner"
+        },
+        {
+          "confidence": "high",
+          "detail_lookup": {
+            "end_line": 5,
+            "mode": "snippet",
+            "path": "src/auth.py",
+            "start_line": 1,
+            "tool": "context_lookup"
+          },
+          "kind": "class",
+          "path": "src/auth.py",
+          "relationship": "same_file",
+          "symbol": "AuthService"
+        },
+        {
+          "confidence": "high",
+          "detail_lookup": {
+            "end_line": 5,
+            "mode": "snippet",
+            "path": "src/auth.py",
+            "start_line": 2,
+            "tool": "context_lookup"
+          },
+          "kind": "function",
+          "path": "src/auth.py",
+          "relationship": "same_file",
+          "symbol": "login"
+        },
+        {
+          "confidence": "high",
+          "detail_lookup": {
+            "end_line": 9,
+            "mode": "snippet",
+            "path": "src/auth.py",
+            "start_line": 8,
+            "tool": "context_lookup"
+          },
+          "kind": "function",
+          "path": "src/auth.py",
+          "relationship": "same_file",
+          "symbol": "issue_token"
+        },
+        {
+          "confidence": "high",
+          "detail_lookup": {
+            "end_line": 13,
+            "mode": "snippet",
+            "path": "src/auth.py",
+            "start_line": 12,
+            "tool": "context_lookup"
+          },
+          "kind": "function",
+          "path": "src/auth.py",
+          "relationship": "same_file",
+          "symbol": "revoke_token"
+        }
+      ],
+      "schema": "context_lookup.impact.v1",
+      "source": "src/auth.py"
+    },
+    "context_lookup.references": {
+      "references": [
+        {
+          "created_at": "<timestamp>",
+          "expires_at": "<timestamp>",
+          "reference_id": "ctxref-<id>",
+          "repo_boundary_enforced": true,
+          "sha256": "<digest>",
+          "size_bytes": 1936,
+          "status": "active",
+          "uri": "repo://project/python-v1-golden/context/ctxref-<id>",
+          "warnings": []
+        }
+      ],
+      "schema": "context_references.list.v1"
+    },
+    "context_lookup.related_symbols": {
+      "count": 1,
+      "schema": "context_lookup.related_symbols.v1",
+      "source": "src/auth.py",
+      "symbols": [
+        {
+          "confidence": "high",
+          "detail_lookup": {
+            "end_line": 9,
+            "mode": "snippet",
+            "path": "src/auth.py",
+            "start_line": 8,
+            "tool": "context_lookup"
+          },
+          "kind": "function",
+          "path": "src/auth.py",
+          "relationship": "same_file",
+          "symbol": "issue_token"
+        }
+      ]
+    },
+    "context_lookup.search": {
+      "cache": {
+        "hit": false,
+        "namespace": "context_lookup.search",
+        "reason": "native_uncached",
+        "schema": "context_cache.lookup.v1"
+      },
+      "count": 10,
+      "index": {
+        "exists": true,
+        "file_count": 6,
+        "fts_enabled": true,
+        "generated_at": "<timestamp>",
+        "git_branch": "",
+        "git_changes_hash": "",
+        "git_head": "",
+        "git_status_hash": "",
+        "import_count": 12,
+        "index_available": true,
+        "refresh_signature": "files:<digest>",
+        "refresh_signature_available": true,
+        "schema": "context_index.status.v1",
+        "search_backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+        "search_mode": "tantivy",
+        "symbol_count": 5,
+        "tantivy": {
+          "backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+          "doc_count": 12,
+          "engine_version": "tantivy v0.26.1",
+          "package_version": "0.26.1",
+          "refresh_signature": "files:<digest>",
+          "schema_version": "mcp-context-manager.native.v2",
+          "sidecar_signature": "tantivy:<digest>"
+        }
+      },
+      "query": "auth token",
+      "results": [
+        {
+          "excerpt": "class AuthService:\n    def login(self, user, password):\n        if not user:",
+          "line": 1,
+          "path": "src/auth.py",
+          "score": 13.0,
+          "source": "tantivy",
+          "tantivy_score": 13.0,
+          "term_count": 2,
+          "term_hits": 1,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        },
+        {
+          "excerpt": "def issue_token(user):\n    return f\"token-for-{user}\"",
+          "line": 8,
+          "path": "src/auth.py",
+          "score": 12.0,
+          "source": "tantivy",
+          "tantivy_score": 12.0,
+          "term_count": 2,
+          "term_hits": 1,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        },
+        {
+          "excerpt": "def revoke_token(token):\n    return token.startswith(\"token-for-\")",
+          "line": 12,
+          "path": "src/auth.py",
+          "score": 12.0,
+          "source": "tantivy",
+          "tantivy_score": 12.0,
+          "term_count": 2,
+          "term_hits": 1,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        },
+        {
+          "excerpt": "def test_issue_token():\n    assert issue_token(\"alice\") == \"token-for-alice\"",
+          "line": 4,
+          "path": "tests/test_auth.py",
+          "score": 12.0,
+          "source": "tantivy",
+          "tantivy_score": 12.0,
+          "term_count": 2,
+          "term_hits": 1,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        },
+        {
+          "excerpt": "{\n  \"task\": \"Review token handling and update tests\",\n  \"changed_files\": [\n    \"src/auth.py\"",
+          "line": 1,
+          "path": "benchmarks/gold_anchors/auth.json",
+          "score": 5.0,
+          "source": "tantivy",
+          "tantivy_score": 5.0,
+          "term_count": 2,
+          "term_hits": 2,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        },
+        {
+          "excerpt": "from src.auth import issue_token\n",
+          "line": 1,
+          "path": "tests/test_auth.py",
+          "score": 5.0,
+          "source": "tantivy",
+          "tantivy_score": 5.0,
+          "term_count": 2,
+          "term_hits": 2,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        },
+        {
+          "excerpt": "        if not user:\n            raise ValueError(\"missing user\")\n        return issue_token(user)",
+          "line": 3,
+          "path": "src/auth.py",
+          "score": 4.0,
+          "source": "tantivy",
+          "tantivy_score": 4.0,
+          "term_count": 2,
+          "term_hits": 1,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        },
+        {
+          "excerpt": "",
+          "line": 6,
+          "path": "src/auth.py",
+          "score": 3.0,
+          "source": "tantivy",
+          "tantivy_score": 3.0,
+          "term_count": 2,
+          "term_hits": 0,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        },
+        {
+          "excerpt": "",
+          "line": 10,
+          "path": "src/auth.py",
+          "score": 3.0,
+          "source": "tantivy",
+          "tantivy_score": 3.0,
+          "term_count": 2,
+          "term_hits": 0,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        },
+        {
+          "excerpt": "# Demo\n\nAuthentication is handled in src/auth.py.",
+          "line": 1,
+          "path": "README.md",
+          "score": 1.0,
+          "source": "tantivy",
+          "tantivy_score": 1.0,
+          "term_count": 2,
+          "term_hits": 1,
+          "terms": [
+            "auth",
+            "token"
+          ]
+        }
+      ],
+      "schema": "context_search.v1",
+      "terms": [
+        "auth",
+        "token"
+      ]
+    },
+    "context_lookup.snippet": {
+      "content": "class AuthService:\n    def login(self, user, password):\n        if not user:\n            raise ValueError(\"missing user\")\n        return issue_token(user)\n\n\ndef issue_token(user):",
+      "end_line": 8,
+      "path": "src/auth.py",
+      "prompt_injection_signals": {
+        "categories": [],
+        "detected": false,
+        "schema": "prompt_injection_signals.v1"
+      },
+      "redactions": [],
+      "requested": {
+        "end_line": 8,
+        "start_line": 1
+      },
+      "schema": "context_snippet.v1",
+      "source": "index",
+      "start_line": 1,
+      "total_lines": 13,
+      "truncated": false
+    },
+    "context_lookup.symbols": {
+      "count": 2,
+      "schema": "context_symbols.v1",
+      "symbols": [
+        {
+          "kind": "function",
+          "line_end": 9,
+          "line_start": 8,
+          "name": "issue_token",
+          "path": "src/auth.py",
+          "signature": "issue_token(user)"
+        },
+        {
+          "kind": "function",
+          "line_end": 5,
+          "line_start": 4,
+          "name": "test_issue_token",
+          "path": "tests/test_auth.py",
+          "signature": "test_issue_token()"
+        }
+      ]
+    },
+    "context_lookup.test_owners": {
+      "count": 1,
+      "related": [
+        {
+          "confidence": "high",
+          "detail_lookup": {
+            "mode": "snippet",
+            "path": "tests/test_auth.py",
+            "start_line": 1,
+            "tool": "context_lookup"
+          },
+          "path": "tests/test_auth.py",
+          "relationship": "test_owner"
+        }
+      ],
+      "schema": "context_lookup.test_owners.v1",
+      "source": "src/auth.py"
+    },
+    "context_lookup.tree": {
+      "count": 10,
+      "entries": [
+        {
+          "path": "README.md",
+          "size": 50,
+          "type": "file"
+        },
+        {
+          "path": "benchmarks",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "benchmarks/gold_anchors",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "config",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "config/settings.toml",
+          "size": 20,
+          "type": "file"
+        },
+        {
+          "path": "src",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "src/auth.py",
+          "size": 280,
+          "type": "file"
+        },
+        {
+          "path": "tests",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "tests/test_auth.py",
+          "size": 112,
+          "type": "file"
+        },
+        {
+          "path": "unsafe.txt",
+          "size": 78,
+          "type": "file"
+        }
+      ],
+      "path": ".",
+      "schema": "context_tree.v1"
+    },
+    "context_memory.compact": {
+      "compacted": false,
+      "entry_count": 1,
+      "schema": "context_memory.compact.v1"
+    },
+    "context_memory.decision_record": {
+      "effective_decision": [
+        {
+          "confidence": 1.0,
+          "created_at": "<timestamp>",
+          "decided_by": "human",
+          "decision": {
+            "prefix": "token-for-"
+          },
+          "expired": false,
+          "expires_at": null,
+          "id": "decision-1",
+          "namespace": "decision/auth",
+          "rationale": "fixture contract",
+          "sensitivity": {
+            "categories": [],
+            "redacted": false,
+            "redaction_count": 0
+          },
+          "source": "golden",
+          "tags": [],
+          "topic": "token format",
+          "updated_at": "<timestamp>"
+        }
+      ],
+      "recorded": {
+        "confidence": 1.0,
+        "created_at": "<timestamp>",
+        "decided_by": "human",
+        "decision": {
+          "prefix": "token-for-"
+        },
+        "expires_at": null,
+        "id": "decision-1",
+        "namespace": "decision/auth",
+        "rationale": "fixture contract",
+        "sensitivity": {
+          "categories": [],
+          "redacted": false,
+          "redaction_count": 0
+        },
+        "source": "golden",
+        "tags": [],
+        "topic": "token format",
+        "updated_at": "<timestamp>"
+      },
+      "schema": "context_memory.decision_record.v1"
+    },
+    "context_memory.get": {
+      "count": 1,
+      "effective_decision_count": 0,
+      "effective_decisions": [],
+      "entries": [
+        {
+          "confidence": 1.0,
+          "created_at": "<timestamp>",
+          "expired": false,
+          "expires_at": null,
+          "key": "token-contract",
+          "namespace": "component/auth",
+          "sensitivity": {
+            "categories": [],
+            "redacted": false,
+            "redaction_count": 0
+          },
+          "source": "golden",
+          "tags": [],
+          "updated_at": "<timestamp>",
+          "value": {
+            "issuer": "issue_token"
+          }
+        }
+      ],
+      "repo_boundary_enforced": true,
+      "schema": "context_memory.get.v1",
+      "summaries": [
+        {
+          "confidence": 1.0,
+          "created_at": "<timestamp>",
+          "expired": false,
+          "expires_at": null,
+          "focus": "token flow",
+          "namespace": "component/auth",
+          "sensitivity": {
+            "categories": [],
+            "redacted": false,
+            "redaction_count": 0
+          },
+          "source": "golden",
+          "summary": "issue_token creates deterministic fixture tokens",
+          "tags": [],
+          "updated_at": "<timestamp>"
+        }
+      ],
+      "summary_count": 1
+    },
+    "context_memory.summary_upsert": {
+      "focus": "token flow",
+      "namespace": "component/auth",
+      "schema": "context_memory.summary_upsert.v1",
+      "sensitivity": {
+        "categories": [],
+        "redacted": false,
+        "redaction_count": 0
+      },
+      "updated": true
+    },
+    "context_memory.upsert": {
+      "expires_at": null,
+      "key": "token-contract",
+      "namespace": "component/auth",
+      "repo_boundary_enforced": true,
+      "schema": "context_memory.upsert.v1",
+      "sensitivity": {
+        "categories": [],
+        "redacted": false,
+        "redaction_count": 0
+      },
+      "updated": true
+    },
+    "context_memory.validate": {
+      "decision_count": 1,
+      "entry_count": 1,
+      "missing_metadata": [],
+      "schema": "context_memory.validate.v1",
+      "stale_count": 0,
+      "stale_entries": [],
+      "summary_count": 1
+    },
+    "context_pack.v2": {
+      "evidence": [
+        [
+          "ev_<digest>",
+          1,
+          8,
+          9,
+          "issue_token",
+          "sig: def issue_token(user):; exit: return f\"token-for-{user}\"",
+          16
+        ],
+        [
+          "ev_<digest>",
+          1,
+          4,
+          5,
+          "test_issue_token",
+          "sig: def test_issue_token():; guard: assert issue_token(\"alice\") == \"token-for-alice\"; call: assert issue_token(\"alice\") == \"token-for-alice\"; test evidence",
+          39
+        ]
+      ],
+      "id": "pk_<digest>",
+      "more": "ctxref-<id>",
+      "paths": [
+        "src/auth.py",
+        "tests/test_auth.py"
+      ],
+      "route": "review",
+      "v": 2
+    },
+    "resources.instructions": {
+      "boundary": "Repository-side MCP configuration can require server initialization but cannot force a model to call a tool on every turn.",
+      "codex_config_example": {
+        "config_file": "~/.codex/config.toml or trusted-project .codex/config.toml",
+        "effect": "required=true fails startup if the enabled server cannot initialize.",
+        "toml": "[mcp_servers.mcp-context-manager]\nurl = \"http://localhost:8000/mcp\"\nrequired = true\n"
+      },
+      "enforcement_layers": [
+        "MCP server availability",
+        "MCP server instructions",
+        "AGENTS.md workflow",
+        "Review and CI checks"
+      ],
+      "instruction": "For repository coding, review, debug, test, docs, security, or general questions, call context_pack first with the user's task and client_profile. Pass changed_files and focus_paths when named. Use context_lookup for targeted follow-up before broad inspection, result_reference_resolve before relying on deferred raw evidence, context_admin for health and generated state, and context_memory only for structured non-secret repository facts.",
+      "preferred_tool_order": [
+        "context_pack",
+        "context_lookup",
+        "result_reference_resolve",
+        "context_admin",
+        "context_memory"
+      ],
+      "profile_selection": {
+        "auto_detection": false,
+        "calibration": "context_admin(mode=\"profile_calibrate\") reports recommendations only.",
+        "client_profiles": {
+          "claude": {
+            "model_profile": "anthropic",
+            "recommended_output_profile": "compact"
+          },
+          "codex": {
+            "model_profile": "openai",
+            "recommended_output_profile": "minimal"
+          },
+          "copilot": {
+            "model_profile": "github",
+            "recommended_output_profile": "compact",
+            "tools_only": true
+          },
+          "generic": {
+            "model_profile": "unknown",
+            "recommended_output_profile": "balanced"
+          }
+        },
+        "precedence": [
+          "explicit request fields",
+          "client profile defaults",
+          "server defaults"
+        ],
+        "set_by": "MCP caller per context_pack request"
+      },
+      "purpose": "Speed up coding agents with a first-pass context pack.",
+      "resource_uris": [
+        "repo://instructions/codex-context-pack-first",
+        "repo://project/{project_id}/instructions/codex-context-pack-first"
+      ],
+      "schema": "codex_context_pack_first.instructions.v1"
+    },
+    "resources.repo_file": "class AuthService:\n    def login(self, user, password):\n        if not user:\n            raise ValueError(\"missing user\")\n        return issue_token(user)\n\n\ndef issue_token(user):\n    return f\"token-for-{user}\"\n\n\ndef revoke_token(token):\n    return token.startswith(\"token-for-\")\n",
+    "resources.repo_metrics": {
+      "background": {
+        "status": "change_pending"
+      },
+      "benchmarks": {},
+      "cache": {
+        "hit_ratio": 0.0,
+        "hits": 0,
+        "l0": {
+          "entries": 0,
+          "hits": 0,
+          "misses": 1,
+          "weighted_bytes": 0
+        },
+        "l1": {
+          "approximate_hits": 0,
+          "exact_hits": 0,
+          "retrieval_misses": 1
+        },
+        "misses": 1
+      },
+      "generated_at": "<timestamp>",
+      "index_freshness": {
+        "coalesce_ms": 50,
+        "dirty": true,
+        "generation": 0,
+        "poll_interval_ms": 2000,
+        "refreshes": 0,
+        "strategy": "notify_with_polling_fallback"
+      },
+      "project_id": "python-v1-golden",
+      "references": {
+        "active_count": 1,
+        "total_count": 1
+      },
+      "requests": {
+        "by_tool": {
+          "context_pack": 1
+        },
+        "total": 1
+      },
+      "retrieval": {
+        "backend": "tantivy",
+        "doc_count": 12,
+        "misses": 1
+      },
+      "retrieval_queue": {
+        "active": 0,
+        "pending": 0
+      },
+      "schema": "context_metrics.v1",
+      "since": "<timestamp>",
+      "tokens": {
+        "input_est": 0,
+        "output_est": 0,
+        "saved_est": 0
+      },
+      "tooling": {
+        "external_calls_saved_est": 0
+      },
+      "updated_at": "<timestamp>",
+      "warmup": {
+        "runs": 0
+      }
+    },
+    "resources.repo_summary": {
+      "file_count": 6,
+      "git_branch": "",
+      "git_head": "",
+      "has_readme": true,
+      "has_tests_dir": true,
+      "index": {
+        "exists": true,
+        "file_count": 6,
+        "fts_enabled": true,
+        "generated_at": "<timestamp>",
+        "git_branch": "",
+        "git_changes_hash": "",
+        "git_head": "",
+        "git_status_hash": "",
+        "import_count": 12,
+        "index_available": true,
+        "refresh_signature": "files:<digest>",
+        "refresh_signature_available": true,
+        "schema": "context_index.status.v1",
+        "search_backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+        "search_mode": "tantivy",
+        "symbol_count": 5,
+        "tantivy": {
+          "backend_version": "tantivy:mcp-context-manager.native.v2:0.26.1",
+          "doc_count": 12,
+          "engine_version": "tantivy v0.26.1",
+          "package_version": "0.26.1",
+          "refresh_signature": "files:<digest>",
+          "schema_version": "mcp-context-manager.native.v2",
+          "sidecar_signature": "tantivy:<digest>"
+        }
+      },
+      "is_git_repo": false,
+      "schema": "workspace_facts.v1",
+      "top_extensions": [
+        {
+          "count": 2,
+          "extension": "py"
+        },
+        {
+          "count": 1,
+          "extension": "json"
+        },
+        {
+          "count": 1,
+          "extension": "md"
+        },
+        {
+          "count": 1,
+          "extension": "toml"
+        },
+        {
+          "count": 1,
+          "extension": "txt"
+        }
+      ]
+    },
+    "resources.repo_tree": {
+      "count": 10,
+      "entries": [
+        {
+          "path": "README.md",
+          "size": 50,
+          "type": "file"
+        },
+        {
+          "path": "benchmarks",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "benchmarks/gold_anchors",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "config",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "config/settings.toml",
+          "size": 20,
+          "type": "file"
+        },
+        {
+          "path": "src",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "src/auth.py",
+          "size": 280,
+          "type": "file"
+        },
+        {
+          "path": "tests",
+          "size": 0,
+          "type": "dir"
+        },
+        {
+          "path": "tests/test_auth.py",
+          "size": 112,
+          "type": "file"
+        },
+        {
+          "path": "unsafe.txt",
+          "size": 78,
+          "type": "file"
+        }
+      ],
+      "path": ".",
+      "schema": "context_tree.v1"
+    },
+    "result_reference_resolve.resolve": {
+      "content": {
+        "candidates": [
+          {
+            "content": "def test_issue_token():\n    assert issue_token(\"alice\") == \"token-for-alice\"",
+            "end_line": 5,
+            "id": "ev_<digest>",
+            "path": "tests/test_auth.py",
+            "start_line": 4,
+            "symbol": "test_issue_token"
+          },
+          {
+            "content": "def issue_token(user):\n    return f\"token-for-{user}\"",
+            "end_line": 9,
+            "id": "ev_<digest>",
+            "path": "src/auth.py",
+            "start_line": 8,
+            "symbol": "issue_token"
+          },
+          {
+            "content": "def revoke_token(token):\n    return token.startswith(\"token-for-\")",
+            "end_line": 13,
+            "id": "ev_<digest>",
+            "path": "src/auth.py",
+            "start_line": 12,
+            "symbol": "revoke_token"
+          },
+          {
+            "content": "from src.auth import issue_token\n",
+            "end_line": 3,
+            "id": "ev_<digest>",
+            "path": "tests/test_auth.py",
+            "start_line": 1,
+            "symbol": ""
+          },
+          {
+            "content": "        if not user:\n            raise ValueError(\"missing user\")\n        return issue_token(user)",
+            "end_line": 5,
+            "id": "ev_<digest>",
+            "path": "src/auth.py",
+            "start_line": 1,
+            "symbol": "AuthService"
+          },
+          {
+            "content": "        if not user:\n            raise ValueError(\"missing user\")\n        return issue_token(user)",
+            "end_line": 5,
+            "id": "ev_<digest>",
+            "path": "src/auth.py",
+            "start_line": 2,
+            "symbol": "login"
+          },
+          {
+            "content": "{\n  \"task\": \"Review token handling and update tests\",\n  \"changed_files\": [\n    \"src/auth.py\"",
+            "end_line": 16,
+            "id": "ev_<digest>",
+            "path": "benchmarks/gold_anchors/auth.json",
+            "start_line": 1,
+            "symbol": ""
+          }
+        ],
+        "pack_id": "pk_<digest>",
+        "schema": "context_pack.v2.deferred_evidence.v1"
+      },
+      "content_sha256": "<digest>",
+      "metadata": {
+        "created_at": "<timestamp>",
+        "expires_at": "<timestamp>",
+        "producer_tool": "context_pack",
+        "project_id": "python-v1-golden",
+        "reference_id": "ctxref-<id>"
+      },
+      "reference_id": "ctxref-<id>",
+      "repo_boundary_enforced": true,
+      "schema": "mcp_result_reference.resolve.v1",
+      "sensitivity": {
+        "categories": [],
+        "payload_embedded": false,
+        "redacted": false,
+        "redaction_count": 0
+      },
+      "status": "resolved",
+      "summary": {
+        "candidate_count": 7,
+        "kind": "deferred_evidence"
+      },
+      "uri": "repo://project/python-v1-golden/context/ctxref-<id>",
+      "warnings": []
+    }
+  },
+  "schema": "rust_v2_contract_oracle.v1",
+  "source": {
+    "python_golden": "tests/golden/python-v1/contracts.json"
+  },
+  "validation": {
+    "failures": [],
+    "stable_non_pack_captures_checked": 41
+  }
+}

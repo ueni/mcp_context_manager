@@ -29,78 +29,64 @@ set(_common_mounts
 if(MCP_RUNTIME STREQUAL "glibc")
     set(_build_script [=[
 set -eu
-mkdir -p /workspace/dist \
-  /workspace/.downloads/apt/cache/partial \
-  /workspace/.downloads/apt/lists/partial \
-  /workspace/.downloads/pip \
-  /workspace/.downloads/pyinstaller
-chown -R 0:0 /workspace/.downloads/pip /workspace/.downloads/pyinstaller
+mkdir -p /workspace/dist /workspace/.downloads/apt/cache/partial \
+  /workspace/.downloads/apt/lists/partial /workspace/.downloads/cargo \
+  /workspace/.downloads/cargo-target/glibc
 rm -f /etc/apt/apt.conf.d/docker-clean
 APT_CACHE_OPTIONS="-o Dir::Cache::archives=/workspace/.downloads/apt/cache -o Dir::State::lists=/workspace/.downloads/apt/lists"
 apt-get $APT_CACHE_OPTIONS update
 apt-get $APT_CACHE_OPTIONS install -y --no-install-recommends \
-  python3 python3-pip python3.10-dev libpython3.10 \
-  ca-certificates libffi-dev libssl-dev binutils build-essential cargo rustc
+  ca-certificates binutils file
 update-ca-certificates
-export PIP_CACHE_DIR=/workspace/.downloads/pip
-export PIP_ROOT_USER_ACTION=ignore
 CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 if [ -f /host-ssl-certs/ca-certificates.crt ]; then
   CERT_FILE=/host-ssl-certs/ca-certificates.crt
 fi
 export SSL_CERT_FILE="$CERT_FILE"
-export REQUESTS_CA_BUNDLE="$CERT_FILE"
 export CARGO_HTTP_CAINFO="$CERT_FILE"
-python3 -m pip install --upgrade pip
-python3 -m pip install pyinstaller .
-pyinstaller \
-  --onefile \
-  --optimize 1 \
-  --name "$MCP_OUTPUT_NAME" \
-  --distpath /workspace/dist \
-  --workpath "/workspace/.downloads/pyinstaller/build-$MCP_OUTPUT_NAME" \
-  --specpath "/workspace/.downloads/pyinstaller/spec-$MCP_OUTPUT_NAME" \
-  --copy-metadata mcp-context-manager \
-  --collect-all tantivy \
-  --collect-all mcp_context_manager \
-  src/mcp_context_manager/__main__.py
-chown -R "$(stat -c "%u:%g" /workspace)" /workspace/dist /workspace/.downloads
+export CARGO_HOME=/workspace/.downloads/cargo
+export CARGO_TARGET_DIR=/workspace/.downloads/cargo-target/glibc
+TARGET=x86_64-unknown-linux-gnu
+rustup target add "$TARGET"
+cargo build --locked --release --target "$TARGET" -p contextd --bin mcp-context-manager
+OUTPUT="/workspace/dist/$MCP_OUTPUT_NAME"
+cp "$CARGO_TARGET_DIR/$TARGET/release/mcp-context-manager" "$OUTPUT"
+chmod 0755 "$OUTPUT"
+file "$OUTPUT" | grep -Eq 'ELF 64-bit.*dynamically linked'
+readelf -l "$OUTPUT" | grep -q 'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2'
+! ldd "$OUTPUT" | grep -q 'not found'
+"$OUTPUT" --version | grep -q '^mcp-context-manager '
+chown "$(stat -c "%u:%g" /workspace)" "$OUTPUT"
 ]=])
 elseif(MCP_RUNTIME STREQUAL "musl")
     set(_build_script [=[
 set -eu
-mkdir -p /workspace/dist \
-  /workspace/.downloads/apk \
-  /workspace/.downloads/pip \
-  /workspace/.downloads/pyinstaller
-chown -R 0:0 /workspace/.downloads/pip /workspace/.downloads/pyinstaller
+mkdir -p /workspace/dist /workspace/.downloads/apk \
+  /workspace/.downloads/cargo /workspace/.downloads/cargo-target/musl
 apk add --cache-dir /workspace/.downloads/apk --update-cache \
-  ca-certificates binutils build-base musl-dev libffi-dev openssl-dev \
-  cargo rust python3-dev
+  ca-certificates binutils file musl-dev
 update-ca-certificates
-export PIP_CACHE_DIR=/workspace/.downloads/pip
-export PIP_ROOT_USER_ACTION=ignore
 CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 if [ -f /host-ssl-certs/ca-certificates.crt ]; then
   CERT_FILE=/host-ssl-certs/ca-certificates.crt
 fi
 export SSL_CERT_FILE="$CERT_FILE"
-export REQUESTS_CA_BUNDLE="$CERT_FILE"
 export CARGO_HTTP_CAINFO="$CERT_FILE"
-python -m pip install --upgrade pip
-python -m pip install pyinstaller .
-pyinstaller \
-  --onefile \
-  --optimize 1 \
-  --name "$MCP_OUTPUT_NAME" \
-  --distpath /workspace/dist \
-  --workpath "/workspace/.downloads/pyinstaller/build-$MCP_OUTPUT_NAME" \
-  --specpath "/workspace/.downloads/pyinstaller/spec-$MCP_OUTPUT_NAME" \
-  --copy-metadata mcp-context-manager \
-  --collect-all tantivy \
-  --collect-all mcp_context_manager \
-  src/mcp_context_manager/__main__.py
-chown -R "$(stat -c "%u:%g" /workspace)" /workspace/dist /workspace/.downloads
+export CARGO_HOME=/workspace/.downloads/cargo
+export CARGO_TARGET_DIR=/workspace/.downloads/cargo-target/musl
+TARGET=x86_64-unknown-linux-musl
+rustup target add "$TARGET"
+cargo build --locked --release --target "$TARGET" -p contextd --bin mcp-context-manager
+OUTPUT="/workspace/dist/$MCP_OUTPUT_NAME"
+cp "$CARGO_TARGET_DIR/$TARGET/release/mcp-context-manager" "$OUTPUT"
+chmod 0755 "$OUTPUT"
+file "$OUTPUT" | grep -Eq 'ELF 64-bit.*static'
+if readelf -l "$OUTPUT" | grep -q 'INTERP'; then
+  echo "musl artifact unexpectedly contains a dynamic interpreter" >&2
+  exit 1
+fi
+"$OUTPUT" --version | grep -q '^mcp-context-manager '
+chown "$(stat -c "%u:%g" /workspace)" "$OUTPUT"
 ]=])
 else()
     message(FATAL_ERROR "unsupported MCP_RUNTIME: ${MCP_RUNTIME}")

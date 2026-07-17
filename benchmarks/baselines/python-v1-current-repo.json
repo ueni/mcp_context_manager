@@ -1,0 +1,927 @@
+{
+  "cases": [
+    {
+      "allowed_paths": [
+        "src/mcp_context_manager/context.py",
+        "src/mcp_context_manager/metrics.py",
+        "tests/test_context_pack.py",
+        "tests/test_admin_and_regression.py"
+      ],
+      "anchors": [
+        {
+          "lines": [],
+          "path": "tests/test_context_pack.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/metrics.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_admin_and_regression.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "doc/technical-paper.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "README.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "benchmarks/context_pack_benchmark.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "monitor-metrics.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "benchmarks/cache_prompt_warmup_benchmark.py",
+          "reason": [
+            "lexical_match"
+          ]
+        }
+      ],
+      "external_ms": 881.407,
+      "focus_paths": [
+        "src/mcp_context_manager/context.py",
+        "src/mcp_context_manager/metrics.py"
+      ],
+      "internal_ms": 881.391,
+      "name": "context_pack_latency",
+      "noise_ratio": 0.625,
+      "output_tokens_est": 4962,
+      "paths": [
+        "tests/test_context_pack.py",
+        "src/mcp_context_manager/metrics.py",
+        "tests/test_admin_and_regression.py",
+        "doc/technical-paper.md",
+        "README.md",
+        "benchmarks/context_pack_benchmark.py",
+        "monitor-metrics.py",
+        "benchmarks/cache_prompt_warmup_benchmark.py"
+      ],
+      "prompt": "Profile context_pack retrieval latency and identify the measured hot path",
+      "required_paths": [
+        "src/mcp_context_manager/context.py"
+      ],
+      "required_recall": 0.0,
+      "selected_count": 8,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.0018
+    },
+    {
+      "allowed_paths": [
+        "src/mcp_context_manager/store.py",
+        "src/mcp_context_manager/references.py",
+        "src/mcp_context_manager/config.py",
+        "tests/test_references.py",
+        "tests/test_boundaries_and_index.py"
+      ],
+      "anchors": [
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/references.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_admin_and_regression.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "doc/technical-paper.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/server.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "README.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_memory_and_references.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "AGENTS.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_context_pack.py",
+          "reason": [
+            "lexical_match"
+          ]
+        }
+      ],
+      "external_ms": 777.151,
+      "focus_paths": [
+        "src/mcp_context_manager/store.py",
+        "src/mcp_context_manager/references.py"
+      ],
+      "internal_ms": 776.985,
+      "name": "lmdb_references",
+      "noise_ratio": 0.875,
+      "output_tokens_est": 5160,
+      "paths": [
+        "src/mcp_context_manager/references.py",
+        "tests/test_admin_and_regression.py",
+        "doc/technical-paper.md",
+        "src/mcp_context_manager/server.py",
+        "README.md",
+        "tests/test_memory_and_references.py",
+        "AGENTS.md",
+        "tests/test_context_pack.py"
+      ],
+      "prompt": "Review LMDB result reference expiry and repository boundary validation",
+      "required_paths": [
+        "src/mcp_context_manager/store.py",
+        "src/mcp_context_manager/references.py"
+      ],
+      "required_recall": 0.5,
+      "selected_count": 8,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.0213
+    },
+    {
+      "allowed_paths": [
+        "src/mcp_context_manager/server.py",
+        "tests/test_http_payload.py",
+        "tests/test_admin_and_regression.py"
+      ],
+      "anchors": [
+        {
+          "lines": [],
+          "path": "tests/test_http_payload.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/server.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_context_pack.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "doc/technical-paper.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "README.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_admin_and_regression.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_monitor_metrics.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "monitor-metrics.py",
+          "reason": [
+            "lexical_match"
+          ]
+        }
+      ],
+      "external_ms": 859.945,
+      "focus_paths": [
+        "src/mcp_context_manager/server.py",
+        "tests/test_http_payload.py"
+      ],
+      "internal_ms": 859.832,
+      "name": "http_contract",
+      "noise_ratio": 0.625,
+      "output_tokens_est": 5159,
+      "paths": [
+        "tests/test_http_payload.py",
+        "src/mcp_context_manager/server.py",
+        "tests/test_context_pack.py",
+        "doc/technical-paper.md",
+        "README.md",
+        "tests/test_admin_and_regression.py",
+        "tests/test_monitor_metrics.py",
+        "monitor-metrics.py"
+      ],
+      "prompt": "Debug Streamable HTTP context_pack payload normalization and health routes",
+      "required_paths": [
+        "src/mcp_context_manager/server.py",
+        "tests/test_http_payload.py"
+      ],
+      "required_recall": 1.0,
+      "selected_count": 8,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.0132
+    },
+    {
+      "allowed_paths": [
+        "src/mcp_context_manager/tantivy_index.py",
+        "src/mcp_context_manager/context.py",
+        "src/mcp_context_manager/index.py",
+        "tests/test_boundaries_and_index.py"
+      ],
+      "anchors": [
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/tantivy_index.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_admin_and_regression.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_boundaries_and_index.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/index.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "doc/technical-paper.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/server.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "README.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/schemas.py",
+          "reason": [
+            "lexical_match"
+          ]
+        }
+      ],
+      "external_ms": 810.583,
+      "focus_paths": [
+        "src/mcp_context_manager/tantivy_index.py",
+        "src/mcp_context_manager/context.py"
+      ],
+      "internal_ms": 810.406,
+      "name": "tantivy_ranking",
+      "noise_ratio": 0.625,
+      "output_tokens_est": 5051,
+      "paths": [
+        "src/mcp_context_manager/tantivy_index.py",
+        "tests/test_admin_and_regression.py",
+        "tests/test_boundaries_and_index.py",
+        "src/mcp_context_manager/index.py",
+        "doc/technical-paper.md",
+        "src/mcp_context_manager/server.py",
+        "README.md",
+        "src/mcp_context_manager/schemas.py"
+      ],
+      "prompt": "Explain exact path ranking through Tantivy search and public fragment merge",
+      "required_paths": [
+        "src/mcp_context_manager/tantivy_index.py",
+        "src/mcp_context_manager/context.py"
+      ],
+      "required_recall": 0.5,
+      "selected_count": 8,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.0218
+    },
+    {
+      "allowed_paths": [
+        "src/mcp_context_manager/memory.py",
+        "src/mcp_context_manager/context.py",
+        "tests/test_memory.py"
+      ],
+      "anchors": [
+        {
+          "lines": [],
+          "path": "tests/test_memory_and_references.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/memory.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "doc/technical-paper.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/server.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "README.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_admin_and_regression.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/memory.py",
+          "reason": [
+            "explicit_path"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "AGENTS.md",
+          "reason": [
+            "lexical_match"
+          ]
+        }
+      ],
+      "external_ms": 689.974,
+      "focus_paths": [
+        "src/mcp_context_manager/memory.py"
+      ],
+      "internal_ms": 689.539,
+      "name": "memory_compaction",
+      "noise_ratio": 0.75,
+      "output_tokens_est": 4781,
+      "paths": [
+        "tests/test_memory_and_references.py",
+        "src/mcp_context_manager/memory.py",
+        "doc/technical-paper.md",
+        "src/mcp_context_manager/server.py",
+        "README.md",
+        "tests/test_admin_and_regression.py",
+        "src/mcp_context_manager/memory.py",
+        "AGENTS.md"
+      ],
+      "prompt": "Review memory validation compaction and expiry behavior",
+      "required_paths": [
+        "src/mcp_context_manager/memory.py"
+      ],
+      "required_recall": 1.0,
+      "selected_count": 8,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.063
+    },
+    {
+      "allowed_paths": [
+        "src/mcp_context_manager/projects.py",
+        "src/mcp_context_manager/manager.py",
+        "src/mcp_context_manager/config.py",
+        "tests/test_project_routing.py"
+      ],
+      "anchors": [
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/projects.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_projects.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "doc/technical-paper.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/manager.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "README.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/config.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_monitor_metrics.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "AGENTS.md",
+          "reason": [
+            "lexical_match"
+          ]
+        }
+      ],
+      "external_ms": 1039.698,
+      "focus_paths": [
+        "src/mcp_context_manager/projects.py",
+        "src/mcp_context_manager/manager.py"
+      ],
+      "internal_ms": 1039.556,
+      "name": "project_routing",
+      "noise_ratio": 0.625,
+      "output_tokens_est": 5139,
+      "paths": [
+        "src/mcp_context_manager/projects.py",
+        "tests/test_projects.py",
+        "doc/technical-paper.md",
+        "src/mcp_context_manager/manager.py",
+        "README.md",
+        "src/mcp_context_manager/config.py",
+        "tests/test_monitor_metrics.py",
+        "AGENTS.md"
+      ],
+      "prompt": "Trace multi-project root URI discovery routing and allowed root enforcement",
+      "required_paths": [
+        "src/mcp_context_manager/projects.py",
+        "src/mcp_context_manager/manager.py"
+      ],
+      "required_recall": 1.0,
+      "selected_count": 8,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.0137
+    },
+    {
+      "allowed_paths": [
+        "CMakeLists.txt",
+        "cmake/BuildArtifacts.cmake",
+        "cmake/BuildStandalone.cmake",
+        "Dockerfile",
+        ".github/workflows/build.yml",
+        ".github/workflows/release.yml"
+      ],
+      "anchors": [
+        {
+          "lines": [],
+          "path": "README.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": ".github/workflows/build.yml",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": ".github/workflows/release.yml",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "Dockerfile",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "CMakePresets.json",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": ".vscode/tasks.json",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_release_version.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "Dockerfile",
+          "reason": [
+            "explicit_path"
+          ]
+        }
+      ],
+      "external_ms": 747.777,
+      "focus_paths": [
+        "cmake/BuildArtifacts.cmake",
+        "cmake/BuildStandalone.cmake",
+        "Dockerfile"
+      ],
+      "internal_ms": 747.653,
+      "name": "artifact_build",
+      "noise_ratio": 0.5,
+      "output_tokens_est": 4993,
+      "paths": [
+        "README.md",
+        ".github/workflows/build.yml",
+        ".github/workflows/release.yml",
+        "Dockerfile",
+        "CMakePresets.json",
+        ".vscode/tasks.json",
+        "tests/test_release_version.py",
+        "Dockerfile"
+      ],
+      "prompt": "Build standalone glibc and musl artifacts and validate Docker packaging",
+      "required_paths": [
+        "cmake/BuildArtifacts.cmake",
+        "cmake/BuildStandalone.cmake"
+      ],
+      "required_recall": 0.0,
+      "selected_count": 8,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.0166
+    },
+    {
+      "allowed_paths": [
+        "src/mcp_context_manager/schemas.py",
+        "src/mcp_context_manager/server.py",
+        "tests/test_admin_and_regression.py",
+        "tests/test_http_payload.py"
+      ],
+      "anchors": [
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/schemas.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/server.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "tests/test_admin_and_regression.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "AGENTS.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/metrics.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "doc/technical-paper.md",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "src/mcp_context_manager/manager.py",
+          "reason": [
+            "lexical_match"
+          ]
+        },
+        {
+          "lines": [],
+          "path": "README.md",
+          "reason": [
+            "lexical_match"
+          ]
+        }
+      ],
+      "external_ms": 1273.328,
+      "focus_paths": [
+        "src/mcp_context_manager/schemas.py",
+        "src/mcp_context_manager/server.py"
+      ],
+      "internal_ms": 1273.189,
+      "name": "tool_schemas",
+      "noise_ratio": 0.625,
+      "output_tokens_est": 5195,
+      "paths": [
+        "src/mcp_context_manager/schemas.py",
+        "src/mcp_context_manager/server.py",
+        "tests/test_admin_and_regression.py",
+        "AGENTS.md",
+        "src/mcp_context_manager/metrics.py",
+        "doc/technical-paper.md",
+        "src/mcp_context_manager/manager.py",
+        "README.md"
+      ],
+      "prompt": "Review stable MCP tool schemas and compact output contracts",
+      "required_paths": [
+        "src/mcp_context_manager/schemas.py"
+      ],
+      "required_recall": 1.0,
+      "selected_count": 8,
+      "shape": [
+        "budget",
+        "cache",
+        "diagnostics_ref",
+        "generated_at",
+        "indexing",
+        "items",
+        "memory",
+        "metrics",
+        "next_actions",
+        "omitted",
+        "omitted_ref",
+        "references",
+        "repo",
+        "request",
+        "safety",
+        "schema",
+        "summary"
+      ],
+      "timing_delta_pct": 0.0109
+    }
+  ],
+  "method": {
+    "cache": "fresh per-case state with stable strategy",
+    "index": "fresh per-case index completed before timing",
+    "max_items": 8,
+    "profile": "normal"
+  },
+  "schema": "python_v1_current_repo_baseline.v1",
+  "source": {
+    "dirty_diff_sha256": "0fcc7d2b284a1aecac0a52cc70ed121537bafec64801fa96d76525eeb83bac1c",
+    "dirty_files": [
+      "README.md",
+      "compose.yaml",
+      "src/mcp_context_manager/context.py",
+      "src/mcp_context_manager/metrics.py",
+      "src/mcp_context_manager/runtime.py",
+      "src/mcp_context_manager/tantivy_index.py"
+    ],
+    "head": "8375530555ad3cf7eb3d4e047bd85fa3414647f3",
+    "server_version": "1.3.1"
+  },
+  "summary": {
+    "case_count": 8,
+    "max_timing_delta_pct": 0.063,
+    "noise_ratio": 0.6562,
+    "output_tokens_median": 5095.0,
+    "required_anchor_recall": 0.625,
+    "warm_miss_median_ms": 835.264,
+    "warm_miss_p95_ms": 1273.328
+  }
+}
