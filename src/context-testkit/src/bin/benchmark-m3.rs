@@ -1,7 +1,7 @@
 use std::{env, fs, path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result, ensure};
-use context_core::{ContextPackRequest, ContextPackV2, ProjectEngine};
+use context_core::{ContextAdminRequest, ContextPackRequest, ContextPackV2, ProjectEngine};
 use serde_json::{Value, json};
 
 fn percentile_95(samples: &[f64]) -> f64 {
@@ -27,6 +27,37 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp/mcp-context-native-m3-direct"));
     let engine = ProjectEngine::build_with_state(&root, &state, "benchmark")?;
+    let general_warmup: ContextAdminRequest = serde_json::from_value(json!({"mode": "warmup"}))?;
+    let general_warmup_started = Instant::now();
+    let general_warmup_response: Value =
+        serde_json::from_slice(&engine.context_admin(&general_warmup).await?)?;
+    let general_warmup_ms = general_warmup_started.elapsed().as_secs_f64() * 1_000.0;
+    let general_warmup_retrieval_ms = general_warmup_response["stage_timings_ms"]["retrieval"]
+        .as_f64()
+        .context("general warmup retrieval timing")?;
+    ensure!(
+        general_warmup_response["search_cache"]["query_count"]
+            .as_u64()
+            .is_some_and(|count| count == 0),
+        "general warmup unexpectedly executed generic retrieval seeds"
+    );
+
+    let prompt_warmup_text = "benchmark prompt warmup exact cache admission";
+    let prompt_warmup: ContextAdminRequest = serde_json::from_value(json!({
+        "mode": "warmup",
+        "prompt": prompt_warmup_text,
+        "path": "src/context-core/src/lib.rs"
+    }))?;
+    let prompt_warmup_started = Instant::now();
+    engine.context_admin(&prompt_warmup).await?;
+    let prompt_warmup_ms = prompt_warmup_started.elapsed().as_secs_f64() * 1_000.0;
+    let prompt_request = request(json!({
+        "prompt": prompt_warmup_text,
+        "focus_paths": ["src/context-core/src/lib.rs"]
+    }))?;
+    let prompt_l0_started = Instant::now();
+    engine.context_pack_cached(&prompt_request).await?;
+    let post_prompt_warmup_l0_ms = prompt_l0_started.elapsed().as_secs_f64() * 1_000.0;
     let base_request = request(json!({
         "prompt": "Profile native context pack retrieval latency and identify the measured hot path",
         "focus_paths": ["src/context-core/src/lib.rs", "src/context-index/src/lib.rs"],
@@ -36,6 +67,14 @@ async fn main() -> Result<()> {
     }))?;
     let full_bytes = engine.context_pack_cached(&base_request).await?;
     let full: ContextPackV2 = serde_json::from_slice(&full_bytes)?;
+    let more = full
+        .more
+        .as_deref()
+        .context("benchmark pack must carry an active more reference")?;
+    ensure!(
+        engine.store().reference_is_active(more)?,
+        "benchmark more reference must be active before L0 samples"
+    );
 
     let mut l0 = Vec::new();
     for _ in 0..100 {
@@ -169,6 +208,10 @@ async fn main() -> Result<()> {
         "required_anchor_recall": recall,
         "noise_ratio": noise,
         "freshness_ms": freshness_ms,
+        "general_warmup_ms": general_warmup_ms,
+        "general_warmup_retrieval_ms": general_warmup_retrieval_ms,
+        "prompt_warmup_ms": prompt_warmup_ms,
+        "post_prompt_warmup_l0_ms": post_prompt_warmup_l0_ms,
     });
     let gates = json!({
         "l0_server_p95_lte_2ms": summary["l0_server_p95_ms"].as_f64().unwrap() <= 2.0,
@@ -179,6 +222,8 @@ async fn main() -> Result<()> {
         "required_anchor_recall_100pct": recall == 1.0,
         "noise_ratio_lte_30pct": noise <= 0.30,
         "freshness_lte_2s": freshness_ms <= 2_000.0,
+        "general_warmup_lte_50ms": general_warmup_ms <= 50.0,
+        "post_prompt_warmup_l0_lte_2ms": post_prompt_warmup_l0_ms <= 2.0,
     });
     println!(
         "{}",

@@ -85,6 +85,20 @@ bytes. The tuple opcode is `0..2` for reference/balanced/source evidence and
 Stable diagnostics and accounting are queried through `context_admin` rather
 than repeated in every response.
 
+`context_admin(mode="warmup")` performs one normal freshness refresh and
+optionally admits the supplied prompt through the shared L0 path without
+recording a user `context_pack` operation. It does not issue generic retrieval
+seeds.
+`context_admin(mode="cache_prune")` invalidates L0 and deletes persistent L1
+rows in one bounded transaction, classifying each row once in expired-negative,
+stale-signature, then age order. The response reports bounded counts and timing,
+never the raw warmup prompt.
+
+`context_admin(mode="monitor_usage")` controls a process-global, default-off
+30-day aggregate ledger. Its buckets contain counts, timing, and token totals
+only; raw prompts, responses, and paths are never stored. Disabled request
+handling is an atomic flag check and does not change cache behavior.
+
 ## Project routing and boundaries
 
 `ProjectRegistry` canonicalizes the configured default repository and all
@@ -190,19 +204,22 @@ already listed in `known_evidence` are omitted.
 L0 is a 64 MiB weighted Moka future cache of immutable encoded response bytes,
 reference ids, and a validity certificate. It uses 30-minute time-to-idle
 expiry and `try_get_with` singleflight, so concurrent identical misses perform
-one build.
+one build. Every apparent hit revalidates its generation, refresh signature,
+and referenced bodies (existence, expiry, and content hash) before serving the
+cached bytes.
 
 ### L1 frontier cache
 
 L1 stores ranked frontiers rather than final responses. The in-memory budget is
 128 MiB and the persistent LMDB budget is 256 MiB. A frontier records ordered
-chunk ids, scores, cumulative token costs, dependencies, term/symbol epochs,
-near-frontier candidates, and the cutoff.
+chunk ids, scores, cumulative token costs, dependencies, canonical terms and
+scope, source generation, candidate capacity, and the cutoff.
 
-Approximate reuse requires equal route and scope, concept Jaccard at least
-0.70, and SimHash Hamming distance at most six. Reuse supplies candidates only;
-the current request always reranks deterministically. Negative entries expire
-after 30 seconds.
+Positive frontiers are admitted only after two identical observations within
+30 minutes. Serving is exact-only and requires matching canonical terms, scope,
+generation, and sufficient candidate capacity; route is diagnostic only.
+Missing source candidates fall back to a new search. Negative entries expire
+after 30 seconds and are also exact-only.
 
 ## Freshness
 
@@ -256,6 +273,8 @@ semantics, and deferred reference resolution rather than v1 envelope bytes.
 The native performance gate measures:
 
 - L0 server p95 at most 2 ms;
+- general admin warmup at most 50 ms;
+- a prompt admitted by admin warmup returns through L0 at most 2 ms;
 - local MCP L0 p95 at most 10 ms;
 - L1 p95 at most 15 ms;
 - current-repository warm miss p95 at most 50 ms;

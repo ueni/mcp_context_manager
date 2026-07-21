@@ -18,6 +18,10 @@ pub type V2Environment = heed::Env;
 
 pub const CODEC_VERSION: u8 = 1;
 const V2_MAP_SIZE: usize = 1024 * 1024 * 1024;
+// The LMDB map itself bounds the number of possible records. This conservative
+// minimum encoded-record footprint keeps a single prune transaction bounded
+// without rejecting any realistically representable frontier set.
+const MAX_DELETE_BATCH: usize = V2_MAP_SIZE / 16;
 
 #[derive(Clone, Debug)]
 pub struct StatePaths {
@@ -31,6 +35,13 @@ pub struct StateStore {
     paths: StatePaths,
     environment: V2Environment,
     records: Database<Str, Bytes>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceValidation {
+    pub reference_id: String,
+    encoded_sha256: String,
+    expires_at_unix_seconds: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -153,10 +164,47 @@ impl StateStore {
         Ok(true)
     }
 
+    pub fn put_json_batch(&self, rows: &[(String, serde_json::Value)]) -> Result<()> {
+        if rows.len() > MAX_DELETE_BATCH {
+            bail!("state write batch exceeds {MAX_DELETE_BATCH} rows");
+        }
+        let encoded = rows
+            .iter()
+            .map(|(key, value)| {
+                validate_state_key(key)?;
+                Ok((key, encode_json_record(value)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut write_txn = self.environment.write_txn()?;
+        for (key, value) in encoded {
+            self.records.put(&mut write_txn, key, &value)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     pub fn delete(&self, key: &str) -> Result<bool> {
         validate_state_key(key)?;
         let mut write_txn = self.environment.write_txn()?;
         let deleted = self.records.delete(&mut write_txn, key)?;
+        write_txn.commit()?;
+        Ok(deleted)
+    }
+
+    pub fn delete_batch(&self, keys: &[String]) -> Result<usize> {
+        if keys.len() > MAX_DELETE_BATCH {
+            bail!("state delete batch exceeds {MAX_DELETE_BATCH} keys");
+        }
+        for key in keys {
+            validate_state_key(key)?;
+        }
+        let mut write_txn = self.environment.write_txn()?;
+        let mut deleted = 0_usize;
+        for key in keys {
+            if self.records.delete(&mut write_txn, key)? {
+                deleted = deleted.saturating_add(1);
+            }
+        }
         write_txn.commit()?;
         Ok(deleted)
     }
@@ -390,6 +438,58 @@ impl StateStore {
         };
         Ok(record.get("sha256").and_then(serde_json::Value::as_str)
             == Some(sha256_bytes(body.as_bytes()).as_str()))
+    }
+
+    pub fn reference_validation(&self, reference_id: &str) -> Result<Option<ReferenceValidation>> {
+        if !valid_reference_id(reference_id) {
+            return Ok(None);
+        }
+        let read_txn = self.environment.read_txn()?;
+        let Some(encoded) = self
+            .records
+            .get(&read_txn, &format!("reference:{reference_id}"))?
+        else {
+            return Ok(None);
+        };
+        let encoded_sha256 = sha256_bytes(encoded);
+        let record = decode_json_record(encoded)?;
+        let Some(expires_at) = record
+            .get("expires_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        else {
+            return Ok(None);
+        };
+        if expires_at < OffsetDateTime::now_utc() {
+            return Ok(None);
+        }
+        let Some(body) = record.get("body").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        if record.get("sha256").and_then(serde_json::Value::as_str)
+            != Some(sha256_bytes(body.as_bytes()).as_str())
+        {
+            return Ok(None);
+        }
+        Ok(Some(ReferenceValidation {
+            reference_id: reference_id.to_owned(),
+            encoded_sha256,
+            expires_at_unix_seconds: expires_at.unix_timestamp(),
+        }))
+    }
+
+    pub fn reference_validation_is_active(&self, validation: &ReferenceValidation) -> Result<bool> {
+        if validation.expires_at_unix_seconds < OffsetDateTime::now_utc().unix_timestamp() {
+            return Ok(false);
+        }
+        let read_txn = self.environment.read_txn()?;
+        let Some(encoded) = self
+            .records
+            .get(&read_txn, &format!("reference:{}", validation.reference_id))?
+        else {
+            return Ok(false);
+        };
+        Ok(sha256_bytes(encoded) == validation.encoded_sha256)
     }
 
     pub fn resolve_reference(
@@ -736,6 +836,45 @@ mod tests {
         assert_eq!(encoded[0], CODEC_VERSION);
         let decoded: Vec<String> = decode(&encoded).expect("decode");
         assert_eq!(decoded, ["memory", "reference"]);
+    }
+
+    #[test]
+    fn delete_batch_removes_rows_in_one_bounded_operation() {
+        let root = tempfile::tempdir().expect("temporary state root");
+        let store = StateStore::open(root.path()).expect("state store");
+        store
+            .put_json("frontier:one", &json!({"value": 1}))
+            .expect("row one");
+        store
+            .put_json("frontier:two", &json!({"value": 2}))
+            .expect("row two");
+
+        assert_eq!(
+            store
+                .delete_batch(&["frontier:one".to_owned(), "frontier:two".to_owned()])
+                .expect("delete batch"),
+            2
+        );
+        assert!(
+            store
+                .iter_json("frontier:")
+                .expect("remaining rows")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn put_json_batch_persists_all_rows() {
+        let root = tempfile::tempdir().expect("temporary state root");
+        let store = StateStore::open(root.path()).expect("state store");
+        store
+            .put_json_batch(&[
+                ("frontier:one".to_owned(), json!({"value": 1})),
+                ("frontier:two".to_owned(), json!({"value": 2})),
+            ])
+            .expect("write batch");
+
+        assert_eq!(store.iter_json("frontier:").expect("rows").len(), 2);
     }
 
     #[test]

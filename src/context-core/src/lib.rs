@@ -15,7 +15,7 @@ use context_index::{
     IndexStats, ProjectIndex, SearchHit, SymbolRecord, normalize_terms, repository_signature,
     validate_relative_path,
 };
-use context_store::StateStore;
+use context_store::{ReferenceValidation, StateStore};
 use moka::future::Cache;
 use notify::{
     Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
@@ -173,6 +173,10 @@ pub struct ContextAdminRequest {
     pub mode: String,
     #[serde(default = "default_lookup_path")]
     pub path: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub action: String,
     pub max_files: Option<u32>,
     #[serde(default = "default_max_age_minutes")]
     pub max_age_minutes: u32,
@@ -244,6 +248,8 @@ const L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const FAST_POLL_INTERVAL_MS: u64 = 2_000;
 const WATCH_COALESCE_MS: u64 = 50;
 const NEGATIVE_FRONTIER_TTL_MS: u64 = 30_000;
+const POSITIVE_FRONTIER_ADMISSION_WINDOW_MS: u64 = 30 * 60 * 1_000;
+const FRONTIER_ADMISSION_TRACKER_MAX_ENTRIES: usize = 2_048;
 const OPERATION_SAMPLE_LIMIT: usize = 128;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -252,9 +258,14 @@ struct PackCacheKey(String);
 #[derive(Clone)]
 struct CachedPack {
     bytes: Arc<Vec<u8>>,
-    reference_ids: Arc<Vec<String>>,
+    reference_validations: Arc<Vec<ReferenceValidation>>,
     validity: ValidityCertificate,
     telemetry: PackTelemetry,
+}
+
+struct CachedAdmission {
+    cached: Arc<CachedPack>,
+    outcome: PackCacheOutcome,
 }
 
 #[derive(Clone)]
@@ -273,7 +284,11 @@ fn l0_entry_weight(key: &PackCacheKey, value: &CachedPack) -> u32 {
     let bytes = key.0.len()
         + value.bytes.len()
         + value.validity.refresh_signature.len()
-        + value.reference_ids.iter().map(String::len).sum::<usize>();
+        + value
+            .reference_validations
+            .iter()
+            .map(|validation| validation.reference_id.len())
+            .sum::<usize>();
     u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 
@@ -309,7 +324,8 @@ struct FrontierRecord {
     route: String,
     scope: Vec<String>,
     terms: Vec<String>,
-    simhash: u64,
+    generation: u64,
+    candidate_capacity: u8,
     candidate_ids: Vec<String>,
     scores: Vec<f32>,
     cumulative_token_costs: Vec<u32>,
@@ -352,6 +368,65 @@ struct FrontierState {
     bytes: usize,
 }
 
+#[derive(Default)]
+struct FrontierAdmissionTracker {
+    observations: HashMap<String, (u8, u64)>,
+}
+
+impl FrontierAdmissionTracker {
+    fn observe(&mut self, key: String, now: u64) -> bool {
+        self.observations.retain(|_, (_, seen)| {
+            now.saturating_sub(*seen) <= POSITIVE_FRONTIER_ADMISSION_WINDOW_MS
+        });
+        if let Some((count, seen)) = self.observations.get_mut(&key) {
+            *count = count.saturating_add(1);
+            *seen = now;
+            if *count >= 2 {
+                self.observations.remove(&key);
+                return true;
+            }
+            return false;
+        }
+        if self.observations.len() >= FRONTIER_ADMISSION_TRACKER_MAX_ENTRIES
+            && let Some(oldest) = self
+                .observations
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(key, _)| key.clone())
+        {
+            self.observations.remove(&oldest);
+        }
+        self.observations.insert(key, (1, now));
+        false
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+enum FrontierOutcome {
+    #[default]
+    Search,
+    ExactHit,
+    NegativeHit,
+    Admitted,
+    CapacityFallback,
+    SourceFallback,
+}
+
+struct DeferredRetrieval {
+    hits: Vec<SearchHit>,
+    terms: Vec<String>,
+    pending: Option<Arc<FrontierRecord>>,
+    outcome: FrontierOutcome,
+}
+
+#[derive(Clone, Copy)]
+enum PackCacheOutcome {
+    Uncached,
+    L0Hit,
+    L0Miss,
+    L0Singleflight,
+}
+
 #[derive(Clone, Copy, Default)]
 struct PackTelemetry {
     input_tokens_est: u32,
@@ -364,6 +439,22 @@ struct PackTelemetry {
     delta_tokens_saved_est: u32,
     candidate_count: u32,
     selected_count: u32,
+    retrieval_micros: u64,
+    pack_build_micros: u64,
+    frontier_outcome: FrontierOutcome,
+    base_pack_used: bool,
+    known_evidence_used: bool,
+}
+
+struct UsageSample {
+    elapsed: StdDuration,
+    telemetry: PackTelemetry,
+    cache_outcome: PackCacheOutcome,
+    refresh_checked: bool,
+    refresh_updated: bool,
+    route: &'static str,
+    term_count: usize,
+    scope_count: usize,
 }
 
 struct BuiltPack {
@@ -468,6 +559,7 @@ struct EngineMetrics {
     pack_delta_tokens_saved_est: AtomicU64,
     pack_candidate_count: AtomicU64,
     pack_selected_count: AtomicU64,
+    warmup_runs: AtomicU64,
 }
 
 impl EngineMetrics {
@@ -545,6 +637,323 @@ struct WatchGuard {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+pub struct UsageMonitor {
+    store: StateStore,
+    enabled: AtomicBool,
+    update_lock: Mutex<()>,
+}
+
+impl UsageMonitor {
+    pub fn open(global_state: impl AsRef<std::path::Path>) -> Result<Self> {
+        let store = StateStore::open(global_state)?;
+        let enabled = store
+            .get_json("monitor:config")?
+            .and_then(|value| value.get("enabled").and_then(Value::as_bool))
+            .unwrap_or(false);
+        Ok(Self {
+            store,
+            enabled: AtomicBool::new(enabled),
+            update_lock: Mutex::new(()),
+        })
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn action(&self, action: &str, project_id: Option<&str>) -> Result<Value> {
+        match action {
+            "enable" | "disable" => {
+                let _guard = self
+                    .update_lock
+                    .lock()
+                    .map_err(|_| anyhow!("usage monitor lock poisoned"))?;
+                let enabled = action == "enable";
+                self.enabled.store(enabled, Ordering::Release);
+                self.store.put_json(
+                    "monitor:config",
+                    &json!({"schema":"context_monitor_usage.config.v1", "enabled":enabled}),
+                )?;
+                self.status()
+            }
+            "status" | "" => self.status(),
+            "report" => self.report(project_id),
+            unsupported => bail!("unsupported monitor_usage action: {unsupported}"),
+        }
+    }
+
+    fn status(&self) -> Result<Value> {
+        Ok(json!({
+            "schema": "context_monitor_usage.status.v1",
+            "enabled": self.enabled(),
+            "retention_days": 30,
+            "global": true,
+        }))
+    }
+
+    fn record(&self, project_id: &str, sample: UsageSample) -> Result<()> {
+        if !self.enabled() {
+            return Ok(());
+        }
+        let _guard = self
+            .update_lock
+            .lock()
+            .map_err(|_| anyhow!("usage monitor lock poisoned"))?;
+        let day = OffsetDateTime::now_utc().date().to_string();
+        let key = format!("monitor:usage:{day}:{project_id}");
+        let mut value = self.store.get_json(&key)?.unwrap_or_else(|| {
+            json!({
+                "schema": "context_monitor_usage.bucket.v1",
+                "day": day,
+                "project_id": project_id,
+                "request_count": 0,
+                "elapsed_micros_total": 0,
+                "elapsed_micros_max": 0,
+                "input_tokens_est": 0,
+                "wire_tokens_est": 0,
+                "candidate_count": 0,
+                "selected_count": 0,
+                "tokens_saved_est": 0,
+                "delta_tokens_saved_est": 0,
+                "cache_outcomes": {},
+                "frontier_outcomes": {},
+                "index": {},
+                "delta": {},
+                "routes": {},
+                "term_count_buckets": {},
+                "scope_count_buckets": {},
+                "stages_micros": {},
+            })
+        });
+        let telemetry = sample.telemetry;
+        let elapsed_micros = u64::try_from(sample.elapsed.as_micros()).unwrap_or(u64::MAX);
+        increment_json_u64(&mut value, "request_count", 1);
+        increment_json_u64(&mut value, "elapsed_micros_total", elapsed_micros);
+        let previous_max = value
+            .get("elapsed_micros_max")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        value["elapsed_micros_max"] = Value::from(previous_max.max(elapsed_micros));
+        increment_json_u64(
+            &mut value,
+            "input_tokens_est",
+            u64::from(telemetry.input_tokens_est),
+        );
+        increment_json_u64(
+            &mut value,
+            "wire_tokens_est",
+            u64::from(telemetry.wire_tokens_est),
+        );
+        increment_json_u64(
+            &mut value,
+            "candidate_count",
+            u64::from(telemetry.candidate_count),
+        );
+        increment_json_u64(
+            &mut value,
+            "selected_count",
+            u64::from(telemetry.selected_count),
+        );
+        increment_json_u64(
+            &mut value,
+            "tokens_saved_est",
+            u64::from(telemetry.tokens_saved_est),
+        );
+        increment_json_u64(
+            &mut value,
+            "delta_tokens_saved_est",
+            u64::from(telemetry.delta_tokens_saved_est),
+        );
+        increment_json_nested(
+            &mut value,
+            "cache_outcomes",
+            match sample.cache_outcome {
+                PackCacheOutcome::Uncached => "uncached",
+                PackCacheOutcome::L0Hit => "l0_hit",
+                PackCacheOutcome::L0Miss => "l0_miss",
+                PackCacheOutcome::L0Singleflight => "l0_singleflight",
+            },
+            1,
+        );
+        if matches!(
+            sample.cache_outcome,
+            PackCacheOutcome::Uncached | PackCacheOutcome::L0Miss
+        ) {
+            increment_json_nested(
+                &mut value,
+                "frontier_outcomes",
+                match telemetry.frontier_outcome {
+                    FrontierOutcome::Search => "search",
+                    FrontierOutcome::ExactHit => "exact_hit",
+                    FrontierOutcome::NegativeHit => "negative_hit",
+                    FrontierOutcome::Admitted => "admitted",
+                    FrontierOutcome::CapacityFallback => "capacity_fallback",
+                    FrontierOutcome::SourceFallback => "source_fallback",
+                },
+                1,
+            );
+        }
+        increment_json_nested(
+            &mut value,
+            "index",
+            "refresh_checked",
+            u64::from(sample.refresh_checked),
+        );
+        increment_json_nested(
+            &mut value,
+            "index",
+            "refresh_updated",
+            u64::from(sample.refresh_updated),
+        );
+        increment_json_nested(
+            &mut value,
+            "delta",
+            "base_pack_requests",
+            u64::from(telemetry.base_pack_used),
+        );
+        increment_json_nested(
+            &mut value,
+            "delta",
+            "known_evidence_requests",
+            u64::from(telemetry.known_evidence_used),
+        );
+        increment_json_nested(&mut value, "routes", sample.route, 1);
+        increment_json_nested(
+            &mut value,
+            "term_count_buckets",
+            coarse_count_bucket(sample.term_count),
+            1,
+        );
+        increment_json_nested(
+            &mut value,
+            "scope_count_buckets",
+            coarse_count_bucket(sample.scope_count),
+            1,
+        );
+        match sample.cache_outcome {
+            PackCacheOutcome::L0Hit | PackCacheOutcome::L0Singleflight => {
+                increment_json_nested(&mut value, "stages_micros", "cache", elapsed_micros);
+            }
+            PackCacheOutcome::Uncached | PackCacheOutcome::L0Miss => {
+                increment_json_nested(
+                    &mut value,
+                    "stages_micros",
+                    "retrieval",
+                    telemetry.retrieval_micros,
+                );
+                increment_json_nested(
+                    &mut value,
+                    "stages_micros",
+                    "pack_build",
+                    telemetry.pack_build_micros,
+                );
+            }
+        }
+        self.store.put_json(&key, &value)?;
+        self.prune()?;
+        Ok(())
+    }
+
+    fn prune(&self) -> Result<()> {
+        let cutoff = (OffsetDateTime::now_utc() - Duration::days(29))
+            .date()
+            .to_string();
+        let rows = self.store.iter_json("monitor:usage:")?;
+        let mut remove = rows
+            .iter()
+            .filter(|(_, value)| {
+                value
+                    .get("day")
+                    .and_then(Value::as_str)
+                    .is_none_or(|day| day < cutoff.as_str())
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if rows.len().saturating_sub(remove.len()) > 4_096 {
+            let mut retained = rows
+                .iter()
+                .filter(|(key, _)| !remove.contains(key))
+                .map(|(key, value)| {
+                    (
+                        value.get("day").and_then(Value::as_str).unwrap_or_default(),
+                        key,
+                    )
+                })
+                .collect::<Vec<_>>();
+            retained.sort();
+            remove.extend(
+                retained
+                    .into_iter()
+                    .take(
+                        rows.len()
+                            .saturating_sub(remove.len())
+                            .saturating_sub(4_096),
+                    )
+                    .map(|(_, key)| key.clone()),
+            );
+        }
+        self.store.delete_batch(&remove)?;
+        Ok(())
+    }
+
+    fn report(&self, project_id: Option<&str>) -> Result<Value> {
+        let _guard = self
+            .update_lock
+            .lock()
+            .map_err(|_| anyhow!("usage monitor lock poisoned"))?;
+        self.prune()?;
+        let mut buckets = self
+            .store
+            .iter_json("monitor:usage:")?
+            .into_iter()
+            .map(|(_, value)| value)
+            .filter(|value| {
+                project_id.is_none_or(|selected| {
+                    value.get("project_id").and_then(Value::as_str) == Some(selected)
+                })
+            })
+            .collect::<Vec<_>>();
+        buckets.sort_by(|left, right| {
+            left.get("day")
+                .and_then(Value::as_str)
+                .cmp(&right.get("day").and_then(Value::as_str))
+        });
+        Ok(json!({
+            "schema": "context_monitor_usage.report.v1",
+            "enabled": self.enabled(),
+            "retention_days": 30,
+            "global": true,
+            "project_id": project_id,
+            "buckets": buckets,
+        }))
+    }
+}
+
+fn increment_json_u64(value: &mut Value, field: &str, increment: u64) {
+    let current = value.get(field).and_then(Value::as_u64).unwrap_or_default();
+    value[field] = Value::from(current.saturating_add(increment));
+}
+
+fn increment_json_nested(value: &mut Value, section: &str, field: &str, increment: u64) {
+    if !value.get(section).is_some_and(Value::is_object) {
+        value[section] = json!({});
+    }
+    let current = value[section]
+        .get(field)
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    value[section][field] = Value::from(current.saturating_add(increment));
+}
+
+fn coarse_count_bucket(count: usize) -> &'static str {
+    match count {
+        0 => "0",
+        1..=2 => "1_2",
+        3..=5 => "3_5",
+        _ => "6_plus",
+    }
+}
+
 impl WatchGuard {
     fn start(root: std::path::PathBuf, freshness: Arc<FreshnessState>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -574,13 +983,14 @@ pub struct ProjectEngine {
     store: Arc<StateStore>,
     project_id: String,
     l0: Cache<PackCacheKey, Arc<CachedPack>>,
-    l0_has_admitted_value: AtomicBool,
     frontiers: Mutex<FrontierState>,
+    frontier_admissions: Mutex<FrontierAdmissionTracker>,
     pack_snapshots: Mutex<HashMap<String, Arc<PackSnapshot>>>,
-    deferred_references: Mutex<HashMap<String, String>>,
+    deferred_references: Mutex<HashMap<String, ReferenceValidation>>,
     freshness: Arc<FreshnessState>,
     refresh_lock: Mutex<()>,
     metrics: EngineMetrics,
+    usage_monitor: Arc<UsageMonitor>,
     _watcher: WatchGuard,
 }
 
@@ -595,6 +1005,34 @@ impl ProjectEngine {
         root: impl AsRef<std::path::Path>,
         project_state: impl AsRef<std::path::Path>,
         project_id: impl Into<String>,
+    ) -> Result<Self> {
+        let monitor = Arc::new(UsageMonitor::open(
+            project_state.as_ref().join("monitor-global"),
+        )?);
+        Self::build_with_state_and_monitor(root, project_state, project_id, monitor)
+    }
+
+    pub fn build_with_state_and_monitor(
+        root: impl AsRef<std::path::Path>,
+        project_state: impl AsRef<std::path::Path>,
+        project_id: impl Into<String>,
+        usage_monitor: Arc<UsageMonitor>,
+    ) -> Result<Self> {
+        Self::build_with_state_and_l0_idle(
+            root,
+            project_state,
+            project_id,
+            StdDuration::from_secs(30 * 60),
+            usage_monitor,
+        )
+    }
+
+    fn build_with_state_and_l0_idle(
+        root: impl AsRef<std::path::Path>,
+        project_state: impl AsRef<std::path::Path>,
+        project_id: impl Into<String>,
+        l0_idle: StdDuration,
+        usage_monitor: Arc<UsageMonitor>,
     ) -> Result<Self> {
         let index = Arc::new(ProjectIndex::build(root)?);
         let store = Arc::new(StateStore::open(project_state)?);
@@ -617,20 +1055,21 @@ impl ProjectEngine {
         let l0 = Cache::builder()
             .max_capacity(L0_MAX_BYTES)
             .weigher(|key: &PackCacheKey, value: &Arc<CachedPack>| l0_entry_weight(key, value))
-            .time_to_idle(StdDuration::from_secs(30 * 60))
+            .time_to_idle(l0_idle)
             .build();
         Ok(Self {
             index: RwLock::new(index),
             store,
             project_id: project_id.into(),
             l0,
-            l0_has_admitted_value: AtomicBool::new(false),
             frontiers: Mutex::new(frontiers),
+            frontier_admissions: Mutex::new(FrontierAdmissionTracker::default()),
             pack_snapshots: Mutex::new(pack_snapshots),
             deferred_references: Mutex::new(deferred_references),
             freshness,
             refresh_lock: Mutex::new(()),
             metrics,
+            usage_monitor,
             _watcher: watcher,
         })
     }
@@ -663,7 +1102,6 @@ impl ProjectEngine {
             .l0_invalidated_entries
             .fetch_add(stats.entries, Ordering::Relaxed);
         self.l0.invalidate_all();
-        self.l0_has_admitted_value.store(false, Ordering::Release);
     }
 
     pub fn store(&self) -> &StateStore {
@@ -677,12 +1115,28 @@ impl ProjectEngine {
     pub fn context_pack(&self, request: &ContextPackRequest) -> Result<Vec<u8>> {
         let started = Instant::now();
         let result = (|| {
-            self.ensure_fresh(request)?;
-            self.build_context_pack(request)
+            let refresh = self.ensure_fresh(request)?;
+            Ok::<_, anyhow::Error>((self.build_context_pack(request)?, refresh))
         })();
         match result {
-            Ok(pack) => {
+            Ok((pack, (refresh_checked, refresh_updated))) => {
                 self.record_context_pack(started, &pack.telemetry);
+                if self.usage_monitor.enabled() {
+                    let _ = self.usage_monitor.record(
+                        &self.project_id,
+                        UsageSample {
+                            elapsed: started.elapsed(),
+                            telemetry: pack.telemetry,
+                            cache_outcome: PackCacheOutcome::Uncached,
+                            refresh_checked,
+                            refresh_updated,
+                            route: classify_route(&request.prompt),
+                            term_count: normalize_terms(&request.prompt, 8).len(),
+                            scope_count: normalized_explicit_paths(request)
+                                .map_or(0, |paths| paths.len()),
+                        },
+                    );
+                }
                 Ok(pack.bytes)
             }
             Err(error) => {
@@ -700,64 +1154,30 @@ impl ProjectEngine {
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
-            self.ensure_fresh(request)?;
-
-            let index = self.index();
-            let generation = self.freshness.generation.load(Ordering::Acquire);
-            let refresh_signature = index.stats().refresh_signature.clone();
-            let explicit_paths = normalized_explicit_paths(request)?;
-            let key = l0_cache_key(request, &explicit_paths, generation, &refresh_signature)?;
-            if let Some(cached) = self.l0.get(&key).await
-                && cached.validity.generation == generation
-                && cached.validity.refresh_signature == refresh_signature
-            {
-                self.metrics.l0_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok::<Arc<CachedPack>, anyhow::Error>(cached);
-            }
-            let built_by_this_request = Arc::new(AtomicBool::new(false));
-            let build_marker = Arc::clone(&built_by_this_request);
-            let cached = self
-                .l0
-                .try_get_with(key, async {
-                    build_marker.store(true, Ordering::Release);
-                    let pack = self.build_context_pack(request)?;
-                    let response: ContextPackV2 = serde_json::from_slice(&pack.bytes)?;
-                    Ok::<Arc<CachedPack>, anyhow::Error>(Arc::new(CachedPack {
-                        bytes: Arc::new(pack.bytes),
-                        reference_ids: Arc::new(response.more.into_iter().collect()),
-                        validity: ValidityCertificate {
-                            generation,
-                            refresh_signature,
-                        },
-                        telemetry: pack.telemetry,
-                    }))
-                })
-                .await
-                .map_err(|error| anyhow!(error.to_string()))?;
-            if built_by_this_request.load(Ordering::Acquire) {
-                self.metrics.l0_misses.fetch_add(1, Ordering::Relaxed);
-                if self.l0_has_admitted_value.swap(true, Ordering::AcqRel) {
-                    self.metrics
-                        .l0_request_variant_misses
-                        .fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.metrics
-                        .l0_cold_or_invalidated_misses
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                self.metrics.l0_hits.fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .l0_singleflight_hits
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(cached)
+            let refresh = self.ensure_fresh(request)?;
+            Ok::<_, anyhow::Error>((self.admit_context_pack_cached(request).await?, refresh))
         }
         .await;
         match result {
-            Ok(cached) => {
-                self.record_context_pack(started, &cached.telemetry);
-                Ok(cached.bytes.as_ref().clone())
+            Ok((admission, (refresh_checked, refresh_updated))) => {
+                self.record_context_pack(started, &admission.cached.telemetry);
+                if self.usage_monitor.enabled() {
+                    let _ = self.usage_monitor.record(
+                        &self.project_id,
+                        UsageSample {
+                            elapsed: started.elapsed(),
+                            telemetry: admission.cached.telemetry,
+                            cache_outcome: admission.outcome,
+                            refresh_checked,
+                            refresh_updated,
+                            route: classify_route(&request.prompt),
+                            term_count: normalize_terms(&request.prompt, 8).len(),
+                            scope_count: normalized_explicit_paths(request)
+                                .map_or(0, |paths| paths.len()),
+                        },
+                    );
+                }
+                Ok(admission.cached.bytes.as_ref().clone())
             }
             Err(error) => {
                 self.record_operation("context_pack", started, false, 0);
@@ -766,13 +1186,143 @@ impl ProjectEngine {
         }
     }
 
+    async fn admit_context_pack_cached(
+        &self,
+        request: &ContextPackRequest,
+    ) -> Result<CachedAdmission> {
+        request.validate_limits()?;
+        self.validate_project_selector(request.project_id.as_deref(), request.root_uri.as_deref())?;
+        let index = self.index();
+        let generation = self.freshness.generation.load(Ordering::Acquire);
+        let refresh_signature = index.stats().refresh_signature.clone();
+        let explicit_paths = normalized_explicit_paths(request)?;
+        let key = l0_cache_key(request, &explicit_paths, generation, &refresh_signature)?;
+        if let Some(cached) = self.l0.get(&key).await {
+            match self.cached_pack_is_valid(&cached, generation, &refresh_signature) {
+                Ok(true) => {
+                    self.metrics.l0_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(CachedAdmission {
+                        cached,
+                        outcome: PackCacheOutcome::L0Hit,
+                    });
+                }
+                Ok(false) => self.invalidate_l0_entry(&key).await,
+                Err(error) => {
+                    self.invalidate_l0_entry(&key).await;
+                    return Err(error);
+                }
+            }
+        }
+
+        self.l0.run_pending_tasks().await;
+        let cache_was_empty = self.l0.iter().next().is_none();
+        let built_by_this_request = Arc::new(AtomicBool::new(false));
+        let build_marker = Arc::clone(&built_by_this_request);
+        let cached = self
+            .l0
+            .try_get_with(key, async {
+                build_marker.store(true, Ordering::Release);
+                let pack = self.build_context_pack(request)?;
+                let response: ContextPackV2 = serde_json::from_slice(&pack.bytes)?;
+                let reference_validations = response
+                    .more
+                    .into_iter()
+                    .map(|reference_id| self.cached_reference_validation(&reference_id))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok::<Arc<CachedPack>, anyhow::Error>(Arc::new(CachedPack {
+                    bytes: Arc::new(pack.bytes),
+                    reference_validations: Arc::new(reference_validations),
+                    validity: ValidityCertificate {
+                        generation,
+                        refresh_signature,
+                    },
+                    telemetry: pack.telemetry,
+                }))
+            })
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let outcome = if built_by_this_request.load(Ordering::Acquire) {
+            self.metrics.l0_misses.fetch_add(1, Ordering::Relaxed);
+            if cache_was_empty {
+                self.metrics
+                    .l0_cold_or_invalidated_misses
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics
+                    .l0_request_variant_misses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PackCacheOutcome::L0Miss
+        } else {
+            self.metrics.l0_hits.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .l0_singleflight_hits
+                .fetch_add(1, Ordering::Relaxed);
+            PackCacheOutcome::L0Singleflight
+        };
+        Ok(CachedAdmission { cached, outcome })
+    }
+
+    fn cached_pack_is_valid(
+        &self,
+        cached: &CachedPack,
+        generation: u64,
+        refresh_signature: &str,
+    ) -> Result<bool> {
+        if cached.validity.generation != generation
+            || cached.validity.refresh_signature != refresh_signature
+        {
+            return Ok(false);
+        }
+        for validation in cached.reference_validations.iter() {
+            if !self.store.reference_validation_is_active(validation)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn cached_reference_validation(&self, reference_id: &str) -> Result<ReferenceValidation> {
+        let cached = {
+            self.deferred_references
+                .lock()
+                .map_err(|_| anyhow!("deferred reference lock poisoned"))?
+                .values()
+                .find(|validation| validation.reference_id == reference_id)
+                .cloned()
+        };
+        if let Some(validation) = cached
+            && self.store.reference_validation_is_active(&validation)?
+        {
+            return Ok(validation);
+        }
+        self.store
+            .reference_validation(reference_id)?
+            .ok_or_else(|| anyhow!("context pack produced an invalid reference"))
+    }
+
+    async fn invalidate_l0_entry(&self, key: &PackCacheKey) {
+        self.l0.invalidate(key).await;
+        self.metrics
+            .l0_invalidations
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .l0_invalidated_entries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn build_context_pack(&self, request: &ContextPackRequest) -> Result<BuiltPack> {
+        let pack_started = Instant::now();
         request.validate_limits()?;
         self.validate_project_selector(request.project_id.as_deref(), request.root_uri.as_deref())?;
 
         let explicit_paths = normalized_explicit_paths(request)?;
         let index = self.index();
-        let (candidates, terms) = self.retrieve_candidates(&index, request, &explicit_paths)?;
+        let retrieval_started = Instant::now();
+        let (candidates, terms, frontier_outcome) =
+            self.retrieve_candidates(&index, request, &explicit_paths)?;
+        let retrieval_micros =
+            u64::try_from(retrieval_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let selected = select_hits(
             candidates.as_slice(),
             explicit_paths.as_slice(),
@@ -899,6 +1449,13 @@ impl ProjectEngine {
                     .saturating_sub(returned_evidence_tokens_est),
                 candidate_count: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
                 selected_count: u32::try_from(selected.len()).unwrap_or(u32::MAX),
+                retrieval_micros,
+                pack_build_micros: u64::try_from(pack_started.elapsed().as_micros())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(retrieval_micros),
+                frontier_outcome,
+                base_pack_used: request.base_pack.is_some(),
+                known_evidence_used: !request.known_evidence.is_empty(),
             },
             bytes: encoded,
         })
@@ -925,24 +1482,32 @@ impl ProjectEngine {
                 "terms": term_fingerprints,
             }))?,
         );
-        if let Some(reference_id) = self
-            .deferred_references
-            .lock()
-            .map_err(|_| anyhow!("deferred reference lock poisoned"))?
-            .get(&key)
-            .cloned()
-        {
-            return Ok(Some(reference_id));
-        }
-        if let Some(cached) = self.store.get_json(&format!("deferred:{key}"))?
-            && let Some(reference_id) = cached.get("reference_id").and_then(Value::as_str)
-            && self.store.reference_is_active(reference_id)?
-        {
+        let cached_reference_id = {
             self.deferred_references
                 .lock()
                 .map_err(|_| anyhow!("deferred reference lock poisoned"))?
-                .insert(key, reference_id.to_owned());
-            return Ok(Some(reference_id.to_owned()));
+                .get(&key)
+                .cloned()
+        };
+        if let Some(validation) = cached_reference_id {
+            if self.store.reference_validation_is_active(&validation)? {
+                return Ok(Some(validation.reference_id));
+            }
+            self.deferred_references
+                .lock()
+                .map_err(|_| anyhow!("deferred reference lock poisoned"))?
+                .remove(&key);
+        }
+        if let Some(cached) = self.store.get_json(&format!("deferred:{key}"))?
+            && let Some(reference_id) = cached.get("reference_id").and_then(Value::as_str)
+            && let Some(validation) = self.store.reference_validation(reference_id)?
+        {
+            let reference_id = validation.reference_id.clone();
+            self.deferred_references
+                .lock()
+                .map_err(|_| anyhow!("deferred reference lock poisoned"))?
+                .insert(key, validation);
+            return Ok(Some(reference_id));
         }
         let deferred = candidates
             .iter()
@@ -988,10 +1553,14 @@ impl ProjectEngine {
                 "expires_at": reference.get("expires_at").cloned().unwrap_or_default(),
             }),
         )?;
+        let validation = self
+            .store
+            .reference_validation(&reference_id)?
+            .ok_or_else(|| anyhow!("reference store produced an invalid reference"))?;
         self.deferred_references
             .lock()
             .map_err(|_| anyhow!("deferred reference lock poisoned"))?
-            .insert(key, reference_id.clone());
+            .insert(key, validation);
         Ok(Some(reference_id))
     }
 
@@ -1027,18 +1596,33 @@ impl ProjectEngine {
         index: &ProjectIndex,
         request: &ContextPackRequest,
         explicit_paths: &[String],
-    ) -> Result<(Vec<SearchHit>, Vec<String>)> {
+    ) -> Result<(Vec<SearchHit>, Vec<String>, FrontierOutcome)> {
+        let retrieval = self.retrieve_candidates_deferred(index, request, explicit_paths)?;
+        if let Some(record) = retrieval.pending {
+            self.admit_frontier_batch(&[record])?;
+        }
+        Ok((retrieval.hits, retrieval.terms, retrieval.outcome))
+    }
+
+    fn retrieve_candidates_deferred(
+        &self,
+        index: &ProjectIndex,
+        request: &ContextPackRequest,
+        explicit_paths: &[String],
+    ) -> Result<DeferredRetrieval> {
         let terms = normalize_terms(&request.prompt, 8);
-        let term_fingerprints = concept_fingerprints(&terms);
+        let mut term_fingerprints = concept_fingerprints(&terms);
+        term_fingerprints.sort();
+        term_fingerprints.dedup();
         let route = classify_route(&request.prompt);
         let mut scope = explicit_paths.to_vec();
         scope.sort();
         scope.dedup();
         let signature = &index.stats().refresh_signature;
-        let simhash = concept_simhash(&term_fingerprints);
+        let generation = self.freshness.generation.load(Ordering::Acquire);
         let now = now_millis();
 
-        let match_record = {
+        let (match_record, capacity_fallback) = {
             let mut state = self
                 .frontiers
                 .lock()
@@ -1053,33 +1637,36 @@ impl ProjectEngine {
                 .map(|record| record.estimated_bytes())
                 .sum();
             let exact = state.records.iter().position(|record| {
-                record.route == route && record.scope == scope && record.terms == term_fingerprints
+                record.scope == scope
+                    && record.terms == term_fingerprints
+                    && record.generation == generation
+                    && record.candidate_capacity >= request.max_items
             });
-            let approximate = exact.or_else(|| {
-                state.records.iter().position(|record| {
-                    record.route == route
-                        && record.scope == scope
-                        && concept_jaccard(&record.terms, &term_fingerprints) >= 0.70
-                        && (record.simhash ^ simhash).count_ones() <= 6
-                })
-            });
-            approximate.and_then(|position| {
+            let capacity_fallback = exact.is_none()
+                && state.records.iter().any(|record| {
+                    record.scope == scope
+                        && record.terms == term_fingerprints
+                        && record.generation == generation
+                        && record.candidate_capacity < request.max_items
+                });
+            let record = exact.and_then(|position| {
                 let record = state.records.remove(position)?;
                 state.records.push_back(Arc::clone(&record));
-                Some((record, exact.is_some()))
-            })
+                Some(record)
+            });
+            (record, capacity_fallback)
         };
 
-        if let Some((record, exact)) = match_record {
+        let had_match = match_record.is_some();
+        if let Some(record) = match_record {
             if record.negative {
-                if exact {
-                    self.metrics.l1_exact_hits.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.metrics
-                        .l1_approximate_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok((Vec::new(), terms));
+                self.metrics.l1_exact_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(DeferredRetrieval {
+                    hits: Vec::new(),
+                    terms,
+                    pending: None,
+                    outcome: FrontierOutcome::NegativeHit,
+                });
             }
             let (hits, reranked_terms) = index.rerank(
                 &request.prompt,
@@ -1088,14 +1675,13 @@ impl ProjectEngine {
                 usize::from(request.max_items),
             )?;
             if !hits.is_empty() {
-                if exact {
-                    self.metrics.l1_exact_hits.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.metrics
-                        .l1_approximate_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok((hits, reranked_terms));
+                self.metrics.l1_exact_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(DeferredRetrieval {
+                    hits,
+                    terms: reranked_terms,
+                    pending: None,
+                    outcome: FrontierOutcome::ExactHit,
+                });
             }
         }
 
@@ -1107,25 +1693,56 @@ impl ProjectEngine {
             explicit_paths,
             usize::from(request.max_items),
         )?;
-        self.admit_frontier(index, route, scope, term_fingerprints, &hits)?;
-        Ok((hits, terms))
+        let record = self.build_frontier_record(
+            index,
+            route,
+            scope,
+            term_fingerprints,
+            request.max_items,
+            &hits,
+        )?;
+        let should_admit = hits.is_empty() || {
+            let mut tracker = self
+                .frontier_admissions
+                .lock()
+                .map_err(|_| anyhow!("frontier admission tracker poisoned"))?;
+            tracker.observe(record.key.clone(), now)
+        };
+        let outcome = if should_admit && !hits.is_empty() {
+            FrontierOutcome::Admitted
+        } else if capacity_fallback {
+            FrontierOutcome::CapacityFallback
+        } else if had_match {
+            FrontierOutcome::SourceFallback
+        } else {
+            FrontierOutcome::Search
+        };
+        Ok(DeferredRetrieval {
+            hits,
+            terms,
+            pending: should_admit.then_some(record),
+            outcome,
+        })
     }
 
-    fn admit_frontier(
+    fn build_frontier_record(
         &self,
         index: &ProjectIndex,
         route: &str,
         scope: Vec<String>,
         terms: Vec<String>,
+        candidate_capacity: u8,
         hits: &[SearchHit],
-    ) -> Result<()> {
+    ) -> Result<Arc<FrontierRecord>> {
+        let generation = self.freshness.generation.load(Ordering::Acquire);
         let now = now_millis();
         let key = digest_id(
             "fr_",
             &serde_json::to_vec(&json!({
-                "route": route,
                 "scope": &scope,
                 "terms": &terms,
+                "generation": generation,
+                "candidate_capacity": candidate_capacity,
                 "signature": &index.stats().refresh_signature,
             }))?,
         );
@@ -1140,12 +1757,13 @@ impl ProjectEngine {
         let mut dependencies = hits.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>();
         dependencies.sort();
         dependencies.dedup();
-        let record = Arc::new(FrontierRecord {
-            schema: "context_frontier.v1".to_owned(),
+        Ok(Arc::new(FrontierRecord {
+            schema: "context_frontier.v2".to_owned(),
             key: key.clone(),
             route: route.to_owned(),
             scope,
-            simhash: concept_simhash(&terms),
+            generation,
+            candidate_capacity,
             terms,
             candidate_ids: hits.iter().map(|hit| hit.id.clone()).collect(),
             scores: hits.iter().map(|hit| hit.score).collect(),
@@ -1160,15 +1778,33 @@ impl ProjectEngine {
                 0
             },
             updated_at_ms: now,
-        });
-        self.store
-            .put_json(&format!("frontier:{key}"), &serde_json::to_value(&*record)?)?;
-        {
-            let mut state = self
-                .frontiers
-                .lock()
-                .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
-            if let Some(position) = state.records.iter().position(|item| item.key == key)
+        }))
+    }
+
+    fn admit_frontier_batch(&self, records: &[Arc<FrontierRecord>]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let rows = records
+            .iter()
+            .map(|record| {
+                Ok((
+                    format!("frontier:{}", record.key),
+                    serde_json::to_value(&**record)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.store.put_json_batch(&rows)?;
+        let mut state = self
+            .frontiers
+            .lock()
+            .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
+        for record in records {
+            let key = &record.key;
+            if let Some(position) = state
+                .records
+                .iter()
+                .position(|item| item.key.as_str() == key.as_str())
                 && let Some(previous) = state.records.remove(position)
             {
                 state.bytes = state.bytes.saturating_sub(previous.estimated_bytes());
@@ -1183,9 +1819,10 @@ impl ProjectEngine {
             }
             if bytes <= L1_MEMORY_MAX_BYTES {
                 state.bytes = state.bytes.saturating_add(bytes);
-                state.records.push_back(record);
+                state.records.push_back(Arc::clone(record));
             }
         }
+        drop(state);
         prune_persistent_frontiers(&self.store)
     }
 
@@ -1212,10 +1849,10 @@ impl ProjectEngine {
         self.metrics.record_pack_telemetry(*telemetry);
     }
 
-    fn ensure_fresh(&self, request: &ContextPackRequest) -> Result<()> {
+    fn ensure_fresh(&self, request: &ContextPackRequest) -> Result<(bool, bool)> {
         let force =
             request.cache_strategy == CacheStrategy::Fresh || !request.changed_files.is_empty();
-        self.refresh_index(force).map(|_| ())
+        self.refresh_index(force)
     }
 
     fn refresh_index(&self, force: bool) -> Result<(bool, bool)> {
@@ -1343,17 +1980,18 @@ impl ProjectEngine {
         result
     }
 
-    pub fn context_admin(&self, request: &ContextAdminRequest) -> Result<Vec<u8>> {
+    pub async fn context_admin(&self, request: &ContextAdminRequest) -> Result<Vec<u8>> {
         let started = Instant::now();
         let operation = admin_operation(&request.mode);
-        let result = (|| {
+        let result = async {
             self.validate_project_selector(
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
-            let value = admin_dispatch(self, request)?;
+            let value = admin_dispatch(self, request).await?;
             serde_json::to_vec(&value).map_err(Into::into)
-        })();
+        }
+        .await;
         self.record_result(operation, started, &result);
         result
     }
@@ -1815,7 +2453,8 @@ fn load_frontiers(store: &StateStore, refresh_signature: &str) -> Result<Frontie
         .into_iter()
         .filter_map(|(_, value)| serde_json::from_value::<FrontierRecord>(value).ok())
         .filter(|record| {
-            record.refresh_signature == refresh_signature
+            record.schema == "context_frontier.v2"
+                && record.refresh_signature == refresh_signature
                 && (!record.negative || record.expires_at_ms > now)
         })
         .collect::<Vec<_>>();
@@ -1849,7 +2488,7 @@ fn load_pack_snapshots(store: &StateStore) -> Result<HashMap<String, Arc<PackSna
         .collect())
 }
 
-fn load_deferred_references(store: &StateStore) -> Result<HashMap<String, String>> {
+fn load_deferred_references(store: &StateStore) -> Result<HashMap<String, ReferenceValidation>> {
     let mut references = HashMap::new();
     for (key, value) in store.iter_json("deferred:")? {
         let Some(cache_key) = key.strip_prefix("deferred:") else {
@@ -1858,8 +2497,8 @@ fn load_deferred_references(store: &StateStore) -> Result<HashMap<String, String
         let Some(reference_id) = value.get("reference_id").and_then(Value::as_str) else {
             continue;
         };
-        if store.reference_is_active(reference_id)? {
-            references.insert(cache_key.to_owned(), reference_id.to_owned());
+        if let Some(validation) = store.reference_validation(reference_id)? {
+            references.insert(cache_key.to_owned(), validation);
         }
     }
     Ok(references)
@@ -1903,16 +2542,6 @@ fn prune_persistent_frontiers(store: &StateStore) -> Result<()> {
     Ok(())
 }
 
-fn concept_jaccard(left: &[String], right: &[String]) -> f64 {
-    let left = left.iter().map(String::as_str).collect::<HashSet<_>>();
-    let right = right.iter().map(String::as_str).collect::<HashSet<_>>();
-    let union = left.union(&right).count();
-    if union == 0 {
-        return 1.0;
-    }
-    left.intersection(&right).count() as f64 / union as f64
-}
-
 fn concept_fingerprints(terms: &[String]) -> Vec<String> {
     terms
         .iter()
@@ -1920,34 +2549,7 @@ fn concept_fingerprints(terms: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn concept_simhash(terms: &[String]) -> u64 {
-    if terms.is_empty() {
-        return 0;
-    }
-    let mut votes = [0_i16; 64];
-    for term in terms {
-        let digest = Sha256::digest(term.as_bytes());
-        let mut bytes = [0_u8; 8];
-        bytes.copy_from_slice(&digest[..8]);
-        let value = u64::from_be_bytes(bytes);
-        for (bit, vote) in votes.iter_mut().enumerate() {
-            if value & (1_u64 << bit) == 0 {
-                *vote -= 1;
-            } else {
-                *vote += 1;
-            }
-        }
-    }
-    votes.iter().enumerate().fold(0_u64, |value, (bit, vote)| {
-        if *vote >= 0 {
-            value | (1_u64 << bit)
-        } else {
-            value
-        }
-    })
-}
-
-fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -> Result<Value> {
+async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -> Result<Value> {
     let now = now_iso()?;
     let index = engine.index();
     let stats = index.stats();
@@ -2023,6 +2625,12 @@ fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -> Resu
             engine.invalidate_l0();
             let mut expired_removed = 0_u64;
             let mut stale_removed = 0_u64;
+            let mut age_removed = 0_u64;
+            let mut deferred_removed = 0_u64;
+            let mut reference_removed = 0_u64;
+            let now_ms = now_millis();
+            let max_age_ms = u64::from(request.max_age_minutes).saturating_mul(60_000);
+            let mut remove_keys = Vec::new();
             for (key, value) in engine.store.iter_json("frontier:")? {
                 let expired = value
                     .get("negative")
@@ -2031,17 +2639,56 @@ fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -> Resu
                     && value
                         .get("expires_at_ms")
                         .and_then(Value::as_u64)
-                        .is_some_and(|expiry| expiry <= now_millis());
-                let stale = value.get("refresh_signature").and_then(Value::as_str)
-                    != Some(stats.refresh_signature.as_str());
-                if (expired || stale) && engine.store.delete(&key)? {
-                    if expired {
-                        expired_removed += 1;
-                    } else {
-                        stale_removed += 1;
-                    }
+                        .is_some_and(|expiry| expiry <= now_ms);
+                let stale = value.get("schema").and_then(Value::as_str)
+                    != Some("context_frontier.v2")
+                    || value.get("refresh_signature").and_then(Value::as_str)
+                        != Some(stats.refresh_signature.as_str());
+                let aged = value
+                    .get("updated_at_ms")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|updated| {
+                        updated <= now_ms && now_ms.saturating_sub(updated) >= max_age_ms
+                    });
+                if expired {
+                    expired_removed = expired_removed.saturating_add(1);
+                    remove_keys.push(key);
+                } else if stale {
+                    stale_removed = stale_removed.saturating_add(1);
+                    remove_keys.push(key);
+                } else if aged {
+                    age_removed = age_removed.saturating_add(1);
+                    remove_keys.push(key);
                 }
             }
+            let now_time = OffsetDateTime::now_utc();
+            for (key, value) in engine.store.iter_json("deferred:")? {
+                let inactive = match value.get("reference_id").and_then(Value::as_str) {
+                    Some(reference_id) => !engine.store.reference_is_active(reference_id)?,
+                    None => true,
+                };
+                let expired = value
+                    .get("expires_at")
+                    .and_then(Value::as_str)
+                    .and_then(|expiry| OffsetDateTime::parse(expiry, &Rfc3339).ok())
+                    .is_some_and(|expiry| expiry <= now_time);
+                if inactive || expired {
+                    deferred_removed = deferred_removed.saturating_add(1);
+                    remove_keys.push(key);
+                }
+            }
+            for (key, value) in engine.store.iter_json("reference:")? {
+                let expired = value
+                    .get("expires_at")
+                    .and_then(Value::as_str)
+                    .and_then(|expiry| OffsetDateTime::parse(expiry, &Rfc3339).ok())
+                    .is_none_or(|expiry| expiry <= now_time);
+                if expired {
+                    reference_removed = reference_removed.saturating_add(1);
+                    remove_keys.push(key);
+                }
+            }
+            let persistent_removed = engine.store.delete_batch(&remove_keys)? as u64;
             let mut frontiers = engine
                 .frontiers
                 .lock()
@@ -2050,42 +2697,15 @@ fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -> Resu
             Ok(json!({
                 "schema": "context_cache.prune.v1",
                 "entry_count": frontiers.records.len(),
-                "removed_entries": l0_removed + expired_removed + stale_removed,
+                "removed_entries": l0_removed + persistent_removed,
                 "expired_removed": expired_removed,
                 "stale_removed": stale_removed,
+                "age_removed": age_removed,
+                "deferred_removed": deferred_removed,
+                "reference_removed": reference_removed,
             }))
         }
-        "warmup" => Ok(json!({
-            "schema": "context_cache.warmup.v1",
-            "generated_at": now,
-            "elapsed_ms": 0.0,
-            "project_id": engine.project_id,
-            "trigger": "manual",
-            "generated_state_only": true,
-            "repo_boundary_enforced": true,
-            "index": {
-                "schema": "context_index.refresh.v1",
-                "file_count": stats.file_count,
-                "import_count": stats.chunk_count,
-                "symbol_count": stats.symbol_chunks,
-                "search_mode": "tantivy",
-                "skipped": true,
-                "reason": "native_reader_already_warm",
-            },
-            "cache": {"entry_count_before": 0, "entry_count_after": 0},
-            "workspace": {"file_count": stats.file_count},
-            "symbols": {"count": stats.symbol_chunks},
-            "state": {"overlay": "rust-v2"},
-            "manifest": {"schema": "warmup.manifest.v1", "project_id": engine.project_id},
-            "hot_chunks": {"target_count": 0, "targets": []},
-            "route_seeds": {"routes": {}},
-            "search_cache": {"hits": 0, "misses": 0},
-            "file_summary_cache": {"hits": 0, "misses": 0, "summary_count": 0},
-            "term_stats": {},
-            "test_owner_targets": [],
-            "stage_timings_ms": {},
-            "omitted": [],
-        })),
+        "warmup" => warmup_dispatch(engine, request, &now).await,
         "budget" => {
             let value = json!({
                 "schema": "context_budget.v1",
@@ -2148,6 +2768,140 @@ fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -> Resu
         }
         "schema_minify" => Ok(contract_for_tool(&request.tool_name)),
         unsupported => bail!("unsupported context_admin mode: {unsupported}"),
+    }
+}
+
+async fn warmup_dispatch(
+    engine: &ProjectEngine,
+    request: &ContextAdminRequest,
+    generated_at: &str,
+) -> Result<Value> {
+    let started = Instant::now();
+    let l0_before = engine.l0_storage_stats();
+    let l1_before = engine
+        .frontiers
+        .lock()
+        .map_err(|_| anyhow!("frontier cache lock poisoned"))?
+        .records
+        .len() as u64;
+    let exact_before = engine.metrics.l1_exact_hits.load(Ordering::Relaxed);
+    let approximate_before = engine.metrics.l1_approximate_hits.load(Ordering::Relaxed);
+    let misses_before = engine.metrics.retrieval_misses.load(Ordering::Relaxed);
+
+    let refresh_started = Instant::now();
+    let (refresh_checked, refresh_updated) = engine.refresh_index(false)?;
+    let refresh_elapsed_ms = refresh_started.elapsed().as_secs_f64() * 1_000.0;
+    let stats = engine.index().stats().clone();
+
+    let prompt_warmed = !request.prompt.trim().is_empty();
+    let prompt_started = Instant::now();
+    if prompt_warmed {
+        let focus_path = (!request.path.trim().is_empty() && request.path.trim() != ".")
+            .then(|| request.path.trim());
+        let prompt_request = warmup_prompt_request(&request.prompt, focus_path);
+        engine.admit_context_pack_cached(&prompt_request).await?;
+    }
+    let prompt_elapsed_ms = prompt_started.elapsed().as_secs_f64() * 1_000.0;
+
+    let l0_after = engine.l0_storage_stats();
+    let l1_after = engine
+        .frontiers
+        .lock()
+        .map_err(|_| anyhow!("frontier cache lock poisoned"))?
+        .records
+        .len() as u64;
+    let exact_hits = engine
+        .metrics
+        .l1_exact_hits
+        .load(Ordering::Relaxed)
+        .saturating_sub(exact_before);
+    let approximate_hits = engine
+        .metrics
+        .l1_approximate_hits
+        .load(Ordering::Relaxed)
+        .saturating_sub(approximate_before);
+    let misses = engine
+        .metrics
+        .retrieval_misses
+        .load(Ordering::Relaxed)
+        .saturating_sub(misses_before);
+    let hits = exact_hits.saturating_add(approximate_hits);
+    let query_count = hits.saturating_add(misses);
+    engine.metrics.warmup_runs.fetch_add(1, Ordering::Relaxed);
+    let total_elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+    Ok(json!({
+        "schema": "context_cache.warmup.v1",
+        "generated_at": generated_at,
+        "elapsed_ms": total_elapsed_ms,
+        "project_id": engine.project_id,
+        "trigger": "manual",
+        "generated_state_only": true,
+        "repo_boundary_enforced": true,
+        "index": {
+            "schema": "context_index.refresh.v1",
+            "file_count": stats.file_count,
+            "import_count": stats.chunk_count,
+            "symbol_count": stats.symbol_chunks,
+            "search_mode": "tantivy",
+            "skipped": !refresh_checked,
+            "updated": refresh_updated,
+            "reason": if refresh_updated {"signature_changed"} else {"signature_unchanged"},
+        },
+        "cache": {
+            "entry_count_before": l0_before.entries.saturating_add(l1_before),
+            "entry_count_after": l0_after.entries.saturating_add(l1_after),
+            "l0_before": l0_before.entries,
+            "l0_after": l0_after.entries,
+            "l1_before": l1_before,
+            "l1_after": l1_after,
+        },
+        "workspace": {"file_count": stats.file_count},
+        "symbols": {"count": stats.symbol_chunks},
+        "state": {"overlay": "rust-v2"},
+        "manifest": {
+            "schema": "warmup.manifest.v1",
+            "project_id": engine.project_id,
+            "prompt_warmed": prompt_warmed,
+        },
+        "hot_chunks": {"target_count": 0, "targets": []},
+        "route_seeds": {"routes": {}, "seed_count": 0},
+        "search_cache": {
+            "query_count": query_count,
+            "hits": hits,
+            "misses": misses,
+            "exact_hits": exact_hits,
+            "approximate_hits": approximate_hits,
+        },
+        "file_summary_cache": {"hits": 0, "misses": 0, "summary_count": 0},
+        "term_stats": {},
+        "test_owner_targets": [],
+        "stage_timings_ms": {
+            "refresh": refresh_elapsed_ms,
+            "retrieval": 0.0,
+            "prompt_cache": prompt_elapsed_ms,
+            "total": total_elapsed_ms,
+        },
+        "omitted": [],
+    }))
+}
+
+fn warmup_prompt_request(prompt: &str, focus_path: Option<&str>) -> ContextPackRequest {
+    ContextPackRequest {
+        prompt: prompt.to_owned(),
+        changed_files: Vec::new(),
+        focus_paths: focus_path.into_iter().map(str::to_owned).collect(),
+        memory_session: None,
+        client_profile: None,
+        model_profile: None,
+        project_id: None,
+        root_uri: None,
+        max_items: default_max_items(),
+        max_source_tokens: default_max_source_tokens(),
+        evidence_policy: EvidencePolicy::Balanced,
+        cache_strategy: CacheStrategy::Fast,
+        base_pack: None,
+        known_evidence: Vec::new(),
     }
 }
 
@@ -2283,7 +3037,7 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
             "total_count": engine.metrics.total_references.load(Ordering::Relaxed),
         },
         "tooling": {"external_calls_saved_est": 0},
-        "warmup": {"runs": 0},
+        "warmup": {"runs": engine.metrics.warmup_runs.load(Ordering::Relaxed)},
         "benchmarks": {},
         "index_freshness": {
             "strategy": "notify_with_polling_fallback",
@@ -2638,8 +3392,10 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "context_resource_proxy.v1"
             ]),
             json!({
-                "mode": "health, projects, active_projects, cached_projects, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, metrics_and_matrix, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
+                "mode": "health, projects, active_projects, cached_projects, monitor_usage, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, metrics_and_matrix, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
+                "action": "For monitor_usage: status, enable, disable, or report.",
                 "path": "Repository-relative path or resource URI.", "max_files": "Index file cap.",
+                "prompt": "Optional prompt to warm exact context_pack cache without echoing it.",
                 "max_age_minutes": "Cache prune age.", "max_entries": "Maximum rows.",
                 "max_output_chars": "Budget override.", "default_output_profile": "Budget profile.",
                 "tool_name": "Filter to one tool.", "contract_profile": "compact or verbose.",
@@ -3788,6 +4544,7 @@ fn admin_operation(mode: &str) -> &'static str {
         "index_status" => "context_admin.index_status",
         "cache_stats" => "context_admin.cache_stats",
         "cache_prune" => "context_admin.cache_prune",
+        "monitor_usage" => "context_admin.monitor_usage",
         "warmup" => "context_admin.warmup",
         "budget" => "context_admin.budget",
         "contracts" => "context_admin.contracts",
@@ -4085,8 +4842,8 @@ mod tests {
         assert_eq!(glob["results"][0]["path"], "tests/test_scope.rs");
     }
 
-    #[test]
-    fn explicit_index_refresh_rebuilds_before_lookup_and_metrics_keep_monitor_fields() {
+    #[tokio::test]
+    async fn explicit_index_refresh_rebuilds_before_lookup_and_metrics_keep_monitor_fields() {
         let root = tempdir().expect("temporary repository");
         std::fs::write(root.path().join("notes.txt"), "before refresh\n").expect("fixture");
         let engine = ProjectEngine::build(root.path()).expect("engine");
@@ -4096,7 +4853,7 @@ mod tests {
         let refresh: ContextAdminRequest =
             serde_json::from_value(json!({"mode": "index_refresh"})).expect("refresh request");
         let refresh: Value =
-            serde_json::from_slice(&engine.context_admin(&refresh).expect("refresh index"))
+            serde_json::from_slice(&engine.context_admin(&refresh).await.expect("refresh index"))
                 .expect("refresh JSON");
         assert_eq!(refresh["skipped"], false);
         assert_eq!(refresh["updated_count"], 1);
@@ -4132,7 +4889,7 @@ mod tests {
         let metrics: ContextAdminRequest =
             serde_json::from_value(json!({"mode": "metrics"})).expect("metrics request");
         let metrics: Value =
-            serde_json::from_slice(&engine.context_admin(&metrics).expect("metrics"))
+            serde_json::from_slice(&engine.context_admin(&metrics).await.expect("metrics"))
                 .expect("metrics JSON");
         assert_eq!(
             metrics["requests"]["by_operation"]["context_pack"]["count"],
@@ -4184,9 +4941,13 @@ mod tests {
         );
         let matrix: ContextAdminRequest =
             serde_json::from_value(json!({"mode": "measurement_matrix"})).expect("matrix request");
-        let matrix: Value =
-            serde_json::from_slice(&engine.context_admin(&matrix).expect("measurement matrix"))
-                .expect("measurement matrix JSON");
+        let matrix: Value = serde_json::from_slice(
+            &engine
+                .context_admin(&matrix)
+                .await
+                .expect("measurement matrix"),
+        )
+        .expect("measurement matrix JSON");
         assert_eq!(matrix["checks"][0]["status"], "pass");
         assert_eq!(
             matrix["checks"][1]["key"],
@@ -4218,8 +4979,8 @@ mod tests {
         assert_eq!(response["matrix"]["checks"][0]["status"], "insufficient");
     }
 
-    #[test]
-    fn stable_admin_modes_and_resources_keep_schema_and_path_boundaries() {
+    #[tokio::test]
+    async fn stable_admin_modes_and_resources_keep_schema_and_path_boundaries() {
         let root = tempdir().expect("temporary repository");
         std::fs::write(root.path().join("README.md"), "# Fixture\n").expect("fixture file");
         let engine = ProjectEngine::build(root.path()).expect("engine");
@@ -4249,9 +5010,13 @@ mod tests {
                 "tool_name": "context_lookup"
             }))
             .expect("admin request");
-            let response: Value =
-                serde_json::from_slice(&engine.context_admin(&request).expect("admin response"))
-                    .expect("admin JSON");
+            let response: Value = serde_json::from_slice(
+                &engine
+                    .context_admin(&request)
+                    .await
+                    .expect("admin response"),
+            )
+            .expect("admin JSON");
             assert_eq!(response["schema"], schema, "mode={mode}");
             assert!(
                 !response
@@ -4274,9 +5039,13 @@ mod tests {
         );
         let metrics: ContextAdminRequest =
             serde_json::from_value(json!({"mode": "metrics"})).expect("metrics request");
-        let metrics: Value =
-            serde_json::from_slice(&engine.context_admin(&metrics).expect("metrics response"))
-                .expect("metrics JSON");
+        let metrics: Value = serde_json::from_slice(
+            &engine
+                .context_admin(&metrics)
+                .await
+                .expect("metrics response"),
+        )
+        .expect("metrics JSON");
         assert_eq!(
             metrics["requests"]["by_operation"]["resource.summary"]["count"],
             1
@@ -4463,6 +5232,438 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn l0_revalidates_references_and_rebuilds_invalid_entries() {
+        for mutation in ["missing", "expired", "tampered"] {
+            let root = tempdir().expect("temporary repository");
+            std::fs::write(
+                root.path().join("cache.rs"),
+                "fn active_reference_cache() { assert!(true); }\n",
+            )
+            .expect("fixture file");
+            let engine = ProjectEngine::build(root.path()).expect("engine");
+            let request: ContextPackRequest = serde_json::from_value(json!({
+                "prompt": "active reference cache",
+                "focus_paths": ["cache.rs"]
+            }))
+            .expect("pack request");
+            let first = engine
+                .context_pack_cached(&request)
+                .await
+                .expect("first response");
+            let first_pack: ContextPackV2 = serde_json::from_slice(&first).expect("first pack");
+            let reference_id = first_pack.more.expect("active more reference");
+            let key = format!("reference:{reference_id}");
+            assert!(
+                engine
+                    .store
+                    .reference_is_active(&reference_id)
+                    .expect("active reference")
+            );
+            match mutation {
+                "missing" => {
+                    engine.store.delete(&key).expect("delete reference");
+                }
+                "expired" => {
+                    let mut record = engine
+                        .store
+                        .get_json(&key)
+                        .expect("reference read")
+                        .expect("record");
+                    record["expires_at"] = Value::String("2000-01-01T00:00:00Z".to_owned());
+                    engine
+                        .store
+                        .put_json(&key, &record)
+                        .expect("expire reference");
+                }
+                "tampered" => {
+                    let mut record = engine
+                        .store
+                        .get_json(&key)
+                        .expect("reference read")
+                        .expect("record");
+                    record["body"] = Value::String("tampered".to_owned());
+                    engine
+                        .store
+                        .put_json(&key, &record)
+                        .expect("tamper reference");
+                }
+                _ => unreachable!(),
+            }
+
+            let second = engine
+                .context_pack_cached(&request)
+                .await
+                .expect("rebuilt response");
+            assert_eq!(first, second, "mutation={mutation}");
+            assert!(
+                engine
+                    .store
+                    .reference_is_active(&reference_id)
+                    .expect("rebuilt reference")
+            );
+            assert_eq!(engine.metrics.l0_hits.load(Ordering::Relaxed), 0);
+            assert_eq!(engine.metrics.l0_misses.load(Ordering::Relaxed), 2);
+            assert_eq!(engine.metrics.l0_invalidations.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn naturally_expired_l0_entry_is_a_second_cold_miss() {
+        let root = tempdir().expect("temporary repository");
+        let state = tempdir().expect("temporary state");
+        std::fs::write(root.path().join("cache.rs"), "fn idle_cache() {}\n").expect("fixture file");
+        let engine = ProjectEngine::build_with_state_and_l0_idle(
+            root.path(),
+            state.path(),
+            "idle-expiry",
+            StdDuration::from_millis(5),
+            Arc::new(UsageMonitor::open(state.path().join("monitor")).expect("monitor")),
+        )
+        .expect("engine");
+        let request: ContextPackRequest =
+            serde_json::from_value(json!({"prompt": "idle_cache"})).expect("request");
+        engine
+            .context_pack_cached(&request)
+            .await
+            .expect("first response");
+        std::thread::sleep(StdDuration::from_millis(30));
+        engine
+            .context_pack_cached(&request)
+            .await
+            .expect("second response");
+
+        assert_eq!(engine.metrics.l0_misses.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            engine
+                .metrics
+                .l0_cold_or_invalidated_misses
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            engine
+                .metrics
+                .l0_request_variant_misses
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_populates_l1_and_optional_l0_without_pack_telemetry() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(
+            root.path().join("architecture.rs"),
+            "fn repository_architecture() {}\nfn implementation_source_code() {}\nfn review_correctness_safety() {}\n",
+        )
+        .expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let secret_prompt = "  private prompt cache architecture  ";
+        let request: ContextAdminRequest = serde_json::from_value(json!({
+            "mode": "warmup",
+            "prompt": secret_prompt,
+            "path": "architecture.rs"
+        }))
+        .expect("warmup request");
+        let response = engine
+            .context_admin(&request)
+            .await
+            .expect("warmup response");
+        let warmup: Value = serde_json::from_slice(&response).expect("warmup JSON");
+
+        assert_eq!(warmup["schema"], "context_cache.warmup.v1");
+        assert_eq!(warmup["manifest"]["prompt_warmed"], true);
+        assert_eq!(warmup["cache"]["l1_after"], 0);
+        assert_eq!(warmup["cache"]["l0_after"], 1);
+        assert_eq!(warmup["search_cache"]["query_count"], 1);
+        assert!(!String::from_utf8_lossy(&response).contains(secret_prompt));
+        let prompt_request = warmup_prompt_request(secret_prompt, Some("architecture.rs"));
+        engine
+            .admit_context_pack_cached(&prompt_request)
+            .await
+            .expect("warm exact L0 hit");
+        assert_eq!(engine.metrics.l0_hits.load(Ordering::Relaxed), 1);
+        assert!(
+            !engine
+                .metrics
+                .operations
+                .lock()
+                .expect("operations")
+                .contains_key("context_pack")
+        );
+        assert_eq!(
+            engine.metrics.pack_wire_tokens_est.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(engine.metrics.warmup_runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn generic_warmup_is_empty_and_positive_frontier_requires_two_hits() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(
+            root.path().join("warmup.rs"),
+            "fn repository_architecture() {}\nfn implementation_source_code() {}\nfn debug_failing_tests() {}\nfn review_correctness_safety() {}\nfn test_coverage_ownership() {}\n",
+        )
+        .expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let request: ContextAdminRequest =
+            serde_json::from_value(json!({"mode": "warmup"})).expect("warmup request");
+        let response: Value = serde_json::from_slice(
+            &engine
+                .context_admin(&request)
+                .await
+                .expect("warmup response"),
+        )
+        .expect("warmup JSON");
+
+        assert_eq!(response["search_cache"]["query_count"], 0);
+        assert_eq!(
+            engine
+                .store
+                .iter_json("frontier:")
+                .expect("frontiers")
+                .len(),
+            0
+        );
+        let index = engine.index();
+        let adaptive = warmup_prompt_request("repository architecture", None);
+        engine
+            .retrieve_candidates(&index, &adaptive, &[])
+            .expect("first observation");
+        assert!(
+            engine
+                .store
+                .iter_json("frontier:")
+                .expect("frontiers")
+                .is_empty()
+        );
+        engine
+            .retrieve_candidates(&index, &adaptive, &[])
+            .expect("second observation");
+        assert_eq!(
+            engine
+                .store
+                .iter_json("frontier:")
+                .expect("frontiers")
+                .len(),
+            1
+        );
+        engine
+            .retrieve_candidates(&index, &adaptive, &[])
+            .expect("exact adaptive reuse");
+        assert_eq!(engine.metrics.l1_exact_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn detailed_usage_is_global_default_off_bounded_and_prompt_safe() {
+        let root = tempdir().expect("temporary repository");
+        let state = tempdir().expect("temporary state");
+        std::fs::write(
+            root.path().join("usage.rs"),
+            "fn private_usage_anchor() {}\n",
+        )
+        .expect("fixture file");
+        let monitor = Arc::new(UsageMonitor::open(state.path().join("global")).expect("monitor"));
+        let engine = ProjectEngine::build_with_state_and_monitor(
+            root.path(),
+            state.path().join("project"),
+            "usage-project",
+            Arc::clone(&monitor),
+        )
+        .expect("engine");
+        let secret = "private usage prompt";
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": secret,
+            "focus_paths": ["usage.rs"]
+        }))
+        .expect("request");
+
+        let disabled_bytes = engine
+            .context_pack_cached(&request)
+            .await
+            .expect("disabled pack");
+        let disabled_pack: ContextPackV2 =
+            serde_json::from_slice(&disabled_bytes).expect("disabled response");
+        assert!(
+            monitor.report(Some("usage-project")).expect("report")["buckets"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        monitor.action("enable", None).expect("enable");
+        let mut admitted = request.clone();
+        admitted.known_evidence = vec!["client-one".to_owned()];
+        engine
+            .context_pack_cached(&admitted)
+            .await
+            .expect("admission pack");
+        let mut delta = request.clone();
+        delta.base_pack = Some(disabled_pack.id);
+        delta.known_evidence = vec!["client-two".to_owned()];
+        delta.cache_strategy = CacheStrategy::Fresh;
+        engine
+            .context_pack_cached(&delta)
+            .await
+            .expect("delta pack");
+        engine
+            .context_pack_cached(&delta)
+            .await
+            .expect("cached delta pack");
+        let enabled = monitor
+            .report(Some("usage-project"))
+            .expect("enabled report");
+        let bucket = &enabled["buckets"][0];
+        assert_eq!(bucket["request_count"], 3);
+        assert_eq!(bucket["cache_outcomes"]["l0_miss"], 2);
+        assert_eq!(bucket["cache_outcomes"]["l0_hit"], 1);
+        assert_eq!(bucket["frontier_outcomes"]["admitted"], 1);
+        assert_eq!(bucket["frontier_outcomes"]["exact_hit"], 1);
+        assert_eq!(bucket["index"]["refresh_checked"], 2);
+        assert_eq!(bucket["index"]["refresh_updated"], 0);
+        assert_eq!(bucket["delta"]["base_pack_requests"], 2);
+        assert_eq!(bucket["delta"]["known_evidence_requests"], 3);
+        assert_eq!(bucket["routes"]["explore"], 3);
+        assert_eq!(bucket["term_count_buckets"]["3_5"], 3);
+        assert_eq!(bucket["scope_count_buckets"]["1_2"], 3);
+        assert!(bucket["stages_micros"]["retrieval"].as_u64().is_some());
+        assert!(bucket["stages_micros"]["pack_build"].as_u64().is_some());
+        assert!(bucket["stages_micros"]["cache"].as_u64().is_some());
+        let encoded = enabled.to_string();
+        assert!(!encoded.contains(secret));
+        assert!(!encoded.contains("usage.rs"));
+        monitor.action("disable", None).expect("disable");
+        engine
+            .context_pack_cached(&request)
+            .await
+            .expect("disabled again");
+        assert_eq!(
+            monitor.report(Some("usage-project")).expect("final report")["buckets"][0]["request_count"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_prune_applies_reason_precedence_and_age_to_all_frontiers() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(root.path().join("cache.rs"), "fn prune_cache() {}\n")
+            .expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let signature = engine.index().stats().refresh_signature.clone();
+        let now = now_millis();
+        let record =
+            |key: &str, negative: bool, expires_at_ms: u64, refresh: &str, updated: Option<u64>| {
+                let mut value = serde_json::to_value(FrontierRecord {
+                    schema: "context_frontier.v2".to_owned(),
+                    key: key.to_owned(),
+                    route: "general".to_owned(),
+                    scope: Vec::new(),
+                    generation: 0,
+                    candidate_capacity: DEFAULT_MAX_ITEMS,
+                    terms: Vec::new(),
+                    candidate_ids: Vec::new(),
+                    scores: Vec::new(),
+                    cumulative_token_costs: Vec::new(),
+                    dependencies: Vec::new(),
+                    score_cutoff: 0.0,
+                    refresh_signature: refresh.to_owned(),
+                    negative,
+                    expires_at_ms,
+                    updated_at_ms: updated.unwrap_or_default(),
+                })
+                .expect("frontier JSON");
+                if updated.is_none() {
+                    value
+                        .as_object_mut()
+                        .expect("frontier object")
+                        .remove("updated_at_ms");
+                }
+                value
+            };
+        let old = now.saturating_sub(120 * 60_000);
+        for (key, value) in [
+            (
+                "frontier:expired",
+                record("expired", true, now.saturating_sub(1), "stale", Some(old)),
+            ),
+            (
+                "frontier:stale",
+                record("stale", false, 0, "stale", Some(old)),
+            ),
+            (
+                "frontier:aged",
+                record("aged", false, 0, &signature, Some(old)),
+            ),
+            (
+                "frontier:missing",
+                record("missing", false, 0, &signature, None),
+            ),
+            (
+                "frontier:recent",
+                record("recent", false, 0, &signature, Some(now)),
+            ),
+        ] {
+            engine.store.put_json(key, &value).expect("frontier row");
+        }
+        engine
+            .store
+            .put_json(
+                "reference:ctxref-expired",
+                &json!({"expires_at":"2000-01-01T00:00:00Z"}),
+            )
+            .expect("expired reference");
+        engine
+            .store
+            .put_json(
+                "deferred:expired",
+                &json!({
+                    "reference_id":"ctxref-expired",
+                    "expires_at":"2000-01-01T00:00:00Z"
+                }),
+            )
+            .expect("expired deferred row");
+        let prune: ContextAdminRequest = serde_json::from_value(json!({
+            "mode": "cache_prune", "max_age_minutes": 60
+        }))
+        .expect("prune request");
+        let response: Value =
+            serde_json::from_slice(&engine.context_admin(&prune).await.expect("prune response"))
+                .expect("prune JSON");
+        assert_eq!(response["expired_removed"], 1);
+        assert_eq!(response["stale_removed"], 1);
+        assert_eq!(response["age_removed"], 2);
+        assert_eq!(response["deferred_removed"], 1);
+        assert_eq!(response["reference_removed"], 1);
+        assert_eq!(
+            engine
+                .store
+                .iter_json("frontier:")
+                .expect("remaining")
+                .len(),
+            1
+        );
+
+        let prune_all: ContextAdminRequest = serde_json::from_value(json!({
+            "mode": "cache_prune", "max_age_minutes": 0
+        }))
+        .expect("prune all request");
+        let response: Value = serde_json::from_slice(
+            &engine
+                .context_admin(&prune_all)
+                .await
+                .expect("prune all response"),
+        )
+        .expect("prune all JSON");
+        assert_eq!(response["age_removed"], 1);
+        assert!(
+            engine
+                .store
+                .iter_json("frontier:")
+                .expect("empty")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn base_pack_delta_omits_unchanged_evidence() {
         let root = tempdir().expect("temporary repository");
@@ -4530,7 +5731,7 @@ mod tests {
     }
 
     #[test]
-    fn l1_approximate_match_reranks_fingerprinted_candidates() {
+    fn l1_never_serves_approximate_reordered_terms() {
         let root = tempdir().expect("temporary repository");
         std::fs::write(
             root.path().join("ranking.rs"),
@@ -4550,8 +5751,9 @@ mod tests {
         engine.context_pack(&reordered).expect("reranked pack");
         assert_eq!(
             engine.metrics.l1_approximate_hits.load(Ordering::Relaxed),
-            1
+            0
         );
+        assert_eq!(engine.metrics.retrieval_misses.load(Ordering::Relaxed), 2);
         let state = engine
             .store
             .iter_json("frontier:")
@@ -4561,6 +5763,103 @@ mod tests {
             .collect::<String>();
         assert!(!state.contains("deterministic frontier ranking candidate"));
         assert!(!state.contains("candidate ranking frontier deterministic"));
+    }
+
+    #[test]
+    fn l1_frontier_identity_is_route_independent_and_cold_equivalent() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(
+            root.path().join("shared.rs"),
+            "fn shared_frontier_anchor() { assert!(true); }\n",
+        )
+        .expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "review shared frontier anchor"
+        }))
+        .expect("request");
+        assert_eq!(classify_route(&request.prompt), "review");
+        let index = engine.index();
+        let (cold, terms) = index
+            .search(&request.prompt, &[], usize::from(request.max_items))
+            .expect("cold search");
+        let mut fingerprints = concept_fingerprints(&terms);
+        fingerprints.sort();
+        fingerprints.dedup();
+        let diagnostic_debug_record = engine
+            .build_frontier_record(
+                &index,
+                "debug",
+                Vec::new(),
+                fingerprints,
+                request.max_items,
+                &cold,
+            )
+            .expect("frontier");
+        engine
+            .admit_frontier_batch(&[diagnostic_debug_record])
+            .expect("admit frontier");
+
+        let (cached, _, outcome) = engine
+            .retrieve_candidates(&index, &request, &[])
+            .expect("route-independent hit");
+        assert!(matches!(outcome, FrontierOutcome::ExactHit));
+        assert_eq!(
+            cached.iter().map(|hit| &hit.id).collect::<Vec<_>>(),
+            cold.iter().map(|hit| &hit.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn negative_frontier_is_exact_only_and_does_not_mask_similar_search() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(
+            root.path().join("evidence.rs"),
+            "fn alpha_beta_gamma_delta_epsilon_eta() { assert!(true); }\n",
+        )
+        .expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let negative_prompt = "alpha beta gamma delta epsilon zeta";
+        let exact_request: ContextPackRequest =
+            serde_json::from_value(json!({"prompt": negative_prompt})).expect("exact request");
+        let terms = normalize_terms(negative_prompt, 8);
+        let index = engine.index();
+        let negative = engine
+            .build_frontier_record(
+                &index,
+                classify_route(negative_prompt),
+                Vec::new(),
+                {
+                    let mut fingerprints = concept_fingerprints(&terms);
+                    fingerprints.sort();
+                    fingerprints
+                },
+                DEFAULT_MAX_ITEMS,
+                &[],
+            )
+            .expect("negative frontier");
+        engine
+            .admit_frontier_batch(&[negative])
+            .expect("admit negative frontier");
+        let (exact_hits, _, _) = engine
+            .retrieve_candidates(&index, &exact_request, &[])
+            .expect("exact negative reuse");
+        assert!(exact_hits.is_empty());
+
+        let similar: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "alpha beta gamma delta epsilon eta"
+        }))
+        .expect("similar request");
+        let (similar_hits, _, _) = engine
+            .retrieve_candidates(&index, &similar, &[])
+            .expect("real similar search");
+        assert!(similar_hits.iter().any(|hit| hit.path == "evidence.rs"));
+        assert_eq!(engine.metrics.l1_exact_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            engine.metrics.l1_approximate_hits.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(engine.metrics.retrieval_misses.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -4590,6 +5889,7 @@ mod tests {
 
         engine.context_pack(&first).expect("first pack");
         engine.context_pack(&reordered).expect("reordered pack");
+        engine.context_pack(&first).expect("third pack");
 
         assert_eq!(engine.metrics.l1_exact_hits.load(Ordering::Relaxed), 1);
     }
