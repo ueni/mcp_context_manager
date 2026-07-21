@@ -16,6 +16,8 @@ services:
       MCP_HTTP_ALLOWED_HOSTS: ${MCP_HTTP_ALLOWED_HOSTS:-localhost,localhost:8000,127.0.0.1,127.0.0.1:8000,mcp-context-manager,mcp-context-manager:8000,mcp-context-manager-mcp-context-manager-1,mcp-context-manager-mcp-context-manager-1:8000}
       MCP_HTTP_ALLOWED_ORIGINS: ${MCP_HTTP_ALLOWED_ORIGINS:-}
       MCP_HTTP_BEARER_TOKEN: ${MCP_HTTP_BEARER_TOKEN:-}
+      MCP_HTTP_PUBLIC_BASE_URL: ${MCP_HTTP_PUBLIC_BASE_URL:-}
+      MCP_HTTP_AUTHORIZATION_SERVERS: ${MCP_HTTP_AUTHORIZATION_SERVERS:-}
       PORT: 8000
       REPO_PATH: ${MCP_CONTEXT_REPO_PATH:-/workspace-roots}
       MCP_CONTEXT_RETRIEVAL_WORKERS: ${MCP_CONTEXT_RETRIEVAL_WORKERS:-4}

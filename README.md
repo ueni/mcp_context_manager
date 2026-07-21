@@ -119,6 +119,13 @@ MCP_CONTEXT_REPO_PATH=/workspace-roots/mcp-context-manager \
 docker compose up --build
 ```
 
+The repository devcontainer does not start `mcp-context-manager`. On each
+startup, it looks for an already-running Compose service with the
+`mcp-context-manager` service label and connects to that service's network when
+needed. If the service is not running, startup remains usable with a warning.
+From inside the devcontainer, use `http://mcp-context-manager:8000/mcp`; legacy
+SSE clients can use `http://mcp-context-manager:8000/legacy/sse`.
+
 The mapping is then:
 
 ```text
@@ -189,18 +196,29 @@ server sends the per-session message endpoint as the initial `endpoint` SSE
 event. `/mcp` remains the primary transport. All HTTP routes enforce exact Host
 validation. Browser requests with an `Origin` header also require an exact
 allowed origin. Optional bearer authentication applies to every route,
-including health:
+including health, except the OAuth Protected Resource Metadata discovery
+route:
 
 ```bash
 MCP_HTTP_BEARER_TOKEN='replace-me' \
+MCP_HTTP_PUBLIC_BASE_URL='https://context.example' \
+MCP_HTTP_AUTHORIZATION_SERVERS='https://authorization.example' \
 MCP_HTTP_ALLOWED_HOSTS='context.example,context.example:443' \
 MCP_HTTP_ALLOWED_ORIGINS='https://context.example' \
 MCP_TRANSPORT=streamable-http \
 mcp-context-manager
 ```
 
-Bearer tokens are compared in constant time. Do not place bearer tokens in
-repository files or generated context memory.
+Bearer tokens are compared in constant time. This is a pre-provisioned-token
+boundary, not an OAuth authorization-server or JWT validator: deployments are
+responsible for provisioning an audience-bound token for the configured MCP
+resource. When bearer authentication is enabled, the public base URL and at
+least one HTTPS authorization-server URL are required; the public base may use
+HTTP only for loopback development. Do not place bearer tokens in repository
+files or generated context memory. When set, `MCP_HTTP_PUBLIC_BASE_URL` is also authoritative for the
+legacy SSE message URI, so HTTPS reverse-proxy deployments never infer a public
+scheme from forwarding headers. Without it, legacy SSE preserves the validated
+request `Host` with a local `http` scheme.
 
 HTTP routes:
 
@@ -208,6 +226,7 @@ HTTP routes:
 | --- | --- |
 | `GET /healthz` | Native process health and version. |
 | `GET /mcp/healthz` | Health under the MCP base path. |
+| `GET /.well-known/oauth-protected-resource[/mcp]` | Unauthenticated RFC 9728 Protected Resource Metadata discovery; Host and Origin validation still apply. |
 | `POST /mcp` | Stateful Streamable HTTP MCP endpoint. Sessions expire after 30 idle minutes. |
 | `GET /legacy/sse` | Backward-compatible SSE MCP endpoint; sends the per-session `POST` endpoint. |
 | `POST /legacy/messages?session_id=...` | Legacy SSE client message endpoint, issued by `/legacy/sse`. |
@@ -231,7 +250,9 @@ Stdio remains the default transport when `MCP_TRANSPORT` is omitted.
 | `MCP_CONTEXT_UID`, `MCP_CONTEXT_GID` | Compose image user ids, default `1000:1000`. |
 | `MCP_TRANSPORT` | `stdio` or `streamable-http`. |
 | `HOST`, `PORT` | HTTP bind address and port. |
-| `MCP_HTTP_BEARER_TOKEN` | Optional bearer token for all HTTP routes. |
+| `MCP_HTTP_BEARER_TOKEN` | Optional pre-provisioned bearer token for HTTP routes other than Protected Resource Metadata discovery. |
+| `MCP_HTTP_PUBLIC_BASE_URL` | Optional canonical public HTTP origin; required with bearer auth. Controls metadata identifiers and legacy SSE message URIs when set; otherwise legacy SSE uses the validated request Host. |
+| `MCP_HTTP_AUTHORIZATION_SERVERS` | Comma-separated authorization-server URLs advertised by Protected Resource Metadata. Required with bearer auth. |
 | `MCP_HTTP_ALLOWED_HOSTS` | Comma-separated exact Host values. |
 | `MCP_HTTP_ALLOWED_ORIGINS` | Comma-separated exact browser origins. |
 
