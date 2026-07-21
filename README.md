@@ -72,7 +72,7 @@ Diagnostics, metrics, and token accounting are available through
 
 ## MCP-first workflow
 
-Use `repo://instructions/codex-context-pack-first` as the portable source of
+Use `repo://instructions/context-pack` as the portable source of
 truth:
 
 1. Call `context_pack` first for repository tasks.

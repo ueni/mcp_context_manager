@@ -7,7 +7,7 @@ The tool talks to the Streamable HTTP MCP endpoint and calls:
 - context_admin(mode="cached_projects") when no project is selected
 - context_admin(mode="metrics", project_id=...)
 - context_admin(mode="measurement_matrix", project_id=...)
-- context_admin(mode="metrics_and_matrix", project_id=...)
+- context_admin(mode="measurement_report", project_id=...)
 
 It renders an interactive terminal dashboard for the persisted project
 catalogue. Use one or more explicit selectors to restrict it to projects.
@@ -62,6 +62,7 @@ INTERVAL_STEP = 1.0
 DEFAULT_TERMINAL_COLUMNS = 160
 DEFAULT_TERMINAL_LINES = 30
 STATE_ENTRY_PREVIEW_LIMIT = 64 * 1024
+MCP_INSPECTION_MAX_RESOURCES = 16
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 CRITICAL_MATRIX_KEYS = {
     "latency.context_pack.avg_elapsed_ms",
@@ -126,6 +127,11 @@ class MonitorState:
     usage_enabled: bool | None = None
     usage_report: dict[str, Any] | None = None
     usage_status_requested: bool = False
+    inspection_payload: dict[str, Any] | None = None
+    inspection_error: str = ""
+    inspection_selected_index: int = 0
+    inspection_viewer_index: int | None = None
+    inspection_content_scroll_offset: int = 0
 
 
 @dataclass
@@ -160,6 +166,19 @@ class PruneResult:
 @dataclass
 class MonitorUsageResult:
     payload: dict[str, Any] | None = None
+    error: str = ""
+
+
+@dataclass
+class McpInspectionResult:
+    payload: dict[str, Any] | None = None
+    error: str = ""
+
+
+@dataclass
+class McpResourceContentResult:
+    uri: str
+    content: str = ""
     error: str = ""
 
 
@@ -223,6 +242,18 @@ class McpHttpClient:
         if not isinstance(payload, dict):
             raise RuntimeError(f"unexpected tool payload for {name}: {payload!r}")
         return payload
+
+    def list_tools(self) -> dict[str, Any]:
+        self.initialize()
+        return self.rpc("tools/list")
+
+    def list_resources(self) -> dict[str, Any]:
+        self.initialize()
+        return self.rpc("resources/list")
+
+    def read_resource(self, uri: str) -> dict[str, Any]:
+        self.initialize()
+        return self.rpc("resources/read", {"uri": uri})
 
     def _timeout_for_tool(self, name: str, arguments: dict[str, Any]) -> float:
         if name == "context_admin" and arguments.get("mode") == "warmup":
@@ -493,6 +524,51 @@ def monitor_usage(
     return client.call_tool("context_admin", arguments)
 
 
+def inspect_mcp_surface(client: Any) -> dict[str, Any]:
+    """Fetch only MCP catalogue metadata; resource bodies are on-demand."""
+    tools_result = client.list_tools()
+    resources_result = client.list_resources()
+    tools = tools_result.get("tools") if isinstance(tools_result, dict) else []
+    resources = resources_result.get("resources") if isinstance(resources_result, dict) else []
+    resource_rows = resources if isinstance(resources, list) else []
+    inspected_resources: list[dict[str, Any]] = []
+    for resource in resource_rows[:MCP_INSPECTION_MAX_RESOURCES]:
+        if not isinstance(resource, dict):
+            continue
+        row = dict(resource)
+        if not str(row.get("uri") or ""):
+            row["error"] = "resource has no URI"
+        inspected_resources.append(row)
+    return {
+        "tools": tools if isinstance(tools, list) else [],
+        "resources": inspected_resources,
+        "resource_count": len(resource_rows),
+        "resources_truncated": len(resource_rows) > MCP_INSPECTION_MAX_RESOURCES,
+    }
+
+
+def inspect_mcp_resource_content(client: Any, uri: str) -> McpResourceContentResult:
+    """Read one selected resource off the UI thread."""
+    try:
+        result = client.read_resource(uri)
+        contents = result.get("contents") if isinstance(result, dict) else []
+        if not isinstance(contents, list) or not contents:
+            return McpResourceContentResult(uri=uri)
+        first = contents[0]
+        if isinstance(first, dict):
+            content = first.get("text") or first.get("blob") or ""
+        else:
+            content = first
+        return McpResourceContentResult(
+            uri=uri,
+            # The viewer is scrollable, so retain the entire resource body.
+            # Catalogue cells remain bounded independently for terminal layout.
+            content=_format_mcp_resource_content(content),
+        )
+    except Exception as exc:
+        return McpResourceContentResult(uri=uri, error=friendly_mcp_error(exc))
+
+
 def friendly_mcp_error(exc: Exception) -> str:
     message = str(exc)
     if "write transaction is already active" in message:
@@ -549,7 +625,7 @@ def _collect_one(
     try:
         if include_matrix:
             payload = client.call_tool(
-                "context_admin", {"mode": "metrics_and_matrix", **selector}
+                "context_admin", {"mode": "measurement_report", **selector}
             )
             if (
                 isinstance(payload, dict)
@@ -626,6 +702,8 @@ def render_monitor_screen(
     width: int | None,
     state: MonitorState,
 ) -> str:
+    if state.view == "inspection":
+        return render_mcp_inspection(url=url, color=color, width=width, state=state)
     if state.view == "state":
         return render_state_browser(url=url, color=color, width=width, state=state)
     if state.view == "performance" and snapshots:
@@ -655,6 +733,204 @@ def render_monitor_screen(
         refresh_interval=state.refresh_interval,
         status_line=_mcp_status_line(state, color),
     )
+
+
+def render_mcp_inspection(
+    url: str,
+    color: bool,
+    width: int | None,
+    state: MonitorState,
+    height: int | None = None,
+) -> str:
+    """Render the MCP catalogue or one selected item in a dedicated viewer."""
+    terminal_size = shutil.get_terminal_size(
+        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+    )
+    width = width or terminal_size.columns
+    height = height or terminal_size.lines
+    payload = state.inspection_payload or {}
+    rows = _inspection_rows(payload)
+    lines = [
+        _style("mcp-context-manager MCP inspection", color, Ansi.BOLD + Ansi.CYAN),
+        f"endpoint: {url}",
+        "",
+    ]
+    if state.inspection_error:
+        lines.append(_style(f"ERROR: {state.inspection_error}", color, Ansi.RED))
+    elif not payload:
+        lines.append("Loading MCP tools and resources...")
+    elif state.inspection_viewer_index is not None:
+        item = _inspection_item_at(state, state.inspection_viewer_index)
+        if item is None:
+            state.inspection_viewer_index = None
+            lines.append("The selected item is no longer available.")
+        else:
+            lines.extend(_render_mcp_inspection_viewer(item, color, width, height, state))
+    else:
+        selected_index = _clamped_index(state.inspection_selected_index, len(rows))
+        kind_width, name_width, uri_width, description_width = _inspection_table_widths(width)
+        table_rows = []
+        for index, (kind, item) in enumerate(rows):
+            table_rows.append(
+                (
+                    ">" if index == selected_index else " ",
+                    _trim(kind, kind_width),
+                    _trim(str(item.get("name") or item.get("uri") or "-"), name_width),
+                    _trim(str(item.get("uri") or "-"), uri_width),
+                    _trim(
+                        _bounded_text(item.get("description"), 1_000)
+                        or "(no description supplied)",
+                        description_width,
+                    ),
+                )
+            )
+        resource_total = _int_at(payload, ("resource_count",)) or sum(
+            1 for kind, _item in rows if kind == "resource"
+        )
+        resource_suffix = "; resources truncated" if payload.get("resources_truncated") else ""
+        lines.append(
+            _style(
+                f"CATALOGUE  {len(rows)} items ({resource_total} resources{resource_suffix})",
+                color,
+                Ansi.BOLD + Ansi.CYAN,
+            )
+        )
+        lines.extend(
+            _render_table(
+                ("", "type", "name", "URI", "description"),
+                table_rows,
+                widths=(1, kind_width, name_width, uri_width, description_width),
+                aligns=("left", "left", "left", "left", "left"),
+            )
+        )
+        lines.extend(["", "Enter opens the selected item.  Up/Down and PgUp/PgDn navigate."])
+    lines.append(
+        _controls(state.refresh_interval, color, status_line=_mcp_status_line(state, color))
+    )
+    return "\n".join(lines)
+
+
+def _inspection_table_widths(width: int) -> tuple[int, int, int, int]:
+    # Five table columns add sixteen border/separator characters.
+    available = max(54, width - 16)
+    kind = 8
+    name = min(28, max(14, width // 5))
+    uri = min(38, max(16, width // 3))
+    return kind, name, uri, max(16, available - 1 - kind - name - uri)
+
+
+def _inspection_rows(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
+    resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
+    rows: list[tuple[str, dict[str, Any]]] = []
+    rows.extend(("tool", tool) for tool in tools if isinstance(tool, dict))
+    rows.extend(("resource", resource) for resource in resources if isinstance(resource, dict))
+    return rows
+
+
+def _inspection_item_at(
+    state: MonitorState, index: int | None = None
+) -> tuple[str, dict[str, Any]] | None:
+    rows = _inspection_rows(state.inspection_payload or {})
+    if not rows:
+        return None
+    selected = _clamped_index(
+        state.inspection_selected_index if index is None else index, len(rows)
+    )
+    if index is None:
+        state.inspection_selected_index = selected
+    return rows[selected]
+
+
+def _render_mcp_inspection_viewer(
+    item: tuple[str, dict[str, Any]],
+    color: bool,
+    width: int,
+    height: int,
+    state: MonitorState,
+) -> list[str]:
+    kind, value = item
+    name = str(value.get("name") or value.get("uri") or kind)
+    lines = [_style(f"{kind.upper()}  {name}", color, Ansi.BOLD + Ansi.CYAN)]
+    if kind == "tool":
+        body = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+    elif value.get("error"):
+        body = f"ERROR: {value['error']}"
+    elif "content" in value:
+        body = str(value.get("content") or "(empty content)")
+    elif value.get("error") == "resource has no URI":
+        body = "ERROR: resource has no URI"
+    else:
+        body = "Loading resource content..."
+
+    if kind == "resource":
+        metadata = {
+            key: value[key]
+            for key in ("uri", "name", "description", "mimeType")
+            if value.get(key) is not None
+        }
+        metadata_text = json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True)
+        body = f"{metadata_text}\n\nCONTENT\n{body}"
+    wrapped = _wrap_block(body, max(40, width - 2))
+    visible_count = max(3, height - len(lines) - 7)
+    state.inspection_content_scroll_offset = _clamp_content_scroll_offset(
+        state.inspection_content_scroll_offset, visible_count, len(wrapped)
+    )
+    start = state.inspection_content_scroll_offset
+    visible = wrapped[start : start + visible_count]
+    lines.extend(
+        [
+            "",
+            _style(
+                f"lines {start + 1}-{start + len(visible)} / {len(wrapped)}",
+                color,
+                Ansi.BOLD,
+            ),
+            *visible,
+            "",
+            "Up/Down scroll  PgUp/PgDn page  Home/End jump  Esc catalogue",
+        ]
+    )
+    return lines
+
+
+def _format_mcp_resource_content(content: Any) -> str:
+    """Pretty-print JSON resource bodies while preserving plain-text resources."""
+    if isinstance(content, str):
+        text = content
+    else:
+        return json.dumps(content, ensure_ascii=False, indent=2)
+    try:
+        return json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return text
+
+
+def _selected_inspection_resource(state: MonitorState) -> dict[str, Any] | None:
+    selected = _inspection_item_at(state)
+    if selected is None or selected[0] != "resource":
+        return None
+    return selected[1]
+
+
+def _inspection_resource_for_uri(state: MonitorState, uri: str) -> dict[str, Any] | None:
+    for kind, item in _inspection_rows(state.inspection_payload or {}):
+        if kind == "resource" and item.get("uri") == uri:
+            return item
+    return None
+
+
+def _bounded_text(value: Any, limit: int) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    text = value.replace("\x00", "")
+    if len(text) <= limit:
+        return text
+    # Keep the preview bounded without adding a visible truncation suffix to
+    # field names or resource content.
+    return text[:limit]
 
 
 def render_project_detail(
@@ -1433,8 +1709,8 @@ def _controls(
     status_line: str = "",
 ) -> str:
     keys = (
-        "keys: Up/Down select  Enter details  p performance  l detailed usage  b state  Esc table  "
-        "+/- refresh  r reload  w warmup  P prune  q quit"
+        "keys: Up/Down select  Enter open  p performance  l detailed usage  i inspect  b state  Esc table  "
+        "PgUp/PgDn navigate  +/- refresh  r reload  w warmup  P prune  q quit"
     )
     controls = (
         f"{keys}   refresh={fmt_seconds(refresh_interval)}"
@@ -2166,7 +2442,7 @@ def _bar(ratio: float, width: int, color: bool) -> str:
 def _legend(color: bool) -> str:
     return (
         f"{_style('checks', color, Ansi.BOLD)} come from "
-        "context_admin(mode='metrics_and_matrix'); pending means the project "
+        "context_admin(mode='measurement_report'); pending means the project "
         "has not been opened for a quality run. Cache bars show L0 pack-cache hits."
     )
 
@@ -2413,6 +2689,8 @@ def decode_key(sequence: str) -> str | None:
         return "refresh"
     if sequence in {"b", "B"}:
         return "browser"
+    if sequence in {"i", "I"}:
+        return "inspection"
     if sequence == "p":
         return "performance"
     if sequence == "l":
@@ -2468,6 +2746,7 @@ def _search_text_for_key(key: str) -> str:
         "minus": "-",
         "refresh": "r",
         "browser": "b",
+        "inspection": "i",
         "performance": "p",
         "monitor_usage": "l",
         "prune": "P",
@@ -2541,6 +2820,81 @@ def handle_key(
             return "redraw"
         return "ignore"
 
+    if state.view == "inspection":
+        if state.inspection_viewer_index is not None:
+            if key == "escape":
+                state.inspection_viewer_index = None
+                state.inspection_content_scroll_offset = 0
+                return "redraw"
+            if key == "up":
+                state.inspection_content_scroll_offset = max(
+                    0, state.inspection_content_scroll_offset - 1
+                )
+                return "redraw"
+            if key == "down":
+                state.inspection_content_scroll_offset += 1
+                return "redraw"
+            if key == "page_up":
+                state.inspection_content_scroll_offset = max(
+                    0, state.inspection_content_scroll_offset - 10
+                )
+                return "redraw"
+            if key == "page_down":
+                state.inspection_content_scroll_offset += 10
+                return "redraw"
+            if key == "home":
+                state.inspection_content_scroll_offset = 0
+                return "redraw"
+            if key == "end":
+                state.inspection_content_scroll_offset = 1_000_000
+                return "redraw"
+            return "ignore"
+
+        item = _inspection_item_at(state)
+        item_count = len(_inspection_rows(state.inspection_payload or {}))
+        if key == "up":
+            state.inspection_selected_index = _clamped_index(
+                state.inspection_selected_index - 1,
+                item_count,
+            )
+            return "redraw"
+        if key == "down":
+            state.inspection_selected_index = _clamped_index(
+                state.inspection_selected_index + 1,
+                item_count,
+            )
+            return "redraw"
+        if key == "page_up":
+            state.inspection_selected_index = _clamped_index(
+                state.inspection_selected_index - 10, item_count
+            )
+            return "redraw"
+        if key == "page_down":
+            state.inspection_selected_index = _clamped_index(
+                state.inspection_selected_index + 10, item_count
+            )
+            return "redraw"
+        if key == "home":
+            state.inspection_selected_index = 0
+            return "redraw"
+        if key == "end":
+            state.inspection_selected_index = _clamped_index(1_000_000, item_count)
+            return "redraw"
+        if key == "enter" and item:
+            kind, value = item
+            state.inspection_viewer_index = state.inspection_selected_index
+            state.inspection_content_scroll_offset = 0
+            if (
+                kind == "resource"
+                and "content" not in value
+                and str(value.get("uri") or "")
+            ):
+                return "inspection_resource"
+            return "redraw"
+        if key == "escape":
+            state.view = "table"
+            return "redraw"
+
     if key in {"quit", "interrupt"}:
         return "quit"
     if key == "refresh" and state.view != "state":
@@ -2551,6 +2905,9 @@ def handle_key(
         return "prune"
     if key == "monitor_usage":
         return "monitor_usage"
+    if key == "inspection":
+        state.view = "inspection"
+        return "inspection"
     if key == "browser" and row_count:
         state.view = "state"
         state.state_entry = None
@@ -2827,6 +3184,13 @@ def _fetch_monitor_usage_result(
         return MonitorUsageResult(error=friendly_mcp_error(exc))
 
 
+def _fetch_mcp_inspection_result(client: Any) -> McpInspectionResult:
+    try:
+        return McpInspectionResult(payload=inspect_mcp_surface(client))
+    except Exception as exc:
+        return McpInspectionResult(error=friendly_mcp_error(exc))
+
+
 def _apply_monitor_usage_result(
     state: MonitorState, result: MonitorUsageResult
 ) -> None:
@@ -2844,6 +3208,29 @@ def _apply_monitor_usage_result(
         "detailed usage enabled" if state.usage_enabled else "detailed usage disabled"
     )
     state.mcp_error = ""
+
+
+def _apply_mcp_inspection_result(state: MonitorState, result: McpInspectionResult) -> None:
+    state.inspection_payload = result.payload
+    state.inspection_error = result.error
+    state.inspection_selected_index = 0
+    state.inspection_viewer_index = None
+    state.inspection_content_scroll_offset = 0
+
+
+def _apply_mcp_resource_content_result(
+    state: MonitorState, result: McpResourceContentResult
+) -> None:
+    resource = _inspection_resource_for_uri(state, result.uri)
+    if resource is None:
+        return
+    resource.pop("error", None)
+    resource.pop("content", None)
+    state.inspection_content_scroll_offset = 0
+    if result.error:
+        resource["error"] = result.error
+    else:
+        resource["content"] = result.content
 
 
 def _apply_warmup_result(state: MonitorState, result: WarmupResult) -> None:
@@ -2946,6 +3333,14 @@ def _apply_mcp_operation_result(
         if isinstance(result, MonitorUsageResult):
             _apply_monitor_usage_result(state, result)
         return snapshots
+    if pending.kind == "inspection":
+        if isinstance(result, McpInspectionResult):
+            _apply_mcp_inspection_result(state, result)
+        return snapshots
+    if pending.kind == "inspection_resource":
+        if isinstance(result, McpResourceContentResult):
+            _apply_mcp_resource_content_result(state, result)
+        return snapshots
     return snapshots
 
 
@@ -3046,7 +3441,7 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                     force_refresh = False
                 dirty = True
 
-            browser_open = state.view == "state"
+            browser_open = state.view in {"state", "inspection"}
             if _needs_initial_usage_status(state, snapshots, pending):
                 state.usage_status_requested = True
                 _set_mcp_loading(state, "loading detailed usage status...")
@@ -3126,6 +3521,33 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                 dirty = True
             elif action == "browser":
                 queued_browser_load = True
+                _set_mcp_loading(state, "waiting for current MCP request...")
+                dirty = True
+            if action == "inspection" and pending is None:
+                state.inspection_payload = None
+                state.inspection_error = ""
+                _set_mcp_loading(state, "inspecting MCP tools and resources...")
+                pending = _submit_mcp_operation(
+                    executor,
+                    "inspection",
+                    lambda: _fetch_mcp_inspection_result(client),
+                )
+                dirty = True
+            elif action == "inspection":
+                _set_mcp_loading(state, "waiting for current MCP request...")
+                dirty = True
+            if action == "inspection_resource" and pending is None:
+                resource = _selected_inspection_resource(state)
+                name = str((resource or {}).get("name") or (resource or {}).get("uri") or "resource")
+                uri = str((resource or {}).get("uri") or "")
+                _set_mcp_loading(state, f"reading {name}...")
+                pending = _submit_mcp_operation(
+                    executor,
+                    "inspection_resource",
+                    lambda: inspect_mcp_resource_content(client, uri),
+                )
+                dirty = True
+            elif action == "inspection_resource":
                 _set_mcp_loading(state, "waiting for current MCP request...")
                 dirty = True
             if action == "state_entry" and pending is None:

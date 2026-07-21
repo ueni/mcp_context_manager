@@ -246,7 +246,7 @@ def capture_contracts(client: Client) -> dict[str, Any]:
         "contracts": {"contract_profile": "compact"},
         "metrics": {},
         "measurement_matrix": {},
-        "metrics_and_matrix": {},
+        "measurement_report": {},
         "benchmark": {"max_files": 100},
         "state_browser": {"max_entries": 10},
         "quality_eval": {"max_entries": 10},
@@ -265,7 +265,7 @@ def capture_contracts(client: Client) -> dict[str, Any]:
     captures["resources.repo_file"] = client.resource("repo://file/src/auth.py")
     captures["resources.repo_metrics"] = json.loads(client.resource("repo://metrics"))
     captures["resources.instructions"] = json.loads(
-        client.resource("repo://instructions/codex-context-pack-first")
+        client.resource("repo://instructions/context-pack")
     )
 
     unsafe = client.tool(

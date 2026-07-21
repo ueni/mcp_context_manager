@@ -1,0 +1,24 @@
+Live MCP cache analysis
+
+Observed active projects:
+
+- mcp-context-manager: 1 context_pack, 0 L0 hits, 0 L1 hits, 1 retrieval miss. Pack latency was 74.7 ms with approximately 18.8k estimated tokens saved.
+- otax-updater: 21 context_pack calls, 0 L0 hits, 0 L1 hits, 21 retrieval misses. There were 13 index refreshes, indicating source churn prevents reuse.
+- COP-Flip: no context_pack calls; only admin polling/warmup.
+- azure-pipelines-agent: no context_pack calls; only admin polling/warmup.
+
+Detailed usage collection is globally enabled:
+
+- otax-updater recorded 20 L0 misses and 20 searches, with no base_pack or known_evidence usage and approximately 60k estimated tokens saved.
+- mcp-context-manager recorded one L0 miss/search and no delta request.
+- base_pack and known_evidence usage were zero across the observed projects.
+
+The monitor generated roughly 500 measurement_report calls per active project. They are inexpensive, with p95 latency around 0.3–0.6 ms, so caching them is not worthwhile.
+
+Conclusions:
+
+- Do not enlarge L0 or L1; there are no repeated canonical requests to reuse.
+- otax-updater misses are mainly caused by frequent source invalidation, not cache capacity.
+- Token compression works well, but agents are not using delta packs. Reusing base_pack and known_evidence is the highest-value next optimization.
+- Persistent state is accumulating stale data: mcp-context-manager has 107 references but only 9 active, and 65 persistent frontiers with no memory hits. Run cache_prune on active projects.
+- Keep approximate frontier reuse disabled until usage evidence justifies the recall risk.

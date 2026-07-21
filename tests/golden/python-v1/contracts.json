@@ -666,7 +666,7 @@
             "context_budget.v1",
             "tool_output_contracts.v1",
             "context_metrics.v1",
-            "context_metrics_and_matrix.v1",
+            "context_measurement_report.v1",
             "context_measurement_matrix.v1",
             "context_benchmark.v1",
             "context_state_browser.v1",
@@ -949,8 +949,8 @@
       },
       "purpose": "Speed up Codex-style coding agents with a first-pass context pack.",
       "resource_uris": [
-        "repo://instructions/codex-context-pack-first",
-        "repo://project/{project_id}/instructions/codex-context-pack-first"
+        "repo://instructions/context-pack",
+        "repo://project/{project_id}/instructions/context-pack"
       ],
       "schema": "codex_context_pack_first.instructions.v1"
     },
@@ -2199,7 +2199,7 @@
         "schema": "context_warmup.metrics.v1"
       }
     },
-    "context_admin.metrics_and_matrix": {
+    "context_admin.measurement_report": {
       "matrix": {
         "checks": [
           {
@@ -3445,7 +3445,7 @@
           "schema": "context_warmup.metrics.v1"
         }
       },
-      "schema": "context_metrics_and_matrix.v1"
+      "schema": "context_measurement_report.v1"
     },
     "context_admin.profile_calibrate": {
       "defaults": {
@@ -4767,8 +4767,8 @@
       },
       "purpose": "Speed up Codex-style coding agents with a first-pass context pack.",
       "resource_uris": [
-        "repo://instructions/codex-context-pack-first",
-        "repo://project/{project_id}/instructions/codex-context-pack-first"
+        "repo://instructions/context-pack",
+        "repo://project/{project_id}/instructions/context-pack"
       ],
       "schema": "codex_context_pack_first.instructions.v1"
     },

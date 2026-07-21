@@ -21,7 +21,7 @@
               "context_budget.v1",
               "tool_output_contracts.v1",
               "context_metrics.v1",
-              "context_metrics_and_matrix.v1",
+              "context_measurement_report.v1",
               "context_measurement_matrix.v1",
               "context_benchmark.v1",
               "context_state_browser.v1",
@@ -37,7 +37,7 @@
               "max_entries": "Maximum rows.",
               "max_files": "Index file cap.",
               "max_output_chars": "Budget override.",
-              "mode": "health, projects, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, metrics_and_matrix, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
+              "mode": "health, projects, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, measurement_report, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
               "path": "Repository-relative path or resource URI.",
               "project_id": "Project selector.",
               "root_uri": "Repository file URI.",
@@ -336,7 +336,7 @@
             "context_budget.v1",
             "tool_output_contracts.v1",
             "context_metrics.v1",
-            "context_metrics_and_matrix.v1",
+            "context_measurement_report.v1",
             "context_measurement_matrix.v1",
             "context_benchmark.v1",
             "context_state_browser.v1",
@@ -352,7 +352,7 @@
             "max_entries": "Maximum rows.",
             "max_files": "Index file cap.",
             "max_output_chars": "Budget override.",
-            "mode": "health, projects, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, metrics_and_matrix, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
+            "mode": "health, projects, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, measurement_report, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
             "path": "Repository-relative path or resource URI.",
             "project_id": "Project selector.",
             "root_uri": "Repository file URI.",
@@ -639,8 +639,8 @@
       },
       "purpose": "Speed up coding agents with a first-pass context pack.",
       "resource_uris": [
-        "repo://instructions/codex-context-pack-first",
-        "repo://project/{project_id}/instructions/codex-context-pack-first"
+        "repo://instructions/context-pack",
+        "repo://project/{project_id}/instructions/context-pack"
       ],
       "schema": "codex_context_pack_first.instructions.v1"
     },
@@ -740,7 +740,7 @@
         "runs": 0
       }
     },
-    "context_admin.metrics_and_matrix": {
+    "context_admin.measurement_report": {
       "matrix": {
         "checks": [
           {
@@ -837,7 +837,7 @@
           "runs": 0
         }
       },
-      "schema": "context_metrics_and_matrix.v1"
+      "schema": "context_measurement_report.v1"
     },
     "context_admin.profile_calibrate": {
       "defaults": {
@@ -1823,8 +1823,8 @@
       },
       "purpose": "Speed up coding agents with a first-pass context pack.",
       "resource_uris": [
-        "repo://instructions/codex-context-pack-first",
-        "repo://project/{project_id}/instructions/codex-context-pack-first"
+        "repo://instructions/context-pack",
+        "repo://project/{project_id}/instructions/context-pack"
       ],
       "schema": "codex_context_pack_first.instructions.v1"
     },

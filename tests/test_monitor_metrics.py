@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -117,6 +118,189 @@ class MonitorUsageControlTests(unittest.TestCase):
         )
 
 
+class McpInspectionViewTests(unittest.TestCase):
+    def test_inspection_bounds_content_without_a_truncation_suffix(self) -> None:
+        preview = monitor_metrics._bounded_text("last_elapsed_ms" + "x" * 32, 16)
+
+        self.assertEqual(preview, "last_elapsed_msx")
+        self.assertLessEqual(len(preview), 16)
+        self.assertNotIn("…", preview)
+        self.assertNotIn("(truncated)", preview)
+
+    def test_catalogue_uses_one_table_and_resources_are_read_on_demand(self) -> None:
+        class InspectionClient:
+            def __init__(self) -> None:
+                self.read_uris: list[str] = []
+
+            def list_tools(self) -> dict[str, object]:
+                return {"tools": [{"name": "context_pack", "description": "Build compact context."}]}
+
+            def list_resources(self) -> dict[str, object]:
+                return {
+                    "resources": [
+                        {
+                            "uri": "repo://instructions/test",
+                            "name": "Agent instructions",
+                            "description": "Agent rules.",
+                        },
+                        {
+                            "uri": "repo://summary",
+                            "name": "Repository summary",
+                            "description": "Repository overview.",
+                        },
+                    ]
+                }
+
+            def read_resource(self, uri: str) -> dict[str, object]:
+                self.read_uris.append(uri)
+                return {"contents": [{"uri": uri, "text": "Use context_pack first."}]}
+
+        client = InspectionClient()
+        payload = monitor_metrics.inspect_mcp_surface(client)
+        self.assertEqual(client.read_uris, [])
+        state = monitor_metrics.MonitorState(view="inspection", inspection_payload=payload)
+        rendered = monitor_metrics.render_mcp_inspection(
+            "http://localhost:8000/mcp", False, 120, state
+        )
+
+        self.assertIn("| type", rendered)
+        self.assertIn("| context_pack", rendered)
+        self.assertIn("Build compact context.", rendered)
+        self.assertIn("| resource", rendered)
+        self.assertIn("Agent instructions", rendered)
+        self.assertIn("repo://instructions/test", rendered)
+        self.assertNotIn("TOOLS", rendered)
+        self.assertNotIn("SELECTED RESOURCE", rendered)
+
+        self.assertEqual(monitor_metrics.handle_key("enter", state, 0), "redraw")
+        self.assertEqual(state.inspection_viewer_index, 0)
+        tool_viewer = monitor_metrics.render_mcp_inspection("url", False, 120, state)
+        self.assertIn("TOOL  context_pack", tool_viewer)
+        self.assertIn('"name": "context_pack"', tool_viewer)
+        self.assertIn('"description": "Build compact context."', tool_viewer)
+        self.assertEqual(monitor_metrics.handle_key("escape", state, 0), "redraw")
+        self.assertIsNone(state.inspection_viewer_index)
+
+        self.assertEqual(monitor_metrics.handle_key("down", state, 0), "redraw")
+        self.assertEqual(monitor_metrics.handle_key("down", state, 0), "redraw")
+        self.assertEqual(state.inspection_selected_index, 2)
+        self.assertEqual(
+            monitor_metrics.handle_key("enter", state, 0), "inspection_resource"
+        )
+        self.assertEqual(state.inspection_viewer_index, 2)
+        self.assertIn(
+            "Loading resource content...",
+            monitor_metrics.render_mcp_inspection("url", False, 120, state),
+        )
+
+        result = monitor_metrics.inspect_mcp_resource_content(client, "repo://summary")
+        monitor_metrics._apply_mcp_resource_content_result(state, result)
+        self.assertEqual(client.read_uris, ["repo://summary"])
+        self.assertIn(
+            "Use context_pack first.",
+            monitor_metrics.render_mcp_inspection("url", False, 120, state),
+        )
+
+    def test_inspection_renders_resource_read_failures_and_is_discoverable(self) -> None:
+        class FailingResourceClient:
+            def list_tools(self) -> dict[str, object]:
+                return {"tools": []}
+
+            def list_resources(self) -> dict[str, object]:
+                return {"resources": [{"uri": "repo://broken"}]}
+
+            def read_resource(self, _uri: str) -> dict[str, object]:
+                raise RuntimeError("read failed")
+
+        client = FailingResourceClient()
+        payload = monitor_metrics.inspect_mcp_surface(client)
+        state = monitor_metrics.MonitorState(view="inspection", inspection_payload=payload)
+        self.assertEqual(
+            monitor_metrics.handle_key("enter", state, 0), "inspection_resource"
+        )
+        result = monitor_metrics.inspect_mcp_resource_content(client, "repo://broken")
+        monitor_metrics._apply_mcp_resource_content_result(state, result)
+        rendered = monitor_metrics.render_mcp_inspection("url", False, 120, state)
+
+        self.assertIn("ERROR: read failed", rendered)
+        self.assertEqual(monitor_metrics.decode_key("i"), "inspection")
+        self.assertEqual(
+            monitor_metrics.handle_key("inspection", monitor_metrics.MonitorState(), 0),
+            "inspection",
+        )
+        self.assertIn("i inspect", monitor_metrics._controls(60, False))
+        self.assertIn("Enter open", monitor_metrics._controls(60, False))
+
+    def test_resource_viewer_prettifies_json_scrolls_and_returns_to_catalogue(self) -> None:
+        class JsonResourceClient:
+            def read_resource(self, uri: str) -> dict[str, object]:
+                return {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "text": json.dumps(
+                                {
+                                    "outer": {"items": list(range(24))},
+                                    "full": ("x" * 2_100) + "END-OF-FULL-RESOURCE",
+                                },
+                                separators=(",", ":"),
+                            ),
+                        }
+                    ]
+                }
+
+        state = monitor_metrics.MonitorState(
+            view="inspection",
+            inspection_payload={
+                "tools": [
+                    {
+                        "name": "context_pack",
+                        "description": "Build compact cited context.",
+                    }
+                ],
+                "resources": [{"uri": "repo://metrics", "name": "Repository metrics"}],
+                "resource_count": 1,
+            },
+        )
+        result = monitor_metrics.inspect_mcp_resource_content(
+            JsonResourceClient(), "repo://metrics"
+        )
+        self.assertGreater(len(result.content), 2_000)
+        self.assertIn("END-OF-FULL-RESOURCE", result.content)
+        state.inspection_selected_index = 1
+        self.assertEqual(
+            monitor_metrics.handle_key("enter", state, 0), "inspection_resource"
+        )
+        monitor_metrics._apply_mcp_resource_content_result(state, result)
+        rendered = monitor_metrics.render_mcp_inspection(
+            "url", False, 100, state, height=22
+        )
+
+        self.assertIn('"outer": {', rendered)
+        self.assertIn("RESOURCE  Repository metrics", rendered)
+        self.assertIn("lines 1-", rendered)
+        self.assertIn("Up/Down scroll", rendered)
+        self.assertEqual(monitor_metrics.handle_key("down", state, 0), "redraw")
+        self.assertEqual(state.inspection_content_scroll_offset, 1)
+        self.assertEqual(monitor_metrics.handle_key("page_down", state, 0), "redraw")
+        self.assertEqual(state.inspection_content_scroll_offset, 11)
+        rendered_after_scroll = monitor_metrics.render_mcp_inspection(
+            "url", False, 100, state, height=22
+        )
+        self.assertIn("lines 12-", rendered_after_scroll)
+        self.assertEqual(monitor_metrics.handle_key("home", state, 0), "redraw")
+        self.assertEqual(state.inspection_content_scroll_offset, 0)
+        self.assertEqual(monitor_metrics.handle_key("end", state, 0), "redraw")
+        rendered_at_end = monitor_metrics.render_mcp_inspection(
+            "url", False, 100, state, height=22
+        )
+        self.assertIn("END-OF-FULL-RESOURCE", rendered_at_end)
+        self.assertEqual(monitor_metrics.handle_key("escape", state, 0), "redraw")
+        self.assertIsNone(state.inspection_viewer_index)
+        catalogue = monitor_metrics.render_mcp_inspection("url", False, 100, state)
+        self.assertIn("CATALOGUE", catalogue)
+
+
 class MonitorProjectSelectionTests(unittest.TestCase):
     def test_default_snapshot_uses_cached_projects_without_discovery(self) -> None:
         client = FakeClient()
@@ -130,8 +314,8 @@ class MonitorProjectSelectionTests(unittest.TestCase):
             client.calls,
             [
                 ("context_admin", {"mode": "cached_projects"}),
-                ("context_admin", {"mode": "metrics_and_matrix", "project_id": "one"}),
-                ("context_admin", {"mode": "metrics_and_matrix", "project_id": "two"}),
+                ("context_admin", {"mode": "measurement_report", "project_id": "one"}),
+                ("context_admin", {"mode": "measurement_report", "project_id": "two"}),
             ],
         )
     def test_explicit_projects_do_not_trigger_workspace_discovery(self) -> None:
@@ -148,8 +332,8 @@ class MonitorProjectSelectionTests(unittest.TestCase):
         self.assertEqual(
             client.calls,
             [
-                ("context_admin", {"mode": "metrics_and_matrix", "project_id": "one"}),
-                ("context_admin", {"mode": "metrics_and_matrix", "project_id": "two"}),
+                ("context_admin", {"mode": "measurement_report", "project_id": "one"}),
+                ("context_admin", {"mode": "measurement_report", "project_id": "two"}),
             ],
         )
 

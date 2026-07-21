@@ -27,7 +27,7 @@ use axum::{
 };
 use context_core::{
     ContextAdminRequest, ContextLookupRequest, ContextMemoryRequest, ContextPackRequest,
-    ResultReferenceRequest, unloaded_admin_response,
+    ResultReferenceRequest, static_resource_text, unloaded_admin_response,
 };
 use http_body_util::{BodyExt, Limited};
 use registry::ProjectRegistry;
@@ -133,12 +133,16 @@ struct LegacySseQuery {
 
 #[tool_router]
 impl ContextServer {
-    #[tool(description = "Report native server readiness")]
+    #[tool(
+        description = "Check whether the native MCP process is responsive. Use this only for transport/readiness diagnosis; it returns `ok` and does not inspect or load a repository project."
+    )]
     fn health(&self) -> String {
         "ok".to_owned()
     }
 
-    #[tool(description = "Build a compact, cited repository context pack using context_pack.v2")]
+    #[tool(
+        description = "Build the primary compact, cited context_pack.v2 for a repository task. Call this first for coding, review, debugging, tests, documentation, security, or general repository questions. Pass the exact task in `prompt`, set `client_profile`, include known `changed_files`/`focus_paths`, and select a project with `project_id` or `root_uri` when needed. The bounded response contains evidence cards and may return a local `more` reference for deferred details."
+    )]
     async fn context_pack(
         &self,
         Parameters(mut request): Parameters<ContextPackRequest>,
@@ -156,7 +160,9 @@ impl ContextServer {
         String::from_utf8(encoded).map_err(|error| error.to_string())
     }
 
-    #[tool(description = "Search or read a targeted repository snippet")]
+    #[tool(
+        description = "Perform bounded targeted follow-up after context_pack. Choose `mode` for search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, or explain_cache; provide repository-relative paths and selectors only. Use this to resolve specific files, symbols, callers, tests, or omitted evidence without broad repository reads."
+    )]
     fn context_lookup(
         &self,
         Parameters(mut request): Parameters<ContextLookupRequest>,
@@ -173,7 +179,9 @@ impl ContextServer {
         String::from_utf8(encoded).map_err(|error| error.to_string())
     }
 
-    #[tool(description = "Manage compact repository-local context memory")]
+    #[tool(
+        description = "Read or update structured, non-secret repository memory. Use the explicit memory modes for durable facts, summaries, decisions, validation results, or compaction; never store raw prompts, model responses, credentials, private conversation text, or host-absolute paths. Select the intended project explicitly when multiple projects are configured."
+    )]
     fn context_memory(
         &self,
         Parameters(mut request): Parameters<ContextMemoryRequest>,
@@ -191,7 +199,7 @@ impl ContextServer {
     }
 
     #[tool(
-        description = "Resolve a local result reference after boundary, expiry, and hash checks"
+        description = "Resolve a `ctxref-*` deferred result returned by context_pack or another tool. Supply the reference id (and expected hash when provided); resolution enforces project boundary, expiry, and content-integrity checks. Use before relying on omitted raw evidence for destructive edits, security conclusions, release claims, or other high-confidence decisions."
     )]
     fn result_reference_resolve(
         &self,
@@ -210,7 +218,7 @@ impl ContextServer {
     }
 
     #[tool(
-        description = "Inspect health, index, cache, contracts, metrics, quality, and generated state"
+        description = "Operate and inspect bounded generated server state. Select `mode` for projects, health, index refresh/status, cache stats/prune/warmup, global monitor_usage, budgets/contracts, metrics and measurement matrices, benchmarks, state browser, quality evaluation, cache planning, instructions, resource proxy, or schema minification. Read-only global/project-list and monitor actions avoid loading a project where possible; mutation modes affect generated MCP state only, never repository source files."
     )]
     async fn context_admin(
         &self,
@@ -287,7 +295,7 @@ impl ContextServer {
 fn is_read_only_admin_mode(mode: &str) -> bool {
     matches!(
         mode,
-        "metrics" | "measurement_matrix" | "metrics_and_matrix"
+        "metrics" | "measurement_matrix" | "measurement_report"
     )
 }
 
@@ -309,18 +317,7 @@ impl ServerHandler for ContextServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        Ok(ListResourcesResult::with_all_items(vec![
-            Resource::new("repo://summary", "Repository summary")
-                .with_mime_type("application/json"),
-            Resource::new("repo://tree/.", "Repository tree").with_mime_type("application/json"),
-            Resource::new("repo://metrics", "Repository metrics")
-                .with_mime_type("application/json"),
-            Resource::new(
-                "repo://instructions/codex-context-pack-first",
-                "MCP-first instructions",
-            )
-            .with_mime_type("application/json"),
-        ]))
+        Ok(ListResourcesResult::with_all_items(advertised_resources()))
     }
 
     async fn list_resource_templates(
@@ -349,15 +346,43 @@ impl ServerHandler for ContextServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         let text = self
-            .registry
-            .engine_for(project_id_from_resource(&request.uri), None)
-            .map_err(|error| McpError::invalid_params(error.to_string(), None))?
-            .resource_text(&request.uri)
+            .read_resource_text(&request.uri)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         Ok(ReadResourceResult::new(vec![ResourceContents::text(
             text,
             request.uri,
         )]))
+    }
+}
+
+#[cfg(test)]
+const ADVERTISED_RESOURCE_URIS: [&str; 4] = [
+    "repo://summary",
+    "repo://tree/.",
+    "repo://metrics",
+    "repo://instructions/context-pack",
+];
+
+fn advertised_resources() -> Vec<Resource> {
+    vec![
+        Resource::new("repo://summary", "Repository summary").with_mime_type("application/json"),
+        Resource::new("repo://tree/.", "Repository tree").with_mime_type("application/json"),
+        Resource::new("repo://metrics", "Repository metrics").with_mime_type("application/json"),
+        Resource::new("repo://instructions/context-pack", "MCP-first instructions")
+            .with_mime_type("application/json"),
+    ]
+}
+
+impl ContextServer {
+    fn read_resource_text(&self, uri: &str) -> Result<String, String> {
+        if let Some(text) = static_resource_text(uri).map_err(|error| error.to_string())? {
+            return Ok(text);
+        }
+        self.registry
+            .engine_for(project_id_from_resource(uri), None)
+            .map_err(|error| error.to_string())?
+            .resource_text(uri)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -496,6 +521,14 @@ async fn mcp_tools_http() -> Json<Value> {
         "legacy_sse_endpoint": "/legacy/sse",
         "tool_count": tools.len(),
         "tools": tools,
+        "descriptions": {
+            "health": "Check transport readiness without loading a repository project.",
+            "context_pack": "Primary compact cited repository context for coding, review, debugging, tests, documentation, and security tasks.",
+            "context_lookup": "Bounded targeted follow-up for repository search, snippets, trees, symbols, relationships, tests, chunks, and references.",
+            "context_memory": "Structured non-secret repository facts, summaries, decisions, validation, and compaction.",
+            "context_admin": "Bounded project, index, cache, monitor, contract, metric, benchmark, quality, and generated-state operations.",
+            "result_reference_resolve": "Boundary-, expiry-, and hash-checked resolution of deferred ctxref evidence."
+        },
     }))
 }
 
@@ -1311,7 +1344,7 @@ mod tests {
         .expect("active JSON");
         assert_eq!(active_after["count"], 0);
         let request: ContextAdminRequest =
-            serde_json::from_value(json!({"mode": "metrics_and_matrix"})).expect("metrics request");
+            serde_json::from_value(json!({"mode": "measurement_report"})).expect("metrics request");
 
         let response: Value = serde_json::from_str(
             &server
@@ -1341,6 +1374,76 @@ mod tests {
             ])
         );
         assert_eq!(payload["legacy_sse_endpoint"], "/legacy/sse");
+        assert_eq!(
+            payload["descriptions"].as_object().map(|rows| rows.len()),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn every_mcp_tool_has_an_agent_usable_description() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("marker");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let server = ContextServer::new(registry);
+        let tools = server.tool_router.list_all();
+
+        assert_eq!(tools.len(), 6);
+        for tool in tools {
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.len() >= 100,
+                "{} description is not agent-usable: {description}",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_advertised_resource_is_readable() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("marker");
+        std::fs::write(root.path().join("README.md"), "# resource fixture\n").expect("readme");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let server = ContextServer::new(Arc::clone(&registry));
+
+        let instructions = server
+            .read_resource_text("repo://instructions/context-pack")
+            .expect("static instructions");
+        assert!(instructions.contains("context_pack"));
+        assert_eq!(
+            registry.active_projects_payload().expect("active")["count"],
+            0
+        );
+        assert!(
+            server
+                .read_resource_text("repo://instructions/codex-context-pack")
+                .is_err(),
+            "the renamed instruction URI must not remain readable"
+        );
+        for uri in ADVERTISED_RESOURCE_URIS {
+            let text = server.read_resource_text(uri).expect(uri);
+            assert!(!text.is_empty(), "empty advertised resource: {uri}");
+            serde_json::from_str::<Value>(&text).expect("advertised JSON resource");
+        }
     }
 
     #[test]

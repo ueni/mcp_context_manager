@@ -129,7 +129,7 @@ def assert_pack(response: dict[str, Any]) -> None:
 def assert_resources(resources: dict[str, Any]) -> None:
     uris = {resource["uri"] for resource in resources["result"]["resources"]}
     assert "repo://summary" in uris
-    assert "repo://instructions/codex-context-pack-first" in uris
+    assert "repo://instructions/context-pack" in uris
 
 
 def assert_summary_resource(response: dict[str, Any]) -> None:

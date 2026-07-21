@@ -48,7 +48,7 @@ default_tools_approval_mode = "auto"
 ```
 
 For portable agent guidance, read
-`repo://instructions/codex-context-pack-first`.
+`repo://instructions/context-pack`.
 
 ## Scope
 

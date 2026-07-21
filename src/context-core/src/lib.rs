@@ -46,8 +46,8 @@ pub fn unloaded_admin_response(
     let value = match request.mode.as_str() {
         "metrics" => unloaded_metrics_snapshot(project_id, &now, status),
         "measurement_matrix" => unloaded_measurement_matrix(project_id, &now, status),
-        "metrics_and_matrix" => json!({
-            "schema": "context_metrics_and_matrix.v1",
+        "measurement_report" => json!({
+            "schema": "context_measurement_report.v1",
             "metrics": unloaded_metrics_snapshot(project_id, &now, status),
             "matrix": unloaded_measurement_matrix(project_id, &now, status),
         }),
@@ -2009,6 +2009,9 @@ impl ProjectEngine {
 
     fn resource_text_inner(&self, uri: &str) -> Result<String> {
         let uri = normalize_project_resource_uri(uri, &self.project_id)?;
+        if let Some(text) = static_resource_text(&uri)? {
+            return Ok(text);
+        }
         let index = self.index();
         let value = match uri.as_str() {
             "repo://summary" => serde_json::to_string(&self.repo_summary()?)?,
@@ -2019,9 +2022,6 @@ impl ProjectEngine {
                 "count": index.tree(".", 5000, 2)?.len(),
             }))?,
             "repo://metrics" => serde_json::to_string(&metrics_snapshot(self)?)?,
-            "repo://instructions/codex-context-pack-first" => {
-                serde_json::to_string(&instructions_payload())?
-            }
             _ if uri.starts_with("repo://file/") => {
                 let path = uri.trim_start_matches("repo://file/");
                 let (content, _) = index.file_content(path, 131_072)?;
@@ -2726,8 +2726,8 @@ async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -
         )),
         "metrics" => metrics_snapshot(engine),
         "measurement_matrix" => measurement_matrix(engine, &now),
-        "metrics_and_matrix" => Ok(json!({
-            "schema": "context_metrics_and_matrix.v1",
+        "measurement_report" => Ok(json!({
+            "schema": "context_measurement_report.v1",
             "metrics": metrics_snapshot(engine)?,
             "matrix": measurement_matrix(engine, &now)?,
         })),
@@ -3382,7 +3382,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "context_budget.v1",
                 "tool_output_contracts.v1",
                 "context_metrics.v1",
-                "context_metrics_and_matrix.v1",
+                "context_measurement_report.v1",
                 "context_measurement_matrix.v1",
                 "context_benchmark.v1",
                 "context_state_browser.v1",
@@ -3392,7 +3392,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "context_resource_proxy.v1"
             ]),
             json!({
-                "mode": "health, projects, active_projects, cached_projects, monitor_usage, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, metrics_and_matrix, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
+                "mode": "health, projects, active_projects, cached_projects, monitor_usage, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, measurement_report, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
                 "action": "For monitor_usage: status, enable, disable, or report.",
                 "path": "Repository-relative path or resource URI.", "max_files": "Index file cap.",
                 "prompt": "Optional prompt to warm exact context_pack cache without echoing it.",
@@ -3466,8 +3466,8 @@ fn instructions_payload() -> Value {
             "calibration": "context_admin(mode=\"profile_calibrate\") reports recommendations only."
         },
         "resource_uris": [
-            "repo://instructions/codex-context-pack-first",
-            "repo://project/{project_id}/instructions/codex-context-pack-first"
+            "repo://instructions/context-pack",
+            "repo://project/{project_id}/instructions/context-pack"
         ],
         "codex_config_example": {
             "config_file": "~/.codex/config.toml or trusted-project .codex/config.toml",
@@ -4550,7 +4550,7 @@ fn admin_operation(mode: &str) -> &'static str {
         "contracts" => "context_admin.contracts",
         "metrics" => "context_admin.metrics",
         "measurement_matrix" => "context_admin.measurement_matrix",
-        "metrics_and_matrix" => "context_admin.metrics_and_matrix",
+        "measurement_report" => "context_admin.measurement_report",
         "benchmark" => "context_admin.benchmark",
         "state_browser" => "context_admin.state_browser",
         "quality_eval" => "context_admin.quality_eval",
@@ -4568,11 +4568,20 @@ fn resource_operation(uri: &str) -> &'static str {
         "repo://summary" => "resource.summary",
         "repo://tree/." | "repo://tree" => "resource.tree",
         "repo://metrics" => "resource.metrics",
-        "repo://instructions/codex-context-pack-first" => "resource.instructions",
+        "repo://instructions/context-pack" => "resource.instructions",
         _ if uri.starts_with("repo://file/") => "resource.file",
         _ if uri.starts_with("repo://tree/") => "resource.tree",
         _ if uri.starts_with("repo://context/") => "resource.context",
         _ => "resource.invalid_uri",
+    }
+}
+
+pub fn static_resource_text(uri: &str) -> Result<Option<String>> {
+    match uri {
+        "repo://instructions/context-pack" => {
+            Ok(Some(serde_json::to_string(&instructions_payload())?))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -4958,13 +4967,13 @@ mod tests {
     #[test]
     fn unloaded_metrics_keep_the_monitor_contract_without_opening_an_engine() {
         let request: ContextAdminRequest =
-            serde_json::from_value(json!({"mode": "metrics_and_matrix"})).expect("metrics request");
+            serde_json::from_value(json!({"mode": "measurement_report"})).expect("metrics request");
         let response: Value = serde_json::from_slice(
             &unloaded_admin_response(&request, "unloaded-project", "unloaded")
                 .expect("metrics response"),
         )
         .expect("metrics JSON");
-        assert_eq!(response["schema"], "context_metrics_and_matrix.v1");
+        assert_eq!(response["schema"], "context_measurement_report.v1");
         assert_eq!(response["metrics"]["schema"], "context_metrics.v1");
         assert_eq!(response["metrics"]["project_id"], "unloaded-project");
         assert_eq!(response["metrics"]["background"]["status"], "unloaded");
@@ -4995,7 +5004,7 @@ mod tests {
             ("contracts", "tool_output_contracts.compact.v1"),
             ("metrics", "context_metrics.v1"),
             ("measurement_matrix", "context_measurement_matrix.v1"),
-            ("metrics_and_matrix", "context_metrics_and_matrix.v1"),
+            ("measurement_report", "context_measurement_report.v1"),
             ("benchmark", "context_benchmark.v1"),
             ("state_browser", "context_state_browser.v1"),
             ("quality_eval", "context_quality_eval.v1"),
@@ -5024,6 +5033,15 @@ mod tests {
                     .contains(root.path().to_string_lossy().as_ref())
             );
         }
+        let legacy_request: ContextAdminRequest = serde_json::from_value(json!({
+            "mode": "metrics_and_matrix"
+        }))
+        .expect("legacy-shaped admin request");
+        let error = engine
+            .context_admin(&legacy_request)
+            .await
+            .expect_err("legacy mode must be rejected");
+        assert!(error.to_string().contains("unsupported context_admin mode"));
         let summary: Value = serde_json::from_str(
             &engine
                 .resource_text("repo://summary")
