@@ -9,7 +9,7 @@ import sys
 import unittest
 
 
-MODULE_PATH = Path(__file__).parents[1] / "monitor-metrics.py"
+MODULE_PATH = Path(__file__).parents[1] / "monitor.py"
 SPEC = importlib.util.spec_from_file_location("monitor_metrics", MODULE_PATH)
 assert SPEC and SPEC.loader
 monitor_metrics = importlib.util.module_from_spec(SPEC)

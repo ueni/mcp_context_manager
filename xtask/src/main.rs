@@ -46,9 +46,9 @@ fn release_version(arguments: Vec<String>) -> Result<()> {
         &format!("version = \"{version}\""),
     )?;
     update_workspace_lock_versions(Path::new("Cargo.lock"), version)?;
-    if Path::new("monitor-metrics.py").exists() {
+    if Path::new("monitor.py").exists() {
         replace_prefixed_line(
-            Path::new("monitor-metrics.py"),
+            Path::new("monitor.py"),
             "EXPECTED_SERVER_VERSION = \"",
             &format!("EXPECTED_SERVER_VERSION = \"{version}\""),
         )?;

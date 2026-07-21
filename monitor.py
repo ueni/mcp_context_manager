@@ -14,11 +14,11 @@ catalogue. Use one or more explicit selectors to restrict it to projects.
 No third-party dependencies are required.
 
 Usage:
-  python3 monitor-metrics.py
-  python3 monitor-metrics.py --once
-  python3 monitor-metrics.py --interval 60
-  python3 monitor-metrics.py --project-id my-repo-123abc
-  python3 monitor-metrics.py --url http://127.0.0.1:8000/mcp --color always
+  python3 monitor.py
+  python3 monitor.py --once
+  python3 monitor.py --interval 60
+  python3 monitor.py --project-id my-repo-123abc
+  python3 monitor.py --url http://127.0.0.1:8000/mcp --color always
 
 Environment:
   MCP_URL (default: http://localhost:8000/mcp)

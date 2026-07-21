@@ -52,7 +52,7 @@
         },
         {
           "lines": [],
-          "path": "monitor-metrics.py",
+          "path": "monitor.py",
           "reason": [
             "lexical_match"
           ]
@@ -81,7 +81,7 @@
         "doc/technical-paper.md",
         "README.md",
         "benchmarks/context_pack_benchmark.py",
-        "monitor-metrics.py",
+        "monitor.py",
         "benchmarks/cache_prompt_warmup_benchmark.py"
       ],
       "prompt": "Profile context_pack retrieval latency and identify the measured hot path",
@@ -282,7 +282,7 @@
         },
         {
           "lines": [],
-          "path": "monitor-metrics.py",
+          "path": "monitor.py",
           "reason": [
             "lexical_match"
           ]
@@ -305,7 +305,7 @@
         "README.md",
         "tests/test_admin_and_regression.py",
         "tests/test_monitor_metrics.py",
-        "monitor-metrics.py"
+        "monitor.py"
       ],
       "prompt": "Debug Streamable HTTP context_pack payload normalization and health routes",
       "required_paths": [
