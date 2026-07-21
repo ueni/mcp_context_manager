@@ -42,7 +42,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import RLock
 from typing import Any
@@ -50,6 +50,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 DEFAULT_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
 DEFAULT_TIMEOUT = 15.0
+DEFAULT_WARMUP_TIMEOUT = 60.0
 DEFAULT_INTERVAL = 60.0
 # Metrics polling is deliberately serialized. This keeps monitor refreshes
 # below one CPU core even when an operator explicitly selects many projects.
@@ -60,6 +61,7 @@ MAX_INTERVAL = 3600.0
 INTERVAL_STEP = 1.0
 DEFAULT_TERMINAL_COLUMNS = 160
 DEFAULT_TERMINAL_LINES = 30
+STATE_ENTRY_PREVIEW_LIMIT = 64 * 1024
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 CRITICAL_MATRIX_KEYS = {
     "latency.context_pack.avg_elapsed_ms",
@@ -112,10 +114,18 @@ class MonitorState:
     state_search_active: bool = False
     state_payload: dict[str, Any] | None = None
     state_entry: dict[str, Any] | None = None
+    state_entry_preview_source_id: int = 0
+    state_entry_preview: str = ""
+    state_entry_preview_truncated: bool = False
+    state_entry_preview_width: int = 0
+    state_entry_preview_lines: list[str] = field(default_factory=list)
     state_error: str = ""
     state_target: ProjectTarget | None = None
     mcp_status: str = ""
     mcp_error: str = ""
+    usage_enabled: bool | None = None
+    usage_report: dict[str, Any] | None = None
+    usage_status_requested: bool = False
 
 
 @dataclass
@@ -143,6 +153,12 @@ class WarmupResult:
 @dataclass
 class PruneResult:
     target: ProjectTarget | None
+    payload: dict[str, Any] | None = None
+    error: str = ""
+
+
+@dataclass
+class MonitorUsageResult:
     payload: dict[str, Any] | None = None
     error: str = ""
 
@@ -201,17 +217,24 @@ class McpHttpClient:
         result = self.rpc(
             "tools/call",
             {"name": name, "arguments": arguments},
+            timeout=self._timeout_for_tool(name, arguments),
         )
         payload = extract_tool_payload(result)
         if not isinstance(payload, dict):
             raise RuntimeError(f"unexpected tool payload for {name}: {payload!r}")
         return payload
 
+    def _timeout_for_tool(self, name: str, arguments: dict[str, Any]) -> float:
+        if name == "context_admin" and arguments.get("mode") == "warmup":
+            return max(self.timeout, DEFAULT_WARMUP_TIMEOUT)
+        return self.timeout
+
     def rpc(
         self,
         method: str,
         params: dict[str, Any] | None = None,
         expect_result: bool = True,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             self._request_id += 1
@@ -237,7 +260,9 @@ class McpHttpClient:
             headers=headers,
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout if timeout is None else timeout
+            ) as response:
                 response_session = response.headers.get(
                     "Mcp-Session-Id"
                 ) or response.headers.get("mcp-session-id")
@@ -455,8 +480,17 @@ def prune_project(client: Any, target: ProjectTarget) -> dict[str, Any]:
     root_uri = target.name if target.source == "root_uri" else ""
     return client.call_tool(
         "context_admin",
-        {"mode": "project_prune", **_selector_args(target, root_uri)},
+        {"mode": "cache_prune", **_selector_args(target, root_uri)},
     )
+
+
+def monitor_usage(
+    client: Any, action: str, target: ProjectTarget | None = None
+) -> dict[str, Any]:
+    arguments: dict[str, Any] = {"mode": "monitor_usage", "action": action}
+    if target and target.project_id:
+        arguments["project_id"] = target.project_id
+    return client.call_tool("context_admin", arguments)
 
 
 def friendly_mcp_error(exc: Exception) -> str:
@@ -492,12 +526,12 @@ def friendly_mcp_error(exc: Exception) -> str:
         )
     if (
         "context_adminArguments" in message
-        and "project_prune" in message
+        and "cache_prune" in message
         and "literal_error" in message
     ):
         return (
             "The running MCP server does not support "
-            "context_admin(mode='project_prune') yet. Rebuild and restart it with "
+            "context_admin(mode='cache_prune') yet. Rebuild and restart it with "
             "the current checkout, for example: "
             "MCP_CONTEXT_HOST_ROOT=/home/user/source docker compose up -d --build"
         )
@@ -541,10 +575,10 @@ def _collect_one(
 
 
 def _selector_args(target: ProjectTarget, root_uri: str) -> dict[str, str]:
-    if root_uri:
-        return {"root_uri": root_uri}
     if target.project_id:
         return {"project_id": target.project_id}
+    if root_uri:
+        return {"root_uri": root_uri}
     return {}
 
 
@@ -846,6 +880,45 @@ def render_performance_view(
             aligns=("left", "left"),
         ),
     ]
+    report = state.usage_report if isinstance(state.usage_report, dict) else {}
+    buckets = report.get("buckets") if isinstance(report.get("buckets"), list) else []
+    request_count = sum(_int_at(row, ("request_count",)) for row in buckets if isinstance(row, dict))
+    elapsed_micros = sum(_int_at(row, ("elapsed_micros_total",)) for row in buckets if isinstance(row, dict))
+    input_tokens = sum(_int_at(row, ("input_tokens_est",)) for row in buckets if isinstance(row, dict))
+    wire_tokens = sum(_int_at(row, ("wire_tokens_est",)) for row in buckets if isinstance(row, dict))
+    l0_hits = sum(_int_at(row, ("cache_outcomes", "l0_hit")) for row in buckets if isinstance(row, dict))
+    l0_misses = sum(_int_at(row, ("cache_outcomes", "l0_miss")) for row in buckets if isinstance(row, dict))
+    frontier_hits = sum(_int_at(row, ("frontier_outcomes", "exact_hit")) for row in buckets if isinstance(row, dict))
+    frontier_admitted = sum(_int_at(row, ("frontier_outcomes", "admitted")) for row in buckets if isinstance(row, dict))
+    capacity_fallbacks = sum(_int_at(row, ("frontier_outcomes", "capacity_fallback")) for row in buckets if isinstance(row, dict))
+    source_fallbacks = sum(_int_at(row, ("frontier_outcomes", "source_fallback")) for row in buckets if isinstance(row, dict))
+    base_pack_requests = sum(_int_at(row, ("delta", "base_pack_requests")) for row in buckets if isinstance(row, dict))
+    delta_saved = sum(_int_at(row, ("delta_tokens_saved_est",)) for row in buckets if isinstance(row, dict))
+    refresh_updates = sum(_int_at(row, ("index", "refresh_updated")) for row in buckets if isinstance(row, dict))
+    average_ms = elapsed_micros / request_count / 1000.0 if request_count else 0.0
+    enabled_label = "enabled" if state.usage_enabled else "disabled"
+    if state.usage_enabled is None:
+        enabled_label = "unknown (press l)"
+    lines.extend(
+        [
+            "",
+            _style("monitor-only detailed usage", color, Ansi.BOLD),
+            *_render_table(
+                ("signal", "value"),
+                (
+                    ("global collection", enabled_label),
+                    ("selected project", f"{fmt_int(request_count)} requests / {average_ms:.2f} avg ms"),
+                    ("30-day tokens", f"{fmt_int(input_tokens)} input / {fmt_int(wire_tokens)} wire"),
+                    ("L0 opportunity", f"{fmt_int(l0_hits)} hits / {fmt_int(l0_misses)} misses"),
+                    ("frontier opportunity", f"{fmt_int(frontier_hits)} hits / {fmt_int(frontier_admitted)} admitted / {fmt_int(capacity_fallbacks + source_fallbacks)} fallbacks"),
+                    ("delta adoption", f"{fmt_int(base_pack_requests)} requests / {fmt_int(delta_saved)} tokens saved"),
+                    ("index invalidation", f"{fmt_int(refresh_updates)} refresh updates"),
+                ),
+                widths=(20, max(20, width - 27)),
+                aligns=("left", "left"),
+            ),
+        ]
+    )
     if snapshot.error:
         lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
     lines.append(
@@ -959,23 +1032,67 @@ def render_state_entry_view(
     width = width or terminal_size.columns
     height = height or terminal_size.lines
     payload = state.state_entry or {}
-    entry = payload.get("entry") if isinstance(payload, dict) else {}
-    entry = entry if isinstance(entry, dict) else {}
-    preview = str(entry.get("preview") or "")
+    wrapped_entry = payload.get("entry") if isinstance(payload, dict) else None
+    entry = wrapped_entry
+    # state_browser entry responses expose the entry fields at the top level;
+    # keep accepting the older wrapped shape for compatibility.
+    if not isinstance(entry, dict):
+        entry = payload if isinstance(payload, dict) else {}
+    value = entry.get("value")
+    if state.state_entry_preview_source_id != id(payload):
+        preview, truncated = _serialize_state_entry_preview(entry)
+        state.state_entry_preview_source_id = id(payload)
+        state.state_entry_preview = preview
+        state.state_entry_preview_truncated = truncated
+        state.state_entry_preview_width = 0
+        state.state_entry_preview_lines = []
+    preview = state.state_entry_preview
+    browser_envelope = (
+        wrapped_entry is None
+        and entry.get("schema") == "context_state_browser.v1"
+        and entry.get("mode") == "entry"
+    )
+
+    def metadata_value(name: str) -> Any:
+        sources = (value, entry) if browser_envelope else (entry, value)
+        for source in sources:
+            if isinstance(source, dict) and source.get(name) not in (None, ""):
+                return source[name]
+        return None
+
+    value_type = entry.get("value_type")
+    if not value_type and "value" in entry:
+        value_type = (
+            "dict" if isinstance(value, dict)
+            else "list" if isinstance(value, list)
+            else "scalar"
+        )
+    size_chars = entry.get("size_chars")
+    if size_chars is None and "value" in entry:
+        size_chars = len(preview)
+    status = metadata_value("status")
+    if not status and "value" in entry:
+        status = "present" if entry.get("found", True) else "missing"
+    expires_at = metadata_value("expires_at")
+    if expires_at is None and "value" in entry:
+        expires_at = "not set"
     lines = _render_table(
         ("field", "value"),
         [
             ("key", entry.get("key", "-")),
-            ("type", entry.get("value_type", "-")),
-            ("size", fmt_int(entry.get("size_chars", 0))),
-            ("schema", entry.get("schema", "-") or "-"),
-            ("status", entry.get("status", "-") or "-"),
-            ("expires", entry.get("expires_at", "-") or "-"),
+            ("type", value_type or "-"),
+            ("size", fmt_int(size_chars or 0)),
+            ("schema", metadata_value("schema") or "-"),
+            ("status", status or "-"),
+            ("expires", expires_at or "-"),
         ],
         aligns=("left", "left"),
     )
     preview_width = max(40, width - 2)
-    preview_lines = _wrap_block(preview, preview_width)
+    if state.state_entry_preview_width != preview_width:
+        state.state_entry_preview_lines = _wrap_block(preview, preview_width)
+        state.state_entry_preview_width = preview_width
+    preview_lines = state.state_entry_preview_lines
     visible_count = _state_entry_visible_count(height)
     state.state_entry_scroll_offset = _clamp_content_scroll_offset(
         state.state_entry_scroll_offset,
@@ -997,7 +1114,10 @@ def render_state_entry_view(
         *lines,
         "",
         _style(
-            f"preview lines {first_line}-{last_line} / {len(preview_lines)}",
+            (
+                f"preview lines {first_line}-{last_line} / {len(preview_lines)}"
+                + (" (truncated)" if state.state_entry_preview_truncated else "")
+            ),
             color,
             Ansi.BOLD,
         ),
@@ -1009,6 +1129,26 @@ def render_state_entry_view(
         _browser_controls(state, color, status_line=_mcp_status_line(state, color))
     )
     return "\n".join(body)
+
+
+def _serialize_state_entry_preview(entry: dict[str, Any]) -> tuple[str, bool]:
+    if "preview" in entry:
+        preview = str(entry.get("preview") or "")
+        return preview[:STATE_ENTRY_PREVIEW_LIMIT], len(preview) > STATE_ENTRY_PREVIEW_LIMIT
+    if "value" not in entry:
+        return "", False
+
+    chunks: list[str] = []
+    size = 0
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+    for chunk in encoder.iterencode(entry.get("value")):
+        remaining = STATE_ENTRY_PREVIEW_LIMIT - size
+        if len(chunk) > remaining:
+            chunks.append(chunk[:remaining])
+            return "".join(chunks), True
+        chunks.append(chunk)
+        size += len(chunk)
+    return "".join(chunks), False
 
 
 def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
@@ -1293,7 +1433,7 @@ def _controls(
     status_line: str = "",
 ) -> str:
     keys = (
-        "keys: Up/Down select  Enter details  p performance  b state  Esc table  "
+        "keys: Up/Down select  Enter details  p performance  l detailed usage  b state  Esc table  "
         "+/- refresh  r reload  w warmup  P prune  q quit"
     )
     controls = (
@@ -1305,11 +1445,17 @@ def _controls(
 
 
 def _mcp_status_line(state: MonitorState, color: bool) -> str:
+    detailed = (
+        "unknown"
+        if state.usage_enabled is None
+        else "on" if state.usage_enabled else "off"
+    )
+    parts = [f"detailed={detailed}"]
     if state.mcp_error:
-        return _style(f"mcp: {state.mcp_error}", color, Ansi.RED)
-    if state.mcp_status:
-        return _style(f"mcp: {state.mcp_status}", color, Ansi.YELLOW)
-    return ""
+        parts.append(_style(f"mcp: {state.mcp_error}", color, Ansi.RED))
+    elif state.mcp_status:
+        parts.append(_style(f"mcp: {state.mcp_status}", color, Ansi.YELLOW))
+    return "   ".join(parts)
 
 
 def _browser_controls(
@@ -2269,6 +2415,8 @@ def decode_key(sequence: str) -> str | None:
         return "browser"
     if sequence == "p":
         return "performance"
+    if sequence == "l":
+        return "monitor_usage"
     if sequence == "P":
         return "prune"
     if sequence in {"w", "W"}:
@@ -2321,6 +2469,7 @@ def _search_text_for_key(key: str) -> str:
         "refresh": "r",
         "browser": "b",
         "performance": "p",
+        "monitor_usage": "l",
         "prune": "P",
         "warmup": "w",
         "quit": "q",
@@ -2400,6 +2549,8 @@ def handle_key(
         return "warmup"
     if key == "prune" and state.view != "state" and row_count:
         return "prune"
+    if key == "monitor_usage":
+        return "monitor_usage"
     if key == "browser" and row_count:
         state.view = "state"
         state.state_entry = None
@@ -2409,7 +2560,7 @@ def handle_key(
         return "browser"
     if key == "performance" and row_count and state.view != "state":
         state.view = "performance"
-        return "redraw"
+        return "performance"
     if key == "up":
         if state.view == "state":
             if state.state_entry:
@@ -2632,6 +2783,11 @@ def _apply_state_entry_result(state: MonitorState, result: StateEntryResult) -> 
         return
     state.state_entry = result.payload
     state.state_entry_scroll_offset = 0
+    state.state_entry_preview_source_id = 0
+    state.state_entry_preview = ""
+    state.state_entry_preview_truncated = False
+    state.state_entry_preview_width = 0
+    state.state_entry_preview_lines = []
     state.state_error = ""
     state.view = "state"
 
@@ -2649,6 +2805,45 @@ def _fetch_warmup_result(
         return WarmupResult(target=target, payload=warmup_project(client, target))
     except Exception as exc:
         return WarmupResult(target=target, error=friendly_mcp_error(exc))
+
+
+def _fetch_monitor_usage_result(
+    client: Any,
+    snapshots: list[ProjectSnapshot],
+    selected_index: int,
+    toggle: bool,
+) -> MonitorUsageResult:
+    target = None
+    if snapshots:
+        target = snapshots[_clamped_index(selected_index, len(snapshots))].target
+    try:
+        status = monitor_usage(client, "status")
+        if toggle:
+            action = "disable" if status.get("enabled") else "enable"
+            status = monitor_usage(client, action)
+        report = monitor_usage(client, "report", target)
+        return MonitorUsageResult(payload={"status": status, "report": report})
+    except Exception as exc:
+        return MonitorUsageResult(error=friendly_mcp_error(exc))
+
+
+def _apply_monitor_usage_result(
+    state: MonitorState, result: MonitorUsageResult
+) -> None:
+    state.usage_status_requested = True
+    if result.error:
+        state.mcp_error = result.error
+        state.mcp_status = ""
+        return
+    payload = result.payload or {}
+    status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+    report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+    state.usage_enabled = bool(status.get("enabled"))
+    state.usage_report = report
+    state.mcp_status = (
+        "detailed usage enabled" if state.usage_enabled else "detailed usage disabled"
+    )
+    state.mcp_error = ""
 
 
 def _apply_warmup_result(state: MonitorState, result: WarmupResult) -> None:
@@ -2747,6 +2942,10 @@ def _apply_mcp_operation_result(
         if isinstance(result, PruneResult):
             _apply_prune_result(state, result)
         return snapshots
+    if pending.kind == "monitor_usage":
+        if isinstance(result, MonitorUsageResult):
+            _apply_monitor_usage_result(state, result)
+        return snapshots
     return snapshots
 
 
@@ -2765,6 +2964,14 @@ def _load_state_entry(client: Any, state: MonitorState) -> None:
         return
     result = _fetch_state_entry_result(client, state.state_target, key)
     _apply_state_entry_result(state, result)
+
+
+def _needs_initial_usage_status(
+    state: MonitorState,
+    snapshots: list[ProjectSnapshot],
+    pending: PendingMcpOperation | None,
+) -> bool:
+    return bool(snapshots) and pending is None and not state.usage_status_requested
 
 
 def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) -> int:
@@ -2794,7 +3001,8 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                     _set_mcp_error(state, exc)
                     completed_kind = ""
                 pending = None
-                next_refresh = time.monotonic() + state.refresh_interval
+                if completed_kind != "monitor_usage":
+                    next_refresh = time.monotonic() + state.refresh_interval
                 if queued_browser_load and state.view == "state":
                     queued_browser_load = False
                     state.state_payload = None
@@ -2839,6 +3047,17 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                 dirty = True
 
             browser_open = state.view == "state"
+            if _needs_initial_usage_status(state, snapshots, pending):
+                state.usage_status_requested = True
+                _set_mcp_loading(state, "loading detailed usage status...")
+                pending = _submit_mcp_operation(
+                    executor,
+                    "monitor_usage",
+                    lambda: _fetch_monitor_usage_result(
+                        client, snapshots, state.selected_index, False
+                    ),
+                )
+                dirty = True
             if pending is None and (
                 force_refresh or (not browser_open and now >= next_refresh)
             ):
@@ -2955,6 +3174,23 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                     )
                 else:
                     queued_prune = True
+                    _set_mcp_loading(state, "waiting for current MCP request...")
+                dirty = True
+            if action in {"performance", "monitor_usage"}:
+                if pending is None:
+                    toggle = action == "monitor_usage"
+                    _set_mcp_loading(
+                        state,
+                        "updating detailed usage..." if toggle else "loading detailed usage...",
+                    )
+                    pending = _submit_mcp_operation(
+                        executor,
+                        "monitor_usage",
+                        lambda toggle=toggle: _fetch_monitor_usage_result(
+                            client, snapshots, state.selected_index, toggle
+                        ),
+                    )
+                else:
                     _set_mcp_loading(state, "waiting for current MCP request...")
                 dirty = True
             if action in {"redraw", "refresh"}:

@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     env,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -45,7 +45,10 @@ use rmcp::{
         stdio,
         streamable_http_server::{
             StreamableHttpServerConfig, StreamableHttpService,
-            session::local::{LocalSessionManager, SessionConfig},
+            session::{
+                SessionId, SessionManager,
+                local::{LocalSessionManager, SessionConfig},
+            },
         },
     },
 };
@@ -62,6 +65,7 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LEGACY_SSE_MAX_SESSIONS: usize = 64;
 const LEGACY_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const LEGACY_SSE_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+const MCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 type NativeMcpService = StreamableHttpService<ContextServer, LocalSessionManager>;
 
@@ -85,6 +89,7 @@ struct HttpState {
     registry: Arc<ProjectRegistry>,
     security: Arc<HttpSecurity>,
     legacy_sse: Arc<LegacySseBridge>,
+    mcp_sessions: Arc<LocalSessionManager>,
 }
 
 struct LegacySseBridge {
@@ -104,6 +109,15 @@ struct HttpSecurity {
     bearer_token: Option<String>,
     allowed_hosts: Vec<String>,
     allowed_origins: Vec<String>,
+    public_base_url: Option<String>,
+    protected_resource: Option<ProtectedResourceConfig>,
+}
+
+#[derive(Debug)]
+struct ProtectedResourceConfig {
+    resource: String,
+    metadata_url: String,
+    authorization_servers: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -198,10 +212,19 @@ impl ContextServer {
     #[tool(
         description = "Inspect health, index, cache, contracts, metrics, quality, and generated state"
     )]
-    fn context_admin(
+    async fn context_admin(
         &self,
         Parameters(mut request): Parameters<ContextAdminRequest>,
     ) -> Result<String, String> {
+        if request.mode == "monitor_usage" {
+            return serde_json::to_string(
+                &self
+                    .registry
+                    .monitor_usage(&request.action, request.project_id.as_deref())
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string());
+        }
         if request.mode == "projects" {
             return serde_json::to_string(
                 &self
@@ -237,7 +260,7 @@ impl ContextServer {
             request.project_id = Some(project_id);
             request.root_uri = None;
             let encoded = match engine {
-                Some(engine) => engine.context_admin(&request),
+                Some(engine) => engine.context_admin(&request).await,
                 None => unloaded_admin_response(
                     &request,
                     request.project_id.as_deref().unwrap_or_default(),
@@ -255,6 +278,7 @@ impl ContextServer {
         request.root_uri = None;
         let encoded = engine
             .context_admin(&request)
+            .await
             .map_err(|error| error.to_string())?;
         String::from_utf8(encoded).map_err(|error| error.to_string())
     }
@@ -389,12 +413,12 @@ async fn run_http(registry: Arc<ProjectRegistry>) -> Result<()> {
     let address: SocketAddr = format!("{host}:{port}")
         .parse()
         .context("HOST and PORT must form a valid socket address")?;
-    let security = Arc::new(HttpSecurity::from_env(&host, port));
+    let security = Arc::new(HttpSecurity::from_env(&host, port)?);
 
     let cancellation = CancellationToken::new();
     let mut local_sessions = LocalSessionManager::default();
     let mut session_config = SessionConfig::default();
-    session_config.keep_alive = Some(Duration::from_secs(30 * 60));
+    session_config.keep_alive = Some(MCP_SESSION_IDLE_TIMEOUT);
     local_sessions.session_config = session_config;
     let session_manager = Arc::new(local_sessions);
     let mcp_config = StreamableHttpServerConfig::default()
@@ -406,29 +430,35 @@ async fn run_http(registry: Arc<ProjectRegistry>) -> Result<()> {
     let mcp_registry = Arc::clone(&registry);
     let mcp: NativeMcpService = StreamableHttpService::new(
         move || Ok(ContextServer::new(Arc::clone(&mcp_registry))),
-        session_manager,
+        Arc::clone(&session_manager),
         mcp_config,
     );
     let state = HttpState {
         registry: Arc::clone(&registry),
         security: Arc::clone(&security),
         legacy_sse: Arc::new(LegacySseBridge::new(mcp.clone())),
+        mcp_sessions: Arc::clone(&session_manager),
     };
     let app = Router::new()
         .route("/", get(root))
         .route("/healthz", get(healthz))
         .route("/mcp/healthz", get(healthz))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(protected_resource_metadata),
+        )
         .route("/legacy/sse", get(legacy_sse_http))
         .route("/legacy/messages", post(legacy_sse_message_http))
         .route("/v1/mcp/tools", get(mcp_tools_http))
         .route("/v1/context/pack", post(context_pack_http))
         .route("/v1/context/references/{reference_id}", get(reference_http))
-        .nest_service("/mcp", mcp)
+        .route_service("/mcp", mcp)
         .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(
-            state.security,
-            validate_http_request,
-        ));
+        .layer(middleware::from_fn_with_state(state, validate_http_request));
     let listener = tokio::net::TcpListener::bind(address).await?;
 
     axum::serve(listener, app)
@@ -457,6 +487,7 @@ async fn mcp_tools_http() -> Json<Value> {
         "context_lookup",
         "context_memory",
         "context_admin",
+        "health",
         "result_reference_resolve",
     ];
     Json(json!({
@@ -466,6 +497,18 @@ async fn mcp_tools_http() -> Json<Value> {
         "tool_count": tools.len(),
         "tools": tools,
     }))
+}
+
+async fn protected_resource_metadata(State(state): State<HttpState>) -> Response {
+    let Some(config) = state.security.protected_resource.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(json!({
+        "resource": config.resource,
+        "authorization_servers": config.authorization_servers,
+        "bearer_methods_supported": ["header"],
+    }))
+    .into_response()
 }
 
 impl LegacySseBridge {
@@ -565,11 +608,19 @@ async fn legacy_sse_http(State(state): State<HttpState>, headers: HeaderMap) -> 
         Ok(session) => session,
         Err(message) => return rest_error(StatusCode::SERVICE_UNAVAILABLE, message),
     };
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("localhost");
-    let endpoint = format!("http://{host}/legacy/messages?session_id={session_id}");
+    let public_base_url = match state.security.public_base_url.as_deref() {
+        Some(public_base_url) => public_base_url.to_owned(),
+        None => {
+            let Some(host) = headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+            else {
+                return rest_error(StatusCode::BAD_REQUEST, "Host is required");
+            };
+            format!("http://{host}")
+        }
+    };
+    let endpoint = format!("{public_base_url}/legacy/messages?session_id={session_id}");
     let events =
         tokio_stream::iter([Ok::<Event, Infallible>(
             Event::default().event("endpoint").data(endpoint),
@@ -623,7 +674,7 @@ async fn legacy_sse_message_http(
     }
     if let Some(protocol_version) = saved_protocol_version
         .as_deref()
-        .or_else(|| request_protocol_version.as_deref())
+        .or(request_protocol_version.as_deref())
         .or_else(|| {
             headers
                 .get("mcp-protocol-version")
@@ -791,10 +842,11 @@ async fn reference_http(
 }
 
 async fn validate_http_request(
-    State(security): State<Arc<HttpSecurity>>,
-    request: Request<Body>,
+    State(state): State<HttpState>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let security = &state.security;
     let host = request
         .headers()
         .get(header::HOST)
@@ -818,17 +870,34 @@ async fn validate_http_request(
     {
         return rest_error(StatusCode::FORBIDDEN, "Origin is not allowed");
     }
-    if let Some(expected) = security.bearer_token.as_deref() {
+    let path = request.uri().path().to_owned();
+    let is_metadata = matches!(
+        path.as_str(),
+        "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/mcp"
+    );
+    if let Some(expected) = security.bearer_token.as_deref()
+        && !is_metadata
+    {
         let provided = request
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+            .map(|(_, token)| token.trim_start())
             .unwrap_or_default();
         if !constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
+            let challenge = format!(
+                "Bearer resource_metadata=\"{}\"",
+                security
+                    .protected_resource
+                    .as_ref()
+                    .expect("bearer authentication has protected resource metadata")
+                    .metadata_url
+            );
             return Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
-                .header(header::WWW_AUTHENTICATE, "Bearer")
+                .header(header::WWW_AUTHENTICATE, challenge)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -841,7 +910,165 @@ async fn validate_http_request(
                 .expect("valid unauthorized response");
         }
     }
+
+    if path == "/mcp" {
+        if request.method() == axum::http::Method::POST {
+            if !content_type_is_json(request.headers()) {
+                return rest_error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "Content-Type must be application/json",
+                );
+            }
+            if !accepts_media(request.headers(), "application/json")
+                || !accepts_media(request.headers(), "text/event-stream")
+            {
+                return rest_error(
+                    StatusCode::NOT_ACCEPTABLE,
+                    "Accept must allow application/json and text/event-stream",
+                );
+            }
+            request.headers_mut().insert(
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            request.headers_mut().insert(
+                header::ACCEPT,
+                axum::http::HeaderValue::from_static("application/json, text/event-stream"),
+            );
+        } else if request.method() == axum::http::Method::GET {
+            if !accepts_media(request.headers(), "text/event-stream") {
+                return rest_error(
+                    StatusCode::NOT_ACCEPTABLE,
+                    "Accept must allow text/event-stream",
+                );
+            }
+            request.headers_mut().insert(
+                header::ACCEPT,
+                axum::http::HeaderValue::from_static("text/event-stream"),
+            );
+        }
+
+        if let Some(session_id) = request
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+        {
+            if request.method() == axum::http::Method::DELETE {
+                let session_id: SessionId = session_id.into();
+                match state.mcp_sessions.has_session(&session_id).await {
+                    Ok(true) => {}
+                    Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+                    Err(_) => {
+                        return rest_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "failed to check MCP session",
+                        );
+                    }
+                }
+            }
+        } else if request.method() == axum::http::Method::DELETE {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    }
+
     next.run(request).await
+}
+
+fn content_type_is_json(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let mut parts = value.split(';');
+    if !parts
+        .next()
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return false;
+    }
+    parts.all(valid_media_parameter)
+}
+
+fn accepts_media(headers: &HeaderMap, representation: &str) -> bool {
+    let mut best_specificity = None;
+    let mut best_quality = 0.0_f32;
+    for header_value in headers.get_all(header::ACCEPT) {
+        let Ok(header_value) = header_value.to_str() else {
+            continue;
+        };
+        for range in header_value.split(',') {
+            let mut parts = range.split(';');
+            let Some(media_range) = parts.next().map(str::trim) else {
+                continue;
+            };
+            let Some(specificity) = media_range_specificity(media_range, representation) else {
+                continue;
+            };
+            let mut quality = 1.0_f32;
+            let mut valid = true;
+            for parameter in parts {
+                let parameter = parameter.trim();
+                let Some((name, value)) = parameter.split_once('=') else {
+                    valid = false;
+                    break;
+                };
+                if name.trim().eq_ignore_ascii_case("q") {
+                    quality = match value.trim().parse::<f32>() {
+                        Ok(value) if (0.0..=1.0).contains(&value) => value,
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    };
+                }
+            }
+            if !valid {
+                continue;
+            }
+            match best_specificity {
+                None => {
+                    best_specificity = Some(specificity);
+                    best_quality = quality;
+                }
+                Some(best) if specificity > best => {
+                    best_specificity = Some(specificity);
+                    best_quality = quality;
+                }
+                Some(best) if specificity == best => {
+                    best_quality = best_quality.max(quality);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    best_specificity.is_some() && best_quality > 0.0
+}
+
+fn media_range_specificity(media_range: &str, representation: &str) -> Option<u8> {
+    if media_range.eq_ignore_ascii_case(representation) {
+        return Some(2);
+    }
+    let (range_type, range_subtype) = media_range.split_once('/')?;
+    let (representation_type, _) = representation.split_once('/')?;
+    if range_type.trim() == "*" && range_subtype.trim() == "*" {
+        Some(0)
+    } else if range_type.trim().eq_ignore_ascii_case(representation_type)
+        && range_subtype.trim() == "*"
+    {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn valid_media_parameter(parameter: &str) -> bool {
+    parameter
+        .trim()
+        .split_once('=')
+        .is_some_and(|(name, value)| !name.trim().is_empty() && !value.trim().is_empty())
 }
 
 fn rest_error(status: StatusCode, message: &str) -> Response {
@@ -857,7 +1084,7 @@ fn rest_error(status: StatusCode, message: &str) -> Response {
 }
 
 impl HttpSecurity {
-    fn from_env(host: &str, port: u16) -> Self {
+    fn from_env(host: &str, port: u16) -> Result<Self> {
         let configured_hosts = split_csv_env("MCP_HTTP_ALLOWED_HOSTS");
         let allowed_hosts = if configured_hosts.is_empty() {
             let mut hosts = vec![
@@ -885,14 +1112,105 @@ impl HttpSecurity {
         } else {
             configured_origins
         };
-        Self {
-            bearer_token: env::var("MCP_HTTP_BEARER_TOKEN")
-                .ok()
-                .filter(|token| !token.trim().is_empty()),
+        let bearer_token = env::var("MCP_HTTP_BEARER_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty());
+        let configured_public_base = env::var("MCP_HTTP_PUBLIC_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let public_base_url = match configured_public_base.as_deref() {
+            Some(value) => Some(
+                validate_absolute_url(value, true, true)
+                    .context("MCP_HTTP_PUBLIC_BASE_URL must be a valid public origin")?,
+            ),
+            None if bearer_token.is_some() => {
+                bail!("MCP_HTTP_PUBLIC_BASE_URL is required when MCP_HTTP_BEARER_TOKEN is set")
+            }
+            None => None,
+        };
+        let authorization_servers = split_csv_env("MCP_HTTP_AUTHORIZATION_SERVERS");
+        let protected_resource = if bearer_token.is_some() {
+            if authorization_servers.is_empty() {
+                bail!(
+                    "MCP_HTTP_AUTHORIZATION_SERVERS is required when MCP_HTTP_BEARER_TOKEN is set"
+                );
+            }
+            let authorization_servers = authorization_servers
+                .into_iter()
+                .map(|value| {
+                    validate_absolute_url(&value, false, false)
+                        .context("MCP_HTTP_AUTHORIZATION_SERVERS contains an invalid URL")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(ProtectedResourceConfig {
+                resource: format!(
+                    "{}/mcp",
+                    public_base_url
+                        .as_deref()
+                        .expect("bearer authentication requires a public base URL")
+                ),
+                metadata_url: format!(
+                    "{}/.well-known/oauth-protected-resource/mcp",
+                    public_base_url
+                        .as_deref()
+                        .expect("bearer authentication requires a public base URL")
+                ),
+                authorization_servers,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            bearer_token,
             allowed_hosts,
             allowed_origins,
-        }
+            public_base_url,
+            protected_resource,
+        })
     }
+}
+
+fn validate_absolute_url(
+    value: &str,
+    origin_only: bool,
+    allow_loopback_http: bool,
+) -> Result<String> {
+    let value = value.trim();
+    let uri = value
+        .parse::<axum::http::Uri>()
+        .context("URL is not a valid absolute URI")?;
+    let scheme = uri.scheme_str().context("URL must include a scheme")?;
+    if !matches!(scheme, "http" | "https") {
+        bail!("URL scheme must be https (or http for loopback development)");
+    }
+    let authority = uri.authority().context("URL must include an authority")?;
+    if authority.as_str().contains('@') {
+        bail!("URL must not contain user information");
+    }
+    if scheme == "http" && !(allow_loopback_http && is_loopback_host(authority.host())) {
+        bail!("URL must use https");
+    }
+    if uri.query().is_some() {
+        bail!("URL must not contain a query");
+    }
+    if origin_only && !matches!(uri.path(), "" | "/") {
+        bail!("public base URL must not contain a path");
+    }
+    Ok(if origin_only {
+        value.trim_end_matches('/').to_owned()
+    } else {
+        value.to_owned()
+    })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 fn split_csv_env(name: &str) -> Vec<String> {
@@ -930,8 +1248,8 @@ fn project_id_from_resource(uri: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn metrics_admin_returns_an_unloaded_snapshot_without_constructing_an_engine() {
+    #[tokio::test]
+    async fn metrics_admin_returns_an_unloaded_snapshot_without_constructing_an_engine() {
         let root = tempfile::tempdir().expect("repository root");
         let state = tempfile::tempdir().expect("state root");
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
@@ -951,6 +1269,7 @@ mod tests {
         let active: Value = serde_json::from_str(
             &server
                 .context_admin(Parameters(active_request))
+                .await
                 .expect("active projects response"),
         )
         .expect("active projects JSON");
@@ -962,16 +1281,42 @@ mod tests {
         let cached: Value = serde_json::from_str(
             &server
                 .context_admin(Parameters(cached_request))
+                .await
                 .expect("cached projects response"),
         )
         .expect("cached projects JSON");
         assert_eq!(cached["schema"], "context_projects.cached.v1");
+        let monitor_request: ContextAdminRequest = serde_json::from_value(json!({
+            "mode": "monitor_usage",
+            "action": "enable"
+        }))
+        .expect("monitor request");
+        let monitor: Value = serde_json::from_str(
+            &server
+                .context_admin(Parameters(monitor_request))
+                .await
+                .expect("monitor response"),
+        )
+        .expect("monitor JSON");
+        assert_eq!(monitor["enabled"], true);
+        let active_after: Value = serde_json::from_str(
+            &server
+                .context_admin(Parameters(
+                    serde_json::from_value(json!({"mode": "active_projects"}))
+                        .expect("active request"),
+                ))
+                .await
+                .expect("active response"),
+        )
+        .expect("active JSON");
+        assert_eq!(active_after["count"], 0);
         let request: ContextAdminRequest =
             serde_json::from_value(json!({"mode": "metrics_and_matrix"})).expect("metrics request");
 
         let response: Value = serde_json::from_str(
             &server
                 .context_admin(Parameters(request))
+                .await
                 .expect("metrics response"),
         )
         .expect("metrics JSON");
@@ -983,7 +1328,7 @@ mod tests {
         let Json(payload) = mcp_tools_http().await;
 
         assert_eq!(payload["mcp_endpoint"], "/mcp");
-        assert_eq!(payload["tool_count"], 5);
+        assert_eq!(payload["tool_count"], 6);
         assert_eq!(
             payload["tools"],
             json!([
@@ -991,6 +1336,7 @@ mod tests {
                 "context_lookup",
                 "context_memory",
                 "context_admin",
+                "health",
                 "result_reference_resolve",
             ])
         );
@@ -1010,6 +1356,56 @@ mod tests {
         assert_eq!(
             messages,
             vec!["{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}"]
+        );
+    }
+
+    #[test]
+    fn media_negotiation_is_case_insensitive_and_honors_quality_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "Application/JSON ; charset=utf-8"
+                .parse()
+                .expect("content type"),
+        );
+        headers.insert(
+            header::ACCEPT,
+            "Application/JSON; q=1, Text/Event-Stream ;q=0.5"
+                .parse()
+                .expect("accept"),
+        );
+        assert!(content_type_is_json(&headers));
+        assert!(accepts_media(&headers, "application/json"));
+        assert!(accepts_media(&headers, "text/event-stream"));
+
+        headers.insert(
+            header::ACCEPT,
+            "*/*;q=1, application/json;q=0, text/event-stream;q=1"
+                .parse()
+                .expect("accept"),
+        );
+        assert!(!accepts_media(&headers, "application/json"));
+        assert!(accepts_media(&headers, "text/event-stream"));
+    }
+
+    #[test]
+    fn configured_urls_require_https_except_for_loopback() {
+        assert_eq!(
+            validate_absolute_url("https://context.example/", true, true).expect("HTTPS origin"),
+            "https://context.example"
+        );
+        assert!(validate_absolute_url("http://context.example", true, true).is_err());
+        assert!(validate_absolute_url("http://127.0.0.1:8000", true, true).is_ok());
+        assert!(validate_absolute_url("http://LOCALHOST:8000", true, true).is_ok());
+        assert!(validate_absolute_url("http://127.0.0.2:8000", true, true).is_ok());
+        assert!(validate_absolute_url("http://[::1]:8000", true, true).is_ok());
+        assert!(validate_absolute_url("http://[2001:db8::1]:8000", true, true).is_err());
+        assert!(validate_absolute_url("https://context.example/base", true, true).is_err());
+        assert!(validate_absolute_url("http://localhost:9000", false, false).is_err());
+        assert_eq!(
+            validate_absolute_url("https://auth.example/", false, false)
+                .expect("authorization server URL"),
+            "https://auth.example/"
         );
     }
 }

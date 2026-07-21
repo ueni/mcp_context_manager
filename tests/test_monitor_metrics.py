@@ -35,6 +35,88 @@ class FakeClient:
         }
 
 
+class MonitorMcpTimeoutTests(unittest.TestCase):
+    def test_warmup_uses_long_deadline_without_weakening_normal_calls(self) -> None:
+        class RecordingClient(monitor_metrics.McpHttpClient):
+            def __init__(self) -> None:
+                super().__init__("http://localhost:8000/mcp", timeout=5.0)
+                self.timeouts: list[float | None] = []
+
+            def initialize(self) -> None:
+                return
+
+            def rpc(
+                self,
+                method: str,
+                params: dict[str, object] | None = None,
+                expect_result: bool = True,
+                timeout: float | None = None,
+            ) -> dict[str, object]:
+                self.timeouts.append(timeout)
+                return {"content": [{"type": "text", "text": "{}"}]}
+
+        client = RecordingClient()
+
+        client.call_tool("context_admin", {"mode": "warmup"})
+        client.call_tool("context_admin", {"mode": "metrics"})
+
+        self.assertEqual(
+            client.timeouts,
+            [monitor_metrics.DEFAULT_WARMUP_TIMEOUT, 5.0],
+        )
+
+    def test_warmup_preserves_larger_configured_deadline(self) -> None:
+        client = monitor_metrics.McpHttpClient("http://localhost:8000/mcp", timeout=90.0)
+
+        self.assertEqual(
+            client._timeout_for_tool("context_admin", {"mode": "warmup"}),
+            90.0,
+        )
+
+
+class MonitorUsageControlTests(unittest.TestCase):
+    def test_startup_requests_status_once_and_controls_show_state(self) -> None:
+        state = monitor_metrics.MonitorState()
+        snapshots = [
+            monitor_metrics.ProjectSnapshot(
+                target=monitor_metrics.ProjectTarget(project_id="one")
+            )
+        ]
+
+        self.assertTrue(
+            monitor_metrics._needs_initial_usage_status(state, snapshots, None)
+        )
+        self.assertIn("detailed=unknown", monitor_metrics._mcp_status_line(state, False))
+        state.usage_status_requested = True
+        state.usage_enabled = False
+        self.assertFalse(
+            monitor_metrics._needs_initial_usage_status(state, snapshots, None)
+        )
+        self.assertIn("detailed=off", monitor_metrics._mcp_status_line(state, False))
+        state.usage_enabled = True
+        self.assertIn("detailed=on", monitor_metrics._mcp_status_line(state, False))
+
+    def test_l_key_is_a_nonblocking_monitor_usage_action(self) -> None:
+        state = monitor_metrics.MonitorState(view="performance")
+
+        self.assertEqual(monitor_metrics.decode_key("l"), "monitor_usage")
+        self.assertEqual(
+            monitor_metrics.handle_key("monitor_usage", state, row_count=1),
+            "monitor_usage",
+        )
+
+    def test_report_is_scoped_to_selected_project(self) -> None:
+        client = FakeClient()
+        target = monitor_metrics.ProjectTarget(project_id="one")
+
+        monitor_metrics.monitor_usage(client, "report", target)
+
+        self.assertEqual(
+            client.calls,
+            [("context_admin", {"mode": "monitor_usage", "action": "report", "project_id": "one"})],
+        )
+
+
 class MonitorProjectSelectionTests(unittest.TestCase):
     def test_default_snapshot_uses_cached_projects_without_discovery(self) -> None:
         client = FakeClient()
@@ -52,7 +134,6 @@ class MonitorProjectSelectionTests(unittest.TestCase):
                 ("context_admin", {"mode": "metrics_and_matrix", "project_id": "two"}),
             ],
         )
-
     def test_explicit_projects_do_not_trigger_workspace_discovery(self) -> None:
         client = FakeClient()
 
@@ -71,6 +152,143 @@ class MonitorProjectSelectionTests(unittest.TestCase):
                 ("context_admin", {"mode": "metrics_and_matrix", "project_id": "two"}),
             ],
         )
+
+    def test_cached_root_uri_source_prefers_project_id_for_actions(self) -> None:
+        client = FakeClient()
+        target = monitor_metrics.ProjectTarget(
+            project_id="demo-project",
+            name="demo-project",
+            source="root_uri",
+        )
+
+        monitor_metrics.fetch_state_browser(client, target)
+        monitor_metrics.warmup_project(client, target)
+        monitor_metrics.prune_project(client, target)
+
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "context_admin",
+                    {
+                        "mode": "state_browser",
+                        "project_id": "demo-project",
+                        "max_entries": 80,
+                        "max_output_chars": 1200,
+                    },
+                ),
+                (
+                    "context_admin",
+                    {"mode": "warmup", "project_id": "demo-project"},
+                ),
+                (
+                    "context_admin",
+                    {"mode": "cache_prune", "project_id": "demo-project"},
+                ),
+            ],
+        )
+
+    def test_explicit_root_uri_is_used_without_project_id(self) -> None:
+        client = FakeClient()
+        target = monitor_metrics.ProjectTarget(
+            project_id="",
+            name="file:///workspace/demo-project",
+            source="root_uri",
+        )
+
+        monitor_metrics.warmup_project(client, target)
+
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "context_admin",
+                    {
+                        "mode": "warmup",
+                        "root_uri": "file:///workspace/demo-project",
+                    },
+                )
+            ],
+        )
+
+
+class MonitorStateEntryViewTests(unittest.TestCase):
+    def test_renders_top_level_state_browser_entry(self) -> None:
+        state = monitor_metrics.MonitorState()
+        state.state_target = monitor_metrics.ProjectTarget(project_id="demo")
+        state.state_entry = {
+            "schema": "context_state_browser.v1",
+            "mode": "entry",
+            "key": "cache:demo",
+            "value": {"answer": 42},
+            "preview": '{"answer":42}',
+            "value_type": "dict",
+            "size_chars": 13,
+            "status": "active",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }
+
+        rendered = monitor_metrics.render_state_entry_view(
+            "http://localhost:8000/mcp", False, 100, state, height=30
+        )
+
+        self.assertIn("cache:demo", rendered)
+        self.assertIn("dict", rendered)
+        self.assertIn('{"answer":42}', rendered)
+
+    def test_renders_value_only_state_browser_entry(self) -> None:
+        state = monitor_metrics.MonitorState()
+        state.state_target = monitor_metrics.ProjectTarget(project_id="demo")
+        state.state_entry = {
+            "schema": "context_state_browser.v1",
+            "mode": "entry",
+            "key": "frontier:fr_demo",
+            "found": True,
+            "value": {"records": [1, 2]},
+        }
+
+        rendered = monitor_metrics.render_state_entry_view(
+            "http://localhost:8000/mcp", False, 100, state, height=30
+        )
+
+        self.assertIn("dict", rendered)
+        self.assertIn('{"records":[1,2]}', rendered)
+        self.assertIn("present", rendered)
+        self.assertIn("not set", rendered)
+
+    def test_renders_stored_metadata_and_bounds_large_preview(self) -> None:
+        state = monitor_metrics.MonitorState()
+        state.state_target = monitor_metrics.ProjectTarget(project_id="demo")
+        state.state_entry = {
+            "schema": "context_state_browser.v1",
+            "mode": "entry",
+            "key": "frontier:fr_demo",
+            "found": True,
+            "value": {
+                "schema": "retrieval_frontier.v1",
+                "status": "ready",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "records": ["x" * 1024] * 100,
+            },
+        }
+
+        rendered = monitor_metrics.render_state_entry_view(
+            "http://localhost:8000/mcp", False, 80, state, height=24
+        )
+
+        self.assertIn("retrieval_frontier.v1", rendered)
+        self.assertIn("ready", rendered)
+        self.assertIn("2099-01-01T00:00:00Z", rendered)
+        self.assertIn("(truncated)", rendered)
+        self.assertLessEqual(
+            len(state.state_entry_preview),
+            monitor_metrics.STATE_ENTRY_PREVIEW_LIMIT,
+        )
+        cached_lines = state.state_entry_preview_lines
+        monitor_metrics.render_state_entry_view(
+            "http://localhost:8000/mcp", False, 80, state, height=24
+        )
+        self.assertIs(state.state_entry_preview_lines, cached_lines)
 
 
 def native_metrics(*, status: str = "idle") -> dict[str, object]:
@@ -184,7 +402,29 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertNotIn("candidate compact.", rendered)
 
     def test_performance_and_detail_views_do_not_render_retired_stages(self) -> None:
-        state = monitor_metrics.MonitorState(last_updated="2026-07-17T21:00:00Z")
+        state = monitor_metrics.MonitorState(
+            last_updated="2026-07-17T21:00:00Z",
+            usage_enabled=True,
+            usage_report={
+                "buckets": [
+                    {
+                        "request_count": 2,
+                        "elapsed_micros_total": 5000,
+                        "input_tokens_est": 100,
+                        "wire_tokens_est": 20,
+                        "cache_outcomes": {"l0_hit": 3, "l0_miss": 1},
+                        "frontier_outcomes": {
+                            "exact_hit": 2,
+                            "admitted": 1,
+                            "capacity_fallback": 1,
+                        },
+                        "delta": {"base_pack_requests": 2},
+                        "delta_tokens_saved_est": 40,
+                        "index": {"refresh_updated": 1},
+                    }
+                ]
+            },
+        )
         performance = monitor_metrics.render_performance_view(
             self.snapshot,
             "http://localhost:8000/mcp",
@@ -209,6 +449,11 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("p95 ms", performance)
         self.assertIn("5.00x source-to-wire", performance)
         self.assertIn("720 source-to-wire, 120 delta", performance)
+        self.assertIn("monitor-only detailed usage", performance)
+        self.assertIn("2 requests / 2.50 avg ms", performance)
+        self.assertIn("3 hits / 1 misses", performance)
+        self.assertIn("2 hits / 1 admitted / 1 fallbacks", performance)
+        self.assertIn("2 requests / 40 tokens saved", performance)
         self.assertNotIn("search_fragment_ms", performance)
         self.assertIn("7 entries, 64.0KiB", detail)
         self.assertIn("4 active / 6 total", detail)

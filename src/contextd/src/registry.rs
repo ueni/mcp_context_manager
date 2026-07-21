@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use context_core::ProjectEngine;
+use context_core::{ProjectEngine, UsageMonitor};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -35,6 +35,7 @@ pub struct ProjectRegistry {
     discovery_max_depth: usize,
     project_markers: Vec<String>,
     default_project_id: String,
+    usage_monitor: Arc<UsageMonitor>,
     state: Arc<Mutex<RegistryState>>,
 }
 
@@ -42,6 +43,7 @@ struct RegistryState {
     clock: u64,
     specs: HashMap<String, ProjectSpec>,
     engines: HashMap<String, CachedEngine>,
+    construction_gates: HashMap<String, Arc<Mutex<()>>>,
 }
 
 struct CachedEngine {
@@ -116,6 +118,7 @@ impl ProjectRegistry {
         };
         let mut specs = HashMap::new();
         specs.insert(project_id.clone(), default_spec);
+        let usage_monitor = Arc::new(UsageMonitor::open(state_root.join("global-monitor"))?);
         Ok(Self {
             base_root,
             state_root,
@@ -124,10 +127,12 @@ impl ProjectRegistry {
             discovery_max_depth: discovery_max_depth_from_env(),
             project_markers: project_markers_from_env(),
             default_project_id: project_id,
+            usage_monitor,
             state: Arc::new(Mutex::new(RegistryState {
                 clock: 1,
                 specs,
                 engines: HashMap::new(),
+                construction_gates: HashMap::new(),
             })),
         })
     }
@@ -137,6 +142,59 @@ impl ProjectRegistry {
         project_id: Option<&str>,
         root_uri: Option<&str>,
     ) -> Result<Arc<ProjectEngine>> {
+        let usage_monitor = Arc::clone(&self.usage_monitor);
+        self.engine_for_with_builder(project_id, root_uri, move |spec| {
+            ProjectEngine::build_with_state_and_monitor(
+                &spec.local_root,
+                &spec.state_root,
+                &spec.project_id,
+                usage_monitor,
+            )
+        })
+    }
+
+    pub fn monitor_usage(&self, action: &str, project_id: Option<&str>) -> Result<Value> {
+        self.usage_monitor.action(action, project_id)
+    }
+
+    fn engine_for_with_builder<F>(
+        &self,
+        project_id: Option<&str>,
+        root_uri: Option<&str>,
+        builder: F,
+    ) -> Result<Arc<ProjectEngine>>
+    where
+        F: FnOnce(&ProjectSpec) -> Result<ProjectEngine>,
+    {
+        self.engine_for_with_builder_inner(project_id, root_uri, builder, || {})
+    }
+
+    #[cfg(test)]
+    fn engine_for_with_builder_and_hook<F, H>(
+        &self,
+        project_id: Option<&str>,
+        root_uri: Option<&str>,
+        builder: F,
+        before_gate: H,
+    ) -> Result<Arc<ProjectEngine>>
+    where
+        F: FnOnce(&ProjectSpec) -> Result<ProjectEngine>,
+        H: FnOnce(),
+    {
+        self.engine_for_with_builder_inner(project_id, root_uri, builder, before_gate)
+    }
+
+    fn engine_for_with_builder_inner<F, H>(
+        &self,
+        project_id: Option<&str>,
+        root_uri: Option<&str>,
+        builder: F,
+        before_gate: H,
+    ) -> Result<Arc<ProjectEngine>>
+    where
+        F: FnOnce(&ProjectSpec) -> Result<ProjectEngine>,
+        H: FnOnce(),
+    {
         let selected = self.select_project(project_id, root_uri)?;
 
         if let Some(engine) = self.cached_engine(&selected)? {
@@ -151,19 +209,33 @@ impl ProjectRegistry {
         {
             self.discover_projects()?;
         }
-        let spec = self
-            .state
+        let (spec, gate) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("project registry lock poisoned"))?;
+            let spec = state
+                .specs
+                .get(&selected)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown project_id"))?;
+            let gate = Arc::clone(
+                state
+                    .construction_gates
+                    .entry(selected.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            );
+            prune_construction_gates(&mut state, &selected);
+            (spec, gate)
+        };
+        before_gate();
+        let _construction = gate
             .lock()
-            .map_err(|_| anyhow!("project registry lock poisoned"))?
-            .specs
-            .get(&selected)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown project_id"))?;
-        let engine = Arc::new(ProjectEngine::build_with_state(
-            &spec.local_root,
-            &spec.state_root,
-            &spec.project_id,
-        )?);
+            .map_err(|_| anyhow!("project construction gate poisoned"))?;
+        if let Some(engine) = self.cached_engine(&selected)? {
+            return Ok(engine);
+        }
+        let engine = Arc::new(builder(&spec)?);
         let mut state = self
             .state
             .lock()
@@ -544,6 +616,22 @@ impl ProjectRegistry {
     }
 }
 
+fn prune_construction_gates(state: &mut RegistryState, selected: &str) {
+    while state.construction_gates.len() > DISCOVERY_MAX_PROJECTS {
+        let candidate = state
+            .construction_gates
+            .iter()
+            .find(|(project_id, gate)| {
+                project_id.as_str() != selected && Arc::strong_count(gate) == 1
+            })
+            .map(|(project_id, _)| project_id.clone());
+        let Some(project_id) = candidate else {
+            break;
+        };
+        state.construction_gates.remove(&project_id);
+    }
+}
+
 impl ProjectSpec {
     fn public_metadata(&self) -> Value {
         json!({
@@ -682,6 +770,103 @@ fn project_markers_from_env() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn same_project_construction_is_singleflight_and_retains_one_arc() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let past_first_miss = Arc::new(Barrier::new(2));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let registry = Arc::clone(&registry);
+            let past_first_miss = Arc::clone(&past_first_miss);
+            let builds = Arc::clone(&builds);
+            threads.push(std::thread::spawn(move || {
+                registry
+                    .engine_for_with_builder_and_hook(
+                        None,
+                        None,
+                        |spec| {
+                            builds.fetch_add(1, Ordering::SeqCst);
+                            ProjectEngine::build_with_state(
+                                &spec.local_root,
+                                &spec.state_root,
+                                &spec.project_id,
+                            )
+                        },
+                        || {
+                            past_first_miss.wait();
+                        },
+                    )
+                    .expect("singleflight engine")
+            }));
+        }
+        let first = threads.remove(0).join().expect("first thread");
+        let second = threads.remove(0).join().expect("second thread");
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn different_projects_construct_concurrently() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let state = tempfile::tempdir().expect("state root");
+        let default = root.path().join("default");
+        let first_root = root.path().join("first");
+        let second_root = root.path().join("second");
+        for repository in [&default, &first_root, &second_root] {
+            std::fs::create_dir_all(repository).expect("repository directory");
+            std::fs::write(repository.join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        }
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                default,
+                state.path().to_owned(),
+                vec![root.path().to_owned()],
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let first_uri = canonical_file_uri(&first_root).expect("first URI");
+        let second_uri = canonical_file_uri(&second_root).expect("second URI");
+        let builders_ready = Arc::new(Barrier::new(2));
+        let mut threads = Vec::new();
+        for uri in [first_uri, second_uri] {
+            let registry = Arc::clone(&registry);
+            let builders_ready = Arc::clone(&builders_ready);
+            threads.push(std::thread::spawn(move || {
+                registry
+                    .engine_for_with_builder(None, Some(&uri), |spec| {
+                        builders_ready.wait();
+                        ProjectEngine::build_with_state(
+                            &spec.local_root,
+                            &spec.state_root,
+                            &spec.project_id,
+                        )
+                    })
+                    .expect("parallel engine")
+            }));
+        }
+        let first = threads.remove(0).join().expect("first thread");
+        let second = threads.remove(0).join().expect("second thread");
+        assert_ne!(first.project_id(), second.project_id());
+    }
 
     #[test]
     fn registry_routes_allowed_projects_and_keeps_in_flight_engine_alive() {
