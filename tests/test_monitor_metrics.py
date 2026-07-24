@@ -418,7 +418,7 @@ class MonitorStateEntryViewTests(unittest.TestCase):
 
         self.assertIn("cache:demo", rendered)
         self.assertIn("dict", rendered)
-        self.assertIn('{"answer":42}', rendered)
+        self.assertIn('"answer": 42', rendered)
 
     def test_renders_value_only_state_browser_entry(self) -> None:
         state = monitor_metrics.MonitorState()
@@ -436,9 +436,19 @@ class MonitorStateEntryViewTests(unittest.TestCase):
         )
 
         self.assertIn("dict", rendered)
-        self.assertIn('{"records":[1,2]}', rendered)
+        self.assertIn('"records": [', rendered)
         self.assertIn("present", rendered)
         self.assertIn("not set", rendered)
+
+    def test_keeps_non_json_preview_unchanged(self) -> None:
+        state = monitor_metrics.MonitorState()
+        state.state_entry = {"key": "cache:raw", "preview": "not-json"}
+
+        rendered = monitor_metrics.render_state_entry_view(
+            "http://localhost:8000/mcp", False, 100, state, height=30
+        )
+
+        self.assertIn("not-json", rendered)
 
     def test_renders_stored_metadata_and_bounds_large_preview(self) -> None:
         state = monitor_metrics.MonitorState()

@@ -1410,20 +1410,31 @@ def render_state_entry_view(
 def _serialize_state_entry_preview(entry: dict[str, Any]) -> tuple[str, bool]:
     if "preview" in entry:
         preview = str(entry.get("preview") or "")
+        try:
+            preview = json.dumps(
+                json.loads(preview), ensure_ascii=False, indent=2, sort_keys=True
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
         return preview[:STATE_ENTRY_PREVIEW_LIMIT], len(preview) > STATE_ENTRY_PREVIEW_LIMIT
     if "value" not in entry:
         return "", False
 
+    value = entry.get("value")
     chunks: list[str] = []
     size = 0
-    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
-    for chunk in encoder.iterencode(entry.get("value")):
-        remaining = STATE_ENTRY_PREVIEW_LIMIT - size
-        if len(chunk) > remaining:
-            chunks.append(chunk[:remaining])
-            return "".join(chunks), True
-        chunks.append(chunk)
-        size += len(chunk)
+    try:
+        encoder = json.JSONEncoder(ensure_ascii=False, indent=2, sort_keys=True)
+        for chunk in encoder.iterencode(value):
+            remaining = STATE_ENTRY_PREVIEW_LIMIT - size
+            if len(chunk) > remaining:
+                chunks.append(chunk[:remaining])
+                return "".join(chunks), True
+            chunks.append(chunk)
+            size += len(chunk)
+    except (TypeError, ValueError):
+        preview = str(value)
+        return preview[:STATE_ENTRY_PREVIEW_LIMIT], len(preview) > STATE_ENTRY_PREVIEW_LIMIT
     return "".join(chunks), False
 
 
