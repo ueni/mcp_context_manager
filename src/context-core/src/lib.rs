@@ -455,11 +455,37 @@ struct UsageSample {
     route: &'static str,
     term_count: usize,
     scope_count: usize,
+    client_profile: &'static str,
 }
 
 struct BuiltPack {
     bytes: Vec<u8>,
     telemetry: PackTelemetry,
+}
+
+const CLIENT_PROFILE_BUCKETS: [&str; 6] =
+    ["codex", "claude", "copilot", "generic", "missing", "other"];
+const CONTEXT_PACK_ROUTE_BUCKETS: [&str; 4] = ["debug", "review", "implementation", "explore"];
+const CONTEXT_PACK_REJECTION_CLASSES: [&str; 4] =
+    ["schema", "root_policy", "project_selection", "internal"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextPackRejectionClass {
+    Schema,
+    RootPolicy,
+    ProjectSelection,
+    Internal,
+}
+
+impl ContextPackRejectionClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Schema => "schema",
+            Self::RootPolicy => "root_policy",
+            Self::ProjectSelection => "project_selection",
+            Self::Internal => "internal",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -703,7 +729,7 @@ impl UsageMonitor {
         let key = format!("monitor:usage:{day}:{project_id}");
         let mut value = self.store.get_json(&key)?.unwrap_or_else(|| {
             json!({
-                "schema": "context_monitor_usage.bucket.v1",
+                "schema": "context_monitor_usage.bucket.v2",
                 "day": day,
                 "project_id": project_id,
                 "request_count": 0,
@@ -723,8 +749,10 @@ impl UsageMonitor {
                 "term_count_buckets": {},
                 "scope_count_buckets": {},
                 "stages_micros": {},
+                "client_profiles": empty_client_profile_buckets(),
             })
         });
+        value["schema"] = Value::String("context_monitor_usage.bucket.v2".to_owned());
         let telemetry = sample.telemetry;
         let elapsed_micros = u64::try_from(sample.elapsed.as_micros()).unwrap_or(u64::MAX);
         increment_json_u64(&mut value, "request_count", 1);
@@ -849,6 +877,30 @@ impl UsageMonitor {
                 );
             }
         }
+        record_client_profile_sample(&mut value, sample.client_profile, &sample, elapsed_micros);
+        self.store.put_json(&key, &value)?;
+        self.prune()?;
+        Ok(())
+    }
+
+    pub fn record_rejection(&self, class: ContextPackRejectionClass) -> Result<()> {
+        if !self.enabled() {
+            return Ok(());
+        }
+        let _guard = self
+            .update_lock
+            .lock()
+            .map_err(|_| anyhow!("usage monitor lock poisoned"))?;
+        let day = OffsetDateTime::now_utc().date().to_string();
+        let key = format!("monitor:rejections:{day}");
+        let mut value = self.store.get_json(&key)?.unwrap_or_else(|| {
+            json!({
+                "schema": "context_monitor_usage.rejections.v1",
+                "day": day,
+                "error_classes": empty_rejection_classes(),
+            })
+        });
+        increment_json_nested(&mut value, "error_classes", class.as_str(), 1);
         self.store.put_json(&key, &value)?;
         self.prune()?;
         Ok(())
@@ -858,7 +910,8 @@ impl UsageMonitor {
         let cutoff = (OffsetDateTime::now_utc() - Duration::days(29))
             .date()
             .to_string();
-        let rows = self.store.iter_json("monitor:usage:")?;
+        let mut rows = self.store.iter_json("monitor:usage:")?;
+        rows.extend(self.store.iter_json("monitor:rejections:")?);
         let mut remove = rows
             .iter()
             .filter(|(_, value)| {
@@ -918,15 +971,310 @@ impl UsageMonitor {
                 .and_then(Value::as_str)
                 .cmp(&right.get("day").and_then(Value::as_str))
         });
+        for bucket in &mut buckets {
+            add_client_profile_report(bucket);
+        }
+        let mut rejection_buckets = self
+            .store
+            .iter_json("monitor:rejections:")?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        rejection_buckets.sort_by(|left, right| {
+            left.get("day")
+                .and_then(Value::as_str)
+                .cmp(&right.get("day").and_then(Value::as_str))
+        });
         Ok(json!({
-            "schema": "context_monitor_usage.report.v1",
+            "schema": "context_monitor_usage.report.v2",
             "enabled": self.enabled(),
             "retention_days": 30,
             "global": true,
             "project_id": project_id,
             "buckets": buckets,
+            "rejection_buckets": rejection_buckets,
         }))
     }
+}
+
+fn empty_client_profile_buckets() -> Value {
+    let mut profiles = serde_json::Map::new();
+    for profile in CLIENT_PROFILE_BUCKETS {
+        profiles.insert(profile.to_owned(), empty_client_profile_bucket(profile));
+    }
+    Value::Object(profiles)
+}
+
+fn empty_client_profile_bucket(profile: &str) -> Value {
+    json!({
+        "client_profile": profile,
+        "request_count": 0,
+        "elapsed_micros_total": 0,
+        "elapsed_micros_max": 0,
+        "input_tokens_est": 0,
+        "wire_tokens_est": 0,
+        "tokens_saved_est": 0,
+        "delta_tokens_saved_est": 0,
+        "cache_outcomes": {},
+        "frontier_outcomes": {},
+        "routes": {},
+        "delta": {},
+    })
+}
+
+fn empty_rejection_classes() -> Value {
+    let mut classes = serde_json::Map::new();
+    for class in CONTEXT_PACK_REJECTION_CLASSES {
+        classes.insert(class.to_owned(), Value::from(0));
+    }
+    Value::Object(classes)
+}
+
+fn normalized_client_profile(client_profile: Option<&str>) -> &'static str {
+    let Some(profile) = client_profile
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return "missing";
+    };
+    if profile.eq_ignore_ascii_case("codex") {
+        "codex"
+    } else if profile.eq_ignore_ascii_case("claude") {
+        "claude"
+    } else if profile.eq_ignore_ascii_case("copilot") {
+        "copilot"
+    } else if profile.eq_ignore_ascii_case("generic") {
+        "generic"
+    } else {
+        "other"
+    }
+}
+
+pub fn classify_context_pack_rejection(error: &anyhow::Error) -> ContextPackRejectionClass {
+    let message = error.to_string();
+    if message.starts_with("max_items ") || message.starts_with("max_source_tokens ") {
+        ContextPackRejectionClass::Schema
+    } else if message.contains("project_id") {
+        ContextPackRejectionClass::ProjectSelection
+    } else if message.contains("root_uri")
+        || message.contains("repository root")
+        || message.contains("project root")
+        || message.contains("MCP root")
+        || message.contains("MCP_CONTEXT_ALLOWED_ROOTS")
+        || message.contains("allowed root")
+        || message.contains("local file:// repository roots")
+        || message.contains("absolute paths are not allowed")
+        || message.contains("path traversal is not allowed")
+    {
+        ContextPackRejectionClass::RootPolicy
+    } else {
+        ContextPackRejectionClass::Internal
+    }
+}
+
+fn record_client_profile_sample(
+    bucket: &mut Value,
+    profile: &str,
+    sample: &UsageSample,
+    elapsed_micros: u64,
+) {
+    if !bucket.get("client_profiles").is_some_and(Value::is_object) {
+        bucket["client_profiles"] = empty_client_profile_buckets();
+    }
+    if !bucket["client_profiles"]
+        .get(profile)
+        .is_some_and(Value::is_object)
+    {
+        bucket["client_profiles"][profile] = empty_client_profile_bucket(profile);
+    }
+    let profile_bucket = &mut bucket["client_profiles"][profile];
+    let telemetry = sample.telemetry;
+    increment_json_u64(profile_bucket, "request_count", 1);
+    increment_json_u64(profile_bucket, "elapsed_micros_total", elapsed_micros);
+    let previous_max = profile_bucket
+        .get("elapsed_micros_max")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    profile_bucket["elapsed_micros_max"] = Value::from(previous_max.max(elapsed_micros));
+    increment_json_u64(
+        profile_bucket,
+        "input_tokens_est",
+        u64::from(telemetry.input_tokens_est),
+    );
+    increment_json_u64(
+        profile_bucket,
+        "wire_tokens_est",
+        u64::from(telemetry.wire_tokens_est),
+    );
+    increment_json_u64(
+        profile_bucket,
+        "tokens_saved_est",
+        u64::from(telemetry.tokens_saved_est),
+    );
+    increment_json_u64(
+        profile_bucket,
+        "delta_tokens_saved_est",
+        u64::from(telemetry.delta_tokens_saved_est),
+    );
+    increment_json_nested(
+        profile_bucket,
+        "cache_outcomes",
+        match sample.cache_outcome {
+            PackCacheOutcome::Uncached => "uncached",
+            PackCacheOutcome::L0Hit => "l0_hit",
+            PackCacheOutcome::L0Miss => "l0_miss",
+            PackCacheOutcome::L0Singleflight => "l0_singleflight",
+        },
+        1,
+    );
+    if matches!(
+        sample.cache_outcome,
+        PackCacheOutcome::Uncached | PackCacheOutcome::L0Miss
+    ) {
+        increment_json_nested(
+            profile_bucket,
+            "frontier_outcomes",
+            match telemetry.frontier_outcome {
+                FrontierOutcome::Search => "search",
+                FrontierOutcome::ExactHit => "exact_hit",
+                FrontierOutcome::NegativeHit => "negative_hit",
+                FrontierOutcome::Admitted => "admitted",
+                FrontierOutcome::CapacityFallback => "capacity_fallback",
+                FrontierOutcome::SourceFallback => "source_fallback",
+            },
+            1,
+        );
+    }
+    increment_json_nested(profile_bucket, "routes", sample.route, 1);
+    increment_json_nested(
+        profile_bucket,
+        "delta",
+        "base_pack_requests",
+        u64::from(telemetry.base_pack_used),
+    );
+    increment_json_nested(
+        profile_bucket,
+        "delta",
+        "known_evidence_requests",
+        u64::from(telemetry.known_evidence_used),
+    );
+}
+
+fn add_client_profile_report(bucket: &mut Value) {
+    let stored = bucket
+        .get("client_profiles")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let profiled_requests = CLIENT_PROFILE_BUCKETS
+        .iter()
+        .map(|profile| {
+            stored
+                .get(*profile)
+                .and_then(|value| value.get("request_count"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        })
+        .fold(0_u64, u64::saturating_add);
+    let profiles = CLIENT_PROFILE_BUCKETS
+        .iter()
+        .map(|profile| {
+            let mut value = stored
+                .get(*profile)
+                .cloned()
+                .unwrap_or_else(|| empty_client_profile_bucket(profile));
+            let requests = value
+                .get("request_count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let elapsed = value
+                .get("elapsed_micros_total")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let input = value
+                .get("input_tokens_est")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let wire = value
+                .get("wire_tokens_est")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let saved = value
+                .get("tokens_saved_est")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let cache_hits =
+                sum_nested_fields(&value, "cache_outcomes", &["l0_hit", "l0_singleflight"]);
+            let frontier_hits =
+                sum_nested_fields(&value, "frontier_outcomes", &["exact_hit", "negative_hit"]);
+            let frontier_requests = value
+                .get("frontier_outcomes")
+                .and_then(Value::as_object)
+                .map(|outcomes| {
+                    outcomes
+                        .values()
+                        .filter_map(Value::as_u64)
+                        .fold(0_u64, u64::saturating_add)
+                })
+                .unwrap_or_default();
+            let delta_reuse = value
+                .pointer("/delta/base_pack_requests")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            value["usage_share_millis"] =
+                Value::from(scaled_ratio(requests, profiled_requests, 1_000));
+            value["avg_elapsed_micros"] = Value::from(divide_or_zero(elapsed, requests));
+            value["input_to_wire_ratio_millis"] = Value::from(scaled_ratio(input, wire, 1_000));
+            value["avg_tokens_saved_est"] = Value::from(divide_or_zero(saved, requests));
+            value["cache_hit_share_millis"] =
+                Value::from(scaled_ratio(cache_hits, requests, 1_000));
+            value["frontier_hit_share_millis"] =
+                Value::from(scaled_ratio(frontier_hits, frontier_requests, 1_000));
+            value["delta_reuse_share_millis"] =
+                Value::from(scaled_ratio(delta_reuse, requests, 1_000));
+            let mut route_shares = serde_json::Map::new();
+            for route in CONTEXT_PACK_ROUTE_BUCKETS {
+                let count = value
+                    .get("routes")
+                    .and_then(Value::as_object)
+                    .and_then(|routes| routes.get(route))
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                route_shares.insert(
+                    route.to_owned(),
+                    Value::from(scaled_ratio(count, requests, 1_000)),
+                );
+            }
+            value["route_shares_millis"] = Value::Object(route_shares);
+            value
+        })
+        .collect::<Vec<_>>();
+    bucket["profiled_request_count"] = Value::from(profiled_requests);
+    bucket["client_profiles"] = Value::Array(profiles);
+}
+
+fn sum_nested_fields(value: &Value, section: &str, fields: &[&str]) -> u64 {
+    value
+        .get(section)
+        .and_then(Value::as_object)
+        .map(|values| {
+            fields
+                .iter()
+                .filter_map(|field| values.get(*field).and_then(Value::as_u64))
+                .fold(0_u64, u64::saturating_add)
+        })
+        .unwrap_or_default()
+}
+
+fn scaled_ratio(numerator: u64, denominator: u64, scale: u64) -> u64 {
+    numerator
+        .saturating_mul(scale)
+        .checked_div(denominator)
+        .unwrap_or_default()
+}
+
+fn divide_or_zero(numerator: u64, denominator: u64) -> u64 {
+    numerator.checked_div(denominator).unwrap_or_default()
 }
 
 fn increment_json_u64(value: &mut Value, field: &str, increment: u64) {
@@ -1134,6 +1482,9 @@ impl ProjectEngine {
                             term_count: normalize_terms(&request.prompt, 8).len(),
                             scope_count: normalized_explicit_paths(request)
                                 .map_or(0, |paths| paths.len()),
+                            client_profile: normalized_client_profile(
+                                request.client_profile.as_deref(),
+                            ),
                         },
                     );
                 }
@@ -1141,6 +1492,11 @@ impl ProjectEngine {
             }
             Err(error) => {
                 self.record_operation("context_pack", started, false, 0);
+                if self.usage_monitor.enabled() {
+                    let _ = self
+                        .usage_monitor
+                        .record_rejection(classify_context_pack_rejection(&error));
+                }
                 Err(error)
             }
         }
@@ -1174,6 +1530,9 @@ impl ProjectEngine {
                             term_count: normalize_terms(&request.prompt, 8).len(),
                             scope_count: normalized_explicit_paths(request)
                                 .map_or(0, |paths| paths.len()),
+                            client_profile: normalized_client_profile(
+                                request.client_profile.as_deref(),
+                            ),
                         },
                     );
                 }
@@ -1181,6 +1540,11 @@ impl ProjectEngine {
             }
             Err(error) => {
                 self.record_operation("context_pack", started, false, 0);
+                if self.usage_monitor.enabled() {
+                    let _ = self
+                        .usage_monitor
+                        .record_rejection(classify_context_pack_rejection(&error));
+                }
                 Err(error)
             }
         }
@@ -5511,12 +5875,14 @@ mod tests {
         );
         monitor.action("enable", None).expect("enable");
         let mut admitted = request.clone();
+        admitted.client_profile = Some(" CODEX ".to_owned());
         admitted.known_evidence = vec!["client-one".to_owned()];
         engine
             .context_pack_cached(&admitted)
             .await
             .expect("admission pack");
         let mut delta = request.clone();
+        delta.client_profile = Some("private-agent-identifier".to_owned());
         delta.base_pack = Some(disabled_pack.id);
         delta.known_evidence = vec!["client-two".to_owned()];
         delta.cache_strategy = CacheStrategy::Fresh;
@@ -5547,9 +5913,36 @@ mod tests {
         assert!(bucket["stages_micros"]["retrieval"].as_u64().is_some());
         assert!(bucket["stages_micros"]["pack_build"].as_u64().is_some());
         assert!(bucket["stages_micros"]["cache"].as_u64().is_some());
+        let profiles = bucket["client_profiles"]
+            .as_array()
+            .expect("client profile buckets");
+        assert_eq!(profiles.len(), CLIENT_PROFILE_BUCKETS.len());
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|value| value["client_profile"].as_str().expect("profile"))
+                .collect::<Vec<_>>(),
+            CLIENT_PROFILE_BUCKETS
+        );
+        assert_eq!(profiles[0]["request_count"], 1);
+        assert_eq!(profiles[5]["request_count"], 2);
+        assert_eq!(profiles[0]["usage_share_millis"], 333);
+        assert_eq!(profiles[5]["usage_share_millis"], 666);
+        for profile in profiles {
+            assert!(profile["avg_elapsed_micros"].as_u64().is_some());
+            assert!(profile["input_to_wire_ratio_millis"].as_u64().is_some());
+            assert!(profile["avg_tokens_saved_est"].as_u64().is_some());
+            assert!(profile["cache_hit_share_millis"].as_u64().is_some());
+            assert!(profile["frontier_hit_share_millis"].as_u64().is_some());
+            assert!(profile["delta_reuse_share_millis"].as_u64().is_some());
+            assert!(profile["route_shares_millis"].is_object());
+        }
+        assert_eq!(profiles[0]["route_shares_millis"]["explore"], 1_000);
+        assert_eq!(profiles[5]["route_shares_millis"]["explore"], 1_000);
         let encoded = enabled.to_string();
         assert!(!encoded.contains(secret));
         assert!(!encoded.contains("usage.rs"));
+        assert!(!encoded.contains("private-agent-identifier"));
         monitor.action("disable", None).expect("disable");
         engine
             .context_pack_cached(&request)
@@ -5558,6 +5951,79 @@ mod tests {
         assert_eq!(
             monitor.report(Some("usage-project")).expect("final report")["buckets"][0]["request_count"],
             3
+        );
+    }
+
+    #[test]
+    fn client_profile_normalization_is_bounded_and_deterministic() {
+        assert_eq!(normalized_client_profile(None), "missing");
+        assert_eq!(normalized_client_profile(Some("")), "missing");
+        assert_eq!(normalized_client_profile(Some(" CoDeX ")), "codex");
+        assert_eq!(normalized_client_profile(Some("CLAUDE")), "claude");
+        assert_eq!(normalized_client_profile(Some("copilot")), "copilot");
+        assert_eq!(normalized_client_profile(Some("generic")), "generic");
+        assert_eq!(normalized_client_profile(Some("secret-agent-id")), "other");
+    }
+
+    #[test]
+    fn rejection_ledger_is_disabled_by_default_bounded_and_value_safe() {
+        let state = tempdir().expect("temporary state");
+        let monitor = UsageMonitor::open(state.path().join("global")).expect("monitor");
+        monitor
+            .record_rejection(ContextPackRejectionClass::Internal)
+            .expect("disabled rejection");
+        assert!(
+            monitor.report(None).expect("disabled report")["rejection_buckets"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+
+        monitor.action("enable", None).expect("enable");
+        for class in [
+            ContextPackRejectionClass::Schema,
+            ContextPackRejectionClass::RootPolicy,
+            ContextPackRejectionClass::ProjectSelection,
+            ContextPackRejectionClass::Internal,
+        ] {
+            monitor.record_rejection(class).expect("record rejection");
+        }
+        let report = monitor.report(None).expect("report");
+        let bucket = &report["rejection_buckets"][0];
+        assert_eq!(bucket["error_classes"]["schema"], 1);
+        assert_eq!(bucket["error_classes"]["root_policy"], 1);
+        assert_eq!(bucket["error_classes"]["project_selection"], 1);
+        assert_eq!(bucket["error_classes"]["internal"], 1);
+        let encoded = report.to_string();
+        assert!(!encoded.contains("prompt"));
+        assert!(!encoded.contains("root_uri"));
+        assert!(!encoded.contains("secret-agent-id"));
+    }
+
+    #[test]
+    fn rejection_classification_coalesces_errors_without_retaining_values() {
+        assert_eq!(
+            classify_context_pack_rejection(&anyhow!("max_items must be in 1..=32, got 99")),
+            ContextPackRejectionClass::Schema
+        );
+        assert_eq!(
+            classify_context_pack_rejection(&anyhow!(
+                "path traversal is not allowed: private/repository"
+            )),
+            ContextPackRejectionClass::RootPolicy
+        );
+        assert_eq!(
+            classify_context_pack_rejection(&anyhow!(
+                "MCP root is outside MCP_CONTEXT_ALLOWED_ROOTS"
+            )),
+            ContextPackRejectionClass::RootPolicy
+        );
+        assert_eq!(
+            classify_context_pack_rejection(&anyhow!("unknown project_id private-project")),
+            ContextPackRejectionClass::ProjectSelection
+        );
+        assert_eq!(
+            classify_context_pack_rejection(&anyhow!("private internal detail")),
+            ContextPackRejectionClass::Internal
         );
     }
 

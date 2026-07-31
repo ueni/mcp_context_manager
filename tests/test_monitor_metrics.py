@@ -615,8 +615,44 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                         "delta": {"base_pack_requests": 2},
                         "delta_tokens_saved_est": 40,
                         "index": {"refresh_updated": 1},
+                        "client_profiles": [
+                            {
+                                "client_profile": "codex",
+                                "request_count": 1,
+                                "elapsed_micros_total": 2000,
+                                "input_tokens_est": 60,
+                                "wire_tokens_est": 10,
+                                "tokens_saved_est": 50,
+                                "cache_outcomes": {"l0_hit": 1},
+                                "frontier_outcomes": {"exact_hit": 1},
+                                "routes": {"explore": 1},
+                                "delta": {"base_pack_requests": 1},
+                            },
+                            {
+                                "client_profile": "other",
+                                "request_count": 1,
+                                "elapsed_micros_total": 3000,
+                                "input_tokens_est": 40,
+                                "wire_tokens_est": 10,
+                                "tokens_saved_est": 30,
+                                "cache_outcomes": {"l0_miss": 1},
+                                "frontier_outcomes": {"admitted": 1},
+                                "routes": {"explore": 1},
+                                "delta": {"base_pack_requests": 1},
+                            },
+                        ],
                     }
-                ]
+                ],
+                "rejection_buckets": [
+                    {
+                        "error_classes": {
+                            "schema": 1,
+                            "root_policy": 2,
+                            "project_selection": 3,
+                            "internal": 4,
+                        }
+                    }
+                ],
             },
         )
         performance = monitor_metrics.render_performance_view(
@@ -648,6 +684,16 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("3 hits / 1 misses", performance)
         self.assertIn("2 hits / 1 admitted / 1 fallbacks", performance)
         self.assertIn("2 requests / 40 tokens saved", performance)
+        self.assertIn("delta reuse", performance)
+        self.assertIn(
+            "schema 1 / root policy 2 / project selection 3 / internal 4",
+            performance,
+        )
+        self.assertIn("client profile usage share", performance)
+        self.assertIn("codex", performance)
+        self.assertIn("other", performance)
+        self.assertIn("1 / 50.0%", performance)
+        self.assertNotIn("adoption", performance.lower())
         self.assertNotIn("search_fragment_ms", performance)
         self.assertIn("7 entries, 64.0KiB", detail)
         self.assertIn("4 active / 6 total", detail)

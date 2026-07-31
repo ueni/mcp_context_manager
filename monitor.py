@@ -63,6 +63,21 @@ DEFAULT_TERMINAL_COLUMNS = 160
 DEFAULT_TERMINAL_LINES = 30
 STATE_ENTRY_PREVIEW_LIMIT = 64 * 1024
 MCP_INSPECTION_MAX_RESOURCES = 16
+USAGE_CLIENT_PROFILES = (
+    "codex",
+    "claude",
+    "copilot",
+    "generic",
+    "missing",
+    "other",
+)
+USAGE_REJECTION_CLASSES = (
+    "schema",
+    "root_policy",
+    "project_selection",
+    "internal",
+)
+USAGE_ROUTE_BUCKETS = ("debug", "review", "implementation", "explore")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 CRITICAL_MATRIX_KEYS = {
     "latency.context_pack.avg_elapsed_ms",
@@ -1171,6 +1186,28 @@ def render_performance_view(
     base_pack_requests = sum(_int_at(row, ("delta", "base_pack_requests")) for row in buckets if isinstance(row, dict))
     delta_saved = sum(_int_at(row, ("delta_tokens_saved_est",)) for row in buckets if isinstance(row, dict))
     refresh_updates = sum(_int_at(row, ("index", "refresh_updated")) for row in buckets if isinstance(row, dict))
+    rejection_buckets = (
+        report.get("rejection_buckets")
+        if isinstance(report.get("rejection_buckets"), list)
+        else []
+    )
+    rejection_counts = {
+        rejection_class: sum(
+            _int_at(row, ("error_classes", rejection_class))
+            for row in rejection_buckets
+            if isinstance(row, dict)
+        )
+        for rejection_class in USAGE_REJECTION_CLASSES
+    }
+    rejection_summary = " / ".join(
+        (
+            f"schema {fmt_int(rejection_counts['schema'])}",
+            f"root policy {fmt_int(rejection_counts['root_policy'])}",
+            f"project selection {fmt_int(rejection_counts['project_selection'])}",
+            f"internal {fmt_int(rejection_counts['internal'])}",
+        )
+    )
+    profile_rows = _usage_profile_rows(buckets, width)
     average_ms = elapsed_micros / request_count / 1000.0 if request_count else 0.0
     enabled_label = "enabled" if state.usage_enabled else "disabled"
     if state.usage_enabled is None:
@@ -1187,14 +1224,31 @@ def render_performance_view(
                     ("30-day tokens", f"{fmt_int(input_tokens)} input / {fmt_int(wire_tokens)} wire"),
                     ("L0 opportunity", f"{fmt_int(l0_hits)} hits / {fmt_int(l0_misses)} misses"),
                     ("frontier opportunity", f"{fmt_int(frontier_hits)} hits / {fmt_int(frontier_admitted)} admitted / {fmt_int(capacity_fallbacks + source_fallbacks)} fallbacks"),
-                    ("delta adoption", f"{fmt_int(base_pack_requests)} requests / {fmt_int(delta_saved)} tokens saved"),
+                    ("delta reuse", f"{fmt_int(base_pack_requests)} requests / {fmt_int(delta_saved)} tokens saved"),
                     ("index invalidation", f"{fmt_int(refresh_updates)} refresh updates"),
+                    (
+                        "rejected attempts",
+                        _bounded_text(rejection_summary, max(20, width - 27)),
+                    ),
                 ),
                 widths=(20, max(20, width - 27)),
                 aligns=("left", "left"),
             ),
         ]
     )
+    if profile_rows:
+        lines.extend(
+            [
+                "",
+                _style("client profile usage share", color, Ansi.BOLD),
+                *_render_table(
+                    ("profile", "requests / share", "efficiency"),
+                    profile_rows,
+                    widths=(14, 20, max(30, width - 44)),
+                    aligns=("left", "right", "left"),
+                ),
+            ]
+        )
     if snapshot.error:
         lines.extend(["", _style(f"ERROR: {snapshot.error}", color, Ansi.RED)])
     lines.append(
@@ -1205,6 +1259,122 @@ def render_performance_view(
         )
     )
     return "\n".join(lines)
+
+
+def _usage_profile_rows(
+    buckets: list[dict[str, Any]], width: int
+) -> list[tuple[str, str, str]]:
+    aggregates: dict[str, dict[str, Any]] = {
+        profile: {
+            "request_count": 0,
+            "elapsed_micros_total": 0,
+            "input_tokens_est": 0,
+            "wire_tokens_est": 0,
+            "tokens_saved_est": 0,
+            "cache_hits": 0,
+            "frontier_hits": 0,
+            "frontier_requests": 0,
+            "delta_reuse": 0,
+            "routes": {},
+        }
+        for profile in USAGE_CLIENT_PROFILES
+    }
+    for bucket in buckets:
+        profiles = (
+            bucket.get("client_profiles")
+            if isinstance(bucket.get("client_profiles"), list)
+            else []
+        )
+        for row in profiles:
+            if not isinstance(row, dict):
+                continue
+            profile = str(row.get("client_profile") or "")
+            if profile not in aggregates:
+                profile = "other"
+            aggregate = aggregates[profile]
+            aggregate["request_count"] += _int_at(row, ("request_count",))
+            aggregate["elapsed_micros_total"] += _int_at(
+                row, ("elapsed_micros_total",)
+            )
+            aggregate["input_tokens_est"] += _int_at(row, ("input_tokens_est",))
+            aggregate["wire_tokens_est"] += _int_at(row, ("wire_tokens_est",))
+            aggregate["tokens_saved_est"] += _int_at(row, ("tokens_saved_est",))
+            aggregate["cache_hits"] += _int_at(
+                row, ("cache_outcomes", "l0_hit")
+            ) + _int_at(row, ("cache_outcomes", "l0_singleflight"))
+            frontier_outcomes = (
+                row.get("frontier_outcomes")
+                if isinstance(row.get("frontier_outcomes"), dict)
+                else {}
+            )
+            aggregate["frontier_hits"] += _int_at(
+                row, ("frontier_outcomes", "exact_hit")
+            ) + _int_at(row, ("frontier_outcomes", "negative_hit"))
+            aggregate["frontier_requests"] += sum(
+                max(0, int(value))
+                for value in frontier_outcomes.values()
+                if isinstance(value, int)
+            )
+            aggregate["delta_reuse"] += _int_at(
+                row, ("delta", "base_pack_requests")
+            )
+            routes = row.get("routes") if isinstance(row.get("routes"), dict) else {}
+            for route, count in routes.items():
+                if route not in USAGE_ROUTE_BUCKETS or not isinstance(count, int):
+                    continue
+                route_name = str(route)
+                aggregate["routes"][route_name] = (
+                    aggregate["routes"].get(route_name, 0) + max(0, count)
+                )
+
+    total_requests = sum(
+        int(aggregate["request_count"]) for aggregate in aggregates.values()
+    )
+    efficiency_width = max(30, width - 44)
+    rows: list[tuple[str, str, str]] = []
+    for profile in USAGE_CLIENT_PROFILES:
+        aggregate = aggregates[profile]
+        requests = int(aggregate["request_count"])
+        if requests <= 0:
+            continue
+        elapsed = int(aggregate["elapsed_micros_total"])
+        input_tokens = int(aggregate["input_tokens_est"])
+        wire_tokens = int(aggregate["wire_tokens_est"])
+        saved_tokens = int(aggregate["tokens_saved_est"])
+        cache_hits = int(aggregate["cache_hits"])
+        frontier_hits = int(aggregate["frontier_hits"])
+        frontier_requests = int(aggregate["frontier_requests"])
+        delta_reuse = int(aggregate["delta_reuse"])
+        usage_share = requests / total_requests * 100.0 if total_requests else 0.0
+        average_ms = elapsed / requests / 1000.0
+        compression = input_tokens / wire_tokens if wire_tokens else 0.0
+        average_saved = saved_tokens / requests
+        cache_share = cache_hits / requests * 100.0
+        frontier_share = (
+            frontier_hits / frontier_requests * 100.0
+            if frontier_requests
+            else 0.0
+        )
+        delta_share = delta_reuse / requests * 100.0
+        route_summary = ", ".join(
+            f"{route}={fmt_int(count)}"
+            for route, count in sorted(aggregate["routes"].items())[:4]
+        )
+        efficiency = (
+            f"{average_ms:.2f} ms; {compression:.2f}x input/wire; "
+            f"{average_saved:.1f} saved/request; cache {cache_share:.1f}%; "
+            f"frontier {frontier_share:.1f}%; delta {delta_share:.1f}%"
+        )
+        if route_summary:
+            efficiency += f"; routes {route_summary}"
+        rows.append(
+            (
+                profile,
+                f"{fmt_int(requests)} / {usage_share:.1f}%",
+                _bounded_text(efficiency, efficiency_width),
+            )
+        )
+    return rows
 
 
 def render_state_browser(

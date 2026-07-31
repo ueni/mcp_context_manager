@@ -26,8 +26,9 @@ use axum::{
     routing::{get, post},
 };
 use context_core::{
-    ContextAdminRequest, ContextLookupRequest, ContextMemoryRequest, ContextPackRequest,
-    ResultReferenceRequest, static_resource_text, unloaded_admin_response,
+    ContextAdminRequest, ContextLookupRequest, ContextMemoryRequest, ContextPackRejectionClass,
+    ContextPackRequest, ResultReferenceRequest, classify_context_pack_rejection,
+    static_resource_text, unloaded_admin_response,
 };
 use http_body_util::{BodyExt, Limited};
 use registry::ProjectRegistry;
@@ -147,10 +148,17 @@ impl ContextServer {
         &self,
         Parameters(mut request): Parameters<ContextPackRequest>,
     ) -> Result<String, String> {
-        let engine = self
+        let engine = match self
             .registry
             .engine_for(request.project_id.as_deref(), request.root_uri.as_deref())
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(engine) => engine,
+            Err(error) => {
+                self.registry
+                    .record_context_pack_rejection(classify_context_pack_rejection(&error));
+                return Err(error.to_string());
+            }
+        };
         request.project_id = Some(engine.project_id().to_owned());
         request.root_uri = None;
         let encoded = engine
@@ -814,6 +822,9 @@ async fn context_pack_http(
     Json(mut payload): Json<Value>,
 ) -> Response {
     let Some(object) = payload.as_object_mut() else {
+        state
+            .registry
+            .record_context_pack_rejection(ContextPackRejectionClass::Schema);
         return rest_error(StatusCode::BAD_REQUEST, "JSON body must be an object");
     };
     if !object.contains_key("prompt")
@@ -823,15 +834,30 @@ async fn context_pack_http(
     }
     let mut request = match serde_json::from_value::<ContextPackRequest>(payload) {
         Ok(request) if !request.prompt.trim().is_empty() => request,
-        Ok(_) => return rest_error(StatusCode::BAD_REQUEST, "prompt is required"),
-        Err(error) => return rest_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        Ok(_) => {
+            state
+                .registry
+                .record_context_pack_rejection(ContextPackRejectionClass::Schema);
+            return rest_error(StatusCode::BAD_REQUEST, "prompt is required");
+        }
+        Err(error) => {
+            state
+                .registry
+                .record_context_pack_rejection(ContextPackRejectionClass::Schema);
+            return rest_error(StatusCode::BAD_REQUEST, &error.to_string());
+        }
     };
     let engine = match state
         .registry
         .engine_for(request.project_id.as_deref(), request.root_uri.as_deref())
     {
         Ok(engine) => engine,
-        Err(error) => return rest_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        Err(error) => {
+            state
+                .registry
+                .record_context_pack_rejection(classify_context_pack_rejection(&error));
+            return rest_error(StatusCode::BAD_REQUEST, &error.to_string());
+        }
     };
     request.project_id = Some(engine.project_id().to_owned());
     request.root_uri = None;
@@ -1354,6 +1380,59 @@ mod tests {
         )
         .expect("metrics JSON");
         assert_eq!(response["metrics"]["background"]["status"], "unloaded");
+    }
+
+    #[tokio::test]
+    async fn context_pack_rejections_are_counted_by_class_without_retaining_values() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        registry
+            .monitor_usage("enable", None)
+            .expect("enable usage monitor");
+        let server = ContextServer::new(Arc::clone(&registry));
+
+        for request in [
+            json!({
+                "prompt": "private schema prompt",
+                "max_items": 99,
+            }),
+            json!({
+                "prompt": "private root prompt",
+                "root_uri": "file:///private/repository",
+            }),
+            json!({
+                "prompt": "private project prompt",
+                "project_id": "private-project-identifier",
+            }),
+        ] {
+            let request =
+                serde_json::from_value::<ContextPackRequest>(request).expect("context request");
+            assert!(server.context_pack(Parameters(request)).await.is_err());
+        }
+
+        let report = registry
+            .monitor_usage("report", None)
+            .expect("usage report");
+        let classes = &report["rejection_buckets"][0]["error_classes"];
+        assert_eq!(classes["schema"], 1);
+        assert_eq!(classes["root_policy"], 1);
+        assert_eq!(classes["project_selection"], 1);
+        assert_eq!(classes["internal"], 0);
+        let encoded = report.to_string();
+        assert!(!encoded.contains("private schema prompt"));
+        assert!(!encoded.contains("private root prompt"));
+        assert!(!encoded.contains("private/repository"));
+        assert!(!encoded.contains("private-project-identifier"));
     }
 
     #[tokio::test]
