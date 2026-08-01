@@ -70,6 +70,23 @@ inclusive line interval, symbol, evidence card, and estimated source tokens.
 Diagnostics, metrics, and token accounting are available through
 `context_admin` rather than being repeated in every pack.
 
+## Usage and efficiency reporting
+
+`context_admin(mode="monitor_usage")` controls an opt-in, process-global
+30-day usage ledger. Successful `context_pack` requests are grouped into the
+bounded client profiles `codex`, `claude`, `copilot`, `generic`, `missing`, and
+`other`. Reports include request counts and bounded latency, input-to-wire,
+token-saving, cache, frontier, route, and delta-reuse summaries. Rejected
+attempts are counted only as `schema`, `root_policy`, `project_selection`, or
+`internal`.
+
+The report measures client-profile usage and usage share among requests observed
+by this ledger. It is not an organization-wide adoption rate because no
+external denominator is available. Raw profile values, prompts, responses,
+paths, root URIs, error values, credentials, and agent identifiers are never
+stored. Monitoring is disabled by default; the disabled request path is an
+atomic flag check and does not change context-pack behavior.
+
 ## MCP-first workflow
 
 Use `repo://instructions/context-pack` as the portable source of

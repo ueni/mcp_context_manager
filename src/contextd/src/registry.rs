@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use context_core::{ProjectEngine, UsageMonitor};
+use context_core::{ContextPackRejectionClass, ProjectEngine, UsageMonitor};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -155,6 +155,10 @@ impl ProjectRegistry {
 
     pub fn monitor_usage(&self, action: &str, project_id: Option<&str>) -> Result<Value> {
         self.usage_monitor.action(action, project_id)
+    }
+
+    pub fn record_context_pack_rejection(&self, class: ContextPackRejectionClass) {
+        let _ = self.usage_monitor.record_rejection(class);
     }
 
     fn engine_for_with_builder<F>(

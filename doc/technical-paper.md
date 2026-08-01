@@ -95,9 +95,23 @@ stale-signature, then age order. The response reports bounded counts and timing,
 never the raw warmup prompt.
 
 `context_admin(mode="monitor_usage")` controls a process-global, default-off
-30-day aggregate ledger. Its buckets contain counts, timing, and token totals
-only; raw prompts, responses, and paths are never stored. Disabled request
-handling is an atomic flag check and does not change cache behavior.
+30-day aggregate ledger. Version 2 buckets preserve deterministic day ordering
+and add a fixed-order client-profile dimension: `codex`, `claude`, `copilot`,
+`generic`, `missing`, and `other`. Unknown non-empty values are coalesced into
+`other`; raw profile values are not retained. Each profile bucket contains
+request counts and bounded latency, input-to-wire, token-saving, cache,
+frontier, route, and delta-reuse totals plus integer-derived ratios. Route
+shares use the fixed `debug`, `review`, `implementation`, and `explore`
+categories.
+
+Rejected context-pack attempts use a separate process-global daily ledger with
+only four stable classes: `schema`, `root_policy`, `project_selection`, and
+`internal`. Raw prompts, responses, paths, root URIs, error values,
+credentials, and agent identifiers are never stored. `usage_share_millis`
+uses only requests represented in the fixed client-profile buckets as its
+denominator; it describes observed client-profile usage share, not
+organization-wide adoption. Disabled request handling is an atomic flag check
+and does not change cache behavior.
 
 ## Project routing and boundaries
 
