@@ -117,6 +117,48 @@ enabled_tools = [
 default_tools_approval_mode = "auto"
 ```
 
+## Governed project reference corpus
+
+An optional `reference-corpus/manifest.json` lets a project rank locally staged
+technical guides and standards beside repository evidence. Reference hits use
+the synthetic `@corpus/<source>/<hash-prefix>` path, so they cannot be confused
+with repository files. Their evidence symbol carries bounded source, version,
+licence, freshness, and prompt-injection provenance; `context_pack.more` remains
+the resolvable local reference for a bounded deferred excerpt.
+
+The strict schema is documented in
+[`doc/reference-corpus-manifest.schema.json`](doc/reference-corpus-manifest.schema.json).
+It admits at most 32 sources, 4 MiB per normalized source, and 16 MiB per project.
+Only regular, non-symlink UTF-8 text beneath `reference-corpus/` is read. The
+declared original media type may be `application/pdf`, but `normalized_path`
+must point to externally converted text with
+`normalized_media_type="text/plain; charset=utf-8"`. The server has no network
+client, downloader, PDF extractor, or OCR path.
+
+Rights status must be `permitted` with explicit licence evidence before content
+is indexed. `metadata_only` records are accepted only without a content path or
+hash; unknown or missing rights are rejected. Content hashes deduplicate equal
+snapshots and participate in deterministic chunk identity and refresh
+invalidation. Corpus-derived index state has no age expiry; current, stale, and
+superseded status is still surfaced. Project-scope mismatch, traversal,
+absolute paths, symlinks, binary data, unsupported media, and hash mismatch are
+rejected.
+
+Agent use is deliberately repository-and-corpus first: call `context_pack`, use
+`context_lookup(mode="search")` for a targeted query, and resolve `more` only
+when more evidence is necessary. If no suitable source exists, advise an
+external agent, job, or human to acquire and rights-check it, normalize it to
+UTF-8, and stage it locally. Do not treat public accessibility as permission.
+
+Re-run the labelled RFC/W3C spike from the repository root with:
+
+```bash
+cargo run -p context-testkit --bin benchmark-reference-corpus --quiet
+```
+
+The bounded recorded report is
+[`benchmarks/results/governed-reference-corpus-spike.json`](benchmarks/results/governed-reference-corpus-spike.json).
+
 ## Run with Docker Compose
 
 Build the locked musl artifact and image, then start the service:

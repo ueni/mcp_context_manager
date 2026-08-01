@@ -294,6 +294,7 @@ dependencies = [
  "anyhow",
  "notify",
  "serde",
+ "serde_json",
  "sha2",
  "tantivy",
  "tempfile",

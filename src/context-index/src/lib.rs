@@ -1,5 +1,7 @@
 //! Native repository scanning, deterministic chunking, and Tantivy retrieval.
 
+mod corpus;
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
@@ -107,6 +109,10 @@ pub struct IndexStats {
     pub generic_chunks: usize,
     pub skipped_binary: usize,
     pub skipped_symlink: usize,
+    pub corpus_source_count: usize,
+    pub corpus_chunk_count: usize,
+    pub corpus_metadata_only_count: usize,
+    pub corpus_deduplicated_count: usize,
     pub refresh_signature: String,
 }
 
@@ -152,6 +158,10 @@ pub struct ProjectIndex {
 
 impl ProjectIndex {
     pub fn build(root: impl AsRef<Path>) -> Result<Self> {
+        Self::build_for_project(root, None)
+    }
+
+    pub fn build_for_project(root: impl AsRef<Path>, project_scope: Option<&str>) -> Result<Self> {
         let root = root.as_ref().canonicalize().with_context(|| {
             format!(
                 "repository root does not exist: {}",
@@ -162,7 +172,7 @@ impl ProjectIndex {
             bail!("repository root is not a directory: {}", root.display());
         }
 
-        let (chunks, stats) = scan_repository(&root)?;
+        let (chunks, stats) = scan_repository(&root, project_scope)?;
         let mut schema_builder = Schema::builder();
         let fields = Fields {
             id: schema_builder.add_text_field("id", STRING | STORED),
@@ -577,6 +587,13 @@ impl ProjectIndex {
 }
 
 pub fn repository_signature(root: impl AsRef<Path>) -> Result<String> {
+    repository_signature_for_project(root, None)
+}
+
+pub fn repository_signature_for_project(
+    root: impl AsRef<Path>,
+    project_scope: Option<&str>,
+) -> Result<String> {
     let root = root.as_ref().canonicalize()?;
     let mut digest = Sha256::new();
     for entry in WalkDir::new(&root)
@@ -600,6 +617,9 @@ pub fn repository_signature(root: impl AsRef<Path>) -> Result<String> {
             .replace('\\', "/");
         update_source_signature(&mut digest, &path, &text);
     }
+    let corpus = corpus::load(&root, project_scope)?;
+    digest.update(b"reference-corpus\0");
+    digest.update(corpus.digest.as_bytes());
     Ok(format!("files:{}", digest_hex(digest)))
 }
 
@@ -649,7 +669,7 @@ pub fn validate_relative_path(raw: &str) -> Result<String> {
     }
 }
 
-fn scan_repository(root: &Path) -> Result<(Vec<Chunk>, IndexStats)> {
+fn scan_repository(root: &Path, project_scope: Option<&str>) -> Result<(Vec<Chunk>, IndexStats)> {
     let mut chunks = Vec::new();
     let mut source_digest = Sha256::new();
     let mut file_count = 0;
@@ -714,6 +734,11 @@ fn scan_repository(root: &Path) -> Result<(Vec<Chunk>, IndexStats)> {
         chunks.append(&mut file_chunks);
     }
 
+    let corpus = corpus::load(root, project_scope)?;
+    let corpus_chunk_count = corpus.chunks.len();
+    source_digest.update(b"reference-corpus\0");
+    source_digest.update(corpus.digest.as_bytes());
+    chunks.extend(corpus.chunks);
     chunks.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -726,12 +751,16 @@ fn scan_repository(root: &Path) -> Result<(Vec<Chunk>, IndexStats)> {
         IndexStats {
             schema: "context_index.native.v1",
             file_count,
-            chunk_count: symbol_chunks + generic_chunks,
+            chunk_count: symbol_chunks + generic_chunks + corpus_chunk_count,
             symbol_chunks,
             python_symbol_chunks,
             generic_chunks,
             skipped_binary,
             skipped_symlink,
+            corpus_source_count: corpus.source_count,
+            corpus_chunk_count,
+            corpus_metadata_only_count: corpus.metadata_only_count,
+            corpus_deduplicated_count: corpus.deduplicated_count,
             refresh_signature: format!("files:{}", digest_hex(source_digest)),
         },
     ))
@@ -761,6 +790,7 @@ fn should_visit(entry: &DirEntry) -> bool {
     }
     !entry.file_type().is_dir()
         || !IGNORED_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref())
+            && entry.file_name().to_string_lossy() != corpus::CORPUS_DIRECTORY
 }
 
 fn read_text(path: &Path) -> Result<Option<String>> {
@@ -1246,7 +1276,7 @@ mod tests {
         fs::write(root.path().join("artifact.bin"), b"binary\0payload")
             .expect("write binary fixture");
 
-        let (chunks, stats) = scan_repository(root.path()).expect("scan repository");
+        let (chunks, stats) = scan_repository(root.path(), None).expect("scan repository");
 
         assert!(chunks.iter().any(|chunk| chunk.path == "Cargo.lock"));
         assert!(!chunks.iter().any(|chunk| chunk.path == "artifact.bin"));
@@ -1260,7 +1290,7 @@ mod tests {
         let large = root.path().join("generated.min.js");
         fs::write(&large, vec![b'x'; MAX_READ_BYTES + 1]).expect("write oversized fixture");
 
-        let (chunks, _) = scan_repository(root.path()).expect("scan repository");
+        let (chunks, _) = scan_repository(root.path(), None).expect("scan repository");
         assert!(!chunks.iter().any(|chunk| chunk.path == "generated.min.js"));
 
         let index = ProjectIndex::build(root.path()).expect("build index");

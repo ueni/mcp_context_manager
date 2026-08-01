@@ -1,0 +1,2 @@
+The repository implements a generic HTTP client and propagates diagnostic identifiers.
+Protocol requirements and normative header syntax are intentionally absent from repository-only evidence.

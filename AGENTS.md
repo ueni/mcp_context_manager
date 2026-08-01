@@ -28,6 +28,16 @@ debug, test, docs, security, and general repository tasks.
    checks.
 8. Use `context_memory` only for structured, non-secret repository facts,
    summaries, decisions, validation, or compaction.
+9. Before advising new technical-document acquisition, scan repository evidence
+   and the governed `reference-corpus/manifest.json` through `context_pack` or
+   `context_lookup(mode="search")`. Reuse a suitable current source when present.
+   If it is absent, advise an external agent, job, or human to acquire it,
+   verify local-use rights, normalize it to UTF-8 text, hash it, and stage it
+   under `reference-corpus/`; this MCP never fetches, converts PDFs, or runs OCR.
+10. Treat `@corpus/` paths as governed reference evidence. Read the compact
+    source/version/licence/freshness provenance and prompt-injection signal,
+    then use the pack's `more` id with `result_reference_resolve` when the
+    bounded deferred excerpt is required.
 
 Repository instructions alone cannot force a model to call a tool on every
 turn. The expected setup is to combine this file with the server instructions
