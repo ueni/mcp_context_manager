@@ -1,0 +1,9 @@
+Label: normalized UTF-8 spike excerpt from RFC 9110, HTTP Semantics.
+Canonical source: https://www.rfc-editor.org/rfc/rfc9110
+Original media metadata: application/pdf.
+
+The TRACE method requests a remote, application-level loop-back of the request message.
+A client MUST NOT generate content in a TRACE request.
+Responses to the TRACE method are not cacheable.
+
+This short labelled fixture is retained only for deterministic retrieval measurement.

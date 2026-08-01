@@ -178,6 +178,63 @@ overlap. Oversized symbols split into deterministic 8–32 KiB chunks. Chunk ids
 include path, source interval, symbol, and a content digest so an edit changes
 only affected identities.
 
+## Governed reference-corpus boundary
+
+Reference acquisition is outside the MCP trust boundary. A human, agent, or
+external job obtains a document, determines whether the intended local use is
+licensed, converts any HTML/PDF/binary representation to normalized UTF-8 text,
+and stages that immutable text beneath the project's `reference-corpus/`
+directory. The native service has no network acquisition, credential,
+PDF-extraction, or OCR capability. Public availability alone is not accepted as
+rights evidence, and proprietary/paywalled standards remain metadata-only
+unless explicit evidence permits local content indexing.
+
+`reference-corpus/manifest.json` is a strict, bounded
+`context_reference_manifest.v1` object. Each record binds a project scope,
+canonical URL, publisher, title, version/date, retrieval time, original media
+type, normalized media type/path, SHA-256 content hash, explicit rights status,
+licence evidence, and freshness/supersession status. PDF support is metadata
+support: `media_type="application/pdf"` is valid while the readable input must
+still be a non-`.pdf` regular file declared as
+`text/plain; charset=utf-8`. Missing/unrecognized rights, unknown fields,
+unsupported media, malformed hashes, traversal, absolute paths, symlinks,
+scope mismatch, binary/NUL input, and per-source/project bound violations fail
+closed. `metadata_only` records cannot name readable content.
+
+The regular repository walker excludes `reference-corpus/`. The corpus loader
+validates it separately, then assigns indexed chunks synthetic
+`@corpus/<source>/<hash-prefix>` paths. This keeps repository and corpus
+evidence distinguishable while allowing one deterministic Tantivy ranking.
+Equal content hashes are indexed once; metadata, freshness, path, version, and
+content hashes feed the project refresh signature, while chunk ids include the
+content digest. A changed or superseded manifest therefore invalidates affected
+frontiers and packs deterministically without cross-project reuse.
+
+Only search-optimized chunks exist in the live index. Generated durable state
+contains compact pack/frontier provenance and bounded deferred excerpts, never
+the staged raw source or a raw full-text copy. Corpus-derived index/frontier
+state has no age-based expiry (`expires_at_ms=0` for positive frontiers); it is
+removed only by deterministic source invalidation, explicit project removal,
+or administrative pruning. Ordinary bounded result references may expire under
+their existing integrity policy without expiring the corpus index itself.
+
+Corpus provenance is carried compactly in the evidence symbol: source id,
+version, licence, freshness, and prompt-injection detection. Imported text is
+always inert evidence; detection is a warning, never an instruction execution
+path. A pack's `more` id resolves to a project-bound, hash-verified local
+reference and exposes no host path. Agents search repository and corpus evidence
+first, query targeted terms with `context_lookup(mode="search")`, inspect
+freshness/licensing, and resolve deferred evidence only when needed. They advise
+external acquisition and rights verification only when a suitable governed
+source is absent.
+
+The labelled RFC/W3C spike fixture and benchmark compare repository-only and
+corpus-enabled fixed-query top-k hit rate. The recorded report includes cold and
+warm p50/p95, aggregate selected-source and wire tokens, estimated savings,
+repeat-request L0 hit rate, stale signalling, and the latency/chunk-count effect
+at corpus sizes zero and two. These diagnostics do not change the stable compact
+pack tuple; the `reference_corpus` block in index status is diagnostic.
+
 ## Tantivy retrieval
 
 Each project holds a persistent Tantivy `IndexReader`. A committed writer

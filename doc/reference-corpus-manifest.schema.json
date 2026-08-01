@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ueni/mcp_context_manager/blob/dev/v2.x.x/doc/reference-corpus-manifest.schema.json",
+  "title": "Governed project reference corpus manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "project_scope", "sources"],
+  "properties": {
+    "schema": {"const": "context_reference_manifest.v1"},
+    "project_scope": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:/-]+$"},
+    "sources": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {"$ref": "#/$defs/source"}
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_id", "canonical_url", "publisher", "title", "version",
+        "retrieved_at", "media_type", "normalized_media_type",
+        "normalized_path", "content_sha256", "rights", "freshness"
+      ],
+      "properties": {
+        "source_id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$"},
+        "canonical_url": {"type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2048},
+        "publisher": {"type": "string", "minLength": 1, "maxLength": 160},
+        "title": {"type": "string", "minLength": 1, "maxLength": 240},
+        "version": {"type": "string", "minLength": 1, "maxLength": 96, "pattern": "^[A-Za-z0-9._:/-]+$"},
+        "retrieved_at": {"type": "string", "format": "date-time", "maxLength": 64},
+        "media_type": {"enum": ["text/plain", "text/html", "application/xhtml+xml", "application/pdf"]},
+        "normalized_media_type": {"const": "text/plain; charset=utf-8"},
+        "normalized_path": {"type": ["string", "null"], "maxLength": 4096},
+        "content_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "rights": {"$ref": "#/$defs/rights"},
+        "freshness": {"$ref": "#/$defs/freshness"}
+      }
+    },
+    "rights": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "license", "evidence"],
+      "properties": {
+        "status": {"enum": ["permitted", "metadata_only"]},
+        "license": {"type": "string", "minLength": 1, "maxLength": 96, "pattern": "^[A-Za-z0-9._:/-]+$"},
+        "evidence": {"type": "string", "format": "uri", "pattern": "^https://", "maxLength": 512}
+      }
+    },
+    "freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "checked_at", "superseded_by"],
+      "properties": {
+        "status": {"enum": ["current", "stale", "superseded"]},
+        "checked_at": {"type": "string", "format": "date-time", "maxLength": 64},
+        "superseded_by": {"type": ["string", "null"], "maxLength": 96}
+      }
+    }
+  }
+}

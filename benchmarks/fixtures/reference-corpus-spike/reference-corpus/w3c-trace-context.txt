@@ -1,0 +1,9 @@
+Label: normalized UTF-8 spike excerpt from the W3C Trace Context Recommendation.
+Canonical source: https://www.w3.org/TR/trace-context/
+Original media metadata: text/html.
+
+The traceparent HTTP header field identifies the incoming request in a tracing system.
+The tracestate HTTP header field adds vendor-specific information to the trace context.
+Trace vendors MUST accept traceparent headers and validate their format.
+
+This short labelled fixture is retained only for deterministic retrieval measurement.

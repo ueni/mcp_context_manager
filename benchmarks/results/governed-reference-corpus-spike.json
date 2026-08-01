@@ -1,0 +1,35 @@
+{
+  "corpus_size_effects": [
+    {"chunk_count": 0, "source_count": 0, "warm_p95_ms": 0.29871},
+    {"chunk_count": 2, "source_count": 2, "warm_p95_ms": 0.402534}
+  ],
+  "fixture": {
+    "documents": ["RFC 9110", "W3C Trace Context"],
+    "fixed_query_count": 2,
+    "top_k": 4
+  },
+  "gates": {
+    "corpus_top_k_hit_rate_100pct": true,
+    "repeat_cache_hit_rate_gte_90pct": true,
+    "repository_and_corpus_distinguishable": true,
+    "stale_source_signalled": true
+  },
+  "latency_ms": {
+    "cold_p50": 8.899121,
+    "cold_p95": 25.585307,
+    "warm_p50": 0.34579899999999997,
+    "warm_p95": 0.402534
+  },
+  "quality": {
+    "corpus_top_k_hit_rate": 1.0,
+    "repository_only_top_k_hit_rate": 0.0,
+    "stale_source_signalled": true
+  },
+  "repeat_request_cache_hit_rate": 0.9534883720930232,
+  "schema": "governed_reference_corpus_spike.v1",
+  "tokens": {
+    "estimated_savings": 3573,
+    "selected_source_est": 11333,
+    "wire_est": 7760
+  }
+}

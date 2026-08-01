@@ -1,0 +1,50 @@
+{
+  "schema": "context_reference_manifest.v1",
+  "project_scope": "reference-spike",
+  "sources": [
+    {
+      "source_id": "rfc9110",
+      "canonical_url": "https://www.rfc-editor.org/rfc/rfc9110.pdf",
+      "publisher": "RFC Editor",
+      "title": "RFC 9110 HTTP Semantics",
+      "version": "RFC-9110",
+      "retrieved_at": "2026-08-01T00:00:00Z",
+      "media_type": "application/pdf",
+      "normalized_media_type": "text/plain; charset=utf-8",
+      "normalized_path": "reference-corpus/rfc9110.txt",
+      "content_sha256": "47289a1306d03aeecfa0b53ab92d5c81ffab50c155bd933b14da6e4ad3feb011",
+      "rights": {
+        "status": "permitted",
+        "license": "IETF-Trust",
+        "evidence": "https://www.rfc-editor.org/series/rfc-use/"
+      },
+      "freshness": {
+        "status": "current",
+        "checked_at": "2026-08-01T00:00:00Z",
+        "superseded_by": null
+      }
+    },
+    {
+      "source_id": "w3c-trace-context",
+      "canonical_url": "https://www.w3.org/TR/trace-context/",
+      "publisher": "World Wide Web Consortium",
+      "title": "Trace Context",
+      "version": "REC-20211123",
+      "retrieved_at": "2026-08-01T00:00:00Z",
+      "media_type": "text/html",
+      "normalized_media_type": "text/plain; charset=utf-8",
+      "normalized_path": "reference-corpus/w3c-trace-context.txt",
+      "content_sha256": "7ad8112291be580e7bfc965dcf6dc4f7a7d7eb73c01cb1879f074064ec84a771",
+      "rights": {
+        "status": "permitted",
+        "license": "W3C-2023",
+        "evidence": "https://www.w3.org/copyright/document-license-2023/"
+      },
+      "freshness": {
+        "status": "stale",
+        "checked_at": "2026-01-01T00:00:00Z",
+        "superseded_by": null
+      }
+    }
+  ]
+}
