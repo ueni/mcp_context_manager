@@ -1177,7 +1177,12 @@ def render_performance_view(
     elapsed_micros = sum(_int_at(row, ("elapsed_micros_total",)) for row in buckets if isinstance(row, dict))
     input_tokens = sum(_int_at(row, ("input_tokens_est",)) for row in buckets if isinstance(row, dict))
     wire_tokens = sum(_int_at(row, ("wire_tokens_est",)) for row in buckets if isinstance(row, dict))
-    l0_hits = sum(_int_at(row, ("cache_outcomes", "l0_hit")) for row in buckets if isinstance(row, dict))
+    l0_hits = sum(
+        _int_at(row, ("cache_outcomes", "l0_hit"))
+        + _int_at(row, ("cache_outcomes", "l0_singleflight"))
+        for row in buckets
+        if isinstance(row, dict)
+    )
     l0_misses = sum(_int_at(row, ("cache_outcomes", "l0_miss")) for row in buckets if isinstance(row, dict))
     frontier_hits = sum(_int_at(row, ("frontier_outcomes", "exact_hit")) for row in buckets if isinstance(row, dict))
     frontier_admitted = sum(_int_at(row, ("frontier_outcomes", "admitted")) for row in buckets if isinstance(row, dict))

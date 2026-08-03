@@ -606,7 +606,11 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                         "elapsed_micros_total": 5000,
                         "input_tokens_est": 100,
                         "wire_tokens_est": 20,
-                        "cache_outcomes": {"l0_hit": 3, "l0_miss": 1},
+                        "cache_outcomes": {
+                            "l0_hit": 3,
+                            "l0_singleflight": 2,
+                            "l0_miss": 1,
+                        },
                         "frontier_outcomes": {
                             "exact_hit": 2,
                             "admitted": 1,
@@ -689,7 +693,7 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("720 source-to-wire, 120 delta", performance)
         self.assertIn("monitor-only detailed usage", performance)
         self.assertIn("2 requests / 2.50 avg ms", performance)
-        self.assertIn("3 hits / 1 misses = 75.0%", performance)
+        self.assertIn("5 hits / 1 misses = 83.3%", performance)
         self.assertIn("exact 3 / frontier 2 / delta 2 / lineage 1", performance)
         self.assertIn("exact 3/3 (100.0%)", performance)
         self.assertIn("1/2 eligible (50.0%)", performance)
