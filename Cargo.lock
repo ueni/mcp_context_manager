@@ -276,6 +276,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -321,6 +322,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "context-core",
+ "context-store",
  "serde_json",
  "tempfile",
  "tokio",

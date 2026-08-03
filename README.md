@@ -76,7 +76,8 @@ Diagnostics, metrics, and token accounting are available through
 30-day usage ledger. Successful `context_pack` requests are grouped into the
 bounded client profiles `codex`, `claude`, `copilot`, `generic`, `missing`, and
 `other`. Reports include request counts and bounded latency, input-to-wire,
-token-saving, cache, frontier, route, and delta-reuse summaries. Rejected
+token-saving, raw cache outcomes, opportunity-normalized reuse, miss causes,
+coarse repeat distance, frontier, route, and delta-adoption summaries. Rejected
 attempts are counted only as `schema`, `root_policy`, `project_selection`, or
 `internal`.
 
@@ -86,6 +87,22 @@ external denominator is available. Raw profile values, prompts, responses,
 paths, root URIs, error values, credentials, and agent identifiers are never
 stored. Monitoring is disabled by default; the disabled request path is an
 atomic flag check and does not change context-pack behavior.
+
+Raw L0 hit rate uses all L0 hits and misses. Exact effectiveness uses only
+requests whose semantic L0 identity was observed earlier in the same project;
+frontier effectiveness uses L0 misses with an earlier canonical term/scope
+identity; delta adoption uses related earlier exact/frontier packs as its
+denominator. Lineage opportunity counts matching salted identities in another
+worktree derived from the same Git common directory, but never shares cache or
+source state across projects. Synthetic repeated-request hit rate is a cache
+mechanics benchmark, not evidence of production reuse adoption.
+
+Replay exact, unique, expiry, invalidation, restart, and linked-worktree
+telemetry scenarios with:
+
+```bash
+cargo run -p context-testkit --bin benchmark-reuse-opportunity --quiet
+```
 
 ## MCP-first workflow
 
