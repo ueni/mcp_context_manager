@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
 pub const CONTEXT_PACK_VERSION: u8 = 2;
 pub const DEFAULT_MAX_ITEMS: u8 = 8;
@@ -251,6 +252,11 @@ const NEGATIVE_FRONTIER_TTL_MS: u64 = 30_000;
 const POSITIVE_FRONTIER_ADMISSION_WINDOW_MS: u64 = 30 * 60 * 1_000;
 const FRONTIER_ADMISSION_TRACKER_MAX_ENTRIES: usize = 2_048;
 const OPERATION_SAMPLE_LIMIT: usize = 128;
+const REUSE_IDENTITY_VERSION: &str = "v1";
+const REUSE_TRACKER_MAX_ENTRIES: usize = 2_048;
+const REUSE_SLOT_MINUTES: i64 = 15;
+const REUSE_IDLE_SLOTS: u64 = 2;
+const REUSE_RETENTION_SLOTS: u64 = 30 * 24 * 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PackCacheKey(String);
@@ -456,7 +462,48 @@ struct UsageSample {
     term_count: usize,
     scope_count: usize,
     client_profile: &'static str,
+    reuse: ReuseIdentityInput,
 }
+
+#[derive(Clone, Default)]
+struct ReuseIdentityInput {
+    prompt: String,
+    terms: Vec<String>,
+    scope: Vec<String>,
+    options: Value,
+    evidence: Value,
+    refresh_signature: String,
+    lineage_seed: String,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReuseOutcome {
+    exact_eligible: bool,
+    frontier_eligible: bool,
+    delta_eligible: bool,
+    lineage_eligible: bool,
+    exact_hit: bool,
+    frontier_hit: bool,
+    delta_adopted: bool,
+    miss_cause: Option<&'static str>,
+    repeat_distance: Option<&'static str>,
+}
+
+const REUSE_MISS_CAUSES: [&str; 6] = [
+    "cold_or_restart",
+    "expired",
+    "invalidated_generation_or_signature",
+    "request_variant",
+    "scope_or_options_variant",
+    "evidence_state_variant",
+];
+const REPEAT_DISTANCE_BUCKETS: [&str; 5] = [
+    "same_15m_slot",
+    "within_30m_idle_window",
+    "30m_to_2h",
+    "2h_to_1d",
+    "1d_to_30d",
+];
 
 struct BuiltPack {
     bytes: Vec<u8>,
@@ -666,19 +713,40 @@ struct WatchGuard {
 pub struct UsageMonitor {
     store: StateStore,
     enabled: AtomicBool,
+    identity_salt: String,
     update_lock: Mutex<()>,
 }
 
 impl UsageMonitor {
     pub fn open(global_state: impl AsRef<std::path::Path>) -> Result<Self> {
         let store = StateStore::open(global_state)?;
-        let enabled = store
+        let mut config = store
             .get_json("monitor:config")?
-            .and_then(|value| value.get("enabled").and_then(Value::as_bool))
+            .unwrap_or_else(|| json!({}));
+        let enabled = config
+            .get("enabled")
+            .and_then(Value::as_bool)
             .unwrap_or(false);
+        let identity_salt = config
+            .get("identity_salt")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(str::to_owned)
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        config = json!({
+            "schema": "context_monitor_usage.config.v2",
+            "enabled": enabled,
+            "identity_salt_version": REUSE_IDENTITY_VERSION,
+            "identity_salt": identity_salt,
+        });
+        store.put_json("monitor:config", &config)?;
         Ok(Self {
             store,
             enabled: AtomicBool::new(enabled),
+            identity_salt: config["identity_salt"]
+                .as_str()
+                .expect("stored monitor salt is a string")
+                .to_owned(),
             update_lock: Mutex::new(()),
         })
     }
@@ -698,7 +766,12 @@ impl UsageMonitor {
                 self.enabled.store(enabled, Ordering::Release);
                 self.store.put_json(
                     "monitor:config",
-                    &json!({"schema":"context_monitor_usage.config.v1", "enabled":enabled}),
+                    &json!({
+                        "schema":"context_monitor_usage.config.v2",
+                        "enabled":enabled,
+                        "identity_salt_version": REUSE_IDENTITY_VERSION,
+                        "identity_salt": self.identity_salt,
+                    }),
                 )?;
                 self.status()
             }
@@ -718,6 +791,15 @@ impl UsageMonitor {
     }
 
     fn record(&self, project_id: &str, sample: UsageSample) -> Result<()> {
+        self.record_at(project_id, sample, OffsetDateTime::now_utc())
+    }
+
+    fn record_at(
+        &self,
+        project_id: &str,
+        sample: UsageSample,
+        observed_at: OffsetDateTime,
+    ) -> Result<()> {
         if !self.enabled() {
             return Ok(());
         }
@@ -725,11 +807,12 @@ impl UsageMonitor {
             .update_lock
             .lock()
             .map_err(|_| anyhow!("usage monitor lock poisoned"))?;
-        let day = OffsetDateTime::now_utc().date().to_string();
+        let day = observed_at.date().to_string();
         let key = format!("monitor:usage:{day}:{project_id}");
+        let reuse = self.classify_and_record_reuse(project_id, &sample, observed_at)?;
         let mut value = self.store.get_json(&key)?.unwrap_or_else(|| {
             json!({
-                "schema": "context_monitor_usage.bucket.v2",
+                "schema": "context_monitor_usage.bucket.v3",
                 "day": day,
                 "project_id": project_id,
                 "request_count": 0,
@@ -750,9 +833,13 @@ impl UsageMonitor {
                 "scope_count_buckets": {},
                 "stages_micros": {},
                 "client_profiles": empty_client_profile_buckets(),
+                "reuse_opportunities": {},
+                "reuse_effectiveness": {},
+                "miss_causes": empty_named_counters(&REUSE_MISS_CAUSES),
+                "repeat_distance_buckets": empty_named_counters(&REPEAT_DISTANCE_BUCKETS),
             })
         });
-        value["schema"] = Value::String("context_monitor_usage.bucket.v2".to_owned());
+        migrate_usage_bucket(&mut value);
         let telemetry = sample.telemetry;
         let elapsed_micros = u64::try_from(sample.elapsed.as_micros()).unwrap_or(u64::MAX);
         increment_json_u64(&mut value, "request_count", 1);
@@ -858,6 +945,7 @@ impl UsageMonitor {
             coarse_count_bucket(sample.scope_count),
             1,
         );
+        record_reuse_outcome(&mut value, reuse);
         match sample.cache_outcome {
             PackCacheOutcome::L0Hit | PackCacheOutcome::L0Singleflight => {
                 increment_json_nested(&mut value, "stages_micros", "cache", elapsed_micros);
@@ -877,10 +965,195 @@ impl UsageMonitor {
                 );
             }
         }
-        record_client_profile_sample(&mut value, sample.client_profile, &sample, elapsed_micros);
+        record_client_profile_sample(
+            &mut value,
+            sample.client_profile,
+            &sample,
+            reuse,
+            elapsed_micros,
+        );
         self.store.put_json(&key, &value)?;
         self.prune()?;
         Ok(())
+    }
+
+    fn classify_and_record_reuse(
+        &self,
+        project_id: &str,
+        sample: &UsageSample,
+        observed_at: OffsetDateTime,
+    ) -> Result<ReuseOutcome> {
+        let slot = reuse_time_slot(observed_at);
+        let prompt = self.reuse_sketch("prompt", &json!(sample.reuse.prompt))?;
+        let terms = self.reuse_sketch("terms", &json!(sample.reuse.terms))?;
+        let scope = self.reuse_sketch("scope", &json!(sample.reuse.scope))?;
+        let options = self.reuse_sketch("options", &sample.reuse.options)?;
+        let evidence = self.reuse_sketch("evidence", &sample.reuse.evidence)?;
+        let exact = self.reuse_sketch("exact", &json!([&prompt, &scope, &options, &evidence]))?;
+        let frontier = self.reuse_sketch("frontier", &json!([&terms, &scope]))?;
+        let scope_options = self.reuse_sketch("scope_options", &json!([&scope, &options]))?;
+        let lineage = self.reuse_sketch("lineage", &json!(sample.reuse.lineage_seed))?;
+        let signature = self.reuse_sketch(
+            "generation_signature",
+            &json!(sample.reuse.refresh_signature),
+        )?;
+
+        let mut state = self
+            .store
+            .get_json("monitor:reuse:state")?
+            .filter(|value| {
+                value.get("schema").and_then(Value::as_str)
+                    == Some("context_monitor_reuse.state.v1")
+            })
+            .unwrap_or_else(empty_reuse_state);
+        let entries = state
+            .get("entries")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .get("last_slot")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|last| slot.saturating_sub(last) <= REUSE_RETENTION_SLOTS)
+            })
+            .collect::<Vec<_>>();
+        let local = entries
+            .iter()
+            .filter(|entry| entry.get("project_id").and_then(Value::as_str) == Some(project_id))
+            .collect::<Vec<_>>();
+        let prior_exact = newest_reuse_entry(&local, "exact", &exact);
+        let prior_frontier = newest_reuse_entry(&local, "frontier", &frontier);
+        let prior_prompt = newest_reuse_entry(&local, "prompt", &prompt);
+        let prior_scope_options = newest_reuse_entry(&local, "scope_options", &scope_options);
+        let prior_lineage = entries
+            .iter()
+            .filter(|entry| {
+                entry.get("project_id").and_then(Value::as_str) != Some(project_id)
+                    && entry.get("lineage").and_then(Value::as_str) == Some(lineage.as_str())
+                    && (entry.get("exact").and_then(Value::as_str) == Some(exact.as_str())
+                        || entry.get("frontier").and_then(Value::as_str) == Some(frontier.as_str()))
+            })
+            .max_by_key(|entry| {
+                entry
+                    .get("last_slot")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+            });
+
+        let exact_hit = matches!(
+            sample.cache_outcome,
+            PackCacheOutcome::L0Hit | PackCacheOutcome::L0Singleflight
+        );
+        let exact_eligible = prior_exact.is_some() || exact_hit;
+        let frontier_eligible = matches!(
+            sample.cache_outcome,
+            PackCacheOutcome::Uncached | PackCacheOutcome::L0Miss
+        ) && prior_frontier.is_some();
+        let delta_eligible = prior_exact.is_some() || prior_frontier.is_some();
+        let lineage_eligible = prior_lineage.is_some();
+        let frontier_hit = frontier_eligible
+            && matches!(
+                sample.telemetry.frontier_outcome,
+                FrontierOutcome::ExactHit | FrontierOutcome::NegativeHit
+            );
+        let delta_adopted = delta_eligible
+            && (sample.telemetry.base_pack_used || sample.telemetry.known_evidence_used);
+
+        let miss_cause = if !matches!(sample.cache_outcome, PackCacheOutcome::L0Miss) {
+            None
+        } else if let Some(previous) = prior_exact {
+            let distance = slot.saturating_sub(reuse_entry_slot(previous));
+            if distance > REUSE_IDLE_SLOTS {
+                Some("expired")
+            } else if previous.get("signature").and_then(Value::as_str) != Some(signature.as_str())
+            {
+                Some("invalidated_generation_or_signature")
+            } else {
+                Some("cold_or_restart")
+            }
+        } else if prior_prompt.is_some_and(|previous| {
+            previous.get("scope_options").and_then(Value::as_str) == Some(scope_options.as_str())
+                && previous.get("evidence").and_then(Value::as_str) != Some(evidence.as_str())
+        }) {
+            Some("evidence_state_variant")
+        } else if prior_prompt.is_some() {
+            Some("scope_or_options_variant")
+        } else if prior_frontier.is_some() || prior_scope_options.is_some() {
+            Some("request_variant")
+        } else {
+            Some("cold_or_restart")
+        };
+
+        let nearest_slot = [prior_exact, prior_frontier, prior_lineage]
+            .into_iter()
+            .flatten()
+            .map(reuse_entry_slot)
+            .max();
+        let repeat_distance =
+            nearest_slot.map(|last| repeat_distance_bucket(slot.saturating_sub(last)));
+
+        let mut retained = entries
+            .into_iter()
+            .filter(|entry| {
+                !(entry.get("project_id").and_then(Value::as_str) == Some(project_id)
+                    && entry.get("exact").and_then(Value::as_str) == Some(exact.as_str()))
+            })
+            .collect::<Vec<_>>();
+        retained.push(json!({
+            "schema": "context_monitor_reuse.entry.v1",
+            "project_id": project_id,
+            "identity_version": REUSE_IDENTITY_VERSION,
+            "exact": exact,
+            "prompt": prompt,
+            "frontier": frontier,
+            "scope_options": scope_options,
+            "evidence": evidence,
+            "lineage": lineage,
+            "signature": signature,
+            "last_slot": slot,
+        }));
+        retained.sort_by(|left, right| {
+            reuse_entry_slot(right)
+                .cmp(&reuse_entry_slot(left))
+                .then_with(|| {
+                    left.get("exact")
+                        .and_then(Value::as_str)
+                        .cmp(&right.get("exact").and_then(Value::as_str))
+                })
+        });
+        retained.truncate(REUSE_TRACKER_MAX_ENTRIES);
+        state = json!({
+            "schema": "context_monitor_reuse.state.v1",
+            "identity_version": REUSE_IDENTITY_VERSION,
+            "slot_minutes": REUSE_SLOT_MINUTES,
+            "max_entries": REUSE_TRACKER_MAX_ENTRIES,
+            "entries": retained,
+        });
+        self.store.put_json("monitor:reuse:state", &state)?;
+
+        Ok(ReuseOutcome {
+            exact_eligible,
+            frontier_eligible,
+            delta_eligible,
+            lineage_eligible,
+            exact_hit,
+            frontier_hit,
+            delta_adopted,
+            miss_cause,
+            repeat_distance,
+        })
+    }
+
+    fn reuse_sketch(&self, namespace: &str, value: &Value) -> Result<String> {
+        let encoded = serde_json::to_vec(&json!({
+            "version": REUSE_IDENTITY_VERSION,
+            "salt": self.identity_salt,
+            "namespace": namespace,
+            "value": value,
+        }))?;
+        Ok(digest_id("ru_", &encoded))
     }
 
     pub fn record_rejection(&self, class: ContextPackRejectionClass) -> Result<()> {
@@ -946,6 +1219,27 @@ impl UsageMonitor {
             );
         }
         self.store.delete_batch(&remove)?;
+        if let Some(mut state) = self.store.get_json("monitor:reuse:state")? {
+            let slot = reuse_time_slot(OffsetDateTime::now_utc());
+            let mut entries = state
+                .get("entries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| {
+                    entry
+                        .get("last_slot")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|last| slot.saturating_sub(last) <= REUSE_RETENTION_SLOTS)
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| std::cmp::Reverse(reuse_entry_slot(entry)));
+            entries.truncate(REUSE_TRACKER_MAX_ENTRIES);
+            state = empty_reuse_state();
+            state["entries"] = Value::Array(entries);
+            self.store.put_json("monitor:reuse:state", &state)?;
+        }
         Ok(())
     }
 
@@ -972,6 +1266,8 @@ impl UsageMonitor {
                 .cmp(&right.get("day").and_then(Value::as_str))
         });
         for bucket in &mut buckets {
+            migrate_usage_bucket(bucket);
+            add_reuse_report(bucket);
             add_client_profile_report(bucket);
         }
         let mut rejection_buckets = self
@@ -986,7 +1282,7 @@ impl UsageMonitor {
                 .cmp(&right.get("day").and_then(Value::as_str))
         });
         Ok(json!({
-            "schema": "context_monitor_usage.report.v2",
+            "schema": "context_monitor_usage.report.v3",
             "enabled": self.enabled(),
             "retention_days": 30,
             "global": true,
@@ -995,6 +1291,125 @@ impl UsageMonitor {
             "rejection_buckets": rejection_buckets,
         }))
     }
+}
+
+fn empty_reuse_state() -> Value {
+    json!({
+        "schema": "context_monitor_reuse.state.v1",
+        "identity_version": REUSE_IDENTITY_VERSION,
+        "slot_minutes": REUSE_SLOT_MINUTES,
+        "max_entries": REUSE_TRACKER_MAX_ENTRIES,
+        "entries": [],
+    })
+}
+
+fn reuse_time_slot(observed_at: OffsetDateTime) -> u64 {
+    let divisor = REUSE_SLOT_MINUTES.saturating_mul(60);
+    u64::try_from(observed_at.unix_timestamp().div_euclid(divisor)).unwrap_or_default()
+}
+
+fn reuse_entry_slot(entry: &Value) -> u64 {
+    entry
+        .get("last_slot")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn newest_reuse_entry<'a>(entries: &[&'a Value], field: &str, expected: &str) -> Option<&'a Value> {
+    entries
+        .iter()
+        .copied()
+        .filter(|entry| entry.get(field).and_then(Value::as_str) == Some(expected))
+        .max_by_key(|entry| reuse_entry_slot(entry))
+}
+
+fn repeat_distance_bucket(distance_slots: u64) -> &'static str {
+    match distance_slots {
+        0 => "same_15m_slot",
+        1..=REUSE_IDLE_SLOTS => "within_30m_idle_window",
+        3..=8 => "30m_to_2h",
+        9..=96 => "2h_to_1d",
+        _ => "1d_to_30d",
+    }
+}
+
+fn empty_named_counters(names: &[&str]) -> Value {
+    let mut counters = serde_json::Map::new();
+    for name in names {
+        counters.insert((*name).to_owned(), Value::from(0));
+    }
+    Value::Object(counters)
+}
+
+fn migrate_usage_bucket(bucket: &mut Value) {
+    bucket["schema"] = Value::String("context_monitor_usage.bucket.v3".to_owned());
+    ensure_reuse_sections(bucket);
+}
+
+fn ensure_reuse_sections(bucket: &mut Value) {
+    if !bucket
+        .get("reuse_opportunities")
+        .is_some_and(Value::is_object)
+    {
+        bucket["reuse_opportunities"] = json!({});
+    }
+    if !bucket
+        .get("reuse_effectiveness")
+        .is_some_and(Value::is_object)
+    {
+        bucket["reuse_effectiveness"] = json!({});
+    }
+    if !bucket.get("miss_causes").is_some_and(Value::is_object) {
+        bucket["miss_causes"] = empty_named_counters(&REUSE_MISS_CAUSES);
+    }
+    if !bucket
+        .get("repeat_distance_buckets")
+        .is_some_and(Value::is_object)
+    {
+        bucket["repeat_distance_buckets"] = empty_named_counters(&REPEAT_DISTANCE_BUCKETS);
+    }
+}
+
+fn record_reuse_outcome(bucket: &mut Value, outcome: ReuseOutcome) {
+    for (field, eligible) in [
+        ("exact", outcome.exact_eligible),
+        ("frontier", outcome.frontier_eligible),
+        ("delta", outcome.delta_eligible),
+        ("lineage", outcome.lineage_eligible),
+    ] {
+        increment_json_nested(bucket, "reuse_opportunities", field, u64::from(eligible));
+    }
+    for (field, effective) in [
+        ("exact_hits", outcome.exact_hit && outcome.exact_eligible),
+        ("frontier_hits", outcome.frontier_hit),
+        ("delta_adoptions", outcome.delta_adopted),
+    ] {
+        increment_json_nested(bucket, "reuse_effectiveness", field, u64::from(effective));
+    }
+    if let Some(cause) = outcome.miss_cause {
+        increment_json_nested(bucket, "miss_causes", cause, 1);
+    }
+    if let Some(distance) = outcome.repeat_distance {
+        increment_json_nested(bucket, "repeat_distance_buckets", distance, 1);
+    }
+}
+
+fn add_reuse_report(bucket: &mut Value) {
+    let raw_hits = sum_nested_fields(bucket, "cache_outcomes", &["l0_hit", "l0_singleflight"]);
+    let raw_attempts =
+        raw_hits.saturating_add(sum_nested_fields(bucket, "cache_outcomes", &["l0_miss"]));
+    let exact = sum_nested_fields(bucket, "reuse_opportunities", &["exact"]);
+    let frontier = sum_nested_fields(bucket, "reuse_opportunities", &["frontier"]);
+    let delta = sum_nested_fields(bucket, "reuse_opportunities", &["delta"]);
+    let exact_hits = sum_nested_fields(bucket, "reuse_effectiveness", &["exact_hits"]);
+    let frontier_hits = sum_nested_fields(bucket, "reuse_effectiveness", &["frontier_hits"]);
+    let delta_adoptions = sum_nested_fields(bucket, "reuse_effectiveness", &["delta_adoptions"]);
+    bucket["opportunity_normalized"] = json!({
+        "raw_l0_hit_rate_millis": scaled_ratio(raw_hits, raw_attempts, 1_000),
+        "exact_effectiveness_millis": scaled_ratio(exact_hits, exact, 1_000),
+        "frontier_effectiveness_millis": scaled_ratio(frontier_hits, frontier, 1_000),
+        "delta_adoption_millis": scaled_ratio(delta_adoptions, delta, 1_000),
+    });
 }
 
 fn empty_client_profile_buckets() -> Value {
@@ -1019,6 +1434,10 @@ fn empty_client_profile_bucket(profile: &str) -> Value {
         "frontier_outcomes": {},
         "routes": {},
         "delta": {},
+        "reuse_opportunities": {},
+        "reuse_effectiveness": {},
+        "miss_causes": empty_named_counters(&REUSE_MISS_CAUSES),
+        "repeat_distance_buckets": empty_named_counters(&REPEAT_DISTANCE_BUCKETS),
     })
 }
 
@@ -1076,6 +1495,7 @@ fn record_client_profile_sample(
     bucket: &mut Value,
     profile: &str,
     sample: &UsageSample,
+    reuse: ReuseOutcome,
     elapsed_micros: u64,
 ) {
     if !bucket.get("client_profiles").is_some_and(Value::is_object) {
@@ -1158,6 +1578,7 @@ fn record_client_profile_sample(
         "known_evidence_requests",
         u64::from(telemetry.known_evidence_used),
     );
+    record_reuse_outcome(profile_bucket, reuse);
 }
 
 fn add_client_profile_report(bucket: &mut Value) {
@@ -1183,6 +1604,8 @@ fn add_client_profile_report(bucket: &mut Value) {
                 .get(*profile)
                 .cloned()
                 .unwrap_or_else(|| empty_client_profile_bucket(profile));
+            ensure_reuse_sections(&mut value);
+            add_reuse_report(&mut value);
             let requests = value
                 .get("request_count")
                 .and_then(Value::as_u64)
@@ -1339,6 +1762,7 @@ pub struct ProjectEngine {
     refresh_lock: Mutex<()>,
     metrics: EngineMetrics,
     usage_monitor: Arc<UsageMonitor>,
+    lineage_seed: String,
     _watcher: WatchGuard,
 }
 
@@ -1401,6 +1825,7 @@ impl ProjectEngine {
             .total_references
             .store(total_references, Ordering::Relaxed);
         let watcher = WatchGuard::start(index.root().to_path_buf(), Arc::clone(&freshness));
+        let lineage_seed = repository_lineage_seed(index.root());
         let l0 = Cache::builder()
             .max_capacity(L0_MAX_BYTES)
             .weigher(|key: &PackCacheKey, value: &Arc<CachedPack>| l0_entry_weight(key, value))
@@ -1419,6 +1844,7 @@ impl ProjectEngine {
             refresh_lock: Mutex::new(()),
             metrics,
             usage_monitor,
+            lineage_seed,
             _watcher: watcher,
         })
     }
@@ -1461,6 +1887,50 @@ impl ProjectEngine {
         &self.project_id
     }
 
+    fn usage_sample(
+        &self,
+        request: &ContextPackRequest,
+        elapsed: StdDuration,
+        telemetry: PackTelemetry,
+        cache_outcome: PackCacheOutcome,
+        refresh_checked: bool,
+        refresh_updated: bool,
+    ) -> UsageSample {
+        let scope = normalized_explicit_paths(request).unwrap_or_default();
+        let mut known_evidence = request.known_evidence.clone();
+        known_evidence.sort();
+        known_evidence.dedup();
+        let index = self.index();
+        UsageSample {
+            elapsed,
+            telemetry,
+            cache_outcome,
+            refresh_checked,
+            refresh_updated,
+            route: classify_route(&request.prompt),
+            term_count: normalize_terms(&request.prompt, 8).len(),
+            scope_count: scope.len(),
+            client_profile: normalized_client_profile(request.client_profile.as_deref()),
+            reuse: ReuseIdentityInput {
+                prompt: request.prompt.clone(),
+                terms: normalize_terms(&request.prompt, 8),
+                scope: scope.clone(),
+                options: json!({
+                    "scope": scope,
+                    "max_items": request.max_items,
+                    "max_source_tokens": request.max_source_tokens,
+                    "evidence_policy": request.evidence_policy,
+                }),
+                evidence: json!({
+                    "base_pack": request.base_pack,
+                    "known_evidence": known_evidence,
+                }),
+                refresh_signature: index.stats().refresh_signature.clone(),
+                lineage_seed: self.lineage_seed.clone(),
+            },
+        }
+    }
+
     pub fn context_pack(&self, request: &ContextPackRequest) -> Result<Vec<u8>> {
         let started = Instant::now();
         let result = (|| {
@@ -1473,20 +1943,14 @@ impl ProjectEngine {
                 if self.usage_monitor.enabled() {
                     let _ = self.usage_monitor.record(
                         &self.project_id,
-                        UsageSample {
-                            elapsed: started.elapsed(),
-                            telemetry: pack.telemetry,
-                            cache_outcome: PackCacheOutcome::Uncached,
+                        self.usage_sample(
+                            request,
+                            started.elapsed(),
+                            pack.telemetry,
+                            PackCacheOutcome::Uncached,
                             refresh_checked,
                             refresh_updated,
-                            route: classify_route(&request.prompt),
-                            term_count: normalize_terms(&request.prompt, 8).len(),
-                            scope_count: normalized_explicit_paths(request)
-                                .map_or(0, |paths| paths.len()),
-                            client_profile: normalized_client_profile(
-                                request.client_profile.as_deref(),
-                            ),
-                        },
+                        ),
                     );
                 }
                 Ok(pack.bytes)
@@ -1521,20 +1985,14 @@ impl ProjectEngine {
                 if self.usage_monitor.enabled() {
                     let _ = self.usage_monitor.record(
                         &self.project_id,
-                        UsageSample {
-                            elapsed: started.elapsed(),
-                            telemetry: admission.cached.telemetry,
-                            cache_outcome: admission.outcome,
+                        self.usage_sample(
+                            request,
+                            started.elapsed(),
+                            admission.cached.telemetry,
+                            admission.outcome,
                             refresh_checked,
                             refresh_updated,
-                            route: classify_route(&request.prompt),
-                            term_count: normalize_terms(&request.prompt, 8).len(),
-                            scope_count: normalized_explicit_paths(request)
-                                .map_or(0, |paths| paths.len()),
-                            client_profile: normalized_client_profile(
-                                request.client_profile.as_deref(),
-                            ),
-                        },
+                        ),
                     );
                 }
                 Ok(admission.cached.bytes.as_ref().clone())
@@ -4790,6 +5248,41 @@ fn sha256_text(text: &str) -> String {
         .collect()
 }
 
+fn repository_lineage_seed(root: &std::path::Path) -> String {
+    let dot_git = root.join(".git");
+    let lineage_path = if dot_git.is_dir() {
+        dot_git.canonicalize().ok()
+    } else if dot_git.is_file() {
+        std::fs::read_to_string(&dot_git).ok().and_then(|contents| {
+            let git_dir = contents.trim().strip_prefix("gitdir:")?.trim();
+            let git_dir = std::path::Path::new(git_dir);
+            let git_dir = if git_dir.is_absolute() {
+                git_dir.to_path_buf()
+            } else {
+                root.join(git_dir)
+            };
+            let git_dir = git_dir.canonicalize().ok()?;
+            let common_file = git_dir.join("commondir");
+            if let Ok(common) = std::fs::read_to_string(common_file) {
+                git_dir.join(common.trim()).canonicalize().ok()
+            } else {
+                git_dir
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .and_then(|path| path.canonicalize().ok())
+                    .or(Some(git_dir))
+            }
+        })
+    } else {
+        root.canonicalize().ok()
+    };
+    sha256_text(
+        &lineage_path
+            .unwrap_or_else(|| root.to_path_buf())
+            .to_string_lossy(),
+    )
+}
+
 fn truncate_string(text: &mut String, max_bytes: usize) {
     if text.len() <= max_bytes {
         return;
@@ -5020,6 +5513,44 @@ const fn default_max_age_minutes() -> u32 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[allow(clippy::too_many_arguments)]
+    fn reuse_sample(
+        prompt: &str,
+        terms: &[&str],
+        scope: &[&str],
+        evidence: &str,
+        _generation: u64,
+        signature: &str,
+        lineage: &str,
+        cache_outcome: PackCacheOutcome,
+        frontier_outcome: FrontierOutcome,
+    ) -> UsageSample {
+        UsageSample {
+            elapsed: StdDuration::from_millis(1),
+            telemetry: PackTelemetry {
+                frontier_outcome,
+                base_pack_used: evidence != "none",
+                ..PackTelemetry::default()
+            },
+            cache_outcome,
+            refresh_checked: false,
+            refresh_updated: false,
+            route: "explore",
+            term_count: terms.len(),
+            scope_count: scope.len(),
+            client_profile: "codex",
+            reuse: ReuseIdentityInput {
+                prompt: prompt.to_owned(),
+                terms: terms.iter().map(|value| (*value).to_owned()).collect(),
+                scope: scope.iter().map(|value| (*value).to_owned()).collect(),
+                options: json!({"scope": scope, "max_items": 8, "policy": "balanced"}),
+                evidence: json!({"state": evidence}),
+                refresh_signature: signature.to_owned(),
+                lineage_seed: lineage.to_owned(),
+            },
+        }
+    }
 
     #[test]
     fn request_defaults_are_the_v2_contract_defaults() {
@@ -5970,6 +6501,304 @@ mod tests {
         assert_eq!(
             monitor.report(Some("usage-project")).expect("final report")["buckets"][0]["request_count"],
             3
+        );
+    }
+
+    #[test]
+    fn reuse_telemetry_classifies_opportunities_misses_and_coarse_distance() {
+        let state = tempdir().expect("temporary state");
+        let monitor = UsageMonitor::open(state.path().join("global")).expect("monitor");
+        monitor.action("enable", None).expect("enable");
+        let base = OffsetDateTime::now_utc();
+        let record = |minutes,
+                      project,
+                      prompt,
+                      terms: &[&str],
+                      scope: &[&str],
+                      evidence,
+                      generation,
+                      signature,
+                      lineage,
+                      cache,
+                      frontier| {
+            monitor
+                .record_at(
+                    project,
+                    reuse_sample(
+                        prompt, terms, scope, evidence, generation, signature, lineage, cache,
+                        frontier,
+                    ),
+                    base + Duration::minutes(minutes),
+                )
+                .expect("reuse sample");
+        };
+        let miss = PackCacheOutcome::L0Miss;
+        record(
+            0,
+            "project-a",
+            "exact prompt",
+            &["exact"],
+            &["a.rs"],
+            "none",
+            0,
+            "sig-a",
+            "repo-a",
+            miss,
+            FrontierOutcome::Admitted,
+        );
+        record(
+            15,
+            "project-a",
+            "exact prompt",
+            &["exact"],
+            &["a.rs"],
+            "none",
+            0,
+            "sig-a",
+            "repo-a",
+            PackCacheOutcome::L0Hit,
+            FrontierOutcome::Search,
+        );
+        record(
+            30,
+            "project-a",
+            "exact prompt",
+            &["exact"],
+            &["a.rs"],
+            "none",
+            0,
+            "sig-a",
+            "repo-a",
+            miss,
+            FrontierOutcome::ExactHit,
+        );
+        record(
+            45,
+            "project-a",
+            "exact prompt",
+            &["exact"],
+            &["a.rs"],
+            "none",
+            1,
+            "sig-b",
+            "repo-a",
+            miss,
+            FrontierOutcome::ExactHit,
+        );
+        record(
+            90,
+            "project-a",
+            "exact prompt",
+            &["exact"],
+            &["a.rs"],
+            "none",
+            1,
+            "sig-b",
+            "repo-a",
+            miss,
+            FrontierOutcome::ExactHit,
+        );
+        record(
+            100,
+            "project-a",
+            "evidence prompt",
+            &["evidence"],
+            &["e.rs"],
+            "none",
+            0,
+            "sig-a",
+            "repo-a",
+            miss,
+            FrontierOutcome::Admitted,
+        );
+        record(
+            105,
+            "project-a",
+            "evidence prompt",
+            &["evidence"],
+            &["e.rs"],
+            "base",
+            0,
+            "sig-a",
+            "repo-a",
+            miss,
+            FrontierOutcome::ExactHit,
+        );
+        record(
+            110,
+            "project-a",
+            "scope prompt",
+            &["scope"],
+            &["one.rs"],
+            "none",
+            0,
+            "sig-a",
+            "repo-a",
+            miss,
+            FrontierOutcome::Admitted,
+        );
+        record(
+            115,
+            "project-a",
+            "scope prompt",
+            &["scope"],
+            &["two.rs"],
+            "none",
+            0,
+            "sig-a",
+            "repo-a",
+            miss,
+            FrontierOutcome::Admitted,
+        );
+        record(
+            120,
+            "project-a",
+            "variant one",
+            &["shared"],
+            &["v.rs"],
+            "none",
+            0,
+            "sig-a",
+            "repo-a",
+            miss,
+            FrontierOutcome::Admitted,
+        );
+        record(
+            125,
+            "project-a",
+            "variant two",
+            &["shared"],
+            &["v.rs"],
+            "none",
+            0,
+            "sig-a",
+            "repo-a",
+            miss,
+            FrontierOutcome::ExactHit,
+        );
+        record(
+            130,
+            "project-b",
+            "exact prompt",
+            &["exact"],
+            &["a.rs"],
+            "none",
+            0,
+            "sig-a",
+            "repo-a",
+            miss,
+            FrontierOutcome::Admitted,
+        );
+
+        let report = monitor.report(None).expect("report");
+        let buckets = report["buckets"].as_array().expect("buckets");
+        let sum = |section: &str, field: &str| {
+            buckets
+                .iter()
+                .map(|bucket| {
+                    bucket
+                        .pointer(&format!("/{section}/{field}"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                })
+                .sum::<u64>()
+        };
+        assert_eq!(sum("reuse_opportunities", "exact"), 4);
+        assert_eq!(sum("reuse_opportunities", "lineage"), 1);
+        assert_eq!(sum("reuse_effectiveness", "exact_hits"), 1);
+        assert_eq!(sum("miss_causes", "cold_or_restart"), 6);
+        assert_eq!(sum("miss_causes", "expired"), 1);
+        assert_eq!(sum("miss_causes", "invalidated_generation_or_signature"), 1);
+        assert_eq!(sum("miss_causes", "request_variant"), 1);
+        assert_eq!(sum("miss_causes", "scope_or_options_variant"), 1);
+        assert_eq!(sum("miss_causes", "evidence_state_variant"), 1);
+        assert_eq!(
+            REUSE_MISS_CAUSES
+                .iter()
+                .map(|cause| sum("miss_causes", cause))
+                .sum::<u64>(),
+            11
+        );
+        assert!(sum("repeat_distance_buckets", "within_30m_idle_window") >= 1);
+        assert!(sum("repeat_distance_buckets", "30m_to_2h") >= 1);
+        assert_eq!(report["schema"], "context_monitor_usage.report.v3");
+    }
+
+    #[test]
+    fn reuse_state_is_restart_stable_migrated_redacted_and_bounded() {
+        let state = tempdir().expect("temporary state");
+        let store = StateStore::open(state.path().join("global")).expect("store");
+        store
+            .put_json(
+                "monitor:config",
+                &json!({"schema":"context_monitor_usage.config.v1", "enabled":true}),
+            )
+            .expect("legacy config");
+        store.put_json("monitor:usage:2099-01-01:legacy", &json!({"schema":"context_monitor_usage.bucket.v2", "day":"2099-01-01", "project_id":"legacy", "request_count":1, "cache_outcomes":{"l0_miss":1}})).expect("legacy bucket");
+        drop(store);
+        let monitor = UsageMonitor::open(state.path().join("global")).expect("monitor");
+        let config = monitor
+            .store
+            .get_json("monitor:config")
+            .expect("config read")
+            .expect("config");
+        assert_eq!(config["schema"], "context_monitor_usage.config.v2");
+        let salt = config["identity_salt"].as_str().expect("salt").to_owned();
+        assert_eq!(salt.len(), 32);
+        drop(monitor);
+        let monitor = UsageMonitor::open(state.path().join("global")).expect("reopen");
+        assert_eq!(monitor.identity_salt, salt);
+
+        let slot = reuse_time_slot(OffsetDateTime::now_utc());
+        let entries = (0..=REUSE_TRACKER_MAX_ENTRIES)
+            .map(|index| json!({"project_id":"bounded", "exact":format!("ru_{index:024x}"), "prompt":"ru_000000000000000000000000", "frontier":"ru_000000000000000000000000", "scope_options":"ru_000000000000000000000000", "evidence":"ru_000000000000000000000000", "lineage":"ru_000000000000000000000000", "signature":"ru_000000000000000000000000", "last_slot":slot}))
+            .collect::<Vec<_>>();
+        monitor.store.put_json("monitor:reuse:state", &json!({"schema":"context_monitor_reuse.state.v1", "identity_version":"v1", "entries":entries})).expect("tracker fixture");
+        monitor
+            .record_at(
+                "safe-project",
+                reuse_sample(
+                    "private prompt bearer ghp_secret",
+                    &["private"],
+                    &["/absolute/host/path"],
+                    "private-evidence",
+                    0,
+                    "raw-repository-url",
+                    "/host/private/repository/.git",
+                    PackCacheOutcome::L0Miss,
+                    FrontierOutcome::Admitted,
+                ),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("record");
+        let tracker = monitor
+            .store
+            .get_json("monitor:reuse:state")
+            .expect("tracker read")
+            .expect("tracker");
+        assert_eq!(
+            tracker["entries"].as_array().expect("entries").len(),
+            REUSE_TRACKER_MAX_ENTRIES
+        );
+        let encoded = tracker.to_string();
+        for forbidden in [
+            "private prompt",
+            "ghp_secret",
+            "/absolute/host/path",
+            "private-evidence",
+            "raw-repository-url",
+            "/host/private/repository",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+        let migrated = monitor.report(Some("legacy")).expect("legacy report");
+        assert_eq!(
+            migrated["buckets"][0]["schema"],
+            "context_monitor_usage.bucket.v3"
+        );
+        assert_eq!(
+            migrated["buckets"][0]["opportunity_normalized"]["raw_l0_hit_rate_millis"],
+            0
         );
     }
 

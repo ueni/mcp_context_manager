@@ -606,7 +606,11 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                         "elapsed_micros_total": 5000,
                         "input_tokens_est": 100,
                         "wire_tokens_est": 20,
-                        "cache_outcomes": {"l0_hit": 3, "l0_miss": 1},
+                        "cache_outcomes": {
+                            "l0_hit": 3,
+                            "l0_singleflight": 2,
+                            "l0_miss": 1,
+                        },
                         "frontier_outcomes": {
                             "exact_hit": 2,
                             "admitted": 1,
@@ -614,6 +618,10 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                         },
                         "delta": {"base_pack_requests": 2},
                         "delta_tokens_saved_est": 40,
+                        "reuse_opportunities": {"exact": 3, "frontier": 2, "delta": 2, "lineage": 1},
+                        "reuse_effectiveness": {"exact_hits": 3, "frontier_hits": 2, "delta_adoptions": 1},
+                        "miss_causes": {"cold_or_restart": 1, "expired": 0, "invalidated_generation_or_signature": 0, "request_variant": 0, "scope_or_options_variant": 0, "evidence_state_variant": 0},
+                        "repeat_distance_buckets": {"same_15m_slot": 2, "within_30m_idle_window": 1, "30m_to_2h": 0, "2h_to_1d": 0, "1d_to_30d": 0},
                         "index": {"refresh_updated": 1},
                         "client_profiles": [
                             {
@@ -627,6 +635,8 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                                 "frontier_outcomes": {"exact_hit": 1},
                                 "routes": {"explore": 1},
                                 "delta": {"base_pack_requests": 1},
+                                "reuse_opportunities": {"exact": 1, "frontier": 1, "delta": 1},
+                                "reuse_effectiveness": {"exact_hits": 1, "frontier_hits": 1, "delta_adoptions": 1},
                             },
                             {
                                 "client_profile": "other",
@@ -639,6 +649,8 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                                 "frontier_outcomes": {"admitted": 1},
                                 "routes": {"explore": 1},
                                 "delta": {"base_pack_requests": 1},
+                                "reuse_opportunities": {"exact": 2, "frontier": 1, "delta": 1},
+                                "reuse_effectiveness": {"exact_hits": 2, "frontier_hits": 1, "delta_adoptions": 0},
                             },
                         ],
                     }
@@ -681,10 +693,13 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("720 source-to-wire, 120 delta", performance)
         self.assertIn("monitor-only detailed usage", performance)
         self.assertIn("2 requests / 2.50 avg ms", performance)
-        self.assertIn("3 hits / 1 misses", performance)
+        self.assertIn("5 hits / 1 misses = 83.3%", performance)
+        self.assertIn("exact 3 / frontier 2 / delta 2 / lineage 1", performance)
+        self.assertIn("exact 3/3 (100.0%)", performance)
+        self.assertIn("1/2 eligible (50.0%)", performance)
+        self.assertIn("3 within 30m idle / 0 beyond", performance)
         self.assertIn("2 hits / 1 admitted / 1 fallbacks", performance)
-        self.assertIn("2 requests / 40 tokens saved", performance)
-        self.assertIn("delta reuse", performance)
+        self.assertIn("delta adoption", performance)
         self.assertIn(
             "schema 1 / root policy 2 / project selection 3 / internal 4",
             performance,
@@ -693,7 +708,6 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("codex", performance)
         self.assertIn("other", performance)
         self.assertIn("1 / 50.0%", performance)
-        self.assertNotIn("adoption", performance.lower())
         self.assertNotIn("search_fragment_ms", performance)
         self.assertIn("7 entries, 64.0KiB", detail)
         self.assertIn("4 active / 6 total", detail)

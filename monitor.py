@@ -1177,7 +1177,12 @@ def render_performance_view(
     elapsed_micros = sum(_int_at(row, ("elapsed_micros_total",)) for row in buckets if isinstance(row, dict))
     input_tokens = sum(_int_at(row, ("input_tokens_est",)) for row in buckets if isinstance(row, dict))
     wire_tokens = sum(_int_at(row, ("wire_tokens_est",)) for row in buckets if isinstance(row, dict))
-    l0_hits = sum(_int_at(row, ("cache_outcomes", "l0_hit")) for row in buckets if isinstance(row, dict))
+    l0_hits = sum(
+        _int_at(row, ("cache_outcomes", "l0_hit"))
+        + _int_at(row, ("cache_outcomes", "l0_singleflight"))
+        for row in buckets
+        if isinstance(row, dict)
+    )
     l0_misses = sum(_int_at(row, ("cache_outcomes", "l0_miss")) for row in buckets if isinstance(row, dict))
     frontier_hits = sum(_int_at(row, ("frontier_outcomes", "exact_hit")) for row in buckets if isinstance(row, dict))
     frontier_admitted = sum(_int_at(row, ("frontier_outcomes", "admitted")) for row in buckets if isinstance(row, dict))
@@ -1185,6 +1190,36 @@ def render_performance_view(
     source_fallbacks = sum(_int_at(row, ("frontier_outcomes", "source_fallback")) for row in buckets if isinstance(row, dict))
     base_pack_requests = sum(_int_at(row, ("delta", "base_pack_requests")) for row in buckets if isinstance(row, dict))
     delta_saved = sum(_int_at(row, ("delta_tokens_saved_est",)) for row in buckets if isinstance(row, dict))
+    exact_opportunities = sum(_int_at(row, ("reuse_opportunities", "exact")) for row in buckets if isinstance(row, dict))
+    frontier_opportunities = sum(_int_at(row, ("reuse_opportunities", "frontier")) for row in buckets if isinstance(row, dict))
+    delta_opportunities = sum(_int_at(row, ("reuse_opportunities", "delta")) for row in buckets if isinstance(row, dict))
+    lineage_opportunities = sum(_int_at(row, ("reuse_opportunities", "lineage")) for row in buckets if isinstance(row, dict))
+    exact_effective = sum(_int_at(row, ("reuse_effectiveness", "exact_hits")) for row in buckets if isinstance(row, dict))
+    frontier_effective = sum(_int_at(row, ("reuse_effectiveness", "frontier_hits")) for row in buckets if isinstance(row, dict))
+    delta_adoptions = sum(_int_at(row, ("reuse_effectiveness", "delta_adoptions")) for row in buckets if isinstance(row, dict))
+    miss_causes = {
+        cause: sum(_int_at(row, ("miss_causes", cause)) for row in buckets if isinstance(row, dict))
+        for cause in (
+            "cold_or_restart",
+            "expired",
+            "invalidated_generation_or_signature",
+            "request_variant",
+            "scope_or_options_variant",
+            "evidence_state_variant",
+        )
+    }
+    repeat_within_idle = sum(
+        _int_at(row, ("repeat_distance_buckets", bucket))
+        for row in buckets
+        if isinstance(row, dict)
+        for bucket in ("same_15m_slot", "within_30m_idle_window")
+    )
+    repeat_beyond_idle = sum(
+        _int_at(row, ("repeat_distance_buckets", bucket))
+        for row in buckets
+        if isinstance(row, dict)
+        for bucket in ("30m_to_2h", "2h_to_1d", "1d_to_30d")
+    )
     refresh_updates = sum(_int_at(row, ("index", "refresh_updated")) for row in buckets if isinstance(row, dict))
     rejection_buckets = (
         report.get("rejection_buckets")
@@ -1208,6 +1243,17 @@ def render_performance_view(
         )
     )
     profile_rows = _usage_profile_rows(buckets, width)
+    percentage = lambda numerator, denominator: (
+        f"{numerator / denominator * 100.0:.1f}%" if denominator else "n/a"
+    )
+    miss_summary = (
+        f"cold/restart {fmt_int(miss_causes['cold_or_restart'])}; "
+        f"expired {fmt_int(miss_causes['expired'])}; "
+        f"invalidated {fmt_int(miss_causes['invalidated_generation_or_signature'])}; "
+        f"request {fmt_int(miss_causes['request_variant'])}; "
+        f"scope/options {fmt_int(miss_causes['scope_or_options_variant'])}; "
+        f"evidence {fmt_int(miss_causes['evidence_state_variant'])}"
+    )
     average_ms = elapsed_micros / request_count / 1000.0 if request_count else 0.0
     enabled_label = "enabled" if state.usage_enabled else "disabled"
     if state.usage_enabled is None:
@@ -1222,9 +1268,13 @@ def render_performance_view(
                     ("global collection", enabled_label),
                     ("selected project", f"{fmt_int(request_count)} requests / {average_ms:.2f} avg ms"),
                     ("30-day tokens", f"{fmt_int(input_tokens)} input / {fmt_int(wire_tokens)} wire"),
-                    ("L0 opportunity", f"{fmt_int(l0_hits)} hits / {fmt_int(l0_misses)} misses"),
-                    ("frontier opportunity", f"{fmt_int(frontier_hits)} hits / {fmt_int(frontier_admitted)} admitted / {fmt_int(capacity_fallbacks + source_fallbacks)} fallbacks"),
-                    ("delta reuse", f"{fmt_int(base_pack_requests)} requests / {fmt_int(delta_saved)} tokens saved"),
+                    ("raw L0 hit rate", f"{fmt_int(l0_hits)} hits / {fmt_int(l0_misses)} misses = {percentage(l0_hits, l0_hits + l0_misses)}"),
+                    ("eligible opportunity", f"exact {fmt_int(exact_opportunities)} / frontier {fmt_int(frontier_opportunities)} / delta {fmt_int(delta_opportunities)} / lineage {fmt_int(lineage_opportunities)}"),
+                    ("normalized reuse", f"exact {fmt_int(exact_effective)}/{fmt_int(exact_opportunities)} ({percentage(exact_effective, exact_opportunities)}); frontier {fmt_int(frontier_effective)}/{fmt_int(frontier_opportunities)} ({percentage(frontier_effective, frontier_opportunities)})"),
+                    ("delta adoption", f"{fmt_int(delta_adoptions)}/{fmt_int(delta_opportunities)} eligible ({percentage(delta_adoptions, delta_opportunities)}); {fmt_int(base_pack_requests)} base-pack requests / {fmt_int(delta_saved)} tokens saved"),
+                    ("L0 miss causes", _bounded_text(miss_summary, max(20, width - 27))),
+                    ("repeat distance", f"{fmt_int(repeat_within_idle)} within 30m idle / {fmt_int(repeat_beyond_idle)} beyond"),
+                    ("frontier raw", f"{fmt_int(frontier_hits)} hits / {fmt_int(frontier_admitted)} admitted / {fmt_int(capacity_fallbacks + source_fallbacks)} fallbacks"),
                     ("index invalidation", f"{fmt_int(refresh_updates)} refresh updates"),
                     (
                         "rejected attempts",
@@ -1275,6 +1325,12 @@ def _usage_profile_rows(
             "frontier_hits": 0,
             "frontier_requests": 0,
             "delta_reuse": 0,
+            "exact_opportunities": 0,
+            "exact_effective": 0,
+            "frontier_opportunities": 0,
+            "frontier_effective": 0,
+            "delta_opportunities": 0,
+            "delta_adoptions": 0,
             "routes": {},
         }
         for profile in USAGE_CLIENT_PROFILES
@@ -1318,6 +1374,12 @@ def _usage_profile_rows(
             aggregate["delta_reuse"] += _int_at(
                 row, ("delta", "base_pack_requests")
             )
+            aggregate["exact_opportunities"] += _int_at(row, ("reuse_opportunities", "exact"))
+            aggregate["exact_effective"] += _int_at(row, ("reuse_effectiveness", "exact_hits"))
+            aggregate["frontier_opportunities"] += _int_at(row, ("reuse_opportunities", "frontier"))
+            aggregate["frontier_effective"] += _int_at(row, ("reuse_effectiveness", "frontier_hits"))
+            aggregate["delta_opportunities"] += _int_at(row, ("reuse_opportunities", "delta"))
+            aggregate["delta_adoptions"] += _int_at(row, ("reuse_effectiveness", "delta_adoptions"))
             routes = row.get("routes") if isinstance(row.get("routes"), dict) else {}
             for route, count in routes.items():
                 if route not in USAGE_ROUTE_BUCKETS or not isinstance(count, int):
@@ -1345,17 +1407,20 @@ def _usage_profile_rows(
         frontier_hits = int(aggregate["frontier_hits"])
         frontier_requests = int(aggregate["frontier_requests"])
         delta_reuse = int(aggregate["delta_reuse"])
+        exact_opportunities = int(aggregate["exact_opportunities"])
+        exact_effective = int(aggregate["exact_effective"])
+        frontier_opportunities = int(aggregate["frontier_opportunities"])
+        frontier_effective = int(aggregate["frontier_effective"])
+        delta_opportunities = int(aggregate["delta_opportunities"])
+        delta_adoptions = int(aggregate["delta_adoptions"])
         usage_share = requests / total_requests * 100.0 if total_requests else 0.0
         average_ms = elapsed / requests / 1000.0
         compression = input_tokens / wire_tokens if wire_tokens else 0.0
         average_saved = saved_tokens / requests
         cache_share = cache_hits / requests * 100.0
-        frontier_share = (
-            frontier_hits / frontier_requests * 100.0
-            if frontier_requests
-            else 0.0
-        )
-        delta_share = delta_reuse / requests * 100.0
+        exact_normalized = f"{exact_effective / exact_opportunities * 100.0:.1f}%" if exact_opportunities else "n/a"
+        frontier_normalized = f"{frontier_effective / frontier_opportunities * 100.0:.1f}%" if frontier_opportunities else "n/a"
+        delta_normalized = f"{delta_adoptions / delta_opportunities * 100.0:.1f}%" if delta_opportunities else "n/a"
         route_summary = ", ".join(
             f"{route}={fmt_int(count)}"
             for route, count in sorted(aggregate["routes"].items())[:4]
@@ -1363,7 +1428,9 @@ def _usage_profile_rows(
         efficiency = (
             f"{average_ms:.2f} ms; {compression:.2f}x input/wire; "
             f"{average_saved:.1f} saved/request; cache {cache_share:.1f}%; "
-            f"frontier {frontier_share:.1f}%; delta {delta_share:.1f}%"
+            f"exact {exact_normalized}/{fmt_int(exact_opportunities)} eligible; "
+            f"frontier {frontier_normalized}/{fmt_int(frontier_opportunities)}; "
+            f"delta {delta_normalized}/{fmt_int(delta_opportunities)}"
         )
         if route_summary:
             efficiency += f"; routes {route_summary}"

@@ -95,14 +95,52 @@ stale-signature, then age order. The response reports bounded counts and timing,
 never the raw warmup prompt.
 
 `context_admin(mode="monitor_usage")` controls a process-global, default-off
-30-day aggregate ledger. Version 2 buckets preserve deterministic day ordering
-and add a fixed-order client-profile dimension: `codex`, `claude`, `copilot`,
+30-day aggregate ledger. Version 3 buckets preserve deterministic day ordering
+and the fixed-order client-profile dimension: `codex`, `claude`, `copilot`,
 `generic`, `missing`, and `other`. Unknown non-empty values are coalesced into
 `other`; raw profile values are not retained. Each profile bucket contains
 request counts and bounded latency, input-to-wire, token-saving, cache,
-frontier, route, and delta-reuse totals plus integer-derived ratios. Route
+frontier, route, and delta-reuse totals plus integer-derived ratios. They also
+contain fixed-name opportunity, effectiveness, miss-cause, and repeat-distance
+counters. Route
 shares use the fixed `debug`, `review`, `implementation`, and `explore`
 categories.
+
+The denominators are explicit:
+
+- raw L0 hit rate is `L0 hits including singleflight / (L0 hits + L0 misses)`;
+- exact effectiveness is `exact L0 hits / requests with an earlier retained
+  semantic L0 identity in the same project` (an actual hit remains eligible if
+  the bounded tracker has evicted its older sketch);
+- frontier effectiveness is `frontier exact-or-negative hits / L0 misses or
+  uncached packs with an earlier retained canonical term/scope identity`;
+- delta adoption is `requests using base-pack or known-evidence input / requests
+  with an earlier related exact or frontier identity`; and
+- lineage opportunity is a count, not a hit rate: a matching exact or frontier
+  sketch was observed under another project id with the same Git common-dir
+  lineage sketch.
+
+Lineage detection does not reuse cache entries, evidence, source state, or
+project identifiers. It derives a versioned salted sketch from the local Git
+common directory, so unrelated repositories are not joined. Non-Git roots use
+their own canonical root only as ephemeral hash input. The host value is never
+stored.
+
+Each L0 miss receives exactly one cause in this precedence order: an earlier
+exact identity outside the 30-minute idle window is `expired`; a changed source
+signature is `invalidated_generation_or_signature`; an earlier exact identity
+with the same signature is `cold_or_restart`; otherwise evidence-state,
+scope/options, and canonical request variants are distinguished before the
+remaining cold case. Repeat distances are stored only as 15-minute slots and
+reported as same-slot, within the 30-minute idle window, 30 minutes to two
+hours, two hours to one day, or one to 30 days.
+
+Only generated LMDB state is written. The identity tracker retains at most
+2,048 entries and 30 days. It stores 96-bit SHA-256 sketches under a persisted
+128-bit salt and a version tag; raw prompts, source text, paths, repository
+URLs, client values, evidence values, and precise timestamps are absent.
+Configuration v1 and bucket v1/v2 data are read compatibly and reported as v3
+with zero opportunity counters for history that predates these measurements.
 
 Rejected context-pack attempts use a separate process-global daily ledger with
 only four stable classes: `schema`, `root_policy`, `project_selection`, and
@@ -112,6 +150,12 @@ uses only requests represented in the fixed client-profile buckets as its
 denominator; it describes observed client-profile usage share, not
 organization-wide adoption. Disabled request handling is an atomic flag check
 and does not change cache behavior.
+
+The replayable `benchmark-reuse-opportunity` testkit binary covers exact
+repeats, unique requests, idle expiry, source invalidation, engine restart, and
+linked-worktree variants. Its synthetic repeat hit rate validates cache
+mechanics only; production adoption decisions must use opportunity-normalized
+monitor data.
 
 ## Project routing and boundaries
 
