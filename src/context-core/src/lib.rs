@@ -413,21 +413,21 @@ impl SharedFrontierRecord {
 
     fn content_key(&self) -> Result<String> {
         let content = serde_json::to_string(&json!({
-                "governance": &self.governance_identity,
-                "common_git": &self.git_common_dir_hash,
-                "lineage": &self.lineage_identity,
-                "head": &self.head_oid,
-                "source": &self.source_signature,
-                "index": &self.index_signature,
-                "scope": &self.scope_signature,
-                "terms": &self.terms,
-                "capacity": self.candidate_capacity,
-                "candidates": &self.candidate_addresses,
-                "dependencies": &self.dependency_addresses,
-                "scores": &self.scores,
-                "cumulative_token_costs": &self.cumulative_token_costs,
-                "score_cutoff": self.score_cutoff,
-            }))?;
+            "governance": &self.governance_identity,
+            "common_git": &self.git_common_dir_hash,
+            "lineage": &self.lineage_identity,
+            "head": &self.head_oid,
+            "source": &self.source_signature,
+            "index": &self.index_signature,
+            "scope": &self.scope_signature,
+            "terms": &self.terms,
+            "capacity": self.candidate_capacity,
+            "candidates": &self.candidate_addresses,
+            "dependencies": &self.dependency_addresses,
+            "scores": &self.scores,
+            "cumulative_token_costs": &self.cumulative_token_costs,
+            "score_cutoff": self.score_cutoff,
+        }))?;
         Ok(format!("sfr:{}", sha256_text(&content)))
     }
 }
