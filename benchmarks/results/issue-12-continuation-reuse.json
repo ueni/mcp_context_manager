@@ -1,0 +1,20 @@
+{
+  "schema": "context_continuation_benchmark.v1",
+  "measured_at": "2026-08-04",
+  "turn_count": 3,
+  "scenario": "Stable implementation, testing, and review task terms across iterative turns",
+  "token_count_source": "offline_wire_bytes_div_4",
+  "manual_full_wire_tokens_est": 585,
+  "continuation_wire_tokens_est": 337,
+  "wire_token_reduction": 0.423931623931624,
+  "retrieval_quality": {
+    "paired_pack_ids_equal": true,
+    "paired_paths_equal": true,
+    "regression": false
+  },
+  "gates": {
+    "continuation_reduces_tokens": true,
+    "continuation_no_retrieval_quality_regression": true
+  },
+  "runner": "cargo run -p context-testkit --bin benchmark-m3 --quiet"
+}

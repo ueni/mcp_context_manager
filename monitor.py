@@ -1064,6 +1064,7 @@ def _native_project_details(
     freshness = _mapping_at(metrics, ("index_freshness",))
     references = _mapping_at(metrics, ("references",))
     pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
+    continuation = _mapping_at(metrics, ("cache", "continuation"))
     return [
         ("project", _project_name(snapshot.target)),
         ("project id", _project_identifier(snapshot.target)),
@@ -1105,6 +1106,12 @@ def _native_project_details(
             "tokens saved est.",
             f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire / "
             f"{fmt_int(pack_tokens.get('delta_tokens_saved_est', 0))} delta",
+        ),
+        (
+            "continuation reuse",
+            f"{fmt_int(continuation.get('reuses', 0))}/{fmt_int(continuation.get('requests', 0))} reused / "
+            f"{fmt_int(continuation.get('fallbacks', 0))} fallbacks / "
+            f"{fmt_int(pack_tokens.get('continuation_wire_tokens_avoided_est', 0))} wire tokens avoided",
         ),
         (
             "token estimates",
@@ -1189,6 +1196,10 @@ def render_performance_view(
     capacity_fallbacks = sum(_int_at(row, ("frontier_outcomes", "capacity_fallback")) for row in buckets if isinstance(row, dict))
     source_fallbacks = sum(_int_at(row, ("frontier_outcomes", "source_fallback")) for row in buckets if isinstance(row, dict))
     base_pack_requests = sum(_int_at(row, ("delta", "base_pack_requests")) for row in buckets if isinstance(row, dict))
+    continuation_requests = sum(_int_at(row, ("delta", "continuation_requests")) for row in buckets if isinstance(row, dict))
+    continuation_reuses = sum(_int_at(row, ("delta", "continuation_reuses")) for row in buckets if isinstance(row, dict))
+    continuation_fallbacks = sum(_int_at(row, ("delta", "continuation_fallbacks")) for row in buckets if isinstance(row, dict))
+    continuation_avoided = sum(_int_at(row, ("delta", "continuation_wire_tokens_avoided_est")) for row in buckets if isinstance(row, dict))
     delta_saved = sum(_int_at(row, ("delta_tokens_saved_est",)) for row in buckets if isinstance(row, dict))
     exact_opportunities = sum(_int_at(row, ("reuse_opportunities", "exact")) for row in buckets if isinstance(row, dict))
     frontier_opportunities = sum(_int_at(row, ("reuse_opportunities", "frontier")) for row in buckets if isinstance(row, dict))
@@ -1272,6 +1283,7 @@ def render_performance_view(
                     ("eligible opportunity", f"exact {fmt_int(exact_opportunities)} / frontier {fmt_int(frontier_opportunities)} / delta {fmt_int(delta_opportunities)} / lineage {fmt_int(lineage_opportunities)}"),
                     ("normalized reuse", f"exact {fmt_int(exact_effective)}/{fmt_int(exact_opportunities)} ({percentage(exact_effective, exact_opportunities)}); frontier {fmt_int(frontier_effective)}/{fmt_int(frontier_opportunities)} ({percentage(frontier_effective, frontier_opportunities)})"),
                     ("delta adoption", f"{fmt_int(delta_adoptions)}/{fmt_int(delta_opportunities)} eligible ({percentage(delta_adoptions, delta_opportunities)}); {fmt_int(base_pack_requests)} base-pack requests / {fmt_int(delta_saved)} tokens saved"),
+                    ("continuation reuse", f"{fmt_int(continuation_reuses)}/{fmt_int(continuation_requests)} reused ({percentage(continuation_reuses, continuation_requests)}); {fmt_int(continuation_fallbacks)} fallbacks / {fmt_int(continuation_avoided)} wire tokens avoided"),
                     ("L0 miss causes", _bounded_text(miss_summary, max(20, width - 27))),
                     ("repeat distance", f"{fmt_int(repeat_within_idle)} within 30m idle / {fmt_int(repeat_beyond_idle)} beyond"),
                     ("frontier raw", f"{fmt_int(frontier_hits)} hits / {fmt_int(frontier_admitted)} admitted / {fmt_int(capacity_fallbacks + source_fallbacks)} fallbacks"),
@@ -2210,6 +2222,7 @@ def _performance_cache_rows(
         retrieval = _mapping_at(metrics, ("retrieval",))
         references = _mapping_at(metrics, ("references",))
         pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
+        continuation = _mapping_at(metrics, ("cache", "continuation"))
         freshness_state = "dirty" if freshness.get("dirty") else "clean"
         return [
             ("engine", _native_engine_status(metrics)),
@@ -2252,6 +2265,12 @@ def _performance_cache_rows(
                 "tokens saved est.",
                 f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire, "
                 f"{fmt_int(pack_tokens.get('delta_tokens_saved_est', 0))} delta",
+            ),
+            (
+                "continuation reuse",
+                f"{fmt_int(continuation.get('reuses', 0))}/{fmt_int(continuation.get('requests', 0))} reused, "
+                f"{fmt_int(continuation.get('fallbacks', 0))} fallbacks, "
+                f"{fmt_int(pack_tokens.get('continuation_wire_tokens_avoided_est', 0))} wire tokens avoided",
             ),
             (
                 "token estimates",

@@ -40,14 +40,14 @@ Supported fields are:
 | --- | --- |
 | `prompt` | Required task text. |
 | `changed_files`, `focus_paths` | Repository-relative paths ranked first. |
-| `memory_session` | Optional task-scoped memory key. |
+| `memory_session` | Optional explicit continuation key for iterative turns; project-local, 24-hour TTL. |
 | `client_profile`, `model_profile` | Client/provider hints. |
 | `project_id`, `root_uri` | Explicit project selection. |
 | `max_items` | Default `8`, range `1..32`. |
 | `max_source_tokens` | Default `512`, range `0..4096`. |
 | `evidence_policy` | `reference`, `balanced`, or `source`. |
 | `cache_strategy` | `fast`, `stable`, or `fresh`. |
-| `base_pack`, `known_evidence` | Optional session delta inputs. |
+| `base_pack`, `known_evidence` | Optional manual delta inputs; non-empty explicit values override continuation-derived state. |
 
 The MCP tool returns one raw JSON text item. The direct REST endpoint returns
 the same UTF-8 bytes:
@@ -61,9 +61,31 @@ the same UTF-8 bytes:
   "evidence": [
     ["ev_0123456789abcdef", 1, 301, 303, "run_http", "sig: async fn run_http(...)", 13]
   ],
-  "more": "ctxref-0123456789abcdef"
+  "more": "ctxref-0123456789abcdef",
+  "reuse": {
+    "delta_applied": false,
+    "source": "continuation",
+    "status": "missing",
+    "wire_tokens_avoided_est": 0
+  }
 }
 ```
+
+For an iterative coding, testing, or review task, send the same caller-chosen
+`memory_session` on each turn. The first successful request reports `missing`
+and initializes compact project state; later valid requests report `reused`
+and automatically apply the prior pack snapshot and acknowledged evidence.
+The response-level `reuse` object reports whether a delta was applied and the
+estimated evidence-card wire tokens avoided. `base_pack` or a non-empty
+`known_evidence` list selects manual delta state for that request and reports
+`explicit_override`.
+
+Continuation state stores only a hashed session key, pack/evidence identifiers,
+generation/signature, and timestamps. It is limited to 256 records per project
+and expires after 24 hours. Missing state (including first use or the same key
+in another project), expired state, a stale index generation, or a missing pack
+falls back to a full pack with status `missing`, `expired`,
+`stale_generation`, or `missing_pack`. No transport identity is inferred.
 
 The compact evidence tuple contains the evidence id, policy/delta opcode,
 inclusive line interval, symbol, evidence card, and estimated source tokens.
@@ -110,13 +132,15 @@ Use `repo://instructions/context-pack` as the portable source of
 truth:
 
 1. Call `context_pack` first for repository tasks.
-2. Use `context_lookup` for targeted follow-up snippets, search, trees, symbols,
+2. For iterative turns, keep one explicit `memory_session` and inspect the
+   top-level `reuse` status; use manual delta fields only when overriding it.
+3. Use `context_lookup` for targeted follow-up snippets, search, trees, symbols,
    references, impact, test ownership, chunks, and cache explanation.
-3. Resolve raw referenced evidence before destructive changes, release claims,
+4. Resolve raw referenced evidence before destructive changes, release claims,
    or security conclusions.
-4. Use `context_admin` for health, projects, index, cache, metrics, contracts,
+5. Use `context_admin` for health, projects, index, cache, metrics, contracts,
    benchmarks, quality, warmup, and generated-state inspection.
-5. Store only structured, non-secret repository facts through `context_memory`.
+6. Store only structured, non-secret repository facts through `context_memory`.
 
 Recommended Codex configuration:
 
