@@ -488,8 +488,10 @@ and `git diff --check`.
 Rust 1.97.1 and `Cargo.lock` are pinned. CMake invokes locked Cargo builds in
 Debian and Alpine builders, validates executable target and linkage, and emits
 dynamic glibc plus static PIE musl artifacts. The final Alpine image contains
-the musl server and runtime certificates/curl only; no Python interpreter or
-production Python dependency is present.
+the musl server, runtime certificates, curl, Git, and zlib. Git is used only for
+shell-free, read-only governed-worktree lineage proofs with
+`GIT_OPTIONAL_LOCKS=0`; it does not authorize source-repository mutation. No
+Python interpreter or production Python dependency is present.
 
 `cargo xtask release-version` updates the workspace, lockfile, and standalone
 monitor contract. `cargo xtask license-check` enforces the dependency license
