@@ -309,6 +309,12 @@ def validate_against_python(captures: dict[str, Any]) -> dict[str, Any]:
     assert pack["v"] == 2
     assert set(pack["paths"]) == {"src/auth.py", "tests/test_auth.py"}
     assert len(pack["evidence"]) == 2
+    assert pack["reuse"] == {
+        "delta_applied": False,
+        "source": "none",
+        "status": "disabled",
+        "wire_tokens_avoided_est": 0,
+    }
     assert captures["result_reference_resolve.resolve"]["status"] == "resolved"
     assert captures["context_memory.get"]["count"] == 1
     assert captures["context_memory.get"]["summary_count"] == 1

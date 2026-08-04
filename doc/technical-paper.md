@@ -312,6 +312,46 @@ When `base_pack` is supplied, the engine compares the previous evidence
 snapshot with the current one and returns add/drop/replace deltas. Evidence ids
 already listed in `known_evidence` are omitted.
 
+### Explicit iterative continuation
+
+`memory_session` is the opt-in continuation identifier for iterative packs. It
+is never inferred from MCP, HTTP, or transport sessions. The project engine
+hashes the validated caller value and persists a `context_pack.continuation.v1`
+record in that project's generated LMDB state. A record contains only the prior
+pack id, its bounded evidence-id set, index generation and refresh signature,
+and update/expiry timestamps. Raw prompts, source text, session strings,
+secrets, repository paths, and host paths are not stored.
+
+On the next request with the same identifier, a valid record supplies the
+effective `base_pack` and `known_evidence`. A request with an explicit
+`base_pack` or non-empty `known_evidence` list uses that manual delta state
+instead and reports `explicit_override`. Continuation records expire after 24
+hours and are pruned to 256 entries per project. The same identifier in another
+project resolves as project-local missing state; no global identity registry is
+consulted.
+
+Fallback is deterministic and visible in the response-level `reuse` object:
+`missing`, `expired`, `stale_generation`, and `missing_pack` all produce a full
+pack and advance the continuation only after that pack succeeds. `reused`
+reports valid derived delta state. `delta_applied` and
+`wire_tokens_avoided_est` are emitted once at the response level, not copied
+into evidence cards.
+
+Continuation requests are serialized by a per-project continuation gate across
+state resolution, pack construction, and state advancement. This prevents two
+concurrent turns from reading and then overwriting the same predecessor.
+Continuation responses are not admitted to L0 because their meaning advances
+per successful turn; ordinary and explicit-delta requests retain Moka
+singleflight. Replay therefore advances from the latest successful snapshot,
+while failed builds leave the record unchanged.
+
+The direct native benchmark includes a three-turn implementation/test/review
+sequence. It compares manual full-pack wire-token estimates with automatic
+continuation output and gates on positive token reduction plus identical pack
+ids and paths, establishing no retrieval-quality regression for the paired
+turns. The retained issue run is
+`benchmarks/results/issue-12-continuation-reuse.json`.
+
 ## Cache hierarchy
 
 ### L0 wire cache

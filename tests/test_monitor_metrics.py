@@ -520,6 +520,7 @@ def native_metrics(*, status: str = "idle") -> dict[str, object]:
                 "wire_bytes": 720,
                 "saved_tokens_est": 720,
                 "delta_tokens_saved_est": 120,
+                "continuation_wire_tokens_avoided_est": 80,
                 "compression_factor_est": 5.0,
                 "compression_ratio_est": 0.2,
             }
@@ -545,6 +546,7 @@ def native_metrics(*, status: str = "idle") -> dict[str, object]:
                 "approximate_hits": 3,
                 "retrieval_misses": 2,
             },
+            "continuation": {"requests": 4, "reuses": 3, "fallbacks": 1},
         },
         "retrieval": {"backend": "tantivy", "doc_count": 99, "misses": 2},
         "references": {"active_count": 4, "total_count": 6},
@@ -616,7 +618,13 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                             "admitted": 1,
                             "capacity_fallback": 1,
                         },
-                        "delta": {"base_pack_requests": 2},
+                        "delta": {
+                            "base_pack_requests": 2,
+                            "continuation_requests": 4,
+                            "continuation_reuses": 3,
+                            "continuation_fallbacks": 1,
+                            "continuation_wire_tokens_avoided_est": 80,
+                        },
                         "delta_tokens_saved_est": 40,
                         "reuse_opportunities": {"exact": 3, "frontier": 2, "delta": 2, "lineage": 1},
                         "reuse_effectiveness": {"exact_hits": 3, "frontier_hits": 2, "delta_adoptions": 1},
@@ -691,6 +699,10 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("p95 ms", performance)
         self.assertIn("5.00x source-to-wire", performance)
         self.assertIn("720 source-to-wire, 120 delta", performance)
+        self.assertIn(
+            "3/4 reused (75.0%); 1 fallbacks / 80 wire tokens avoided",
+            performance,
+        )
         self.assertIn("monitor-only detailed usage", performance)
         self.assertIn("2 requests / 2.50 avg ms", performance)
         self.assertIn("5 hits / 1 misses = 83.3%", performance)

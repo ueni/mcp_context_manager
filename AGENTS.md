@@ -18,23 +18,26 @@ debug, test, docs, security, and general repository tasks.
    failing tests, review findings, or likely files.
 4. Set `client_profile` per request. Use the v2 `evidence_policy` and bounded
    source/item limits when intentionally changing evidence shape.
-5. Use `context_lookup` for targeted snippets, search, trees, symbols, impact,
+5. For iterative turns in one task, opt in with a stable caller-chosen
+   `memory_session`; inspect the response-level `reuse` status. Explicit
+   `base_pack` or non-empty `known_evidence` values override derived state.
+6. Use `context_lookup` for targeted snippets, search, trees, symbols, impact,
    related symbols, test owners, chunks, or cache explanation before broad
    shell inspection.
-6. Use `result_reference_resolve` before relying on raw omitted evidence for
+7. Use `result_reference_resolve` before relying on raw omitted evidence for
    destructive edits, release claims, or security conclusions.
-7. Use `context_admin` for health, project selection, index, cache, budget,
+8. Use `context_admin` for health, project selection, index, cache, budget,
    contracts, metrics, benchmark, quality evaluation, warmup, or generated-state
    checks.
-8. Use `context_memory` only for structured, non-secret repository facts,
+9. Use `context_memory` only for structured, non-secret repository facts,
    summaries, decisions, validation, or compaction.
-9. Before advising new technical-document acquisition, scan repository evidence
+10. Before advising new technical-document acquisition, scan repository evidence
    and the governed `reference-corpus/manifest.json` through `context_pack` or
    `context_lookup(mode="search")`. Reuse a suitable current source when present.
    If it is absent, advise an external agent, job, or human to acquire it,
    verify local-use rights, normalize it to UTF-8 text, hash it, and stage it
    under `reference-corpus/`; this MCP never fetches, converts PDFs, or runs OCR.
-10. Treat `@corpus/` paths as governed reference evidence. Read the compact
+11. Treat `@corpus/` paths as governed reference evidence. Read the compact
     source/version/licence/freshness provenance and prompt-injection signal,
     then use the pack's `more` id with `result_reference_resolve` when the
     bounded deferred excerpt is required.

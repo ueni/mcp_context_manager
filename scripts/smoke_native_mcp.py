@@ -107,6 +107,12 @@ def pack_message(request_id: int) -> dict[str, Any]:
     )
 
 
+def continuation_pack_message(request_id: int) -> dict[str, Any]:
+    message = pack_message(request_id)
+    message["params"]["arguments"]["memory_session"] = "smoke-iterative-v1"
+    return message
+
+
 def assert_lookup(response: dict[str, Any]) -> None:
     lookup = tool_json(response)
     assert lookup["schema"] == "context_search.v1"
@@ -124,6 +130,15 @@ def assert_pack(response: dict[str, Any]) -> None:
     assert pack["paths"] == ["src/context-core/src/lib.rs"]
     assert len(pack["evidence"]) == 1
     assert pack["more"].startswith("ctxref-")
+    assert pack["reuse"]["status"] == "disabled"
+
+
+def assert_continuation_reused(response: dict[str, Any]) -> None:
+    pack = tool_json(response)
+    assert pack["reuse"]["source"] == "continuation"
+    assert pack["reuse"]["status"] == "reused"
+    assert pack["reuse"]["delta_applied"] is True
+    assert pack["reuse"]["wire_tokens_avoided_est"] > 0
 
 
 def assert_resources(resources: dict[str, Any]) -> None:
@@ -167,11 +182,15 @@ def smoke_stdio(binary: Path) -> None:
         assert_lookup(read_stdio(process))
         write_stdio(process, pack_message(4))
         assert_pack(read_stdio(process))
-        write_stdio(process, request(5, "resources/list"))
+        write_stdio(process, continuation_pack_message(5))
+        read_stdio(process)
+        write_stdio(process, continuation_pack_message(6))
+        assert_continuation_reused(read_stdio(process))
+        write_stdio(process, request(7, "resources/list"))
         assert_resources(read_stdio(process))
         write_stdio(
             process,
-            request(6, "resources/read", {"uri": "repo://summary"}),
+            request(8, "resources/read", {"uri": "repo://summary"}),
         )
         assert_summary_resource(read_stdio(process))
     finally:

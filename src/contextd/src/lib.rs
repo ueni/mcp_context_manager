@@ -142,7 +142,7 @@ impl ContextServer {
     }
 
     #[tool(
-        description = "Build the primary compact, cited context_pack.v2 for a repository task. Call this first for coding, review, debugging, tests, documentation, security, or general repository questions. Pass the exact task in `prompt`, set `client_profile`, include known `changed_files`/`focus_paths`, and select a project with `project_id` or `root_uri` when needed. The bounded response contains evidence cards and may return a local `more` reference for deferred details."
+        description = "Build the primary compact, cited context_pack.v2 for a repository task. Call this first for coding, review, debugging, tests, documentation, security, or general repository questions. Pass the exact task in `prompt`, set `client_profile`, include known `changed_files`/`focus_paths`, and select a project with `project_id` or `root_uri` when needed. For iterative turns, opt in with one stable `memory_session`; the project-local continuation automatically reuses the previous valid pack unless explicit `base_pack` or `known_evidence` delta state overrides it. The bounded response contains evidence cards, one top-level reuse diagnostic, and may return a local `more` reference for deferred details."
     )]
     async fn context_pack(
         &self,

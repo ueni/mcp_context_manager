@@ -197,6 +197,44 @@ async fn main() -> Result<()> {
         "fresh request returned stale evidence"
     );
 
+    let manual_state = tempfile::tempdir()?;
+    let continuation_state = tempfile::tempdir()?;
+    let manual_engine = ProjectEngine::build_with_state(&root, manual_state.path(), "manual-full")?;
+    let continuation_engine =
+        ProjectEngine::build_with_state(&root, continuation_state.path(), "continuation")?;
+    let iterative_prompts = [
+        "iterative context pack evidence reuse implementation testing review turn one",
+        "iterative context pack evidence reuse implementation testing review turn two",
+        "iterative context pack evidence reuse implementation testing review turn three",
+    ];
+    let mut manual_full_wire_tokens = 0_usize;
+    let mut continuation_wire_tokens = 0_usize;
+    let mut continuation_quality_equal = true;
+    for prompt in iterative_prompts {
+        let mut manual_request = base_request.clone();
+        manual_request.prompt = prompt.to_owned();
+        let manual_bytes = manual_engine.context_pack_cached(&manual_request).await?;
+        let manual_pack: ContextPackV2 = serde_json::from_slice(&manual_bytes)?;
+        manual_full_wire_tokens =
+            manual_full_wire_tokens.saturating_add(token_estimate(&manual_bytes));
+
+        let mut continuation_request = manual_request;
+        continuation_request.memory_session = Some("benchmark-iterative-reuse".to_owned());
+        let continuation_bytes = continuation_engine
+            .context_pack_cached(&continuation_request)
+            .await?;
+        let continuation_pack: ContextPackV2 = serde_json::from_slice(&continuation_bytes)?;
+        continuation_wire_tokens =
+            continuation_wire_tokens.saturating_add(token_estimate(&continuation_bytes));
+        continuation_quality_equal &=
+            continuation_pack.id == manual_pack.id && continuation_pack.paths == manual_pack.paths;
+    }
+    let continuation_token_reduction = if manual_full_wire_tokens == 0 {
+        0.0
+    } else {
+        1.0 - continuation_wire_tokens as f64 / manual_full_wire_tokens as f64
+    };
+
     tokens.sort_unstable();
     let balanced_tokens_median = tokens[tokens.len() / 2];
     let summary = json!({
@@ -212,6 +250,10 @@ async fn main() -> Result<()> {
         "general_warmup_retrieval_ms": general_warmup_retrieval_ms,
         "prompt_warmup_ms": prompt_warmup_ms,
         "post_prompt_warmup_l0_ms": post_prompt_warmup_l0_ms,
+        "iterative_manual_full_wire_tokens_est": manual_full_wire_tokens,
+        "iterative_continuation_wire_tokens_est": continuation_wire_tokens,
+        "iterative_continuation_token_reduction": continuation_token_reduction,
+        "iterative_continuation_quality_equal": continuation_quality_equal,
     });
     let gates = json!({
         "l0_server_p95_lte_2ms": summary["l0_server_p95_ms"].as_f64().unwrap() <= 2.0,
@@ -224,6 +266,8 @@ async fn main() -> Result<()> {
         "freshness_lte_2s": freshness_ms <= 2_000.0,
         "general_warmup_lte_50ms": general_warmup_ms <= 50.0,
         "post_prompt_warmup_l0_lte_2ms": post_prompt_warmup_l0_ms <= 2.0,
+        "iterative_continuation_reduces_tokens": continuation_token_reduction > 0.0,
+        "iterative_continuation_no_quality_regression": continuation_quality_equal,
     });
     println!(
         "{}",
