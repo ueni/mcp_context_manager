@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    process::Command,
     sync::{
         Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -12,8 +13,8 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use context_index::{
-    IndexStats, ProjectIndex, SearchHit, SymbolRecord, normalize_terms,
-    repository_signature_for_project, validate_relative_path,
+    IndexStats, ProjectIndex, SearchHit, SymbolRecord, immutable_candidate_address,
+    normalize_terms, repository_signature_for_project, validate_relative_path,
 };
 use context_store::{ReferenceValidation, StateStore};
 use moka::future::Cache;
@@ -282,6 +283,8 @@ pub struct ContextPackReuseV1 {
 const L0_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const L1_MEMORY_MAX_BYTES: usize = 128 * 1024 * 1024;
 const L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
+const SHARED_L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
+const WARM_MISS_TARGET_MICROS: u64 = 50_000;
 const FAST_POLL_INTERVAL_MS: u64 = 2_000;
 const WATCH_COALESCE_MS: u64 = 50;
 const NEGATIVE_FRONTIER_TTL_MS: u64 = 30_000;
@@ -383,6 +386,199 @@ struct FrontierRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct SharedFrontierRecord {
+    schema: String,
+    key: String,
+    governance_identity: String,
+    git_common_dir_hash: String,
+    lineage_identity: String,
+    head_oid: String,
+    source_signature: String,
+    index_signature: String,
+    scope_signature: String,
+    terms: Vec<String>,
+    candidate_capacity: u8,
+    candidate_addresses: Vec<String>,
+    dependency_addresses: Vec<String>,
+    scores: Vec<f32>,
+    cumulative_token_costs: Vec<u32>,
+    score_cutoff: f32,
+    admitted_at_ms: u64,
+}
+
+impl SharedFrontierRecord {
+    fn estimated_bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(0, |encoded| encoded.len())
+    }
+
+    fn content_key(&self) -> Result<String> {
+        let content = serde_json::to_string(&json!({
+                "governance": &self.governance_identity,
+                "common_git": &self.git_common_dir_hash,
+                "lineage": &self.lineage_identity,
+                "head": &self.head_oid,
+                "source": &self.source_signature,
+                "index": &self.index_signature,
+                "scope": &self.scope_signature,
+                "terms": &self.terms,
+                "capacity": self.candidate_capacity,
+                "candidates": &self.candidate_addresses,
+                "dependencies": &self.dependency_addresses,
+                "scores": &self.scores,
+                "cumulative_token_costs": &self.cumulative_token_costs,
+                "score_cutoff": self.score_cutoff,
+            }))?;
+        Ok(format!("sfr:{}", sha256_text(&content)))
+    }
+}
+
+#[derive(Default)]
+struct SharedFrontierState {
+    records: VecDeque<Arc<SharedFrontierRecord>>,
+    bytes: usize,
+}
+
+/// Process-global, generated-state-only pool for immutable frontier records.
+/// Project stores never point into this pool and shared records intentionally
+/// have no project ids, paths, prompts, references, or continuation state.
+pub struct SharedFrontierCache {
+    store: StateStore,
+    state: Mutex<SharedFrontierState>,
+}
+
+impl SharedFrontierCache {
+    pub fn open(global_state: impl AsRef<std::path::Path>) -> Result<Self> {
+        let store = StateStore::open(global_state)?;
+        let state = load_shared_frontiers(&store)?;
+        Ok(Self {
+            store,
+            state: Mutex::new(state),
+        })
+    }
+
+    fn admit(&self, record: Arc<SharedFrontierRecord>) -> Result<bool> {
+        if record.schema != "context_shared_frontier.v1" || record.content_key()? != record.key {
+            return Ok(false);
+        }
+        let key = format!("shared-frontier:{}", record.key);
+        let bytes = record.estimated_bytes();
+        if bytes > SHARED_L1_PERSISTENT_MAX_BYTES {
+            return Ok(false);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("shared frontier cache lock poisoned"))?;
+        if self.store.get_json(&key)?.is_some() {
+            return Ok(false);
+        }
+        self.store
+            .put_json(&key, &serde_json::to_value(&*record)?)?;
+        while state.bytes.saturating_add(bytes) > SHARED_L1_PERSISTENT_MAX_BYTES {
+            if let Some(removed) = state.records.pop_front() {
+                state.bytes = state.bytes.saturating_sub(removed.estimated_bytes());
+                let _ = self
+                    .store
+                    .delete(&format!("shared-frontier:{}", removed.key));
+            } else {
+                break;
+            }
+        }
+        state.bytes = state.bytes.saturating_add(bytes);
+        state.records.push_back(record);
+        Ok(true)
+    }
+
+    fn records(&self) -> Result<Vec<Arc<SharedFrontierRecord>>> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("shared frontier cache lock poisoned"))?
+            .records
+            .iter()
+            .cloned()
+            .collect())
+    }
+
+    fn stats(&self) -> Result<(usize, usize)> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("shared frontier cache lock poisoned"))?;
+        Ok((state.records.len(), state.bytes))
+    }
+
+    fn prune(&self, max_age_ms: u64) -> Result<u64> {
+        let cutoff = now_millis().saturating_sub(max_age_ms);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("shared frontier cache lock poisoned"))?;
+        let removed = state
+            .records
+            .iter()
+            .filter(|record| record.admitted_at_ms <= cutoff)
+            .map(|record| format!("shared-frontier:{}", record.key))
+            .collect::<Vec<_>>();
+        let count = self.store.delete_batch(&removed)? as u64;
+        state
+            .records
+            .retain(|record| record.admitted_at_ms > cutoff);
+        state.bytes = state
+            .records
+            .iter()
+            .map(|record| record.estimated_bytes())
+            .sum();
+        Ok(count)
+    }
+}
+
+#[derive(Clone)]
+pub struct GovernedFrontierLineage {
+    governance_identity: String,
+}
+
+impl GovernedFrontierLineage {
+    pub fn new(governance_identity: impl Into<String>) -> Result<Self> {
+        let governance_identity = governance_identity.into();
+        if governance_identity.len() < 16
+            || !governance_identity
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("governed frontier lineage identity must be a hexadecimal digest");
+        }
+        Ok(Self {
+            governance_identity,
+        })
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.governance_identity
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitWorktreeProof {
+    common_dir_hash: String,
+    head_oid: String,
+}
+
+struct SharedEligibility {
+    governance_identity: String,
+    git: GitWorktreeProof,
+    lineage_identity: String,
+    source_signature: String,
+    index_signature: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitProofRejection {
+    Dirty,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PackSnapshot {
     schema: String,
     pack_id: String,
@@ -472,6 +668,7 @@ enum FrontierOutcome {
     Admitted,
     CapacityFallback,
     SourceFallback,
+    LineageHit,
 }
 
 struct DeferredRetrieval {
@@ -479,6 +676,16 @@ struct DeferredRetrieval {
     terms: Vec<String>,
     pending: Option<Arc<FrontierRecord>>,
     outcome: FrontierOutcome,
+    lineage: LineageRequestTelemetry,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LineageRequestTelemetry {
+    eligible: bool,
+    safe_hit: bool,
+    fallback: bool,
+    latency_saved_micros_est: u64,
+    isolation_rejection: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -510,6 +717,7 @@ struct PackTelemetry {
     continuation_reused: bool,
     continuation_fallback: bool,
     explicit_delta_override: bool,
+    lineage: LineageRequestTelemetry,
 }
 
 struct UsageSample {
@@ -680,6 +888,17 @@ struct EngineMetrics {
     l0_invalidated_entries: AtomicU64,
     l1_exact_hits: AtomicU64,
     l1_approximate_hits: AtomicU64,
+    lineage_eligible_opportunities: AtomicU64,
+    lineage_safe_hits: AtomicU64,
+    lineage_fallbacks: AtomicU64,
+    lineage_latency_saved_micros: AtomicU64,
+    lineage_isolation_rejections: AtomicU64,
+    lineage_dirty_rejections: AtomicU64,
+    lineage_divergent_rejections: AtomicU64,
+    lineage_stale_index_rejections: AtomicU64,
+    lineage_governed_corpus_rejections: AtomicU64,
+    lineage_missing_candidate_rejections: AtomicU64,
+    lineage_capacity_rejections: AtomicU64,
     retrieval_misses: AtomicU64,
     refreshes: AtomicU64,
     pack_input_tokens_est: AtomicU64,
@@ -911,6 +1130,7 @@ impl UsageMonitor {
                 "delta_tokens_saved_est": 0,
                 "cache_outcomes": {},
                 "frontier_outcomes": {},
+                "lineage_frontier": {},
                 "index": {},
                 "delta": {},
                 "routes": {},
@@ -989,9 +1209,11 @@ impl UsageMonitor {
                     FrontierOutcome::Admitted => "admitted",
                     FrontierOutcome::CapacityFallback => "capacity_fallback",
                     FrontierOutcome::SourceFallback => "source_fallback",
+                    FrontierOutcome::LineageHit => "lineage_hit",
                 },
                 1,
             );
+            record_lineage_telemetry(&mut value, telemetry.lineage);
         }
         increment_json_nested(
             &mut value,
@@ -1175,7 +1397,9 @@ impl UsageMonitor {
         let frontier_hit = frontier_eligible
             && matches!(
                 sample.telemetry.frontier_outcome,
-                FrontierOutcome::ExactHit | FrontierOutcome::NegativeHit
+                FrontierOutcome::ExactHit
+                    | FrontierOutcome::NegativeHit
+                    | FrontierOutcome::LineageHit
             );
         let delta_adopted = delta_eligible
             && (sample.telemetry.base_pack_used || sample.telemetry.known_evidence_used);
@@ -1466,6 +1690,9 @@ fn migrate_usage_bucket(bucket: &mut Value) {
 }
 
 fn ensure_reuse_sections(bucket: &mut Value) {
+    if !bucket.get("lineage_frontier").is_some_and(Value::is_object) {
+        bucket["lineage_frontier"] = json!({});
+    }
     if !bucket
         .get("reuse_opportunities")
         .is_some_and(Value::is_object)
@@ -1513,6 +1740,24 @@ fn record_reuse_outcome(bucket: &mut Value, outcome: ReuseOutcome) {
     }
 }
 
+fn record_lineage_telemetry(bucket: &mut Value, telemetry: LineageRequestTelemetry) {
+    for (field, value) in [
+        ("eligible_opportunities", u64::from(telemetry.eligible)),
+        ("safe_hits", u64::from(telemetry.safe_hit)),
+        ("fallbacks", u64::from(telemetry.fallback)),
+        (
+            "isolation_rejections",
+            u64::from(telemetry.isolation_rejection),
+        ),
+        (
+            "latency_saved_micros_est",
+            telemetry.latency_saved_micros_est,
+        ),
+    ] {
+        increment_json_nested(bucket, "lineage_frontier", field, value);
+    }
+}
+
 fn add_reuse_report(bucket: &mut Value) {
     let raw_hits = sum_nested_fields(bucket, "cache_outcomes", &["l0_hit", "l0_singleflight"]);
     let raw_attempts =
@@ -1551,6 +1796,7 @@ fn empty_client_profile_bucket(profile: &str) -> Value {
         "delta_tokens_saved_est": 0,
         "cache_outcomes": {},
         "frontier_outcomes": {},
+        "lineage_frontier": {},
         "routes": {},
         "delta": {},
         "reuse_opportunities": {},
@@ -1683,9 +1929,11 @@ fn record_client_profile_sample(
                 FrontierOutcome::Admitted => "admitted",
                 FrontierOutcome::CapacityFallback => "capacity_fallback",
                 FrontierOutcome::SourceFallback => "source_fallback",
+                FrontierOutcome::LineageHit => "lineage_hit",
             },
             1,
         );
+        record_lineage_telemetry(profile_bucket, telemetry.lineage);
     }
     increment_json_nested(profile_bucket, "routes", sample.route, 1);
     increment_json_nested(
@@ -1904,6 +2152,8 @@ pub struct ProjectEngine {
     metrics: EngineMetrics,
     usage_monitor: Arc<UsageMonitor>,
     lineage_seed: String,
+    governed_lineage: Option<GovernedFrontierLineage>,
+    shared_frontiers: Option<Arc<SharedFrontierCache>>,
     _watcher: WatchGuard,
 }
 
@@ -1937,6 +2187,27 @@ impl ProjectEngine {
             project_id,
             StdDuration::from_secs(30 * 60),
             usage_monitor,
+            None,
+            None,
+        )
+    }
+
+    pub fn build_with_governed_frontiers(
+        root: impl AsRef<std::path::Path>,
+        project_state: impl AsRef<std::path::Path>,
+        project_id: impl Into<String>,
+        usage_monitor: Arc<UsageMonitor>,
+        governed_lineage: GovernedFrontierLineage,
+        shared_frontiers: Arc<SharedFrontierCache>,
+    ) -> Result<Self> {
+        Self::build_with_state_and_l0_idle(
+            root,
+            project_state,
+            project_id,
+            StdDuration::from_secs(30 * 60),
+            usage_monitor,
+            Some(governed_lineage),
+            Some(shared_frontiers),
         )
     }
 
@@ -1946,6 +2217,8 @@ impl ProjectEngine {
         project_id: impl Into<String>,
         l0_idle: StdDuration,
         usage_monitor: Arc<UsageMonitor>,
+        governed_lineage: Option<GovernedFrontierLineage>,
+        shared_frontiers: Option<Arc<SharedFrontierCache>>,
     ) -> Result<Self> {
         let project_id = project_id.into();
         let index = Arc::new(ProjectIndex::build_for_project(root, Some(&project_id))?);
@@ -1987,6 +2260,8 @@ impl ProjectEngine {
             metrics,
             usage_monitor,
             lineage_seed,
+            governed_lineage,
+            shared_frontiers,
             _watcher: watcher,
         })
     }
@@ -2427,7 +2702,7 @@ impl ProjectEngine {
         let explicit_paths = normalized_explicit_paths(request)?;
         let index = self.index();
         let retrieval_started = Instant::now();
-        let (candidates, terms, frontier_outcome) =
+        let (candidates, terms, frontier_outcome, lineage) =
             self.retrieve_candidates(&index, request, &explicit_paths)?;
         let retrieval_micros =
             u64::try_from(retrieval_started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -2578,6 +2853,7 @@ impl ProjectEngine {
                         "missing" | "expired" | "stale_generation" | "missing_pack"
                     ),
                 explicit_delta_override: reuse.status == "explicit_override",
+                lineage,
             },
             bytes: encoded,
         })
@@ -2718,12 +2994,22 @@ impl ProjectEngine {
         index: &ProjectIndex,
         request: &ContextPackRequest,
         explicit_paths: &[String],
-    ) -> Result<(Vec<SearchHit>, Vec<String>, FrontierOutcome)> {
+    ) -> Result<(
+        Vec<SearchHit>,
+        Vec<String>,
+        FrontierOutcome,
+        LineageRequestTelemetry,
+    )> {
         let retrieval = self.retrieve_candidates_deferred(index, request, explicit_paths)?;
         if let Some(record) = retrieval.pending {
             self.admit_frontier_batch(&[record])?;
         }
-        Ok((retrieval.hits, retrieval.terms, retrieval.outcome))
+        Ok((
+            retrieval.hits,
+            retrieval.terms,
+            retrieval.outcome,
+            retrieval.lineage,
+        ))
     }
 
     fn retrieve_candidates_deferred(
@@ -2743,6 +3029,7 @@ impl ProjectEngine {
         let signature = &index.stats().refresh_signature;
         let generation = self.freshness.generation.load(Ordering::Acquire);
         let now = now_millis();
+        let mut lineage = LineageRequestTelemetry::default();
 
         let (match_record, capacity_fallback) = {
             let mut state = self
@@ -2788,6 +3075,7 @@ impl ProjectEngine {
                     terms,
                     pending: None,
                     outcome: FrontierOutcome::NegativeHit,
+                    lineage,
                 });
             }
             let (hits, reranked_terms) = index.rerank(
@@ -2803,8 +3091,26 @@ impl ProjectEngine {
                     terms: reranked_terms,
                     pending: None,
                     outcome: FrontierOutcome::ExactHit,
+                    lineage,
                 });
             }
+        }
+
+        if let Some((hits, reranked_terms)) = self.try_shared_frontier(
+            index,
+            request,
+            explicit_paths,
+            &scope,
+            &term_fingerprints,
+            &mut lineage,
+        )? {
+            return Ok(DeferredRetrieval {
+                hits,
+                terms: reranked_terms,
+                pending: None,
+                outcome: FrontierOutcome::LineageHit,
+                lineage,
+            });
         }
 
         self.metrics
@@ -2844,6 +3150,7 @@ impl ProjectEngine {
             terms,
             pending: should_admit.then_some(record),
             outcome,
+            lineage,
         })
     }
 
@@ -2945,7 +3252,287 @@ impl ProjectEngine {
             }
         }
         drop(state);
-        prune_persistent_frontiers(&self.store)
+        prune_persistent_frontiers(&self.store)?;
+        for record in records.iter().filter(|record| !record.negative) {
+            self.publish_shared_frontier(record)?;
+        }
+        Ok(())
+    }
+
+    fn shared_eligibility(
+        &self,
+        index: &ProjectIndex,
+    ) -> std::result::Result<Option<SharedEligibility>, GitProofRejection> {
+        let Some(governed) = &self.governed_lineage else {
+            return Ok(None);
+        };
+        if self.shared_frontiers.is_none() {
+            return Ok(None);
+        }
+        if index.stats().corpus_source_count > 0 {
+            return Err(GitProofRejection::Unavailable);
+        }
+        let git = git_worktree_proof(index.root())?;
+        let lineage_identity = format!(
+            "ln:{}",
+            sha256_text(&format!(
+                "{}:{}",
+                governed.governance_identity, git.common_dir_hash
+            ))
+        );
+        Ok(Some(SharedEligibility {
+            governance_identity: governed.governance_identity.clone(),
+            git,
+            lineage_identity,
+            source_signature: index.stats().refresh_signature.clone(),
+            index_signature: immutable_index_signature(index.stats()),
+        }))
+    }
+
+    fn try_shared_frontier(
+        &self,
+        index: &ProjectIndex,
+        request: &ContextPackRequest,
+        explicit_paths: &[String],
+        scope: &[String],
+        terms: &[String],
+        telemetry: &mut LineageRequestTelemetry,
+    ) -> Result<Option<(Vec<SearchHit>, Vec<String>)>> {
+        let Some(pool) = &self.shared_frontiers else {
+            return Ok(None);
+        };
+        if self.governed_lineage.is_none() {
+            return Ok(None);
+        }
+        if index.stats().corpus_source_count > 0 {
+            telemetry.fallback = true;
+            telemetry.isolation_rejection = true;
+            self.metrics
+                .lineage_governed_corpus_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .lineage_isolation_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .lineage_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let eligibility = match self.shared_eligibility(index) {
+            Ok(Some(eligibility)) => eligibility,
+            Ok(None) => return Ok(None),
+            Err(GitProofRejection::Dirty) => {
+                telemetry.fallback = true;
+                telemetry.isolation_rejection = true;
+                self.metrics
+                    .lineage_dirty_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .lineage_isolation_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .lineage_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+            Err(GitProofRejection::Unavailable) => {
+                telemetry.fallback = true;
+                telemetry.isolation_rejection = true;
+                self.metrics
+                    .lineage_isolation_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .lineage_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+        };
+        telemetry.eligible = true;
+        self.metrics
+            .lineage_eligible_opportunities
+            .fetch_add(1, Ordering::Relaxed);
+        let lookup_started = Instant::now();
+        let scope_signature = opaque_scope_signature(scope)?;
+        let generation = self.freshness.generation.load(Ordering::Acquire);
+        let mut exact = None;
+        let mut rejected = false;
+        for record in pool.records()? {
+            if record.terms != terms || record.scope_signature != scope_signature {
+                continue;
+            }
+            if record.governance_identity == eligibility.governance_identity
+                && record.git_common_dir_hash != eligibility.git.common_dir_hash
+            {
+                rejected = true;
+                continue;
+            }
+            if record.lineage_identity != eligibility.lineage_identity {
+                continue;
+            }
+            if record.head_oid != eligibility.git.head_oid
+                || record.source_signature != eligibility.source_signature
+            {
+                self.metrics
+                    .lineage_divergent_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                rejected = true;
+                continue;
+            }
+            if record.index_signature != eligibility.index_signature {
+                self.metrics
+                    .lineage_stale_index_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                rejected = true;
+                continue;
+            }
+            if record.candidate_capacity < request.max_items {
+                self.metrics
+                    .lineage_capacity_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                rejected = true;
+                continue;
+            }
+            exact = Some(record);
+            break;
+        }
+        let Some(record) = exact else {
+            telemetry.fallback = true;
+            telemetry.isolation_rejection = rejected;
+            if rejected {
+                self.metrics
+                    .lineage_isolation_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.metrics
+                .lineage_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        let mut expected_dependencies = record.candidate_addresses.clone();
+        expected_dependencies.sort();
+        expected_dependencies.dedup();
+        if record.candidate_addresses.is_empty()
+            || record.candidate_addresses.len() != record.scores.len()
+            || record.candidate_addresses.len() != record.cumulative_token_costs.len()
+            || record.dependency_addresses != expected_dependencies
+            || record.candidate_addresses.iter().any(|candidate| {
+                candidate.strip_prefix("ca:").is_none_or(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            })
+        {
+            telemetry.fallback = true;
+            telemetry.isolation_rejection = true;
+            self.metrics
+                .lineage_missing_candidate_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .lineage_isolation_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .lineage_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let Some((hits, reranked_terms)) = index.rerank_immutable_candidates(
+            &request.prompt,
+            explicit_paths,
+            &record.candidate_addresses,
+            usize::from(request.max_items),
+        )?
+        else {
+            telemetry.fallback = true;
+            telemetry.isolation_rejection = true;
+            self.metrics
+                .lineage_missing_candidate_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .lineage_isolation_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .lineage_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        let stable = self.freshness.generation.load(Ordering::Acquire) == generation
+            && self
+                .shared_eligibility(index)
+                .ok()
+                .flatten()
+                .is_some_and(|current| {
+                    current.git == eligibility.git
+                        && current.source_signature == eligibility.source_signature
+                        && current.index_signature == eligibility.index_signature
+                });
+        if !stable {
+            telemetry.fallback = true;
+            telemetry.isolation_rejection = true;
+            self.metrics
+                .lineage_stale_index_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .lineage_isolation_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .lineage_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        let lookup_micros = u64::try_from(lookup_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.metrics
+            .lineage_safe_hits
+            .fetch_add(1, Ordering::Relaxed);
+        let latency_saved_micros_est = WARM_MISS_TARGET_MICROS.saturating_sub(lookup_micros);
+        self.metrics
+            .lineage_latency_saved_micros
+            .fetch_add(latency_saved_micros_est, Ordering::Relaxed);
+        telemetry.safe_hit = true;
+        telemetry.latency_saved_micros_est = latency_saved_micros_est;
+        Ok(Some((hits, reranked_terms)))
+    }
+
+    fn publish_shared_frontier(&self, record: &FrontierRecord) -> Result<()> {
+        let Some(pool) = &self.shared_frontiers else {
+            return Ok(());
+        };
+        let index = self.index();
+        let Ok(Some(eligibility)) = self.shared_eligibility(&index) else {
+            return Ok(());
+        };
+        let candidate_addresses = record
+            .candidate_ids
+            .iter()
+            .map(|candidate| immutable_candidate_address(candidate))
+            .collect::<Vec<_>>();
+        if candidate_addresses.is_empty() {
+            return Ok(());
+        }
+        let mut dependency_addresses = candidate_addresses.clone();
+        dependency_addresses.sort();
+        dependency_addresses.dedup();
+        let scope_signature = opaque_scope_signature(&record.scope)?;
+        let mut shared = SharedFrontierRecord {
+            schema: "context_shared_frontier.v1".to_owned(),
+            key: String::new(),
+            governance_identity: eligibility.governance_identity,
+            git_common_dir_hash: eligibility.git.common_dir_hash,
+            lineage_identity: eligibility.lineage_identity,
+            head_oid: eligibility.git.head_oid,
+            source_signature: eligibility.source_signature,
+            index_signature: eligibility.index_signature,
+            scope_signature,
+            terms: record.terms.clone(),
+            candidate_capacity: record.candidate_capacity,
+            candidate_addresses,
+            dependency_addresses,
+            scores: record.scores.clone(),
+            cumulative_token_costs: record.cumulative_token_costs.clone(),
+            score_cutoff: record.score_cutoff,
+            admitted_at_ms: now_millis(),
+        };
+        shared.key = shared.content_key()?;
+        let _ = pool.admit(Arc::new(shared))?;
+        Ok(())
     }
 
     fn record_operation(
@@ -3604,6 +4191,106 @@ fn load_frontiers(store: &StateStore, refresh_signature: &str) -> Result<Frontie
     Ok(state)
 }
 
+fn load_shared_frontiers(store: &StateStore) -> Result<SharedFrontierState> {
+    let mut records = store
+        .iter_json("shared-frontier:")?
+        .into_iter()
+        .filter_map(|(_, value)| serde_json::from_value::<SharedFrontierRecord>(value).ok())
+        .filter(|record| {
+            record.schema == "context_shared_frontier.v1"
+                && record.content_key().is_ok_and(|key| key == record.key)
+        })
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| record.admitted_at_ms);
+    let mut state = SharedFrontierState::default();
+    for record in records {
+        let record = Arc::new(record);
+        let bytes = record.estimated_bytes();
+        if bytes > SHARED_L1_PERSISTENT_MAX_BYTES {
+            continue;
+        }
+        while state.bytes.saturating_add(bytes) > SHARED_L1_PERSISTENT_MAX_BYTES {
+            if let Some(removed) = state.records.pop_front() {
+                state.bytes = state.bytes.saturating_sub(removed.estimated_bytes());
+                let _ = store.delete(&format!("shared-frontier:{}", removed.key));
+            } else {
+                break;
+            }
+        }
+        state.bytes = state.bytes.saturating_add(bytes);
+        state.records.push_back(record);
+    }
+    Ok(state)
+}
+
+fn immutable_index_signature(stats: &IndexStats) -> String {
+    sha256_text(
+        &serde_json::to_string(&json!({
+            "schema": stats.schema,
+            "source_signature": stats.refresh_signature,
+            "file_count": stats.file_count,
+            "chunk_count": stats.chunk_count,
+            "symbol_chunks": stats.symbol_chunks,
+            "generic_chunks": stats.generic_chunks,
+            "candidate_address_version": 1,
+            "backend": "tantivy:mcp-context-manager.native.v2:0.26.1",
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+fn opaque_scope_signature(scope: &[String]) -> Result<String> {
+    Ok(format!(
+        "scp:{}",
+        sha256_text(&String::from_utf8(serde_json::to_vec(scope)?)?)
+    ))
+}
+
+fn git_output(root: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
+    Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+}
+
+fn git_worktree_proof(
+    root: &std::path::Path,
+) -> std::result::Result<GitWorktreeProof, GitProofRejection> {
+    let status = git_output(
+        root,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )
+    .ok_or(GitProofRejection::Unavailable)?;
+    let status = String::from_utf8(status.stdout).map_err(|_| GitProofRejection::Unavailable)?;
+    if status.lines().any(|line| !line.starts_with("# ")) {
+        return Err(GitProofRejection::Dirty);
+    }
+    let common = git_common_dir(root).ok_or(GitProofRejection::Unavailable)?;
+    let head_oid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("# branch.oid "))
+        .ok_or(GitProofRejection::Unavailable)?
+        .to_ascii_lowercase();
+    if !matches!(head_oid.len(), 40 | 64) || !head_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(GitProofRejection::Unavailable);
+    }
+    Ok(GitWorktreeProof {
+        common_dir_hash: sha256_text(&common.to_string_lossy()),
+        head_oid,
+    })
+}
+
 fn load_pack_snapshots(store: &StateStore) -> Result<HashMap<String, Arc<PackSnapshot>>> {
     Ok(store
         .iter_json("pack:")?
@@ -3711,6 +4398,12 @@ async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -
         "index_status" => Ok(index_status(engine.index().stats())),
         "cache_stats" => {
             let l0 = engine.l0_storage_stats();
+            let shared = engine
+                .shared_frontiers
+                .as_ref()
+                .map(|pool| pool.stats())
+                .transpose()?
+                .unwrap_or_default();
             let frontier_rows = engine.store.iter_json("frontier:")?;
             let frontiers = engine
                 .frontiers
@@ -3735,6 +4428,12 @@ async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -
                     "l1.frontier.persistent": {
                         "entries": frontier_rows.len(),
                         "max_bytes": L1_PERSISTENT_MAX_BYTES,
+                    },
+                    "l1.frontier.shared_immutable": {
+                        "entries": shared.0,
+                        "bytes": shared.1,
+                        "max_bytes": SHARED_L1_PERSISTENT_MAX_BYTES,
+                        "project_local_paths": true,
                     },
                 },
                 "auto_learn": {
@@ -3814,6 +4513,12 @@ async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -
                 }
             }
             let persistent_removed = engine.store.delete_batch(&remove_keys)? as u64;
+            let shared_removed = engine
+                .shared_frontiers
+                .as_ref()
+                .map(|pool| pool.prune(max_age_ms))
+                .transpose()?
+                .unwrap_or_default();
             let mut frontiers = engine
                 .frontiers
                 .lock()
@@ -3822,12 +4527,13 @@ async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -
             Ok(json!({
                 "schema": "context_cache.prune.v1",
                 "entry_count": frontiers.records.len(),
-                "removed_entries": l0_removed + persistent_removed,
+                "removed_entries": l0_removed + persistent_removed + shared_removed,
                 "expired_removed": expired_removed,
                 "stale_removed": stale_removed,
                 "age_removed": age_removed,
                 "deferred_removed": deferred_removed,
                 "reference_removed": reference_removed,
+                "shared_frontier_removed": shared_removed,
             }))
         }
         "warmup" => warmup_dispatch(engine, request, &now).await,
@@ -4168,7 +4874,26 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
                 "invalidations": l0_invalidations,
                 "invalidated_entries": l0_invalidated_entries,
             },
-            "l1": {"exact_hits": l1_exact, "approximate_hits": l1_approximate, "retrieval_misses": retrieval_misses},
+            "l1": {
+                "exact_hits": l1_exact,
+                "approximate_hits": l1_approximate,
+                "retrieval_misses": retrieval_misses,
+                "lineage": {
+                    "eligible_opportunities": engine.metrics.lineage_eligible_opportunities.load(Ordering::Relaxed),
+                    "safe_hits": engine.metrics.lineage_safe_hits.load(Ordering::Relaxed),
+                    "fallbacks": engine.metrics.lineage_fallbacks.load(Ordering::Relaxed),
+                    "latency_saved_micros_est": engine.metrics.lineage_latency_saved_micros.load(Ordering::Relaxed),
+                    "isolation_rejections": engine.metrics.lineage_isolation_rejections.load(Ordering::Relaxed),
+                    "rejection_reasons": {
+                        "dirty_worktree": engine.metrics.lineage_dirty_rejections.load(Ordering::Relaxed),
+                        "divergent_head_or_source": engine.metrics.lineage_divergent_rejections.load(Ordering::Relaxed),
+                        "stale_index": engine.metrics.lineage_stale_index_rejections.load(Ordering::Relaxed),
+                        "governed_corpus": engine.metrics.lineage_governed_corpus_rejections.load(Ordering::Relaxed),
+                        "missing_candidate_or_dependency": engine.metrics.lineage_missing_candidate_rejections.load(Ordering::Relaxed),
+                        "insufficient_capacity": engine.metrics.lineage_capacity_rejections.load(Ordering::Relaxed),
+                    }
+                }
+            },
             "continuation": {
                 "requests": continuation_requests,
                 "reuses": continuation_reuses,
@@ -4262,7 +4987,26 @@ fn unloaded_metrics_snapshot(project_id: &str, now: &str, status: &str) -> Value
                 "invalidations": 0,
                 "invalidated_entries": 0,
             },
-            "l1": {"exact_hits": 0, "approximate_hits": 0, "retrieval_misses": 0},
+            "l1": {
+                "exact_hits": 0,
+                "approximate_hits": 0,
+                "retrieval_misses": 0,
+                "lineage": {
+                    "eligible_opportunities": 0,
+                    "safe_hits": 0,
+                    "fallbacks": 0,
+                    "latency_saved_micros_est": 0,
+                    "isolation_rejections": 0,
+                    "rejection_reasons": {
+                        "dirty_worktree": 0,
+                        "divergent_head_or_source": 0,
+                        "stale_index": 0,
+                        "governed_corpus": 0,
+                        "missing_candidate_or_dependency": 0,
+                        "insufficient_capacity": 0,
+                    }
+                }
+            },
             "continuation": {
                 "requests": 0,
                 "reuses": 0,
@@ -5630,8 +6374,17 @@ fn sha256_text(text: &str) -> String {
 }
 
 fn repository_lineage_seed(root: &std::path::Path) -> String {
+    let lineage_path = git_common_dir(root).or_else(|| root.canonicalize().ok());
+    sha256_text(
+        &lineage_path
+            .unwrap_or_else(|| root.to_path_buf())
+            .to_string_lossy(),
+    )
+}
+
+fn git_common_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
     let dot_git = root.join(".git");
-    let lineage_path = if dot_git.is_dir() {
+    if dot_git.is_dir() {
         dot_git.canonicalize().ok()
     } else if dot_git.is_file() {
         std::fs::read_to_string(&dot_git).ok().and_then(|contents| {
@@ -5655,13 +6408,8 @@ fn repository_lineage_seed(root: &std::path::Path) -> String {
             }
         })
     } else {
-        root.canonicalize().ok()
-    };
-    sha256_text(
-        &lineage_path
-            .unwrap_or_else(|| root.to_path_buf())
-            .to_string_lossy(),
-    )
+        None
+    }
 }
 
 fn truncate_string(text: &mut String, max_bytes: usize) {
@@ -5893,7 +6641,75 @@ const fn default_max_age_minutes() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let result = Command::new("git")
+            .env("GIT_AUTHOR_DATE", "2026-08-04T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-08-04T00:00:00Z")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run git fixture command");
+        assert!(result.status.success(), "git fixture command failed");
+    }
+
+    fn init_git_repository(root: &std::path::Path) {
+        fs::create_dir_all(root).expect("repository directory");
+        fs::write(
+            root.join("src.rs"),
+            "fn governed_frontier_anchor() { assert!(true); }\n",
+        )
+        .expect("source fixture");
+        git(root, &["init", "--quiet"]);
+        git(root, &["config", "user.name", "Fixture"]);
+        git(root, &["config", "user.email", "fixture@example.test"]);
+        git(root, &["add", "src.rs"]);
+        git(root, &["commit", "--quiet", "-m", "fixture"]);
+        git(
+            root,
+            &["remote", "add", "origin", "https://example.test/shared.git"],
+        );
+    }
+
+    fn linked_worktree(repository: &std::path::Path, worktree: &std::path::Path) {
+        let worktree_arg = worktree.to_str().expect("UTF-8 fixture path");
+        git(
+            repository,
+            &["worktree", "add", "--quiet", "--detach", worktree_arg],
+        );
+    }
+
+    fn governed_engine(
+        root: &std::path::Path,
+        state: &std::path::Path,
+        project_id: &str,
+        pool: Arc<SharedFrontierCache>,
+    ) -> ProjectEngine {
+        let monitor = Arc::new(
+            UsageMonitor::open(state.join("monitor-global")).expect("usage monitor fixture"),
+        );
+        ProjectEngine::build_with_governed_frontiers(
+            root,
+            state,
+            project_id,
+            monitor,
+            GovernedFrontierLineage::new("a".repeat(64)).expect("governed lineage"),
+            pool,
+        )
+        .expect("governed project engine")
+    }
+
+    fn frontier_request(variant: &str) -> ContextPackRequest {
+        serde_json::from_value(json!({
+            "prompt": "governed frontier anchor",
+            "focus_paths": ["src.rs"],
+            "known_evidence": [variant],
+        }))
+        .expect("frontier request")
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn reuse_sample(
@@ -6681,6 +7497,8 @@ mod tests {
             "idle-expiry",
             StdDuration::from_millis(5),
             Arc::new(UsageMonitor::open(state.path().join("monitor")).expect("monitor")),
+            None,
+            None,
         )
         .expect("engine");
         let request: ContextPackRequest =
@@ -7875,7 +8693,7 @@ mod tests {
             .admit_frontier_batch(&[diagnostic_debug_record])
             .expect("admit frontier");
 
-        let (cached, _, outcome) = engine
+        let (cached, _, outcome, _) = engine
             .retrieve_candidates(&index, &request, &[])
             .expect("route-independent hit");
         assert!(matches!(outcome, FrontierOutcome::ExactHit));
@@ -7916,7 +8734,7 @@ mod tests {
         engine
             .admit_frontier_batch(&[negative])
             .expect("admit negative frontier");
-        let (exact_hits, _, _) = engine
+        let (exact_hits, _, _, _) = engine
             .retrieve_candidates(&index, &exact_request, &[])
             .expect("exact negative reuse");
         assert!(exact_hits.is_empty());
@@ -7925,7 +8743,7 @@ mod tests {
             "prompt": "alpha beta gamma delta epsilon eta"
         }))
         .expect("similar request");
-        let (similar_hits, _, _) = engine
+        let (similar_hits, _, _, _) = engine
             .retrieve_candidates(&index, &similar, &[])
             .expect("real similar search");
         assert!(similar_hits.iter().any(|hit| hit.path == "evidence.rs"));
@@ -8072,5 +8890,408 @@ mod tests {
             .collect::<String>();
         assert!(!persisted.contains("RAW_FULL_TEXT_TAIL_MUST_NOT_BE_PERSISTED"));
         assert!(!persisted.contains(&normalized));
+    }
+
+    #[tokio::test]
+    async fn governed_linked_worktrees_share_only_opaque_frontiers_and_rerank_locally() {
+        let fixture = tempdir().expect("fixture root");
+        let repository = fixture.path().join("repository");
+        let verifier_root = fixture.path().join("verifier");
+        init_git_repository(&repository);
+        linked_worktree(&repository, &verifier_root);
+        assert!(git_worktree_proof(&repository).is_ok());
+        assert!(git_worktree_proof(&verifier_root).is_ok());
+        let state = tempdir().expect("state root");
+        let shared_state = state.path().join("shared");
+        let pool = Arc::new(SharedFrontierCache::open(&shared_state).expect("shared pool"));
+        let builder = governed_engine(
+            &repository,
+            &state.path().join("builder"),
+            "builder",
+            Arc::clone(&pool),
+        );
+        builder
+            .context_pack_cached(&frontier_request("builder-observation-one"))
+            .await
+            .expect("first builder search");
+        let builder_bytes = builder
+            .context_pack_cached(&frontier_request("builder-observation-two"))
+            .await
+            .expect("builder admission");
+        let builder_pack: ContextPackV2 =
+            serde_json::from_slice(&builder_bytes).expect("builder pack");
+        assert_eq!(
+            builder
+                .store()
+                .iter_json("frontier:")
+                .expect("local frontier")
+                .len(),
+            1
+        );
+        assert_eq!(pool.stats().expect("shared stats").0, 1);
+
+        let verifier = governed_engine(
+            &verifier_root,
+            &state.path().join("verifier"),
+            "verifier",
+            Arc::clone(&pool),
+        );
+        verifier
+            .usage_monitor
+            .action("enable", None)
+            .expect("enable verifier telemetry");
+        let verifier_bytes = verifier
+            .context_pack_cached(&frontier_request("verifier-request"))
+            .await
+            .expect("verifier shared lookup");
+        let verifier_pack: ContextPackV2 =
+            serde_json::from_slice(&verifier_bytes).expect("verifier pack");
+        assert_eq!(builder_pack.paths, verifier_pack.paths);
+        assert_eq!(
+            verifier.metrics.lineage_safe_hits.load(Ordering::Relaxed),
+            1
+        );
+        let usage = verifier
+            .usage_monitor
+            .action("report", Some("verifier"))
+            .expect("lineage usage report");
+        assert_eq!(
+            usage["buckets"][0]["lineage_frontier"]["eligible_opportunities"],
+            1
+        );
+        assert_eq!(usage["buckets"][0]["lineage_frontier"]["safe_hits"], 1);
+
+        let shared_json = pool
+            .store
+            .iter_json("shared-frontier:")
+            .expect("shared records")
+            .into_iter()
+            .map(|(_, value)| value.to_string())
+            .collect::<String>();
+        for forbidden in [
+            "src.rs",
+            "builder",
+            "verifier",
+            "governed frontier anchor",
+            "reference:",
+            "pack:",
+        ] {
+            assert!(!shared_json.contains(forbidden), "shared path/state leak");
+        }
+        assert!(shared_json.contains("ca:"));
+        assert!(
+            verifier
+                .store()
+                .iter_json("pack:")
+                .expect("verifier snapshots")
+                .iter()
+                .all(|(_, value)| value["pack_id"] == verifier_pack.id)
+        );
+        if let Some(reference) = builder_pack.more {
+            assert!(
+                !verifier
+                    .store()
+                    .reference_is_active(&reference)
+                    .expect("local reference")
+            );
+        }
+
+        drop(verifier);
+        drop(builder);
+        drop(pool);
+        let reopened = Arc::new(SharedFrontierCache::open(&shared_state).expect("reopened pool"));
+        let gatekeeper = governed_engine(
+            &verifier_root,
+            &state.path().join("gatekeeper"),
+            "gatekeeper",
+            reopened,
+        );
+        gatekeeper
+            .context_pack_cached(&frontier_request("gatekeeper-request"))
+            .await
+            .expect("persistent shared lookup");
+        assert_eq!(
+            gatekeeper.metrics.lineage_safe_hits.load(Ordering::Relaxed),
+            1
+        );
+        let prune: ContextAdminRequest = serde_json::from_value(json!({
+            "mode": "cache_prune",
+            "max_age_minutes": 0
+        }))
+        .expect("prune request");
+        let pruned: Value = serde_json::from_slice(
+            &gatekeeper
+                .context_admin(&prune)
+                .await
+                .expect("shared prune"),
+        )
+        .expect("prune response");
+        assert_eq!(pruned["shared_frontier_removed"], 1);
+    }
+
+    #[tokio::test]
+    async fn unrelated_repositories_cannot_share_even_with_identical_content_remote_and_governance()
+    {
+        let fixture = tempdir().expect("fixture root");
+        let first = fixture.path().join("one/repository");
+        let second = fixture.path().join("two/repository");
+        init_git_repository(&first);
+        init_git_repository(&second);
+        assert_eq!(
+            git_worktree_proof(&first).expect("first proof").head_oid,
+            git_worktree_proof(&second).expect("second proof").head_oid
+        );
+        let state = tempdir().expect("state root");
+        let pool =
+            Arc::new(SharedFrontierCache::open(state.path().join("shared")).expect("shared pool"));
+        let producer = governed_engine(
+            &first,
+            &state.path().join("producer"),
+            "same-name",
+            Arc::clone(&pool),
+        );
+        producer
+            .context_pack_cached(&frontier_request("first"))
+            .await
+            .expect("producer first");
+        producer
+            .context_pack_cached(&frontier_request("second"))
+            .await
+            .expect("producer admission");
+        let attacker = governed_engine(&second, &state.path().join("attacker"), "same-name", pool);
+        attacker
+            .context_pack_cached(&frontier_request("attacker"))
+            .await
+            .expect("safe local fallback");
+        assert_eq!(
+            attacker.metrics.lineage_safe_hits.load(Ordering::Relaxed),
+            0
+        );
+        assert!(
+            attacker
+                .metrics
+                .lineage_isolation_rejections
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_and_missing_candidate_shared_frontiers_fall_back_deterministically() {
+        let fixture = tempdir().expect("fixture root");
+        let repository = fixture.path().join("repository");
+        let consumer_root = fixture.path().join("consumer");
+        init_git_repository(&repository);
+        linked_worktree(&repository, &consumer_root);
+        let state = tempdir().expect("state root");
+        let producer_pool = Arc::new(
+            SharedFrontierCache::open(state.path().join("producer-shared")).expect("producer pool"),
+        );
+        let producer = governed_engine(
+            &repository,
+            &state.path().join("producer"),
+            "producer",
+            Arc::clone(&producer_pool),
+        );
+        producer
+            .context_pack_cached(&frontier_request("first"))
+            .await
+            .expect("producer first");
+        producer
+            .context_pack_cached(&frontier_request("second"))
+            .await
+            .expect("producer admission");
+        let original = producer_pool
+            .records()
+            .expect("shared records")
+            .pop()
+            .expect("shared record");
+
+        fs::write(
+            consumer_root.join("src.rs"),
+            "fn governed_frontier_anchor() { assert!(false); }\n",
+        )
+        .expect("dirty source");
+        let dirty = governed_engine(
+            &consumer_root,
+            &state.path().join("dirty"),
+            "dirty",
+            Arc::clone(&producer_pool),
+        );
+        dirty
+            .context_pack_cached(&frontier_request("dirty"))
+            .await
+            .expect("dirty local fallback");
+        assert_eq!(dirty.metrics.lineage_safe_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            dirty
+                .metrics
+                .lineage_dirty_rejections
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        git(&consumer_root, &["checkout", "--", "src.rs"]);
+        let missing_pool = Arc::new(
+            SharedFrontierCache::open(state.path().join("missing-shared")).expect("missing pool"),
+        );
+        let mut missing = (*original).clone();
+        missing.candidate_addresses = vec![format!("ca:{}", "0".repeat(64))];
+        missing.dependency_addresses = missing.candidate_addresses.clone();
+        missing.scores = vec![1.0];
+        missing.cumulative_token_costs = vec![1];
+        missing.key = missing.content_key().expect("missing candidate key");
+        missing_pool
+            .admit(Arc::new(missing))
+            .expect("inject missing candidate");
+        let consumer = governed_engine(
+            &consumer_root,
+            &state.path().join("missing"),
+            "missing",
+            missing_pool,
+        );
+        consumer
+            .context_pack_cached(&frontier_request("missing"))
+            .await
+            .expect("missing candidate local fallback");
+        assert_eq!(
+            consumer.metrics.lineage_safe_hits.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            consumer
+                .metrics
+                .lineage_missing_candidate_rejections
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn divergent_stale_capacity_and_governed_corpus_never_use_shared_frontiers() {
+        let fixture = tempdir().expect("fixture root");
+        let repository = fixture.path().join("repository");
+        let consumer_root = fixture.path().join("consumer");
+        init_git_repository(&repository);
+        linked_worktree(&repository, &consumer_root);
+        let state = tempdir().expect("state root");
+        let producer_pool = Arc::new(
+            SharedFrontierCache::open(state.path().join("producer-shared")).expect("producer pool"),
+        );
+        let producer = governed_engine(
+            &repository,
+            &state.path().join("producer"),
+            "producer",
+            Arc::clone(&producer_pool),
+        );
+        producer
+            .context_pack_cached(&frontier_request("first"))
+            .await
+            .expect("producer first");
+        producer
+            .context_pack_cached(&frontier_request("second"))
+            .await
+            .expect("producer admission");
+        let original = producer_pool
+            .records()
+            .expect("records")
+            .pop()
+            .expect("record");
+
+        for kind in ["divergent", "stale", "capacity"] {
+            let pool = Arc::new(
+                SharedFrontierCache::open(state.path().join(format!("{kind}-shared")))
+                    .expect("variant pool"),
+            );
+            let mut record = (*original).clone();
+            match kind {
+                "divergent" => record.head_oid = "0".repeat(40),
+                "stale" => record.index_signature = "stale-index".to_owned(),
+                "capacity" => record.candidate_capacity = 1,
+                _ => unreachable!(),
+            }
+            record.key = record.content_key().expect("variant key");
+            pool.admit(Arc::new(record)).expect("variant admission");
+            let engine = governed_engine(&consumer_root, &state.path().join(kind), kind, pool);
+            engine
+                .context_pack_cached(&frontier_request(kind))
+                .await
+                .expect("local fallback");
+            assert_eq!(engine.metrics.lineage_safe_hits.load(Ordering::Relaxed), 0);
+            let rejection = match kind {
+                "divergent" => engine
+                    .metrics
+                    .lineage_divergent_rejections
+                    .load(Ordering::Relaxed),
+                "stale" => engine
+                    .metrics
+                    .lineage_stale_index_rejections
+                    .load(Ordering::Relaxed),
+                "capacity" => engine
+                    .metrics
+                    .lineage_capacity_rejections
+                    .load(Ordering::Relaxed),
+                _ => unreachable!(),
+            };
+            assert_eq!(rejection, 1);
+        }
+
+        let corpus_root = fixture.path().join("corpus");
+        init_git_repository(&corpus_root);
+        fs::create_dir_all(corpus_root.join("reference-corpus")).expect("corpus directory");
+        let corpus_text = "governed corpus text\n";
+        fs::write(corpus_root.join("reference-corpus/spec.txt"), corpus_text).expect("corpus text");
+        fs::write(
+            corpus_root.join("reference-corpus/manifest.json"),
+            serde_json::to_vec(&json!({
+                "schema": "context_reference_manifest.v1",
+                "project_scope": "corpus",
+                "sources": [{
+                    "source_id": "spec",
+                    "canonical_url": "https://example.test/spec",
+                    "publisher": "Fixture",
+                    "title": "Fixture spec",
+                    "version": "1",
+                    "retrieved_at": "2026-08-04T00:00:00Z",
+                    "media_type": "text/plain",
+                    "normalized_media_type": "text/plain; charset=utf-8",
+                    "normalized_path": "reference-corpus/spec.txt",
+                    "content_sha256": sha256_text(corpus_text),
+                    "rights": {"status": "permitted", "license": "MIT", "evidence": "https://example.test/license"},
+                    "freshness": {"status": "current", "checked_at": "2026-08-04T00:00:00Z"}
+                }]
+            }))
+            .expect("manifest"),
+        )
+        .expect("manifest file");
+        git(&corpus_root, &["add", "reference-corpus"]);
+        git(&corpus_root, &["commit", "--quiet", "-m", "corpus"]);
+        let corpus_pool = Arc::new(
+            SharedFrontierCache::open(state.path().join("corpus-shared")).expect("corpus pool"),
+        );
+        let corpus_engine = governed_engine(
+            &corpus_root,
+            &state.path().join("corpus"),
+            "corpus",
+            corpus_pool,
+        );
+        corpus_engine
+            .context_pack_cached(&frontier_request("corpus"))
+            .await
+            .expect("corpus local retrieval");
+        assert_eq!(
+            corpus_engine
+                .metrics
+                .lineage_governed_corpus_rejections
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            corpus_engine
+                .metrics
+                .lineage_safe_hits
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

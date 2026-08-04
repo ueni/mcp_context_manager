@@ -124,6 +124,7 @@ telemetry scenarios with:
 
 ```bash
 cargo run -p context-testkit --bin benchmark-reuse-opportunity --quiet
+cargo run -p context-testkit --bin benchmark-worktree-frontier --quiet
 ```
 
 ## MCP-first workflow
@@ -343,6 +344,7 @@ Stdio remains the default transport when `MCP_TRANSPORT` is omitted.
 | `REPO_PATH` | Default repository root. |
 | `MCP_CONTEXT_STATE_DIR` | Project-state root; Rust creates an isolated `rust-v2` overlay. |
 | `MCP_CONTEXT_PROJECT_ID` | Optional explicit id for the default project. |
+| `MCP_CONTEXT_FRONTIER_LINEAGES_FILE` | Absolute path to an operator-owned `context_frontier_lineages.v1` JSON manifest that explicitly groups 2–64 allowed Git worktree roots. Omit to disable cross-worktree frontier reuse. |
 | `MCP_CONTEXT_ALLOWED_ROOTS` | Host roots allowed for `root_uri` project selection. |
 | `MCP_CONTEXT_ROOT_MAPPINGS` | Comma-separated host-to-container mappings such as `/home/user/source=/workspace-roots`. |
 | `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host directory mounted at `/workspace-roots`. |
@@ -386,9 +388,32 @@ The fast path uses:
 - a 64 MiB Moka L0 cache of immutable encoded response bytes;
 - a 128 MiB in-memory and 256 MiB LMDB frontier cache;
 - deterministic reranking after approximate frontier reuse;
+- an optional 256 MiB persistent pool of path-free immutable frontier records for explicitly governed, clean worktrees that share one Git common directory, HEAD, source signature, and index signature;
 - a 50 ms coalescing filesystem watcher plus polling fallback;
 - synchronous refresh for `changed_files` and `cache_strategy="fresh"`;
 - direct serialization into a preallocated byte buffer.
+
+Cross-worktree reuse is disabled by default. A deployment may opt in with an
+operator-owned manifest such as:
+
+```json
+{
+  "schema": "context_frontier_lineages.v1",
+  "lineages": [
+    {
+      "id": "mcp-context-manager-v2",
+      "roots": ["/workspace-roots/builder", "/workspace-roots/verifier", "/workspace-roots/gatekeeper"]
+    }
+  ]
+}
+```
+
+Every root must also be inside `MCP_CONTEXT_ALLOWED_ROOTS`. The id and root
+list provide governance only; they never prove equivalence by themselves. The
+server invokes Git read-only (`GIT_OPTIONAL_LOCKS=0`) to require a clean linked
+worktree, a shared Git common directory, and an identical commit. It then
+requires exact source and index signatures. If Git is unavailable or any proof
+fails, retrieval remains project-local.
 
 ## Build, test, and release
 

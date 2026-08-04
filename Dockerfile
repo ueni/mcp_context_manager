@@ -23,7 +23,7 @@ ENV HOME=/tmp \
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates curl zlib \
+RUN apk add --no-cache ca-certificates curl git zlib \
     && addgroup -S -g "${MCP_CONTEXT_GID}" mcp \
     && adduser -S -D -H -h /tmp -s /sbin/nologin -u "${MCP_CONTEXT_UID}" -G mcp mcp \
     && mkdir -p /workspace-roots /state \
