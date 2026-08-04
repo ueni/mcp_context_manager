@@ -6,7 +6,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use context_core::{ContextPackRejectionClass, ProjectEngine, UsageMonitor};
+use context_core::{
+    ContextPackRejectionClass, GovernedFrontierLineage, ProjectEngine, SharedFrontierCache,
+    UsageMonitor,
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -36,6 +40,8 @@ pub struct ProjectRegistry {
     project_markers: Vec<String>,
     default_project_id: String,
     usage_monitor: Arc<UsageMonitor>,
+    shared_frontiers: Option<Arc<SharedFrontierCache>>,
+    governed_lineages: HashMap<PathBuf, GovernedFrontierLineage>,
     state: Arc<Mutex<RegistryState>>,
 }
 
@@ -61,6 +67,21 @@ struct ProjectSpec {
     source: String,
     mapped: bool,
     legacy: bool,
+    governed_lineage: Option<GovernedFrontierLineage>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrontierLineageManifest {
+    schema: String,
+    lineages: Vec<FrontierLineageManifestEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrontierLineageManifestEntry {
+    id: String,
+    roots: Vec<PathBuf>,
 }
 
 impl ProjectRegistry {
@@ -80,14 +101,42 @@ impl ProjectRegistry {
                 })
                 .map(|(host, local)| Ok((allowed_root_path(&host)?, PathBuf::from(local))))
                 .collect::<Result<Vec<_>>>()?;
-        Self::new(base_root, state_root, allowed_roots, root_mappings)
+        let mut governance_boundaries = allowed_roots.clone();
+        governance_boundaries.push(base_root.clone());
+        let governed_lineages = load_frontier_lineage_manifest(
+            env::var_os("MCP_CONTEXT_FRONTIER_LINEAGES_FILE").map(PathBuf::from),
+            &governance_boundaries,
+        )?;
+        Self::new_with_lineages(
+            base_root,
+            state_root,
+            allowed_roots,
+            root_mappings,
+            governed_lineages,
+        )
     }
 
     pub fn new(
         base_root: PathBuf,
         state_root: PathBuf,
         allowed_roots: Vec<PathBuf>,
+        root_mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<Self> {
+        Self::new_with_lineages(
+            base_root,
+            state_root,
+            allowed_roots,
+            root_mappings,
+            HashMap::new(),
+        )
+    }
+
+    fn new_with_lineages(
+        base_root: PathBuf,
+        state_root: PathBuf,
+        allowed_roots: Vec<PathBuf>,
         mut root_mappings: Vec<(PathBuf, PathBuf)>,
+        governed_lineages: HashMap<PathBuf, GovernedFrontierLineage>,
     ) -> Result<Self> {
         let base_root = base_root
             .canonicalize()
@@ -115,10 +164,15 @@ impl ProjectRegistry {
             source: "repo_path".to_owned(),
             mapped: false,
             legacy: true,
+            governed_lineage: governed_lineages.get(&base_root).cloned(),
         };
         let mut specs = HashMap::new();
         specs.insert(project_id.clone(), default_spec);
         let usage_monitor = Arc::new(UsageMonitor::open(state_root.join("global-monitor"))?);
+        let shared_frontiers = (!governed_lineages.is_empty())
+            .then(|| SharedFrontierCache::open(state_root.join("global-frontiers")))
+            .transpose()?
+            .map(Arc::new);
         Ok(Self {
             base_root,
             state_root,
@@ -128,6 +182,8 @@ impl ProjectRegistry {
             project_markers: project_markers_from_env(),
             default_project_id: project_id,
             usage_monitor,
+            shared_frontiers,
+            governed_lineages,
             state: Arc::new(Mutex::new(RegistryState {
                 clock: 1,
                 specs,
@@ -143,13 +199,24 @@ impl ProjectRegistry {
         root_uri: Option<&str>,
     ) -> Result<Arc<ProjectEngine>> {
         let usage_monitor = Arc::clone(&self.usage_monitor);
+        let shared_frontiers = self.shared_frontiers.clone();
         self.engine_for_with_builder(project_id, root_uri, move |spec| {
-            ProjectEngine::build_with_state_and_monitor(
-                &spec.local_root,
-                &spec.state_root,
-                &spec.project_id,
-                usage_monitor,
-            )
+            match (&spec.governed_lineage, &shared_frontiers) {
+                (Some(lineage), Some(shared)) => ProjectEngine::build_with_governed_frontiers(
+                    &spec.local_root,
+                    &spec.state_root,
+                    &spec.project_id,
+                    usage_monitor,
+                    lineage.clone(),
+                    Arc::clone(shared),
+                ),
+                _ => ProjectEngine::build_with_state_and_monitor(
+                    &spec.local_root,
+                    &spec.state_root,
+                    &spec.project_id,
+                    usage_monitor,
+                ),
+            }
         })
     }
 
@@ -458,6 +525,7 @@ impl ProjectRegistry {
             source: source.to_owned(),
             mapped,
             legacy: false,
+            governed_lineage: self.governed_lineages.get(&host_root).cloned(),
         })
     }
 
@@ -653,6 +721,11 @@ impl ProjectSpec {
                 "cache_exists": self.state_root.join("rust-v2/state.lmdb/data.mdb").exists(),
                 "repo_boundary_enforced": true,
             },
+            "frontier_lineage": {
+                "governed": self.governed_lineage.is_some(),
+                "identity": self.governed_lineage.as_ref().map(GovernedFrontierLineage::identity),
+                "request_configurable": false,
+            },
             "git": {"is_repo": self.local_root.join(".git").exists(), "available": false, "head": "", "branch": "", "status_hash": "", "changes_hash": "", "dirty": false},
         })
     }
@@ -673,6 +746,78 @@ fn prune_idle_engines(state: &mut RegistryState, default_project_id: &str) {
         };
         state.engines.remove(&project_id);
     }
+}
+
+fn load_frontier_lineage_manifest(
+    manifest_path: Option<PathBuf>,
+    allowed_roots: &[PathBuf],
+) -> Result<HashMap<PathBuf, GovernedFrontierLineage>> {
+    let Some(manifest_path) = manifest_path else {
+        return Ok(HashMap::new());
+    };
+    if !manifest_path.is_absolute() {
+        bail!("MCP_CONTEXT_FRONTIER_LINEAGES_FILE must be absolute");
+    }
+    let metadata = manifest_path
+        .symlink_metadata()
+        .context("stat governed frontier lineage manifest")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 256 * 1024 {
+        bail!("governed frontier lineage manifest must be a regular file at most 256 KiB");
+    }
+    let manifest: FrontierLineageManifest = serde_json::from_slice(
+        &std::fs::read(&manifest_path).context("read governed frontier lineage manifest")?,
+    )
+    .context("parse governed frontier lineage manifest")?;
+    if manifest.schema != "context_frontier_lineages.v1" {
+        bail!("unsupported governed frontier lineage manifest schema");
+    }
+    let mut governed = HashMap::new();
+    for entry in manifest.lineages {
+        if entry.id.is_empty()
+            || entry.id.len() > 128
+            || !entry
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            bail!("governed frontier lineage id is invalid");
+        }
+        if entry.roots.len() < 2 || entry.roots.len() > 64 {
+            bail!("a governed frontier lineage must contain 2..64 explicit roots");
+        }
+        let mut roots = Vec::new();
+        for root in entry.roots {
+            if !root.is_absolute()
+                || root
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                bail!("governed frontier lineage roots must be absolute and normalized");
+            }
+            if !allowed_roots
+                .iter()
+                .any(|allowed| root == *allowed || root.starts_with(allowed))
+            {
+                bail!("governed frontier lineage root is outside configured boundaries");
+            }
+            roots.push(root);
+        }
+        roots.sort();
+        roots.dedup();
+        if roots.len() < 2 {
+            bail!("governed frontier lineage roots must be distinct");
+        }
+        let identity = sha256_hex(&serde_json::to_vec(
+            &json!({"id": entry.id, "roots": roots}),
+        )?);
+        let lineage = GovernedFrontierLineage::new(identity)?;
+        for root in roots {
+            if governed.insert(root, lineage.clone()).is_some() {
+                bail!("a root may belong to only one governed frontier lineage");
+            }
+        }
+    }
+    Ok(governed)
 }
 
 fn split_env_list(value: &str) -> Vec<String> {
@@ -1112,5 +1257,40 @@ mod tests {
         assert_eq!(projects["count"], 1);
         assert_eq!(projects["projects"][0]["name"], "real-project");
         assert_eq!(projects["projects"][0]["source"], "discovered_git");
+    }
+
+    #[test]
+    fn governed_lineage_manifest_requires_explicit_distinct_bounded_roots() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let first = root.path().join("builder");
+        let second = root.path().join("verifier");
+        std::fs::create_dir_all(&first).expect("first root");
+        std::fs::create_dir_all(&second).expect("second root");
+        let manifest = root.path().join("lineages.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec(&json!({
+                "schema": "context_frontier_lineages.v1",
+                "lineages": [{"id": "handoff", "roots": [&first, &second]}]
+            }))
+            .expect("manifest JSON"),
+        )
+        .expect("manifest file");
+        let governed =
+            load_frontier_lineage_manifest(Some(manifest.clone()), &[root.path().to_owned()])
+                .expect("valid manifest");
+        assert_eq!(governed.len(), 2);
+        assert_eq!(governed[&first].identity(), governed[&second].identity());
+
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec(&json!({
+                "schema": "context_frontier_lineages.v1",
+                "lineages": [{"id": "handoff", "roots": [&first, &first]}]
+            }))
+            .expect("duplicate manifest JSON"),
+        )
+        .expect("duplicate manifest file");
+        assert!(load_frontier_lineage_manifest(Some(manifest), &[root.path().to_owned()]).is_err());
     }
 }

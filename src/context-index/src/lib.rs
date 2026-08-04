@@ -153,6 +153,7 @@ pub struct ProjectIndex {
     chunks: Arc<Vec<Chunk>>,
     chunks_by_path: Arc<HashMap<String, Vec<usize>>>,
     chunks_by_id: Arc<HashMap<String, usize>>,
+    chunks_by_address: Arc<HashMap<String, usize>>,
     stats: IndexStats,
 }
 
@@ -206,12 +207,14 @@ impl ProjectIndex {
 
         let mut chunks_by_path: HashMap<String, Vec<usize>> = HashMap::new();
         let mut chunks_by_id = HashMap::new();
+        let mut chunks_by_address = HashMap::new();
         for (index, chunk) in chunks.iter().enumerate() {
             chunks_by_path
                 .entry(chunk.path.clone())
                 .or_default()
                 .push(index);
             chunks_by_id.insert(chunk.id.clone(), index);
+            chunks_by_address.insert(immutable_candidate_address(&chunk.id), index);
         }
 
         Ok(Self {
@@ -222,6 +225,7 @@ impl ProjectIndex {
             chunks: Arc::new(chunks),
             chunks_by_path: Arc::new(chunks_by_path),
             chunks_by_id: Arc::new(chunks_by_id),
+            chunks_by_address: Arc::new(chunks_by_address),
             stats,
         })
     }
@@ -509,6 +513,31 @@ impl ProjectIndex {
         Ok((hits, terms))
     }
 
+    /// Rerank opaque, content-addressed candidate identities against this
+    /// project's current index. `None` is a fail-closed signal that at least
+    /// one shared candidate no longer exists locally.
+    pub fn rerank_immutable_candidates(
+        &self,
+        prompt: &str,
+        explicit_paths: &[String],
+        candidate_addresses: &[String],
+        max_items: usize,
+    ) -> Result<Option<(Vec<SearchHit>, Vec<String>)>> {
+        if candidate_addresses
+            .iter()
+            .any(|address| !self.chunks_by_address.contains_key(address))
+        {
+            return Ok(None);
+        }
+        let candidate_ids = candidate_addresses
+            .iter()
+            .filter_map(|address| self.chunks_by_address.get(address))
+            .map(|index| self.chunks[*index].id.clone())
+            .collect::<Vec<_>>();
+        self.rerank(prompt, explicit_paths, &candidate_ids, max_items)
+            .map(Some)
+    }
+
     pub fn snippet(&self, raw_path: &str, start_line: u32, end_line: Option<u32>) -> Result<Chunk> {
         let path = validate_relative_path(raw_path)?;
         let absolute = self.root.join(&path);
@@ -781,6 +810,15 @@ fn digest_hex(digest: Sha256) -> String {
         .collect()
 }
 
+/// Stable opaque identity for an immutable retrieval candidate. Project-local
+/// chunk ids contain paths, so only this digest may enter a shared frontier.
+pub fn immutable_candidate_address(candidate_id: &str) -> String {
+    format!(
+        "ca:{}",
+        digest_hex(Sha256::new_with_prefix(candidate_id.as_bytes()))
+    )
+}
+
 fn should_visit(entry: &DirEntry) -> bool {
     if entry.depth() == 0 {
         return true;
@@ -788,9 +826,11 @@ fn should_visit(entry: &DirEntry) -> bool {
     if entry.file_type().is_symlink() {
         return false;
     }
-    !entry.file_type().is_dir()
-        || !IGNORED_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref())
-            && entry.file_name().to_string_lossy() != corpus::CORPUS_DIRECTORY
+    let name = entry.file_name().to_string_lossy();
+    if IGNORED_DIRECTORIES.contains(&name.as_ref()) || name == corpus::CORPUS_DIRECTORY {
+        return false;
+    }
+    true
 }
 
 fn read_text(path: &Path) -> Result<Option<String>> {
@@ -1355,5 +1395,26 @@ mod tests {
             let (hits, _) = index.search(&marker, &[], 1).expect("search symbol");
             assert_eq!(hits.first().map(|hit| hit.path.as_str()), Some(path));
         }
+    }
+
+    #[test]
+    fn linked_worktree_git_pointer_is_never_indexed_or_signed() {
+        let main = tempfile::tempdir().expect("main root");
+        let linked = tempfile::tempdir().expect("linked root");
+        fs::write(main.path().join("src.rs"), "fn anchor() {}\n").expect("main source");
+        fs::write(linked.path().join("src.rs"), "fn anchor() {}\n").expect("linked source");
+        fs::create_dir(main.path().join(".git")).expect("main git directory");
+        fs::write(
+            linked.path().join(".git"),
+            "gitdir: /private/common.git/worktrees/x\n",
+        )
+        .expect("linked git pointer");
+        let main_index = ProjectIndex::build(main.path()).expect("main index");
+        let linked_index = ProjectIndex::build(linked.path()).expect("linked index");
+        assert_eq!(
+            main_index.stats().refresh_signature,
+            linked_index.stats().refresh_signature
+        );
+        assert!(!linked_index.all_paths().iter().any(|path| path == ".git"));
     }
 }

@@ -1,0 +1,26 @@
+{
+  "gates": {
+    "builder_to_verifier_to_gatekeeper_modeled": true,
+    "identical_paths_and_evidence": true,
+    "no_isolation_regression": true,
+    "positive_measured_search_work_avoided": true,
+    "two_local_searches_avoided": true
+  },
+  "scenarios": [
+    "builder",
+    "verifier",
+    "gatekeeper",
+    "project_local_baseline"
+  ],
+  "schema": "worktree_frontier_handoff_benchmark.v1",
+  "summary": {
+    "baseline_local_search_ms": 16.80223,
+    "gatekeeper_shared_ms": 19.262801,
+    "isolation_rejections": 0,
+    "latency_saved_micros_est": 95209,
+    "local_searches_avoided": 2,
+    "quality_preserved": true,
+    "safe_shared_hits": 2,
+    "verifier_shared_ms": 19.863279000000002
+  }
+}

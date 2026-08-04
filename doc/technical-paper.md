@@ -376,6 +376,45 @@ generation, and sufficient candidate capacity; route is diagnostic only.
 Missing source candidates fall back to a new search. Negative entries expire
 after 30 seconds and are also exact-only.
 
+### Governed cross-worktree frontier pool
+
+Cross-worktree reuse is opt-in through an operator-owned lineage manifest; no
+request field, repository name, directory name, remote URL, or repository file
+can create membership. The governance digest is combined with the canonical
+Git common-directory digest, so assigning the same manifest id to unrelated
+repositories cannot join them. Eligibility is re-proved for every lookup and
+publication: the worktree must be clean, its top level must equal the selected
+project root, and its commit, source signature, and deterministic index
+signature must match exactly. Governed reference corpora are always excluded.
+
+The shared 256 MiB persistent pool stores immutable positive frontier records
+under content-addressed keys. Candidate and dependency identities are SHA-256
+digests of project-local chunk ids. Shared records contain no prompts, raw
+terms, paths, project ids, generations, pack snapshots, references,
+continuations, memory, metrics, redaction state, or source text. Negative
+frontiers are never shared.
+
+On an apparent hit, the requester verifies capacity, record shape, every
+candidate and dependency address, its own source/index signatures, and a
+stable local generation and Git proof. It reranks the candidates using its own
+index. Any missing/deleted candidate, dirty worktree, divergent head, changed
+file, stale index, governed corpus, or concurrent generation change causes a
+deterministic project-local search. Project-local L1 remains authoritative and
+is checked first.
+
+`context_admin(mode="metrics")` reports eligible lineage opportunities, safe
+hits, fallbacks, estimated search latency saved, aggregate isolation
+rejections, and fixed rejection-reason counters. The latency estimate is
+project-local: it subtracts the requesting lookup time from the accepted 50 ms
+warm-miss envelope; producer timing is never stored in a shared record.
+`cache_stats` reports the
+shared budget without keys or paths. `cache_prune` applies the requested age to
+shared generated records as well as local cache state; reopening the global
+state reloads records within the same fixed budget.
+The opt-in usage monitor from the reuse-opportunity work records the same five
+bounded lineage totals under `lineage_frontier`, globally and per normalized
+client profile, without prompts, paths, ids, or source values.
+
 ## Freshness
 
 A `notify` watcher coalesces events for 50 ms. A content signature poll is the
@@ -449,8 +488,10 @@ and `git diff --check`.
 Rust 1.97.1 and `Cargo.lock` are pinned. CMake invokes locked Cargo builds in
 Debian and Alpine builders, validates executable target and linkage, and emits
 dynamic glibc plus static PIE musl artifacts. The final Alpine image contains
-the musl server and runtime certificates/curl only; no Python interpreter or
-production Python dependency is present.
+the musl server, runtime certificates, curl, Git, and zlib. Git is used only for
+shell-free, read-only governed-worktree lineage proofs with
+`GIT_OPTIONAL_LOCKS=0`; it does not authorize source-repository mutation. No
+Python interpreter or production Python dependency is present.
 
 `cargo xtask release-version` updates the workspace, lockfile, and standalone
 monitor contract. `cargo xtask license-check` enforces the dependency license
