@@ -184,7 +184,7 @@ pub struct ContextAdminRequest {
     pub max_files: Option<u32>,
     #[serde(default = "default_max_age_minutes")]
     pub max_age_minutes: u32,
-    #[serde(default = "default_memory_max_entries")]
+    #[serde(default = "default_admin_max_entries")]
     pub max_entries: u16,
     pub max_output_chars: Option<u32>,
     pub default_output_profile: Option<String>,
@@ -1023,6 +1023,10 @@ pub struct UsageMonitor {
     update_lock: Mutex<()>,
 }
 
+pub const MONITOR_REPORT_DEFAULT_MAX_OUTPUT_CHARS: u32 = 12_000;
+pub const MONITOR_REPORT_METADATA_ALLOWANCE_CHARS: usize = 2_048;
+const MONITOR_REPORT_REFERENCE_TTL_HOURS: i64 = 24;
+
 impl UsageMonitor {
     pub fn open(global_state: impl AsRef<std::path::Path>) -> Result<Self> {
         let store = StateStore::open(global_state)?;
@@ -1085,6 +1089,53 @@ impl UsageMonitor {
             "report" => self.report(project_id),
             unsupported => bail!("unsupported monitor_usage action: {unsupported}"),
         }
+    }
+
+    pub fn bounded_action(
+        &self,
+        action: &str,
+        project_id: Option<&str>,
+        reference_project_id: &str,
+        max_entries: u16,
+        max_output_chars: Option<u32>,
+    ) -> Result<Value> {
+        if action != "report" {
+            return self.action(action, project_id);
+        }
+        self.bounded_report(
+            project_id,
+            reference_project_id,
+            usize::from(max_entries),
+            usize::try_from(max_output_chars.unwrap_or(MONITOR_REPORT_DEFAULT_MAX_OUTPUT_CHARS))
+                .unwrap_or(usize::MAX),
+        )
+    }
+
+    pub fn resolve_reference(
+        &self,
+        request: &ResultReferenceRequest,
+        project_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let reference_id = request
+            .reference
+            .as_ref()
+            .and_then(|reference| reference.get("reference_id"))
+            .and_then(Value::as_str)
+            .unwrap_or(&request.reference_id);
+        let Some(record) = self.store.get_json(&format!("reference:{reference_id}"))? else {
+            return Ok(None);
+        };
+        if record.get("project_id").and_then(Value::as_str) != Some(project_id) {
+            bail!("result reference is outside the selected project boundary");
+        }
+        let expected_hash = request
+            .reference
+            .as_ref()
+            .and_then(|reference| reference.pointer("/content/sha256"))
+            .and_then(Value::as_str)
+            .unwrap_or(&request.expected_hash);
+        let value = self.store.resolve_reference(reference_id, expected_hash)?;
+        Ok(Some(serde_json::to_vec(&value)?))
     }
 
     fn status(&self) -> Result<Value> {
@@ -1636,6 +1687,189 @@ impl UsageMonitor {
             "rejection_buckets": rejection_buckets,
         }))
     }
+
+    fn bounded_report(
+        &self,
+        project_id: Option<&str>,
+        reference_project_id: &str,
+        max_entries: usize,
+        max_output_chars: usize,
+    ) -> Result<Value> {
+        let full = self.report(project_id)?;
+        let full_buckets = full["buckets"].as_array().cloned().unwrap_or_default();
+        let full_rejections = full["rejection_buckets"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut buckets = retain_latest_rows(&full_buckets, max_entries);
+        let mut rejection_buckets = retain_latest_rows(&full_rejections, max_entries);
+        let mut client_profiles_omitted = 0_usize;
+        let mut client_profile_buckets_truncated = 0_usize;
+        for bucket in &mut buckets {
+            let Some(profiles) = bucket
+                .get_mut("client_profiles")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            if profiles.len() > max_entries {
+                client_profiles_omitted =
+                    client_profiles_omitted.saturating_add(profiles.len() - max_entries);
+                client_profile_buckets_truncated =
+                    client_profile_buckets_truncated.saturating_add(1);
+                profiles.truncate(max_entries);
+            }
+        }
+        let entry_truncated = full_buckets.len() > buckets.len()
+            || full_rejections.len() > rejection_buckets.len()
+            || client_profiles_omitted > 0;
+        let mut output_truncated = false;
+        let mut reference = None;
+        let output_limit = max_output_chars.saturating_add(MONITOR_REPORT_METADATA_ALLOWANCE_CHARS);
+
+        let initial = monitor_report_response(
+            &full,
+            buckets.clone(),
+            rejection_buckets.clone(),
+            max_entries,
+            max_output_chars,
+            &full_buckets,
+            &full_rejections,
+            client_profiles_omitted,
+            client_profile_buckets_truncated,
+            entry_truncated,
+            output_truncated,
+            reference.clone(),
+        );
+        if serde_json::to_vec(&initial)?.len() > output_limit {
+            output_truncated = true;
+        }
+        if entry_truncated || output_truncated {
+            reference = Some(self.store.create_reference(
+                "context_admin.monitor_usage",
+                reference_project_id,
+                &full,
+                &json!({
+                    "kind": "complete_monitor_usage_report",
+                    "bucket_count": full_buckets.len(),
+                    "rejection_bucket_count": full_rejections.len(),
+                }),
+                MONITOR_REPORT_REFERENCE_TTL_HOURS,
+            )?);
+        }
+        loop {
+            let response = monitor_report_response(
+                &full,
+                buckets.clone(),
+                rejection_buckets.clone(),
+                max_entries,
+                max_output_chars,
+                &full_buckets,
+                &full_rejections,
+                client_profiles_omitted,
+                client_profile_buckets_truncated,
+                entry_truncated,
+                output_truncated,
+                reference.clone(),
+            );
+            if serde_json::to_vec(&response)?.len() <= output_limit {
+                return Ok(response);
+            }
+            output_truncated = true;
+            if reference.is_none() {
+                reference = Some(self.store.create_reference(
+                    "context_admin.monitor_usage",
+                    reference_project_id,
+                    &full,
+                    &json!({
+                        "kind": "complete_monitor_usage_report",
+                        "bucket_count": full_buckets.len(),
+                        "rejection_bucket_count": full_rejections.len(),
+                    }),
+                    MONITOR_REPORT_REFERENCE_TTL_HOURS,
+                )?);
+            }
+            if !rejection_buckets.is_empty() {
+                rejection_buckets.remove(0);
+            } else if !buckets.is_empty() {
+                buckets.remove(0);
+            } else {
+                bail!("monitor report metadata exceeds the documented output allowance");
+            }
+        }
+    }
+}
+
+fn retain_latest_rows(rows: &[Value], max_entries: usize) -> Vec<Value> {
+    rows.iter()
+        .skip(rows.len().saturating_sub(max_entries))
+        .cloned()
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_report_response(
+    full: &Value,
+    buckets: Vec<Value>,
+    rejection_buckets: Vec<Value>,
+    max_entries: usize,
+    max_output_chars: usize,
+    full_buckets: &[Value],
+    full_rejections: &[Value],
+    client_profiles_omitted: usize,
+    client_profile_buckets_truncated: usize,
+    entry_truncated: bool,
+    output_truncated: bool,
+    reference: Option<Value>,
+) -> Value {
+    let mut reasons = Vec::new();
+    if entry_truncated {
+        reasons.push("max_entries");
+    }
+    if output_truncated {
+        reasons.push("max_output_chars");
+    }
+    let returned_bucket_count = buckets.len();
+    let returned_rejection_count = rejection_buckets.len();
+    json!({
+        "schema": "context_monitor_usage.report.v4",
+        "enabled": full.get("enabled").cloned().unwrap_or_default(),
+        "retention_days": full.get("retention_days").cloned().unwrap_or_default(),
+        "global": full.get("global").cloned().unwrap_or_default(),
+        "project_id": full.get("project_id").cloned().unwrap_or_default(),
+        "buckets": buckets,
+        "rejection_buckets": rejection_buckets,
+        "truncation": {
+            "truncated": entry_truncated || output_truncated,
+            "reasons": reasons,
+            "limits": {
+                "max_entries_per_row_collection": max_entries,
+                "max_output_chars": max_output_chars,
+                "metadata_allowance_chars": MONITOR_REPORT_METADATA_ALLOWANCE_CHARS,
+            },
+            "row_collections": {
+                "buckets": {
+                    "total": full_buckets.len(),
+                    "returned": returned_bucket_count,
+                    "omitted": full_buckets.len().saturating_sub(returned_bucket_count),
+                },
+                "rejection_buckets": {
+                    "total": full_rejections.len(),
+                    "returned": returned_rejection_count,
+                    "omitted": full_rejections.len().saturating_sub(returned_rejection_count),
+                },
+                "client_profiles": {
+                    "max_returned_per_bucket": max_entries,
+                    "omitted": client_profiles_omitted,
+                    "truncated_bucket_count": client_profile_buckets_truncated,
+                },
+            },
+            "retrieval": reference.map(|value| json!({
+                "mode": "result_reference_resolve",
+                "reference": value,
+            })),
+        },
+    })
 }
 
 fn empty_reuse_state() -> Value {
@@ -5283,6 +5517,8 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "context_cache.stats.v1",
                 "context_cache.prune.v1",
                 "context_cache.warmup.v1",
+                "context_monitor_usage.report.v4",
+                "context_monitor_usage.report.v3",
                 "context_budget.v1",
                 "tool_output_contracts.v1",
                 "context_metrics.v1",
@@ -5300,8 +5536,10 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "action": "For monitor_usage: status, enable, disable, or report.",
                 "path": "Repository-relative path or resource URI.", "max_files": "Index file cap.",
                 "prompt": "Optional prompt to warm exact context_pack cache without echoing it.",
-                "max_age_minutes": "Cache prune age.", "max_entries": "Maximum rows.",
-                "max_output_chars": "Budget override.", "default_output_profile": "Budget profile.",
+                "max_age_minutes": "Cache prune age.",
+                "max_entries": "Maximum rows in each applicable collection; monitor reports default to 20.",
+                "max_output_chars": "For monitor reports, inline JSON budget (default 12000) plus at most 2048 characters of truncation and retrieval metadata; otherwise a budget override.",
+                "default_output_profile": "Budget profile.",
                 "tool_name": "Filter to one tool.", "contract_profile": "compact or verbose.",
                 "state_prefix": "Generated state prefix.", "state_key": "Exact generated state key.",
                 "project_id": "Project selector.", "root_uri": "Repository file URI."
@@ -6631,6 +6869,10 @@ fn default_decided_by() -> String {
 
 const fn default_memory_max_entries() -> u16 {
     100
+}
+
+const fn default_admin_max_entries() -> u16 {
+    20
 }
 
 fn default_admin_mode() -> String {
@@ -8206,6 +8448,118 @@ mod tests {
         assert!(!encoded.contains("prompt"));
         assert!(!encoded.contains("root_uri"));
         assert!(!encoded.contains("secret-agent-id"));
+    }
+
+    #[test]
+    fn monitor_report_bounds_large_fixtures_and_preserves_overflow_reference() {
+        let state = tempdir().expect("temporary state");
+        let monitor = UsageMonitor::open(state.path().join("global")).expect("monitor");
+        for index in 0..40 {
+            monitor
+                .store
+                .put_json(
+                    &format!("monitor:usage:2099-01-01:project-{index:03}"),
+                    &json!({
+                        "schema": "context_monitor_usage.bucket.v3",
+                        "day": format!("2099-01-{:02}", (index % 28) + 1),
+                        "project_id": format!("project-{index:03}"),
+                        "request_count": index + 1,
+                    }),
+                )
+                .expect("usage fixture");
+            monitor
+                .store
+                .put_json(
+                    &format!("monitor:rejections:fixture-{index:03}"),
+                    &json!({
+                        "schema": "context_monitor_usage.rejections.v1",
+                        "day": format!("2099-02-{:02}", (index % 28) + 1),
+                        "error_classes": empty_rejection_classes(),
+                    }),
+                )
+                .expect("rejection fixture");
+        }
+
+        let report = monitor
+            .bounded_report(None, "default-project", 2, 1_000)
+            .expect("bounded report");
+        let encoded = serde_json::to_vec(&report).expect("encoded report");
+        assert!(encoded.len() <= 1_000 + MONITOR_REPORT_METADATA_ALLOWANCE_CHARS);
+        assert_eq!(report["schema"], "context_monitor_usage.report.v4");
+        assert_eq!(report["truncation"]["truncated"], true);
+        assert!(
+            report["truncation"]["reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.contains(&json!("max_entries"))
+                    && reasons.contains(&json!("max_output_chars")))
+        );
+        assert!(
+            report["buckets"]
+                .as_array()
+                .is_some_and(|rows| rows.len() <= 2)
+        );
+        assert!(
+            report["rejection_buckets"]
+                .as_array()
+                .is_some_and(|rows| rows.len() <= 2)
+        );
+        for bucket in report["buckets"].as_array().expect("buckets") {
+            assert!(
+                bucket["client_profiles"]
+                    .as_array()
+                    .is_some_and(|rows| rows.len() <= 2)
+            );
+        }
+        let reference = report
+            .pointer("/truncation/retrieval/reference")
+            .cloned()
+            .expect("overflow reference");
+        let resolved = monitor
+            .resolve_reference(
+                &ResultReferenceRequest {
+                    reference_id: String::new(),
+                    reference: Some(reference),
+                    expected_hash: String::new(),
+                    project_id: Some("default-project".to_owned()),
+                    root_uri: None,
+                },
+                "default-project",
+            )
+            .expect("resolve reference")
+            .expect("monitor reference");
+        let resolved: Value = serde_json::from_slice(&resolved).expect("resolved JSON");
+        assert_eq!(resolved["status"], "resolved");
+        assert_eq!(
+            resolved["content"]["schema"],
+            "context_monitor_usage.report.v3"
+        );
+        assert_eq!(
+            resolved["content"]["buckets"].as_array().map(Vec::len),
+            Some(40)
+        );
+        assert_eq!(
+            resolved["content"]["rejection_buckets"]
+                .as_array()
+                .map(Vec::len),
+            Some(40)
+        );
+
+        let defaults = monitor
+            .bounded_action("report", None, "default-project", 20, None)
+            .expect("default bounded report");
+        assert!(
+            serde_json::to_vec(&defaults)
+                .expect("default encoded report")
+                .len()
+                <= usize::try_from(MONITOR_REPORT_DEFAULT_MAX_OUTPUT_CHARS)
+                    .expect("default budget")
+                    + MONITOR_REPORT_METADATA_ALLOWANCE_CHARS
+        );
+        assert!(
+            defaults["buckets"]
+                .as_array()
+                .is_some_and(|rows| rows.len() <= 20)
+        );
     }
 
     #[test]

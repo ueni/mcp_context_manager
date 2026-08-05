@@ -211,15 +211,10 @@ impl ContextServer {
     )]
     fn result_reference_resolve(
         &self,
-        Parameters(mut request): Parameters<ResultReferenceRequest>,
+        Parameters(request): Parameters<ResultReferenceRequest>,
     ) -> Result<String, String> {
-        let engine = self
+        let encoded = self
             .registry
-            .engine_for(request.project_id.as_deref(), request.root_uri.as_deref())
-            .map_err(|error| error.to_string())?;
-        request.project_id = Some(engine.project_id().to_owned());
-        request.root_uri = None;
-        let encoded = engine
             .result_reference_resolve(&request)
             .map_err(|error| error.to_string())?;
         String::from_utf8(encoded).map_err(|error| error.to_string())
@@ -236,7 +231,7 @@ impl ContextServer {
             return serde_json::to_string(
                 &self
                     .registry
-                    .monitor_usage(&request.action, request.project_id.as_deref())
+                    .bounded_monitor_usage(&request)
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string());
@@ -876,21 +871,14 @@ async fn reference_http(
     Path(reference_id): Path<String>,
     Query(query): Query<ReferenceQuery>,
 ) -> Response {
-    let engine = match state
-        .registry
-        .engine_for(query.project_id.as_deref(), query.root_uri.as_deref())
-    {
-        Ok(engine) => engine,
-        Err(error) => return rest_error(StatusCode::BAD_REQUEST, &error.to_string()),
-    };
     let request = ResultReferenceRequest {
         reference_id,
         reference: None,
         expected_hash: String::new(),
-        project_id: Some(engine.project_id().to_owned()),
-        root_uri: None,
+        project_id: query.project_id,
+        root_uri: query.root_uri,
     };
-    match engine.result_reference_resolve(&request) {
+    match state.registry.result_reference_resolve(&request) {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
@@ -1380,6 +1368,77 @@ mod tests {
         )
         .expect("metrics JSON");
         assert_eq!(response["metrics"]["background"]["status"], "unloaded");
+    }
+
+    #[tokio::test]
+    async fn monitor_report_caps_inline_output_and_resolves_complete_report() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        std::fs::write(
+            root.path().join("lib.rs"),
+            "fn bounded_monitor_fixture() {}\n",
+        )
+        .expect("fixture source");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        registry
+            .monitor_usage("enable", None)
+            .expect("enable monitor");
+        let engine = registry.engine_for(None, None).expect("default engine");
+        engine
+            .context_pack_cached(
+                &serde_json::from_value(json!({
+                    "prompt": "bounded monitor fixture",
+                    "focus_paths": ["lib.rs"],
+                }))
+                .expect("pack request"),
+            )
+            .await
+            .expect("record monitored request");
+        let server = ContextServer::new(registry);
+        let response = server
+            .context_admin(Parameters(
+                serde_json::from_value(json!({
+                    "mode": "monitor_usage",
+                    "action": "report",
+                    "max_entries": 1,
+                    "max_output_chars": 1000,
+                }))
+                .expect("monitor request"),
+            ))
+            .await
+            .expect("monitor response");
+        assert!(response.len() <= 1_000 + context_core::MONITOR_REPORT_METADATA_ALLOWANCE_CHARS);
+        let response: Value = serde_json::from_str(&response).expect("monitor JSON");
+        assert_eq!(response["schema"], "context_monitor_usage.report.v4");
+        assert_eq!(response["truncation"]["truncated"], true);
+        let reference = response
+            .pointer("/truncation/retrieval/reference")
+            .cloned()
+            .expect("overflow reference");
+        let resolved = server
+            .result_reference_resolve(Parameters(ResultReferenceRequest {
+                reference_id: String::new(),
+                reference: Some(reference),
+                expected_hash: String::new(),
+                project_id: None,
+                root_uri: None,
+            }))
+            .expect("resolved reference");
+        let resolved: Value = serde_json::from_str(&resolved).expect("resolved JSON");
+        assert_eq!(resolved["status"], "resolved");
+        assert_eq!(
+            resolved["content"]["schema"],
+            "context_monitor_usage.report.v3"
+        );
     }
 
     #[tokio::test]

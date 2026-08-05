@@ -106,6 +106,18 @@ counters. Route
 shares use the fixed `debug`, `review`, `implementation`, and `explore`
 categories.
 
+The public report envelope is `context_monitor_usage.report.v4`. It keeps the
+newest rows while preserving chronological order, applies `max_entries`
+(default 20) independently to usage buckets, rejection buckets, and each
+returned client-profile collection, and applies `max_output_chars` (default
+12,000) to serialized inline output. Up to 2,048 additional characters are
+reserved solely for stable truncation counts, limits, reasons, and retrieval
+metadata. Character-pressure removal is deterministic: oldest rejection rows
+are removed first, then oldest usage rows. Any omitted evidence is stored as a
+complete `context_monitor_usage.report.v3` payload in generated global-monitor
+state behind a project-bound, hash-checked, 24-hour result reference. Report
+generation and resolution never write repository source.
+
 The denominators are explicit:
 
 - raw L0 hit rate is `L0 hits including singleflight / (L0 hits + L0 misses)`;
