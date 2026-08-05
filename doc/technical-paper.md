@@ -82,6 +82,10 @@ MCP returns the object as one raw JSON text item. REST returns the same encoded
 bytes. The tuple opcode is `0..2` for reference/balanced/source evidence and
 `3..5` for add/drop/replace session deltas. Line intervals are inclusive.
 
+Both transports require `prompt` to contain non-whitespace task text after
+trimming. Empty and whitespace-only values are rejected before project loading
+with the stable validation diagnostic `prompt is required`.
+
 Stable diagnostics and accounting are queried through `context_admin` rather
 than repeated in every response.
 
