@@ -19,6 +19,14 @@ The production server has no Python runtime dependency. Releases contain a
 dynamic glibc executable, a static musl executable, a Docker image archive, a
 CycloneDX SBOM, checksums, and a Sigstore signature bundle.
 
+`context_lookup` line ranges for `snippet` and `chunk` modes are inclusive.
+Starts below line 1 normalize to line 1, ends before the normalized start
+normalize to that start, and partially overlapping ranges clamp to the final
+line. Empty files and ranges whose normalized start is past end-of-file return
+a validation error. Every successful range therefore satisfies
+`1 <= start_line <= end_line <= file_line_count`; chunk metadata and its
+`detail_lookup` use the same normalized interval.
+
 Implementation details are in [doc/technical-paper.md](doc/technical-paper.md).
 
 ## Context Pack v2
