@@ -351,24 +351,24 @@ impl ProjectRegistry {
         Ok((selected, engine, known))
     }
 
-    pub fn projects_payload(&self) -> Result<Value> {
+    pub fn projects_payload(&self, max_entries: u16) -> Result<Value> {
         self.discover_projects()?;
         let payload = self.project_payload(false)?;
         self.persist_project_catalog(&payload);
-        Ok(payload)
+        Self::bounded_project_catalog(payload, max_entries)
     }
 
     /// Returns only engines that are already resident in this process.
     ///
     /// Unlike project discovery, this is an in-memory snapshot and is safe to
     /// call from a frequent metrics poll.
-    pub fn active_projects_payload(&self) -> Result<Value> {
-        self.project_payload(true)
+    pub fn active_projects_payload(&self, max_entries: u16) -> Result<Value> {
+        Self::bounded_project_catalog(self.project_payload(true)?, max_entries)
     }
 
     /// Lists a manifest written by explicit project discovery, without walking
     /// an allowed root. When no manifest exists, return resident engines only.
-    pub fn cached_projects_payload(&self) -> Result<Value> {
+    pub fn cached_projects_payload(&self, max_entries: u16) -> Result<Value> {
         if let Ok(bytes) = std::fs::read(self.state_root.join(PROJECT_CATALOG_FILE))
             && let Ok(mut payload) = serde_json::from_slice::<Value>(&bytes)
             && payload.get("schema").and_then(Value::as_str) == Some("context_projects.list.v1")
@@ -376,12 +376,12 @@ impl ProjectRegistry {
         {
             payload["schema"] = Value::String("context_projects.cached.v1".to_owned());
             payload["catalogue"] = Value::String("persisted_discovery".to_owned());
-            return Ok(payload);
+            return Self::bounded_project_catalog(payload, max_entries);
         }
         let mut payload = self.project_payload(true)?;
         payload["schema"] = Value::String("context_projects.cached.v1".to_owned());
         payload["catalogue"] = Value::String("resident_engines_only".to_owned());
-        Ok(payload)
+        Self::bounded_project_catalog(payload, max_entries)
     }
 
     fn persist_project_catalog(&self, payload: &Value) {
@@ -427,6 +427,26 @@ impl ProjectRegistry {
                 "legacy_fallback": {"safe": true, "reason": "configured_default_project"},
             },
         }))
+    }
+
+    fn bounded_project_catalog(mut payload: Value, max_entries: u16) -> Result<Value> {
+        if !(1..=1000).contains(&max_entries) {
+            bail!("max_entries must be in 1..=1000");
+        }
+        let projects = payload
+            .get_mut("projects")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| anyhow!("project catalogue is missing projects"))?;
+        let total_count = projects.len();
+        projects.truncate(usize::from(max_entries));
+        let returned_count = projects.len();
+        payload["count"] = json!(returned_count);
+        payload["total_count"] = json!(total_count);
+        payload["returned_count"] = json!(returned_count);
+        payload["omitted_count"] = json!(total_count.saturating_sub(returned_count));
+        payload["max_entries"] = json!(max_entries);
+        payload["truncated"] = json!(returned_count < total_count);
+        Ok(payload)
     }
 
     pub fn default_engine(&self) -> Result<Arc<ProjectEngine>> {
@@ -1152,12 +1172,16 @@ mod tests {
         )
         .expect("registry");
 
-        let active = registry.active_projects_payload().expect("active projects");
+        let active = registry
+            .active_projects_payload(100)
+            .expect("active projects");
         assert_eq!(active["schema"], "context_projects.active.v1");
         assert_eq!(active["count"], 0);
 
         drop(registry.default_engine().expect("active default engine"));
-        let active = registry.active_projects_payload().expect("active projects");
+        let active = registry
+            .active_projects_payload(100)
+            .expect("active projects");
         assert_eq!(active["count"], 1);
         assert_eq!(
             active["projects"][0]["name"],
@@ -1184,14 +1208,18 @@ mod tests {
         )
         .expect("registry");
 
-        let cached = registry.cached_projects_payload().expect("cached projects");
+        let cached = registry
+            .cached_projects_payload(100)
+            .expect("cached projects");
         assert_eq!(cached["schema"], "context_projects.cached.v1");
         assert_eq!(cached["catalogue"], "resident_engines_only");
         assert_eq!(cached["count"], 0);
 
-        let discovered = registry.projects_payload().expect("explicit discovery");
+        let discovered = registry.projects_payload(100).expect("explicit discovery");
         assert_eq!(discovered["count"], 1);
-        let cached = registry.cached_projects_payload().expect("cached projects");
+        let cached = registry
+            .cached_projects_payload(100)
+            .expect("cached projects");
         assert_eq!(cached["catalogue"], "persisted_discovery");
         assert_eq!(cached["count"], 1);
         assert_eq!(cached["projects"][0]["name"], "persisted-project");
@@ -1201,6 +1229,60 @@ mod tests {
                 .expect("cached engines")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn project_catalogue_cap_validates_and_reports_exact_and_truncated_results() {
+        let payload = |projects: Value| {
+            json!({
+                "schema": "context_projects.list.v1",
+                "count": projects.as_array().map_or(0, Vec::len),
+                "projects": projects,
+            })
+        };
+
+        for invalid in [0, 1001] {
+            let error = ProjectRegistry::bounded_project_catalog(payload(json!([])), invalid)
+                .expect_err("invalid catalogue cap");
+            assert_eq!(error.to_string(), "max_entries must be in 1..=1000");
+        }
+
+        let one =
+            ProjectRegistry::bounded_project_catalog(payload(json!([{"project_id": "alpha"}])), 1)
+                .expect("one-row catalogue");
+        assert_eq!(one["total_count"], 1);
+        assert_eq!(one["returned_count"], 1);
+        assert_eq!(one["omitted_count"], 0);
+        assert_eq!(one["truncated"], false);
+
+        let exact = ProjectRegistry::bounded_project_catalog(
+            payload(json!([
+                {"project_id": "alpha"},
+                {"project_id": "beta"}
+            ])),
+            2,
+        )
+        .expect("exact-size catalogue");
+        assert_eq!(exact["count"], 2);
+        assert_eq!(exact["total_count"], 2);
+        assert_eq!(exact["returned_count"], 2);
+        assert_eq!(exact["truncated"], false);
+
+        let truncated = ProjectRegistry::bounded_project_catalog(
+            payload(json!([
+                {"project_id": "alpha"},
+                {"project_id": "beta"}
+            ])),
+            1,
+        )
+        .expect("truncated catalogue");
+        assert_eq!(truncated["count"], 1);
+        assert_eq!(truncated["total_count"], 2);
+        assert_eq!(truncated["returned_count"], 1);
+        assert_eq!(truncated["omitted_count"], 1);
+        assert_eq!(truncated["max_entries"], 1);
+        assert_eq!(truncated["truncated"], true);
+        assert_eq!(truncated["projects"][0]["project_id"], "alpha");
     }
 
     #[test]
@@ -1253,7 +1335,7 @@ mod tests {
             vec![(host_root, workspace)],
         )
         .expect("registry");
-        let projects = registry.projects_payload().expect("project list");
+        let projects = registry.projects_payload(100).expect("project list");
         assert_eq!(projects["count"], 1);
         assert_eq!(projects["projects"][0]["name"], "real-project");
         assert_eq!(projects["projects"][0]["source"], "discovered_git");

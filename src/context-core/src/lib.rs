@@ -5275,6 +5275,9 @@ fn contract_for_tool(tool_name: &str) -> Value {
             "Inspect health, index, cache, contracts, metrics, quality, and generated state.",
             json!([
                 "context_admin.health.v1",
+                "context_projects.list.v1",
+                "context_projects.active.v1",
+                "context_projects.cached.v1",
                 "context_index.refresh.v1",
                 "context_index.status.v1",
                 "context_cache.stats.v1",
@@ -5297,7 +5300,8 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "action": "For monitor_usage: status, enable, disable, or report.",
                 "path": "Repository-relative path or resource URI.", "max_files": "Index file cap.",
                 "prompt": "Optional prompt to warm exact context_pack cache without echoing it.",
-                "max_age_minutes": "Cache prune age.", "max_entries": "Maximum rows.",
+                "max_age_minutes": "Cache prune age.",
+                "max_entries": "Maximum returned rows for projects, active_projects, cached_projects, and state_browser; project catalogue range 1..=1000.",
                 "max_output_chars": "Budget override.", "default_output_profile": "Budget profile.",
                 "tool_name": "Filter to one tool.", "contract_profile": "compact or verbose.",
                 "state_prefix": "Generated state prefix.", "state_key": "Exact generated state key.",
@@ -7106,6 +7110,38 @@ mod tests {
             "context_measurement_matrix.v1"
         );
         assert_eq!(response["matrix"]["checks"][0]["status"], "insufficient");
+    }
+
+    #[test]
+    fn admin_contract_names_catalogue_limit_modes_and_schemas() {
+        let contract = contract_for_tool("context_admin");
+        let max_entries = contract["parameters"]["max_entries"]
+            .as_str()
+            .expect("max_entries contract");
+        for mode in [
+            "projects",
+            "active_projects",
+            "cached_projects",
+            "state_browser",
+        ] {
+            assert!(
+                max_entries.contains(mode),
+                "missing max_entries mode {mode}"
+            );
+        }
+        assert!(max_entries.contains("1..=1000"));
+        assert!(!max_entries.contains("monitor_usage"));
+
+        let schemas = contract["output_schema_names"]
+            .as_array()
+            .expect("admin output schemas");
+        for schema in [
+            "context_projects.list.v1",
+            "context_projects.active.v1",
+            "context_projects.cached.v1",
+        ] {
+            assert!(schemas.iter().any(|candidate| candidate == schema));
+        }
     }
 
     #[tokio::test]
