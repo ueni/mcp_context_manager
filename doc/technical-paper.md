@@ -85,6 +85,13 @@ bytes. The tuple opcode is `0..2` for reference/balanced/source evidence and
 Stable diagnostics and accounting are queried through `context_admin` rather
 than repeated in every response.
 
+`context_admin(mode="contracts")` accepts the exact lowercase
+`contract_profile` values `compact` and `verbose`. Omitting the field
+deterministically selects `compact`; values are not trimmed or case-normalized,
+and unsupported values are rejected before contract generation. The MCP input
+schema exposes the two accepted values as an enum, and the response's top-level
+`profile` always names the accepted profile used to produce it.
+
 `context_admin(mode="warmup")` performs one normal freshness refresh and
 optionally admits the supplied prompt through the shared L0 path without
 recording a user `context_pack` operation. It does not issue generic retrieval

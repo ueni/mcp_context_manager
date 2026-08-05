@@ -189,13 +189,30 @@ pub struct ContextAdminRequest {
     #[serde(default)]
     pub tool_name: String,
     #[serde(default)]
-    pub contract_profile: String,
+    pub contract_profile: ContractProfile,
     #[serde(default)]
     pub state_prefix: String,
     #[serde(default)]
     pub state_key: String,
     pub project_id: Option<String>,
     pub root_uri: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractProfile {
+    #[default]
+    Compact,
+    Verbose,
+}
+
+impl ContractProfile {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Verbose => "verbose",
+        }
+    }
 }
 
 impl ContextPackRequest {
@@ -4549,11 +4566,7 @@ async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -
         }
         "contracts" => Ok(contracts_payload(
             &request.tool_name,
-            if request.contract_profile.is_empty() {
-                "compact"
-            } else {
-                &request.contract_profile
-            },
+            request.contract_profile,
         )),
         "metrics" => metrics_snapshot(engine),
         "measurement_matrix" => measurement_matrix(engine, &now),
@@ -5111,7 +5124,7 @@ fn benchmark_admin(engine: &ProjectEngine, generated_at: &str) -> Result<Value> 
         "runs": runs,
         "elapsed_ms": started_all.elapsed().as_secs_f64() * 1000.0,
         "measurement_matrix": measurement_matrix(engine, generated_at)?,
-        "compact_contract_sample": contracts_payload("", "compact"),
+        "compact_contract_sample": contracts_payload("", ContractProfile::Compact),
     }))
 }
 
@@ -5174,7 +5187,7 @@ fn state_browser(
     }))
 }
 
-fn contracts_payload(tool_name: &str, profile: &str) -> Value {
+fn contracts_payload(tool_name: &str, profile: ContractProfile) -> Value {
     let names = [
         "context_pack",
         "context_lookup",
@@ -5189,9 +5202,9 @@ fn contracts_payload(tool_name: &str, profile: &str) -> Value {
         .collect::<serde_json::Map<_, _>>();
     let encoded = serde_json::to_vec(&contracts).unwrap_or_default();
     json!({
-        "schema": if profile == "compact" {"tool_output_contracts.compact.v1"} else {"tool_output_contracts.v1"},
+        "schema": if profile == ContractProfile::Compact {"tool_output_contracts.compact.v1"} else {"tool_output_contracts.v1"},
         "contract_version": 2,
-        "profile": profile,
+        "profile": profile.as_str(),
         "stability": "stable",
         "contracts": contracts,
         "metrics": {
@@ -7106,6 +7119,54 @@ mod tests {
             "context_measurement_matrix.v1"
         );
         assert_eq!(response["matrix"]["checks"][0]["status"], "insufficient");
+    }
+
+    #[tokio::test]
+    async fn contract_profiles_are_strict_and_default_to_compact() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(root.path().join("README.md"), "# Fixture\n").expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+
+        for (request, expected_profile, expected_schema) in [
+            (
+                json!({"mode": "contracts"}),
+                "compact",
+                "tool_output_contracts.compact.v1",
+            ),
+            (
+                json!({"mode": "contracts", "contract_profile": "compact"}),
+                "compact",
+                "tool_output_contracts.compact.v1",
+            ),
+            (
+                json!({"mode": "contracts", "contract_profile": "verbose"}),
+                "verbose",
+                "tool_output_contracts.v1",
+            ),
+        ] {
+            let request: ContextAdminRequest =
+                serde_json::from_value(request).expect("supported contract profile");
+            let response: Value = serde_json::from_slice(
+                &engine
+                    .context_admin(&request)
+                    .await
+                    .expect("contracts response"),
+            )
+            .expect("contracts JSON");
+            assert_eq!(response["profile"], expected_profile);
+            assert_eq!(response["schema"], expected_schema);
+        }
+
+        for unsupported in ["nope", "Compact", " compact", "compact "] {
+            let error = serde_json::from_value::<ContextAdminRequest>(json!({
+                "mode": "contracts",
+                "contract_profile": unsupported,
+            }))
+            .expect_err("unsupported contract profile must be rejected");
+            let message = error.to_string();
+            assert!(message.contains("compact"));
+            assert!(message.contains("verbose"));
+        }
     }
 
     #[tokio::test]
