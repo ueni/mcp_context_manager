@@ -1547,6 +1547,43 @@ mod tests {
     }
 
     #[test]
+    fn context_admin_tool_schema_enumerates_contract_profiles() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("marker");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let server = ContextServer::new(registry);
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "context_admin")
+            .expect("context_admin tool");
+        let schema = Value::Object(tool.input_schema.as_ref().clone());
+
+        assert_eq!(
+            schema.pointer("/$defs/ContractProfile/enum"),
+            Some(&json!(["compact", "verbose"]))
+        );
+        assert_eq!(
+            schema.pointer("/properties/contract_profile/$ref"),
+            Some(&json!("#/$defs/ContractProfile"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/contract_profile/default"),
+            Some(&json!("compact"))
+        );
+    }
+
+    #[test]
     fn every_advertised_resource_is_readable() {
         let root = tempfile::tempdir().expect("repository root");
         let state = tempfile::tempdir().expect("state root");
