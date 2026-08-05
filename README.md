@@ -110,6 +110,16 @@ paths, root URIs, error values, credentials, and agent identifiers are never
 stored. Monitoring is disabled by default; the disabled request path is an
 atomic flag check and does not change context-pack behavior.
 
+`action="report"` returns `context_monitor_usage.report.v4`. `max_entries`
+defaults to 20 and bounds `buckets`, `rejection_buckets`, and every returned
+bucket's `client_profiles` rows. `max_output_chars` defaults to 12,000 and
+bounds the serialized inline report with a maximum 2,048-character allowance
+for truncation counts and retrieval metadata. The `truncation` object always
+states the effective limits, returned and omitted row counts, and reasons. If
+any rows are omitted, `truncation.retrieval.reference` identifies a complete
+v3 report retained in generated state for 24 hours; pass that object to
+`result_reference_resolve`. Source repositories remain read-only.
+
 Raw L0 hit rate uses all L0 hits and misses. Exact effectiveness uses only
 requests whose semantic L0 identity was observed earlier in the same project;
 frontier effectiveness uses L0 misses with an earlier canonical term/scope
