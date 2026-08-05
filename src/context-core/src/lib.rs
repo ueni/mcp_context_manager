@@ -110,8 +110,10 @@ pub struct ContextLookupRequest {
     pub query: String,
     #[serde(default = "default_lookup_path")]
     pub path: String,
+    /// Inclusive first line. Values below one normalize to line one; starts past EOF are rejected.
     #[serde(default = "default_start_line")]
     pub start_line: u32,
+    /// Inclusive last line. Values before the start normalize to it; partial ranges clamp to EOF.
     pub end_line: Option<u32>,
     #[serde(default = "default_max_results")]
     pub max_results: u16,
@@ -5245,7 +5247,8 @@ fn contract_for_tool(tool_name: &str) -> Value {
             json!({
                 "mode": "search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, explain_cache.",
                 "query": "Search or symbol terms.", "path": "Repository-relative path.",
-                "start_line": "Snippet start line.", "end_line": "Snippet end line.",
+                "start_line": "Inclusive first line; values below 1 normalize to 1, while starts past EOF and empty files are rejected.",
+                "end_line": "Inclusive last line; values before start normalize to start, and partial ranges clamp to EOF.",
                 "max_results": "Maximum result rows.", "max_entries": "Maximum tree rows.",
                 "max_depth": "Tree depth.", "include_globs": "Result glob filters.",
                 "project_id": "Project selector.", "root_uri": "Repository file URI."
@@ -6930,6 +6933,70 @@ mod tests {
         assert!(filtered["results"].as_array().is_some_and(|rows| {
             !rows.is_empty() && rows.iter().all(|row| row["path"] == "tests/test_auth.py")
         }));
+    }
+
+    #[test]
+    fn chunk_lookup_returns_consistent_valid_intervals_or_rejects_the_request() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(root.path().join("lines.txt"), "one\ntwo\nthree\n").expect("line fixture");
+        std::fs::write(root.path().join("empty.txt"), "").expect("empty fixture");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let lookup = |request: Value| -> Result<Value> {
+            let request: ContextLookupRequest =
+                serde_json::from_value(request).expect("lookup request");
+            Ok(serde_json::from_slice(&engine.context_lookup(&request)?)?)
+        };
+        let assert_interval = |response: &Value, start: u64, end: u64| {
+            assert_eq!(response["chunk"]["start_line"], start);
+            assert_eq!(response["chunk"]["end_line"], end);
+            assert_eq!(response["detail_lookup"]["start_line"], start);
+            assert_eq!(response["detail_lookup"]["end_line"], end);
+            assert!(start >= 1 && start <= end && end <= 3);
+        };
+
+        let final_line = lookup(json!({
+            "mode": "chunk", "path": "lines.txt", "start_line": 3, "end_line": 3
+        }))
+        .expect("final-line chunk");
+        assert_interval(&final_line, 3, 3);
+        assert_eq!(final_line["content"], "three");
+
+        let partial = lookup(json!({
+            "mode": "chunk", "path": "lines.txt", "start_line": 2, "end_line": 100
+        }))
+        .expect("partially overlapping chunk");
+        assert_interval(&partial, 2, 3);
+        assert_eq!(partial["content"], "two\nthree");
+
+        let beyond_eof = lookup(json!({
+            "mode": "chunk",
+            "path": "lines.txt",
+            "start_line": 99_999,
+            "end_line": 100_000
+        }))
+        .expect_err("reject audited out-of-range coordinates");
+        assert!(beyond_eof.to_string().contains("exceeds file line count 3"));
+
+        let empty = lookup(json!({
+            "mode": "chunk", "path": "empty.txt", "start_line": 1, "end_line": 1
+        }))
+        .expect_err("reject empty-file coordinates");
+        assert!(empty.to_string().contains("empty file"));
+    }
+
+    #[test]
+    fn context_lookup_contract_documents_line_range_policy() {
+        let contract = contract_for_tool("context_lookup");
+        assert!(
+            contract["parameters"]["start_line"]
+                .as_str()
+                .is_some_and(|value| value.contains("starts past EOF"))
+        );
+        assert!(
+            contract["parameters"]["end_line"]
+                .as_str()
+                .is_some_and(|value| value.contains("partial ranges clamp to EOF"))
+        );
     }
 
     #[test]
