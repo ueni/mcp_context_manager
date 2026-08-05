@@ -113,7 +113,7 @@ pub struct ContextLookupRequest {
     /// Inclusive first line. Values below one normalize to line one; starts past EOF are rejected.
     #[serde(default = "default_start_line")]
     pub start_line: u32,
-    /// Inclusive last line. Values before the start normalize to it; partial ranges clamp to EOF.
+    /// Inclusive last line. Snippets reject values before the start; partial ranges clamp to EOF.
     pub end_line: Option<u32>,
     #[serde(default = "default_max_results")]
     pub max_results: u16,
@@ -4119,6 +4119,15 @@ impl ProjectEngine {
     }
 
     fn lookup_snippet(&self, request: &ContextLookupRequest) -> Result<Value> {
+        if let Some(end_line) = request
+            .end_line
+            .filter(|end_line| request.start_line > *end_line)
+        {
+            bail!(
+                "invalid snippet line range: end_line ({end_line}) must be greater than or equal to start_line ({})",
+                request.start_line
+            );
+        }
         let index = self.index();
         let chunk = index.snippet(&request.path, request.start_line, request.end_line)?;
         let (content, redactions, prompt_injection_signals) = sanitize_text(&chunk.content);
@@ -5495,7 +5504,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "mode": "search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, explain_cache.",
                 "query": "Search or symbol terms.", "path": "Repository-relative path.",
                 "start_line": "Inclusive first line; values below 1 normalize to 1, while starts past EOF and empty files are rejected.",
-                "end_line": "Inclusive last line; values before start normalize to start, and partial ranges clamp to EOF.",
+                "end_line": "Inclusive last line; snippet values before start are rejected, chunk values before start normalize to start, and partial ranges clamp to EOF.",
                 "max_results": "Maximum result rows.", "max_entries": "Maximum tree rows.",
                 "max_depth": "Tree depth.", "include_globs": "Result glob filters.",
                 "project_id": "Project selector.", "root_uri": "Repository file URI."
@@ -7240,6 +7249,61 @@ mod tests {
     }
 
     #[test]
+    fn snippet_lookup_rejects_reversed_ranges_and_preserves_valid_intervals() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(root.path().join("lines.txt"), "one\ntwo\nthree\n").expect("line fixture");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let lookup = |request: Value| -> Result<Value> {
+            let request: ContextLookupRequest =
+                serde_json::from_value(request).expect("lookup request");
+            Ok(serde_json::from_slice(&engine.context_lookup(&request)?)?)
+        };
+
+        let reversed = lookup(json!({
+            "mode": "snippet", "path": "lines.txt", "start_line": 3, "end_line": 2
+        }))
+        .expect_err("reject reversed snippet range");
+        assert_eq!(
+            reversed.to_string(),
+            "invalid snippet line range: end_line (2) must be greater than or equal to start_line (3)"
+        );
+
+        let equal = lookup(json!({
+            "mode": "snippet", "path": "lines.txt", "start_line": 2, "end_line": 2
+        }))
+        .expect("select one line");
+        assert_eq!(
+            (equal["start_line"].as_u64(), equal["end_line"].as_u64()),
+            (Some(2), Some(2))
+        );
+        assert_eq!(equal["content"], "two");
+
+        let ascending = lookup(json!({
+            "mode": "snippet", "path": "lines.txt", "start_line": 1, "end_line": 2
+        }))
+        .expect("select ascending range");
+        assert_eq!(
+            (
+                ascending["start_line"].as_u64(),
+                ascending["end_line"].as_u64()
+            ),
+            (Some(1), Some(2))
+        );
+        assert_eq!(ascending["content"], "one\ntwo");
+
+        let partial = lookup(json!({
+            "mode": "snippet", "path": "lines.txt", "start_line": 2, "end_line": 100
+        }))
+        .expect("clamp partially overlapping range to EOF");
+        assert_eq!(
+            (partial["start_line"].as_u64(), partial["end_line"].as_u64()),
+            (Some(2), Some(3))
+        );
+        assert_eq!(partial["requested"]["end_line"], 100);
+        assert_eq!(partial["content"], "two\nthree");
+    }
+
+    #[test]
     fn context_lookup_contract_documents_line_range_policy() {
         let contract = contract_for_tool("context_lookup");
         assert!(
@@ -7250,7 +7314,10 @@ mod tests {
         assert!(
             contract["parameters"]["end_line"]
                 .as_str()
-                .is_some_and(|value| value.contains("partial ranges clamp to EOF"))
+                .is_some_and(
+                    |value| value.contains("snippet values before start are rejected")
+                        && value.contains("partial ranges clamp to EOF")
+                )
         );
     }
 
