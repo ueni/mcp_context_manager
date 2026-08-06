@@ -389,7 +389,11 @@ Cold engine construction, freshness scans, Tantivy builds, cache/state access,
 and pack construction run behind the global blocking-job cap rather than on a
 Tokio async worker. Requests that expire while queued never start. Running
 requests receive cooperative cancellation between files and chunks and before
-an index commit or generation swap. REST reports queue/deadline exhaustion as
+an index commit or generation swap. Governed-lineage Git commands have a fixed
+five-second execution cap, bounded output, and are killed when request
+cancellation wins. A response never waits again after cancellation grace;
+cancellation remains latched so work returning late cannot commit cache,
+frontier, manifest, or index state. REST reports queue/deadline exhaustion as
 HTTP 503; MCP returns the stable retryable `context_pack busy` or
 `context_pack timed out` diagnostic with warmup/retry guidance.
 
@@ -404,7 +408,7 @@ Increasing a client timeout can be a bounded fallback, but it does not replace
 the server concurrency cap or cancellation budget. Generated agent/build/cache
 trees such as `.workingdir/`, `.worktrees/`, `.openclaw/`, `target/`, and
 `node_modules/` are excluded consistently from discovery, watching,
-signatures, indexing, and governed Git lineage checks.
+signatures, indexing, and governed Git lineage checks at any directory depth.
 
 ## Native architecture
 

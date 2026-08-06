@@ -470,17 +470,23 @@ boundary, so same-project cold callers share one build.
 A request dropped while queued drops its semaphore future and never starts.
 After a running request expires, its cancellation control is checked between
 files and chunks and before Tantivy commit or index-generation publication.
-Permits and active/queued counters use drop guards. Queue exhaustion and
-deadline expiry return stable retryable diagnostics before the usual 60-second
-MCP client budget. Phase measurements remain bounded and content-free: the
-existing request ledger records cache outcome, refresh checks/updates,
-retrieval, pack-build and total latency. Public runtime measurements add queue
-wait, engine load, queue/active/singleflight depth, cancellations, timeouts,
-deadline remaining, and post-timeout work; freshness measurements add signature
-scan, full/incremental refresh, index-state I/O, cache/state I/O, retrieval, and
-serialization totals. They contain neither prompts, contents, secrets, nor raw
-local paths. Blocking-job tests assert queue, waiter, permit, and active counts
-return to baseline.
+Governed-lineage Git execution is additionally limited to five seconds and 4
+MiB of output; cancellation kills the child and bounded reaping never extends
+the request indefinitely. The async request path drops the blocking join after
+cancellation grace instead of awaiting it again. The cancellation flag remains
+latched, so a closure returning from an uncooperative operating-system or
+library call after the response cannot publish cache, frontier, manifest, or
+index state. Permits and active/queued counters use drop guards. Queue
+exhaustion and deadline expiry return stable retryable diagnostics before the
+usual 60-second MCP client budget. Phase measurements remain bounded and
+content-free: the existing request ledger records cache outcome, refresh
+checks/updates, retrieval, pack-build and total latency. Public runtime
+measurements add queue wait, engine load, queue/active/singleflight depth,
+cancellations, timeouts, deadline remaining, and post-timeout work; freshness
+measurements add signature scan, full/incremental refresh, index-state I/O,
+cache/state I/O, retrieval, and serialization totals. They contain neither
+prompts, contents, secrets, nor raw local paths. Blocking-job tests assert
+queue, waiter, permit, and active counts return to baseline.
 
 The watcher maintains a coalesced 1,024-path journal. A refresh computes the
 authoritative source signature, applies changed/deleted/renamed/untracked file

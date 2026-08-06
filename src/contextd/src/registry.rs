@@ -535,7 +535,7 @@ impl ProjectRegistry {
                         ))
                     }
                     Err(_) => {
-                        let _ = job.await;
+                        job.abort();
                         Err(anyhow!(
                             "context_pack cancellation grace expired; retry after warmup"
                         ))
@@ -645,13 +645,9 @@ impl ProjectRegistry {
 
     #[cfg(test)]
     pub(crate) fn blocking_snapshot(&self) -> (usize, usize, usize, usize, usize) {
-        let active = self.blocking.active.load(Ordering::Acquire);
         (
-            self.blocking
-                .permits
-                .available_permits()
-                .saturating_add(active),
-            active,
+            self.blocking.permits.available_permits(),
+            self.blocking.active.load(Ordering::Acquire),
             self.blocking.queued.load(Ordering::Acquire),
             self.blocking.cancellations.load(Ordering::Relaxed),
             self.blocking.timeouts.load(Ordering::Relaxed),

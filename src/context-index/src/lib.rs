@@ -102,10 +102,15 @@ pub fn is_ignored_repository_path(path: &Path) -> bool {
 
 /// Git pathspec exclusions corresponding to the shared ignore policy.
 pub fn git_exclude_pathspecs() -> Vec<String> {
-    IGNORED_DIRECTORIES
+    let mut pathspecs = IGNORED_DIRECTORIES
         .iter()
-        .map(|directory| format!(":(exclude){directory}/**"))
-        .collect()
+        .map(|directory| format!(":(exclude,glob)**/{directory}/**"))
+        .collect::<Vec<_>>();
+    for component in ["*~", ".#*"] {
+        pathspecs.push(format!(":(exclude,glob)**/{component}"));
+        pathspecs.push(format!(":(exclude,glob)**/{component}/**"));
+    }
+    pathspecs
 }
 
 const STOP_WORDS: &[&str] = &[
@@ -1840,7 +1845,7 @@ mod tests {
         assert!(
             git_exclude_pathspecs()
                 .iter()
-                .any(|path| path == ":(exclude).workingdir/**")
+                .any(|path| path == ":(exclude,glob)**/.workingdir/**")
         );
     }
 

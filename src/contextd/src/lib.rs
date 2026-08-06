@@ -1536,7 +1536,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_queue_waiter_never_starts_or_owns_singleflight() {
         let (_root, _state, registry) =
-            bounded_fixture_registry(10, Duration::from_secs(2), Duration::from_millis(100), 1);
+            bounded_fixture_registry(10, Duration::from_secs(10), Duration::from_millis(100), 1);
         let permit = registry.hold_blocking_permit().await;
         let waiting_registry = Arc::clone(&registry);
         let waiter = tokio::spawn(async move {
@@ -1806,7 +1806,100 @@ mod tests {
             .expect_err("running job must cancel")
             .to_string();
         assert!(error.starts_with("context_pack timed out"));
+        assert_eq!(registry.blocking_snapshot().0, 1);
         assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+        assert_eq!(engine.index().stats().refresh_signature, generation);
+        assert_eq!(
+            engine.store().iter_json("pack:").expect("pack rows").len(),
+            pack_rows
+        );
+        assert_eq!(
+            engine
+                .store()
+                .iter_json("frontier:")
+                .expect("frontier rows")
+                .len(),
+            frontier_rows
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_grace_expiry_returns_bounded_and_cannot_commit_later() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_root, _state, registry) =
+            bounded_fixture_registry(5, Duration::from_millis(120), Duration::from_millis(40), 1);
+        let engine = registry.default_engine().expect("prebuilt engine");
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        registry.set_blocking_hook(Arc::new(move |_| {
+            hook_entered.store(true, Ordering::Release);
+            let safety_deadline = Instant::now() + Duration::from_secs(2);
+            while !hook_release.load(Ordering::Acquire) && Instant::now() < safety_deadline {
+                std::thread::yield_now();
+            }
+            Ok(())
+        }));
+        let pack_registry = Arc::clone(&registry);
+        let pack = tokio::spawn(async move {
+            pack_registry
+                .context_pack_bounded(bounded_request("non-cooperative phase"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking hook entered");
+        let cancellation_started = Instant::now();
+        let generation = engine.index().stats().refresh_signature.clone();
+        let pack_rows = engine.store().iter_json("pack:").expect("pack rows").len();
+        let frontier_rows = engine
+            .store()
+            .iter_json("frontier:")
+            .expect("frontier rows")
+            .len();
+
+        let error = pack
+            .await
+            .expect("pack task")
+            .expect_err("grace expiry must fail")
+            .to_string();
+        assert!(error.starts_with("context_pack cancellation grace expired"));
+        assert!(cancellation_started.elapsed() < Duration::from_millis(300));
+        assert_eq!(registry.blocking_snapshot().0, 0);
+        assert_eq!(registry.blocking_snapshot().1, 1);
+        assert_eq!(
+            engine.store().iter_json("pack:").expect("pack rows").len(),
+            pack_rows
+        );
+        assert_eq!(
+            engine
+                .store()
+                .iter_json("frontier:")
+                .expect("frontier rows")
+                .len(),
+            frontier_rows
+        );
+
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let (permits, active, queued, _, _) = registry.blocking_snapshot();
+                if permits == 1 && active == 0 && queued == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached job returns to baseline");
+        assert_eq!(registry.blocking_snapshot().0, 1);
         assert_eq!(registry.blocking_snapshot().2, 0);
         assert_eq!(engine.index().stats().refresh_signature, generation);
         assert_eq!(

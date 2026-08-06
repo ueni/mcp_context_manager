@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -4778,15 +4778,74 @@ fn opaque_scope_signature(scope: &[String]) -> Result<String> {
     ))
 }
 
+const GIT_COMMAND_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const GIT_COMMAND_REAP_GRACE: StdDuration = StdDuration::from_millis(250);
+const GIT_OUTPUT_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
+
+fn terminate_child_bounded(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let deadline = Instant::now() + GIT_COMMAND_REAP_GRACE;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(StdDuration::from_millis(5)),
+        }
+    }
+}
+
+fn command_output_bounded(
+    command: &mut Command,
+    timeout: StdDuration,
+) -> Option<std::process::Output> {
+    use std::io::{Read, Seek};
+
+    let mut stdout = tempfile::tempfile().ok()?;
+    command
+        .stdout(Stdio::from(stdout.try_clone().ok()?))
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(_) => {
+                terminate_child_bounded(&mut child);
+                return None;
+            }
+        }
+        if current_work_checkpoint().is_err() || Instant::now() >= deadline {
+            terminate_child_bounded(&mut child);
+            return None;
+        }
+        thread::sleep(StdDuration::from_millis(5));
+    };
+    stdout.rewind().ok()?;
+    let mut bytes = Vec::new();
+    stdout
+        .take(GIT_OUTPUT_LIMIT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if u64::try_from(bytes.len()).ok()? > GIT_OUTPUT_LIMIT_BYTES {
+        return None;
+    }
+    Some(std::process::Output {
+        status,
+        stdout: bytes,
+        stderr: Vec::new(),
+    })
+}
+
 fn git_output(root: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    Command::new("git")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
+    command_output_bounded(
+        Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .arg("-C")
+            .arg(root)
+            .args(args),
+        GIT_COMMAND_TIMEOUT,
+    )
+    .filter(|output| output.status.success())
 }
 
 fn git_worktree_proof(
@@ -9934,7 +9993,7 @@ mod tests {
         let fixture = tempdir().expect("fixture root");
         let repository = fixture.path().join("repository");
         init_git_repository(&repository);
-        let generated = repository.join(".workingdir/issue-29/target");
+        let generated = repository.join("nested/.workingdir/issue-29/target");
         std::fs::create_dir_all(&generated).expect("generated tree");
         let churn = generated.join("churn.rs");
         std::fs::write(&churn, "fn churn_initial() {}\n").expect("initial generated file");
@@ -9979,6 +10038,17 @@ mod tests {
             engine.metrics.lineage_git_checks.load(Ordering::Relaxed),
             git_checks
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn governed_git_process_obeys_the_work_deadline() {
+        let control = WorkControl::new(Instant::now() + StdDuration::from_millis(30));
+        let _scope = WorkControlScope::install(Some(&control));
+        let started = Instant::now();
+        let output = command_output_bounded(Command::new("sleep").arg("30"), GIT_COMMAND_TIMEOUT);
+        assert!(output.is_none());
+        assert!(started.elapsed() < StdDuration::from_secs(1));
     }
 
     #[test]
