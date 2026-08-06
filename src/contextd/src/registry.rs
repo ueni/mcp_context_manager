@@ -535,7 +535,11 @@ impl ProjectRegistry {
                         ))
                     }
                     Err(_) => {
-                        job.abort();
+                        // A running `spawn_blocking` closure cannot be aborted. Keep the
+                        // request attached until its drop guards release the global permit
+                        // and active-job counter; returning here would abandon capacity and
+                        // could starve every queued request.
+                        let _ = (&mut job).await;
                         Err(anyhow!(
                             "context_pack cancellation grace expired; retry after warmup"
                         ))

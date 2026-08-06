@@ -447,6 +447,12 @@ errors conservatively dirty the project. Explicit `changed_files` and
 `cache_strategy="fresh"` still force full signature verification and cannot
 return a response certified against an older generation.
 
+Thread-spawn failure, failure of both native and polling watcher setup,
+runtime watcher errors, and event-channel disconnection persistently latch the
+project into fail-closed full verification for ordinary requests. A failed
+verification returns the stable retryable `context_pack freshness unavailable`
+diagnostic instead of serving stale ordinary cache entries.
+
 One shared generated-tree policy is consumed by project discovery, watcher
 filtering, signature traversal, index traversal, and governed Git pathspecs.
 This prevents churn under `.workingdir/` and equivalent agent/build/cache trees
@@ -472,11 +478,14 @@ After a running request expires, its cancellation control is checked between
 files and chunks and before Tantivy commit or index-generation publication.
 Governed-lineage Git execution is additionally limited to five seconds and 4
 MiB of output; cancellation kills the child and bounded reaping never extends
-the request indefinitely. The async request path drops the blocking join after
-cancellation grace instead of awaiting it again. The cancellation flag remains
-latched, so a closure returning from an uncooperative operating-system or
-library call after the response cannot publish cache, frontier, manifest, or
-index state. Permits and active/queued counters use drop guards. Queue
+the request indefinitely. Cooperative repository phases terminate within
+cancellation grace. If an unexpected operating-system or library phase
+outlives that grace, the async request remains attached to the blocking join
+until its permit and active-job drop guards have run; aborting a live
+`spawn_blocking` closure cannot stop it and would abandon executor capacity.
+The cancellation flag remains latched, so the closure cannot publish cache,
+frontier, manifest, or index state. Permits and active/queued counters use drop
+guards. Queue
 exhaustion and deadline expiry return stable retryable diagnostics before the
 usual 60-second MCP client budget. Phase measurements remain bounded and
 content-free: the existing request ledger records cache outcome, refresh

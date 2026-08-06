@@ -846,17 +846,19 @@ async fn context_pack_http_response(
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(bytes))
             .expect("valid REST response"),
-        Err(error) => {
-            let status = if error.starts_with("context_pack busy")
-                || error.starts_with("context_pack timed out")
-                || error.starts_with("context_pack cancellation grace")
-            {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            rest_error(status, &error)
-        }
+        Err(error) => rest_error(context_pack_http_error_status(&error), &error),
+    }
+}
+
+fn context_pack_http_error_status(error: &str) -> StatusCode {
+    if error.starts_with("context_pack busy")
+        || error.starts_with("context_pack timed out")
+        || error.starts_with("context_pack cancellation grace")
+        || error.starts_with("context_pack freshness unavailable")
+    {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
     }
 }
 
@@ -1305,6 +1307,16 @@ fn project_id_from_resource(uri: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freshness_unavailable_is_a_retryable_http_error() {
+        assert_eq!(
+            context_pack_http_error_status(
+                "context_pack freshness unavailable; retry after repository stabilization or warmup"
+            ),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 
     #[tokio::test]
     async fn context_pack_prompt_validation_has_mcp_rest_parity() {
@@ -1825,7 +1837,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cancellation_grace_expiry_returns_bounded_and_cannot_commit_later() {
+    async fn cancellation_grace_expiry_waits_for_permit_and_counter_teardown() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let (_root, _state, registry) =
@@ -1865,13 +1877,11 @@ mod tests {
             .expect("frontier rows")
             .len();
 
-        let error = pack
-            .await
-            .expect("pack task")
-            .expect_err("grace expiry must fail")
-            .to_string();
-        assert!(error.starts_with("context_pack cancellation grace expired"));
-        assert!(cancellation_started.elapsed() < Duration::from_millis(300));
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert!(
+            !pack.is_finished(),
+            "request returned while the live blocking job still owned capacity"
+        );
         assert_eq!(registry.blocking_snapshot().0, 0);
         assert_eq!(registry.blocking_snapshot().1, 1);
         assert_eq!(
@@ -1888,18 +1898,16 @@ mod tests {
         );
 
         release.store(true, Ordering::Release);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let (permits, active, queued, _, _) = registry.blocking_snapshot();
-                if permits == 1 && active == 0 && queued == 0 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("detached job returns to baseline");
+        let error = tokio::time::timeout(Duration::from_secs(1), pack)
+            .await
+            .expect("attached job returns after release")
+            .expect("pack task")
+            .expect_err("grace expiry must fail")
+            .to_string();
+        assert!(error.starts_with("context_pack cancellation grace expired"));
+        assert!(cancellation_started.elapsed() < Duration::from_secs(1));
         assert_eq!(registry.blocking_snapshot().0, 1);
+        assert_eq!(registry.blocking_snapshot().1, 0);
         assert_eq!(registry.blocking_snapshot().2, 0);
         assert_eq!(engine.index().stats().refresh_signature, generation);
         assert_eq!(

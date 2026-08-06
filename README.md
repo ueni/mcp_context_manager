@@ -391,11 +391,14 @@ Tokio async worker. Requests that expire while queued never start. Running
 requests receive cooperative cancellation between files and chunks and before
 an index commit or generation swap. Governed-lineage Git commands have a fixed
 five-second execution cap, bounded output, and are killed when request
-cancellation wins. A response never waits again after cancellation grace;
-cancellation remains latched so work returning late cannot commit cache,
-frontier, manifest, or index state. REST reports queue/deadline exhaustion as
-HTTP 503; MCP returns the stable retryable `context_pack busy` or
-`context_pack timed out` diagnostic with warmup/retry guidance.
+cancellation wins. Cooperative phases stop within cancellation grace. If a
+blocking phase unexpectedly outlives that grace, the response stays attached
+until the job releases its global permit and active-job counter; Tokio cannot
+abort a live `spawn_blocking` closure safely. Cancellation remains latched so
+the job cannot commit cache, frontier, manifest, or index state. REST reports
+queue/deadline or fail-closed freshness exhaustion as HTTP 503; MCP returns a
+stable retryable `context_pack busy`, `context_pack timed out`, or
+`context_pack freshness unavailable` diagnostic with warmup/retry guidance.
 
 Use `context_admin(mode="warmup")` before a latency-sensitive normal request.
 The server also schedules the default project only after stdio/HTTP transport
@@ -448,6 +451,12 @@ changes, ambiguous events, mutation during refresh, and corrupt/incomplete
 persisted state fail closed to a clean full rebuild. Readers obtain one
 immutable index handle and therefore observe only the old or new complete
 generation.
+
+Watcher thread startup, native and polling backend setup, runtime errors, and
+channel disconnection latch fail-closed freshness. Ordinary requests then run
+authoritative full verification instead of serving a generation whose source
+events may have been missed; explicit `cache_strategy="fresh"` verification
+remains available.
 
 Cross-worktree reuse is disabled by default. A deployment may opt in with an
 operator-owned manifest such as:

@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
@@ -1089,6 +1089,41 @@ struct FreshnessState {
     generation: AtomicU64,
     changed_paths: Mutex<BTreeSet<String>>,
     journal_overflow: AtomicBool,
+    watcher_status: AtomicU8,
+}
+
+const WATCHER_STARTING: u8 = 0;
+const WATCHER_HEALTHY: u8 = 1;
+const WATCHER_FAILED: u8 = 2;
+
+impl FreshnessState {
+    fn watcher_requires_verification(&self) -> bool {
+        self.watcher_status.load(Ordering::Acquire) != WATCHER_HEALTHY
+    }
+
+    fn watcher_failed(&self) -> bool {
+        self.watcher_status.load(Ordering::Acquire) == WATCHER_FAILED
+    }
+}
+
+fn mark_watcher_failed(freshness: &FreshnessState) {
+    freshness
+        .watcher_status
+        .store(WATCHER_FAILED, Ordering::Release);
+    freshness.journal_overflow.store(true, Ordering::Release);
+    freshness
+        .last_event_ms
+        .store(now_millis(), Ordering::Release);
+    freshness.dirty.store(true, Ordering::Release);
+}
+
+fn mark_watcher_healthy(freshness: &FreshnessState) {
+    let _ = freshness.watcher_status.compare_exchange(
+        WATCHER_STARTING,
+        WATCHER_HEALTHY,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 }
 
 struct WatchGuard {
@@ -2434,13 +2469,27 @@ impl WatchGuard {
     fn start(root: std::path::PathBuf, freshness: Arc<FreshnessState>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let spawn_freshness = Arc::clone(&freshness);
         let handle = thread::Builder::new()
             .name("context-index-watch".to_owned())
-            .spawn(move || watch_repository(root, freshness, thread_stop))
-            .ok();
-        Self {
-            stop,
-            thread: handle,
+            .spawn(move || watch_repository(root, spawn_freshness, thread_stop));
+        Self::from_spawn_result(stop, freshness, handle)
+    }
+
+    fn from_spawn_result(
+        stop: Arc<AtomicBool>,
+        freshness: Arc<FreshnessState>,
+        handle: std::io::Result<thread::JoinHandle<()>>,
+    ) -> Self {
+        match handle {
+            Ok(handle) => Self {
+                stop,
+                thread: Some(handle),
+            },
+            Err(_) => {
+                mark_watcher_failed(&freshness);
+                Self { stop, thread: None }
+            }
         }
     }
 }
@@ -2593,6 +2642,7 @@ impl ProjectEngine {
         }
         let freshness = Arc::new(FreshnessState {
             last_poll_ms: AtomicU64::new(now_millis()),
+            watcher_status: AtomicU8::new(WATCHER_STARTING),
             ..FreshnessState::default()
         });
         let frontiers = load_frontiers(&store, &index.stats().refresh_signature)?;
@@ -3981,7 +4031,20 @@ impl ProjectEngine {
     ) -> Result<(bool, bool)> {
         let force =
             request.cache_strategy == CacheStrategy::Fresh || !request.changed_files.is_empty();
-        self.refresh_index_with_paths(force, &request.changed_files, control)
+        let watcher_requires_verification = self.freshness.watcher_requires_verification();
+        let result = self.refresh_index_with_paths(force, &request.changed_files, control);
+        match result {
+            Err(error)
+                if (watcher_requires_verification
+                    || self.freshness.watcher_requires_verification())
+                    && error.to_string() != "repository work cancelled before commit" =>
+            {
+                bail!(
+                    "context_pack freshness unavailable; retry after repository stabilization or warmup"
+                );
+            }
+            result => result,
+        }
     }
 
     fn refresh_index(&self, force: bool) -> Result<(bool, bool)> {
@@ -4006,10 +4069,11 @@ impl ProjectEngine {
             control.check()?;
         }
         let now = now_millis();
+        let watcher_requires_verification = self.freshness.watcher_requires_verification();
         let watcher_ready = self.freshness.dirty.load(Ordering::Acquire)
             && now.saturating_sub(self.freshness.last_event_ms.load(Ordering::Acquire))
                 >= WATCH_COALESCE_MS;
-        if !force && !watcher_ready {
+        if !force && !watcher_requires_verification && !watcher_ready {
             return Ok((false, false));
         }
 
@@ -4018,10 +4082,11 @@ impl ProjectEngine {
             .lock()
             .map_err(|_| anyhow!("index refresh lock poisoned"))?;
         let now = now_millis();
+        let watcher_requires_verification = self.freshness.watcher_requires_verification();
         let watcher_ready = self.freshness.dirty.load(Ordering::Acquire)
             && now.saturating_sub(self.freshness.last_event_ms.load(Ordering::Acquire))
                 >= WATCH_COALESCE_MS;
-        if !force && !watcher_ready {
+        if !force && !watcher_requires_verification && !watcher_ready {
             return Ok((false, false));
         }
 
@@ -4055,7 +4120,7 @@ impl ProjectEngine {
                 .clear();
             self.freshness
                 .journal_overflow
-                .store(false, Ordering::Release);
+                .store(self.freshness.watcher_failed(), Ordering::Release);
             self.metrics.refresh_micros.fetch_add(
                 u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
@@ -4126,7 +4191,7 @@ impl ProjectEngine {
             .clear();
         self.freshness
             .journal_overflow
-            .store(false, Ordering::Release);
+            .store(self.freshness.watcher_failed(), Ordering::Release);
         self.invalidate_l0();
         let mut frontiers = self
             .frontiers
@@ -4607,6 +4672,36 @@ fn watch_repository(
     freshness: Arc<FreshnessState>,
     stop: Arc<AtomicBool>,
 ) {
+    watch_repository_with_attempts(
+        &root,
+        &freshness,
+        &stop,
+        try_recommended_watcher,
+        try_polling_watcher,
+    );
+}
+
+fn watch_repository_with_attempts<R, P>(
+    root: &std::path::Path,
+    freshness: &Arc<FreshnessState>,
+    stop: &Arc<AtomicBool>,
+    recommended: R,
+    polling: P,
+) where
+    R: FnOnce(&std::path::Path, &Arc<FreshnessState>, &Arc<AtomicBool>) -> bool,
+    P: FnOnce(&std::path::Path, &Arc<FreshnessState>, &Arc<AtomicBool>) -> bool,
+{
+    if recommended(root, freshness, stop) || polling(root, freshness, stop) {
+        return;
+    }
+    mark_watcher_failed(freshness);
+}
+
+fn try_recommended_watcher(
+    root: &std::path::Path,
+    freshness: &Arc<FreshnessState>,
+    stop: &Arc<AtomicBool>,
+) -> bool {
     let (sender, receiver) = std::sync::mpsc::channel();
     let callback_sender = sender.clone();
     let recommended = RecommendedWatcher::new(
@@ -4616,12 +4711,21 @@ fn watch_repository(
         NotifyConfig::default(),
     );
     if let Ok(mut watcher) = recommended
-        && watcher.watch(&root, RecursiveMode::Recursive).is_ok()
+        && watcher.watch(root, RecursiveMode::Recursive).is_ok()
     {
-        watcher_loop(watcher, &receiver, &root, &freshness, &stop);
-        return;
+        mark_watcher_healthy(freshness);
+        drop(sender);
+        watcher_loop(&receiver, root, freshness, stop);
+        return true;
     }
+    false
+}
 
+fn try_polling_watcher(
+    root: &std::path::Path,
+    freshness: &Arc<FreshnessState>,
+    stop: &Arc<AtomicBool>,
+) -> bool {
     let (sender, receiver) = std::sync::mpsc::channel();
     let polling = PollWatcher::new(
         move |event| {
@@ -4630,14 +4734,16 @@ fn watch_repository(
         NotifyConfig::default().with_poll_interval(StdDuration::from_secs(2)),
     );
     if let Ok(mut watcher) = polling
-        && watcher.watch(&root, RecursiveMode::Recursive).is_ok()
+        && watcher.watch(root, RecursiveMode::Recursive).is_ok()
     {
-        watcher_loop(watcher, &receiver, &root, &freshness, &stop);
+        mark_watcher_healthy(freshness);
+        watcher_loop(&receiver, root, freshness, stop);
+        return true;
     }
+    false
 }
 
-fn watcher_loop<W: Watcher>(
-    _watcher: W,
+fn watcher_loop(
     receiver: &std::sync::mpsc::Receiver<notify::Result<Event>>,
     root: &std::path::Path,
     freshness: &FreshnessState,
@@ -4669,13 +4775,15 @@ fn watcher_loop<W: Watcher>(
                 freshness.dirty.store(true, Ordering::Release);
             }
             Ok(Err(_)) => {
-                freshness
-                    .last_event_ms
-                    .store(now_millis(), Ordering::Release);
-                freshness.dirty.store(true, Ordering::Release);
+                mark_watcher_failed(freshness);
             }
             Ok(Ok(_)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if !stop.load(Ordering::Acquire) {
+                    mark_watcher_failed(freshness);
+                }
+                break;
+            }
         }
     }
 }
@@ -10038,6 +10146,132 @@ mod tests {
             engine.metrics.lineage_git_checks.load(Ordering::Relaxed),
             git_checks
         );
+    }
+
+    #[test]
+    fn watcher_thread_and_backend_startup_fail_closed() {
+        let freshness = Arc::new(FreshnessState::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let guard = WatchGuard::from_spawn_result(
+            Arc::clone(&stop),
+            Arc::clone(&freshness),
+            Err(std::io::Error::other("controlled watcher thread failure")),
+        );
+        assert_eq!(
+            freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_FAILED
+        );
+        assert!(freshness.dirty.load(Ordering::Acquire));
+        assert!(freshness.journal_overflow.load(Ordering::Acquire));
+        drop(guard);
+
+        let fixture = tempdir().expect("fixture root");
+        let backend_freshness = Arc::new(FreshnessState::default());
+        watch_repository_with_attempts(
+            fixture.path(),
+            &backend_freshness,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _, _| false,
+            |_, _, _| false,
+        );
+        assert_eq!(
+            backend_freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_FAILED
+        );
+        assert!(backend_freshness.dirty.load(Ordering::Acquire));
+        assert!(backend_freshness.journal_overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn watcher_runtime_error_and_disconnect_fail_closed() {
+        let root = tempdir().expect("repository root");
+
+        let runtime_freshness = Arc::new(FreshnessState::default());
+        runtime_freshness
+            .watcher_status
+            .store(WATCHER_HEALTHY, Ordering::Release);
+        let runtime_stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let controller_freshness = Arc::clone(&runtime_freshness);
+        let controller_stop = Arc::clone(&runtime_stop);
+        let controller = thread::spawn(move || {
+            sender
+                .send(Err(notify::Error::generic("controlled watcher error")))
+                .expect("runtime watcher error");
+            while controller_freshness.watcher_status.load(Ordering::Acquire) != WATCHER_FAILED {
+                thread::yield_now();
+            }
+            controller_stop.store(true, Ordering::Release);
+        });
+        watcher_loop(&receiver, root.path(), &runtime_freshness, &runtime_stop);
+        controller.join().expect("runtime error controller");
+        assert!(runtime_freshness.dirty.load(Ordering::Acquire));
+        assert!(runtime_freshness.journal_overflow.load(Ordering::Acquire));
+
+        let disconnected_freshness = FreshnessState::default();
+        disconnected_freshness
+            .watcher_status
+            .store(WATCHER_HEALTHY, Ordering::Release);
+        let disconnected_stop = AtomicBool::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        watcher_loop(
+            &receiver,
+            root.path(),
+            &disconnected_freshness,
+            &disconnected_stop,
+        );
+        assert_eq!(
+            disconnected_freshness
+                .watcher_status
+                .load(Ordering::Acquire),
+            WATCHER_FAILED
+        );
+        assert!(disconnected_freshness.dirty.load(Ordering::Acquire));
+        assert!(
+            disconnected_freshness
+                .journal_overflow
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn failed_watcher_forces_ordinary_full_freshness_verification() {
+        let root = tempdir().expect("repository root");
+        let state = tempdir().expect("state root");
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn before_watcher_failure() {}\n").expect("initial source");
+        let engine = ProjectEngine::build_with_state(root.path(), state.path(), "watcher-failed")
+            .expect("project engine");
+        let initial_signature = engine.index().stats().refresh_signature.clone();
+
+        fs::write(&source, "fn after_watcher_failure() {}\n").expect("changed source");
+        mark_watcher_failed(&engine.freshness);
+        engine.freshness.dirty.store(false, Ordering::Release);
+        engine
+            .freshness
+            .changed_paths
+            .lock()
+            .expect("change journal")
+            .clear();
+
+        let (checked, updated) = engine.refresh_index(false).expect("ordinary refresh");
+        assert!(checked);
+        assert!(updated);
+        assert_ne!(engine.index().stats().refresh_signature, initial_signature);
+        assert_eq!(
+            engine.freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_FAILED
+        );
+        assert!(engine.freshness.journal_overflow.load(Ordering::Acquire));
+
+        let verified_signature = engine.index().stats().refresh_signature.clone();
+        let (checked, updated) = engine
+            .refresh_index(true)
+            .expect("explicit fresh verification");
+        assert!(checked);
+        assert!(!updated);
+        assert_eq!(engine.index().stats().refresh_signature, verified_signature);
     }
 
     #[cfg(unix)]
