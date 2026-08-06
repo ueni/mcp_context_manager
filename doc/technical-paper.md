@@ -474,8 +474,28 @@ Permits and active/queued counters use drop guards. Queue exhaustion and
 deadline expiry return stable retryable diagnostics before the usual 60-second
 MCP client budget. Phase measurements remain bounded and content-free: the
 existing request ledger records cache outcome, refresh checks/updates,
-retrieval, pack-build and total latency, while blocking-job tests assert queue
-and active counts return to baseline.
+retrieval, pack-build and total latency. Public runtime measurements add queue
+wait, engine load, queue/active/singleflight depth, cancellations, timeouts,
+deadline remaining, and post-timeout work; freshness measurements add signature
+scan, full/incremental refresh, index-state I/O, cache/state I/O, retrieval, and
+serialization totals. They contain neither prompts, contents, secrets, nor raw
+local paths. Blocking-job tests assert queue, waiter, permit, and active counts
+return to baseline.
+
+The watcher maintains a coalesced 1,024-path journal. A refresh computes the
+authoritative source signature, applies changed/deleted/renamed/untracked file
+deltas to immutable chunks and fingerprints, builds a complete replacement
+Tantivy reader, verifies signature parity, persists a schema/version/generation
+snapshot by sync-plus-rename, and only then swaps the `Arc` visible to readers.
+Overflow, unsafe or corpus paths, ambiguous events, signature mismatch,
+mid-refresh mutation, missing state, incomplete `.pending` state, and corrupt
+snapshots all use the documented full-rebuild fallback. Persisted snapshots are
+accepted only after current source and fingerprint validation.
+
+Transport startup schedules only the default project through the same bounded
+path after stdio service creation or HTTP listener binding. The public runtime
+state progresses through `queued`, `building`, and `ready`, or terminates at
+`failed`; allowed roots are not enumerated by startup warmup.
 
 ## References and memory
 
@@ -528,6 +548,15 @@ The native performance gate measures:
 - required-anchor recall 100%;
 - noise ratio at most 30%;
 - relevant-evidence freshness at most two seconds.
+
+The issue-29 load gate additionally exercises cold start, warm cache, one-file
+refresh, edit burst, deterministic large-file disk pressure, concurrent
+same-project calls, and multiple projects on a current-thread Tokio runtime.
+Every normal request must remain below the SDK's 60-second default and maximum
+event-loop lag must remain below 250 ms. Run it with
+`cargo run -p context-testkit --bin benchmark-context-pack-load --quiet`; the
+bounded reference result is
+`benchmarks/results/issue-29-context-pack-load.json`.
 
 Release acceptance requires three consecutive complete devcontainer runs,
 stable-tool differential fixtures, randomized mutation cases, glibc and musl

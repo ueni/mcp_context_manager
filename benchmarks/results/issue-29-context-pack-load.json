@@ -1,0 +1,53 @@
+{
+  "fixture": {
+    "multiple_project_requests": 8,
+    "ordinary_project_files": 24,
+    "same_project_requests": 8,
+    "slow_disk_pressure_bytes_per_file": 16384,
+    "slow_disk_pressure_files": 256
+  },
+  "gates": {
+    "all_normal_requests_within_sdk_budget": true,
+    "bounded_runtime": {
+      "blocking": {
+        "active": 0,
+        "active_peak": 2,
+        "cancellation_grace_ms": 2000,
+        "cancellations": 0,
+        "completed": 21,
+        "deadline_remaining_ms_last": 45857,
+        "engine_builds": 4,
+        "engine_load_micros_total": 2001168,
+        "limit": 2,
+        "pack_micros_total": 508999,
+        "post_timeout_micros_total": 0,
+        "queue_wait_micros_total": 1087906,
+        "queued": 0,
+        "queued_peak": 6,
+        "request_timeout_ms": 48000,
+        "singleflight_waiters": 0,
+        "singleflight_waiters_peak": 2,
+        "timeouts": 0,
+        "total_micros": 3603239
+      },
+      "schema": "context_runtime.status.v1",
+      "warmup": {
+        "state": "not_started"
+      }
+    },
+    "event_loop_max_lag_gate_ms": 250.0,
+    "event_loop_responsive": true,
+    "sdk_default_budget_ms": 60000.0
+  },
+  "milliseconds": {
+    "cold_start": 117.076834,
+    "concurrent_same_project": 57.27248,
+    "edit_burst": 89.436834,
+    "event_loop_max_lag": 1.972,
+    "multiple_projects": 143.060364,
+    "one_file_refresh": 105.224292,
+    "slow_disk_pressure": 1805.525587,
+    "warm_cache_hit": 0.801465
+  },
+  "schema": "context_pack_load_benchmark.v1"
+}

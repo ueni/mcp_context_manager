@@ -10,6 +10,7 @@ repository.workspace = true
 anyhow.workspace = true
 context-core = { path = "../context-core" }
 context-store = { path = "../context-store" }
+contextd = { path = "../contextd" }
 serde_json.workspace = true
 tempfile = "3.27.0"
 tokio.workspace = true

@@ -1,7 +1,7 @@
 //! Stable contracts and deterministic core behavior for the native server.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     process::Command,
     sync::{
         Arc, Mutex, OnceLock, RwLock,
@@ -13,14 +13,15 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use context_index::{
-    IndexStats, ProjectIndex, SearchHit, SymbolRecord, WorkControl, git_exclude_pathspecs,
-    immutable_candidate_address, is_ignored_repository_path, normalize_terms,
-    repository_signature_for_project_controlled, validate_relative_path,
+    IndexSnapshot, IndexStats, ProjectIndex, SearchHit, SymbolRecord, WorkControl,
+    git_exclude_pathspecs, immutable_candidate_address, is_ignored_repository_path,
+    normalize_terms, repository_signature_for_project_controlled, validate_relative_path,
 };
 use context_store::{ReferenceValidation, StateStore};
 use moka::future::Cache;
 use notify::{
-    Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
+    Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
+    Watcher,
 };
 use regex::Regex;
 use schemars::JsonSchema;
@@ -29,6 +30,36 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
+
+thread_local! {
+    static CURRENT_WORK_CONTROL: std::cell::RefCell<Option<WorkControl>> = const { std::cell::RefCell::new(None) };
+}
+
+struct WorkControlScope(Option<WorkControl>);
+
+impl WorkControlScope {
+    fn install(control: Option<&WorkControl>) -> Self {
+        let previous = CURRENT_WORK_CONTROL.with(|slot| slot.replace(control.cloned()));
+        Self(previous)
+    }
+}
+
+impl Drop for WorkControlScope {
+    fn drop(&mut self) {
+        CURRENT_WORK_CONTROL.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+fn current_work_checkpoint() -> Result<()> {
+    CURRENT_WORK_CONTROL.with(|slot| {
+        if let Some(control) = slot.borrow().as_ref() {
+            control.check()?;
+        }
+        Ok(())
+    })
+}
 
 pub const CONTEXT_PACK_VERSION: u8 = 2;
 pub const DEFAULT_MAX_ITEMS: u8 = 8;
@@ -311,6 +342,7 @@ const L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const SHARED_L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const WARM_MISS_TARGET_MICROS: u64 = 50_000;
 const WATCH_COALESCE_MS: u64 = 50;
+const CHANGE_JOURNAL_MAX_PATHS: usize = 1_024;
 // Watcher-driven freshness avoids repository-wide request-path polling. Zero
 // is exposed in diagnostics to make the disabled fixed poll explicit.
 const FAST_POLL_INTERVAL_MS: u64 = 0;
@@ -736,6 +768,8 @@ struct PackTelemetry {
     candidate_count: u32,
     selected_count: u32,
     retrieval_micros: u64,
+    cache_state_io_micros: u64,
+    serialization_micros: u64,
     pack_build_micros: u64,
     frontier_outcome: FrontierOutcome,
     base_pack_used: bool,
@@ -928,6 +962,16 @@ struct EngineMetrics {
     lineage_capacity_rejections: AtomicU64,
     retrieval_misses: AtomicU64,
     refreshes: AtomicU64,
+    full_refreshes: AtomicU64,
+    incremental_refreshes: AtomicU64,
+    incremental_fallbacks: AtomicU64,
+    lineage_git_checks: AtomicU64,
+    signature_scan_micros: AtomicU64,
+    refresh_micros: AtomicU64,
+    index_state_io_micros: AtomicU64,
+    retrieval_micros: AtomicU64,
+    cache_state_io_micros: AtomicU64,
+    serialization_micros: AtomicU64,
     pack_input_tokens_est: AtomicU64,
     pack_selected_source_tokens_est: AtomicU64,
     pack_evidence_card_tokens_est: AtomicU64,
@@ -1026,6 +1070,15 @@ impl EngineMetrics {
         self.pack_selected_count
             .fetch_add(u64::from(telemetry.selected_count), Ordering::Relaxed);
     }
+
+    fn record_pack_phase_telemetry(&self, telemetry: PackTelemetry) {
+        self.retrieval_micros
+            .fetch_add(telemetry.retrieval_micros, Ordering::Relaxed);
+        self.cache_state_io_micros
+            .fetch_add(telemetry.cache_state_io_micros, Ordering::Relaxed);
+        self.serialization_micros
+            .fetch_add(telemetry.serialization_micros, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -1034,6 +1087,8 @@ struct FreshnessState {
     last_event_ms: AtomicU64,
     last_poll_ms: AtomicU64,
     generation: AtomicU64,
+    changed_paths: Mutex<BTreeSet<String>>,
+    journal_overflow: AtomicBool,
 }
 
 struct WatchGuard {
@@ -2416,6 +2471,7 @@ pub struct ProjectEngine {
     lineage_seed: String,
     governed_lineage: Option<GovernedFrontierLineage>,
     shared_frontiers: Option<Arc<SharedFrontierCache>>,
+    index_snapshot_path: std::path::PathBuf,
     _watcher: WatchGuard,
 }
 
@@ -2523,15 +2579,18 @@ impl ProjectEngine {
         control: Option<&WorkControl>,
     ) -> Result<Self> {
         let project_id = project_id.into();
-        let index = Arc::new(ProjectIndex::build_for_project_controlled(
-            root,
-            Some(&project_id),
-            control,
-        )?);
+        let root = root.as_ref().canonicalize()?;
+        let store = Arc::new(StateStore::open(project_state)?);
+        let index_snapshot_path = store.paths().index.join("context-index.snapshot.v1.json");
+        let index = load_index_snapshot(&root, &project_id, &index_snapshot_path, control)
+            .or_else(|_| {
+                ProjectIndex::build_for_project_controlled(&root, Some(&project_id), control)
+            })?;
+        persist_index_snapshot(&index_snapshot_path, &index, control)?;
+        let index = Arc::new(index);
         if let Some(control) = control {
             control.check()?;
         }
-        let store = Arc::new(StateStore::open(project_state)?);
         let freshness = Arc::new(FreshnessState {
             last_poll_ms: AtomicU64::new(now_millis()),
             ..FreshnessState::default()
@@ -2571,6 +2630,7 @@ impl ProjectEngine {
             lineage_seed,
             governed_lineage,
             shared_frontiers,
+            index_snapshot_path,
             _watcher: watcher,
         })
     }
@@ -2703,6 +2763,7 @@ impl ProjectEngine {
         request: &ContextPackRequest,
         control: Option<&WorkControl>,
     ) -> Result<Vec<u8>> {
+        let _control_scope = WorkControlScope::install(control);
         let started = Instant::now();
         let result = async {
             if let Some(control) = control {
@@ -2744,6 +2805,7 @@ impl ProjectEngine {
             Ok((admission, (refresh_checked, refresh_updated))) => {
                 self.record_context_pack(started, &admission.cached.telemetry);
                 if self.usage_monitor.enabled() {
+                    current_work_checkpoint()?;
                     let _ = self.usage_monitor.record(
                         &self.project_id,
                         self.usage_sample(
@@ -2760,7 +2822,7 @@ impl ProjectEngine {
             }
             Err(error) => {
                 self.record_operation("context_pack", started, false, 0);
-                if self.usage_monitor.enabled() {
+                if self.usage_monitor.enabled() && control.is_none_or(|work| work.check().is_ok()) {
                     let _ = self
                         .usage_monitor
                         .record_rejection(classify_context_pack_rejection(&error));
@@ -2813,6 +2875,7 @@ impl ProjectEngine {
                     .into_iter()
                     .map(|reference_id| self.cached_reference_validation(&reference_id))
                     .collect::<Result<Vec<_>>>()?;
+                current_work_checkpoint()?;
                 Ok::<Arc<CachedPack>, anyhow::Error>(Arc::new(CachedPack {
                     bytes: Arc::new(pack.bytes),
                     reference_validations: Arc::new(reference_validations),
@@ -2905,6 +2968,7 @@ impl ProjectEngine {
     }
 
     fn advance_continuation(&self, state_key: &str, bytes: &[u8]) -> Result<()> {
+        current_work_checkpoint()?;
         let response: ContextPackV2 = serde_json::from_slice(bytes)?;
         let snapshot = self
             .load_pack_snapshot(&response.id)?
@@ -2920,6 +2984,7 @@ impl ProjectEngine {
             expires_at_unix_seconds: now.saturating_add(CONTINUATION_TTL_SECONDS),
         };
         self.prune_continuations(state_key, now)?;
+        current_work_checkpoint()?;
         self.store
             .put_json(state_key, &serde_json::to_value(record)?)?;
         Ok(())
@@ -3111,6 +3176,7 @@ impl ProjectEngine {
             evidence_card_tokens_est.saturating_sub(returned_evidence_tokens_est);
         reuse.delta_applied = reuse.wire_tokens_avoided_est > 0
             && matches!(reuse.source.as_str(), "continuation" | "explicit");
+        let state_io_started = Instant::now();
         let snapshot = Arc::new(PackSnapshot {
             schema: "context_pack.snapshot.v1".to_owned(),
             pack_id: pack_id.clone(),
@@ -3119,6 +3185,7 @@ impl ProjectEngine {
             evidence: snapshots,
             refresh_signature: index.stats().refresh_signature.clone(),
         });
+        current_work_checkpoint()?;
         let new_snapshot = self
             .pack_snapshots
             .lock()
@@ -3126,6 +3193,7 @@ impl ProjectEngine {
             .insert(pack_id.clone(), Arc::clone(&snapshot))
             .is_none();
         if new_snapshot {
+            current_work_checkpoint()?;
             self.store.put_json_if_changed(
                 &format!("pack:{pack_id}"),
                 &serde_json::to_value(&*snapshot)?,
@@ -3137,6 +3205,9 @@ impl ProjectEngine {
             &terms,
             usize::from(request.max_items),
         )?;
+        let cache_state_io_micros =
+            u64::try_from(state_io_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        current_work_checkpoint()?;
         let response = ContextPackV2 {
             v: CONTEXT_PACK_VERSION,
             id: pack_id,
@@ -3146,42 +3217,49 @@ impl ProjectEngine {
             more,
             reuse: reuse.clone(),
         };
+        let serialization_started = Instant::now();
         let mut encoded = Vec::with_capacity(512);
         serde_json::to_writer(&mut encoded, &response)?;
+        let serialization_micros =
+            u64::try_from(serialization_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let wire_tokens_est = std::str::from_utf8(&encoded)
             .map(estimate_tokens)
             .unwrap_or_else(|_| u32::try_from(encoded.len().div_ceil(4)).unwrap_or(u32::MAX));
+        let telemetry = PackTelemetry {
+            input_tokens_est: estimate_tokens(&request.prompt),
+            selected_source_tokens_est,
+            evidence_card_tokens_est,
+            returned_evidence_tokens_est,
+            wire_tokens_est,
+            wire_bytes: encoded.len(),
+            tokens_saved_est: selected_source_tokens_est.saturating_sub(wire_tokens_est),
+            delta_tokens_saved_est: evidence_card_tokens_est
+                .saturating_sub(returned_evidence_tokens_est),
+            candidate_count: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+            selected_count: u32::try_from(selected.len()).unwrap_or(u32::MAX),
+            retrieval_micros,
+            cache_state_io_micros,
+            serialization_micros,
+            pack_build_micros: u64::try_from(pack_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX)
+                .saturating_sub(retrieval_micros),
+            frontier_outcome,
+            base_pack_used: request.base_pack.is_some(),
+            known_evidence_used: !request.known_evidence.is_empty(),
+            continuation_requested: reuse.source == "continuation"
+                || reuse.status == "explicit_override",
+            continuation_reused: reuse.source == "continuation" && reuse.status == "reused",
+            continuation_fallback: reuse.source == "continuation"
+                && matches!(
+                    reuse.status.as_str(),
+                    "missing" | "expired" | "stale_generation" | "missing_pack"
+                ),
+            explicit_delta_override: reuse.status == "explicit_override",
+            lineage,
+        };
+        self.metrics.record_pack_phase_telemetry(telemetry);
         Ok(BuiltPack {
-            telemetry: PackTelemetry {
-                input_tokens_est: estimate_tokens(&request.prompt),
-                selected_source_tokens_est,
-                evidence_card_tokens_est,
-                returned_evidence_tokens_est,
-                wire_tokens_est,
-                wire_bytes: encoded.len(),
-                tokens_saved_est: selected_source_tokens_est.saturating_sub(wire_tokens_est),
-                delta_tokens_saved_est: evidence_card_tokens_est
-                    .saturating_sub(returned_evidence_tokens_est),
-                candidate_count: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
-                selected_count: u32::try_from(selected.len()).unwrap_or(u32::MAX),
-                retrieval_micros,
-                pack_build_micros: u64::try_from(pack_started.elapsed().as_micros())
-                    .unwrap_or(u64::MAX)
-                    .saturating_sub(retrieval_micros),
-                frontier_outcome,
-                base_pack_used: request.base_pack.is_some(),
-                known_evidence_used: !request.known_evidence.is_empty(),
-                continuation_requested: reuse.source == "continuation"
-                    || reuse.status == "explicit_override",
-                continuation_reused: reuse.source == "continuation" && reuse.status == "reused",
-                continuation_fallback: reuse.source == "continuation"
-                    && matches!(
-                        reuse.status.as_str(),
-                        "missing" | "expired" | "stale_generation" | "missing_pack"
-                    ),
-                explicit_delta_override: reuse.status == "explicit_override",
-                lineage,
-            },
+            telemetry,
             bytes: encoded,
         })
     }
@@ -3248,6 +3326,7 @@ impl ProjectEngine {
                 })
             })
             .collect::<Vec<_>>();
+        current_work_checkpoint()?;
         let reference = self.store.create_reference(
             "context_pack",
             &self.project_id,
@@ -3270,6 +3349,7 @@ impl ProjectEngine {
         self.metrics
             .total_references
             .fetch_add(1, Ordering::Relaxed);
+        current_work_checkpoint()?;
         self.store.put_json_if_changed(
             &format!("deferred:{key}"),
             &json!({
@@ -3282,6 +3362,7 @@ impl ProjectEngine {
             .store
             .reference_validation(&reference_id)?
             .ok_or_else(|| anyhow!("reference store produced an invalid reference"))?;
+        current_work_checkpoint()?;
         self.deferred_references
             .lock()
             .map_err(|_| anyhow!("deferred reference lock poisoned"))?
@@ -3329,6 +3410,7 @@ impl ProjectEngine {
     )> {
         let retrieval = self.retrieve_candidates_deferred(index, request, explicit_paths)?;
         if let Some(record) = retrieval.pending {
+            current_work_checkpoint()?;
             self.admit_frontier_batch(&[record])?;
         }
         Ok((
@@ -3599,6 +3681,9 @@ impl ProjectEngine {
         if index.stats().corpus_source_count > 0 {
             return Err(GitProofRejection::Unavailable);
         }
+        self.metrics
+            .lineage_git_checks
+            .fetch_add(1, Ordering::Relaxed);
         let git = git_worktree_proof(index.root())?;
         let lineage_identity = format!(
             "ln:{}",
@@ -3896,7 +3981,7 @@ impl ProjectEngine {
     ) -> Result<(bool, bool)> {
         let force =
             request.cache_strategy == CacheStrategy::Fresh || !request.changed_files.is_empty();
-        self.refresh_index_controlled(force, control)
+        self.refresh_index_with_paths(force, &request.changed_files, control)
     }
 
     fn refresh_index(&self, force: bool) -> Result<(bool, bool)> {
@@ -3906,6 +3991,15 @@ impl ProjectEngine {
     fn refresh_index_controlled(
         &self,
         force: bool,
+        control: Option<&WorkControl>,
+    ) -> Result<(bool, bool)> {
+        self.refresh_index_with_paths(force, &[], control)
+    }
+
+    fn refresh_index_with_paths(
+        &self,
+        force: bool,
+        explicit_paths: &[String],
         control: Option<&WorkControl>,
     ) -> Result<(bool, bool)> {
         if let Some(control) = control {
@@ -3931,26 +4025,91 @@ impl ProjectEngine {
             return Ok((false, false));
         }
 
+        let refresh_started = Instant::now();
         let current = self.index();
+        let mut changed_paths = self
+            .freshness
+            .changed_paths
+            .lock()
+            .map_err(|_| anyhow!("change journal lock poisoned"))?
+            .clone();
+        changed_paths.extend(explicit_paths.iter().cloned());
+        let overflow = self.freshness.journal_overflow.load(Ordering::Acquire);
+        let scan_started = Instant::now();
         let signature = repository_signature_for_project_controlled(
             current.root(),
             Some(&self.project_id),
             control,
         )?;
+        self.metrics.signature_scan_micros.fetch_add(
+            u64::try_from(scan_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         self.freshness.last_poll_ms.store(now, Ordering::Release);
         self.freshness.dirty.store(false, Ordering::Release);
         if signature == current.stats().refresh_signature {
+            self.freshness
+                .changed_paths
+                .lock()
+                .map_err(|_| anyhow!("change journal lock poisoned"))?
+                .clear();
+            self.freshness
+                .journal_overflow
+                .store(false, Ordering::Release);
+            self.metrics.refresh_micros.fetch_add(
+                u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             return Ok((true, false));
         }
 
-        let replacement = Arc::new(ProjectIndex::build_for_project_controlled(
-            current.root(),
-            Some(&self.project_id),
-            control,
-        )?);
+        let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
+        let replacement = if !overflow && !changed_paths.is_empty() {
+            match current.refresh_paths_controlled(&changed_paths, control) {
+                Ok(incremental) if incremental.stats().refresh_signature == signature => {
+                    self.metrics
+                        .incremental_refreshes
+                        .fetch_add(1, Ordering::Relaxed);
+                    incremental
+                }
+                _ => {
+                    self.metrics
+                        .incremental_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics.full_refreshes.fetch_add(1, Ordering::Relaxed);
+                    ProjectIndex::build_for_project_controlled(
+                        current.root(),
+                        Some(&self.project_id),
+                        control,
+                    )?
+                }
+            }
+        } else {
+            if overflow {
+                self.metrics
+                    .incremental_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.metrics.full_refreshes.fetch_add(1, Ordering::Relaxed);
+            ProjectIndex::build_for_project_controlled(
+                current.root(),
+                Some(&self.project_id),
+                control,
+            )?
+        };
+        let replacement = Arc::new(replacement);
         if replacement.stats().refresh_signature != signature {
             bail!("repository changed while rebuilding the native index");
         }
+        if let Some(control) = control {
+            control.check()?;
+        }
+        let state_started = Instant::now();
+        persist_index_snapshot(&self.index_snapshot_path, &replacement, control)?;
+        self.metrics.index_state_io_micros.fetch_add(
+            u64::try_from(state_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         if let Some(control) = control {
             control.check()?;
         }
@@ -3960,6 +4119,14 @@ impl ProjectEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
         self.freshness.generation.fetch_add(1, Ordering::AcqRel);
         self.metrics.refreshes.fetch_add(1, Ordering::Relaxed);
+        self.freshness
+            .changed_paths
+            .lock()
+            .map_err(|_| anyhow!("change journal lock poisoned"))?
+            .clear();
+        self.freshness
+            .journal_overflow
+            .store(false, Ordering::Release);
         self.invalidate_l0();
         let mut frontiers = self
             .frontiers
@@ -3967,6 +4134,10 @@ impl ProjectEngine {
             .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
         frontiers.records.clear();
         frontiers.bytes = 0;
+        self.metrics.refresh_micros.fetch_add(
+            u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         Ok((true, true))
     }
 
@@ -4474,7 +4645,24 @@ fn watcher_loop<W: Watcher>(
 ) {
     while !stop.load(Ordering::Acquire) {
         match receiver.recv_timeout(StdDuration::from_millis(100)) {
+            Ok(Ok(event)) if matches!(event.kind, EventKind::Access(_)) => {}
             Ok(Ok(event)) if event.paths.iter().any(|path| source_event_path(root, path)) => {
+                let mut journal = freshness
+                    .changed_paths
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for path in &event.paths {
+                    let Ok(relative) = path.strip_prefix(root) else {
+                        freshness.journal_overflow.store(true, Ordering::Release);
+                        continue;
+                    };
+                    if !is_ignored_repository_path(relative) {
+                        journal.insert(relative.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+                if journal.len() > CHANGE_JOURNAL_MAX_PATHS || event.need_rescan() {
+                    freshness.journal_overflow.store(true, Ordering::Release);
+                }
                 freshness
                     .last_event_ms
                     .store(now_millis(), Ordering::Release);
@@ -4496,6 +4684,9 @@ fn source_event_path(root: &std::path::Path, path: &std::path::Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
     !is_ignored_repository_path(relative)
 }
 
@@ -4640,6 +4831,44 @@ fn load_pack_snapshots(store: &StateStore) -> Result<HashMap<String, Arc<PackSna
         .filter_map(|(_, value)| serde_json::from_value::<PackSnapshot>(value).ok())
         .map(|snapshot| (snapshot.pack_id.clone(), Arc::new(snapshot)))
         .collect())
+}
+
+fn load_index_snapshot(
+    root: &std::path::Path,
+    project_id: &str,
+    path: &std::path::Path,
+    control: Option<&WorkControl>,
+) -> Result<ProjectIndex> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > 128 * 1024 * 1024
+    {
+        bail!("persisted index snapshot is unsafe")
+    }
+    let snapshot: IndexSnapshot = serde_json::from_slice(&std::fs::read(path)?)?;
+    ProjectIndex::from_snapshot_controlled(root, snapshot, Some(project_id), control)
+}
+
+fn persist_index_snapshot(
+    path: &std::path::Path,
+    index: &ProjectIndex,
+    control: Option<&WorkControl>,
+) -> Result<()> {
+    if let Some(control) = control {
+        control.check()?;
+    }
+    let bytes = serde_json::to_vec(&index.snapshot())?;
+    let temporary = path.with_extension("json.pending");
+    let mut file = std::fs::File::create(&temporary)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    if let Some(control) = control {
+        control.check()?;
+    }
+    std::fs::rename(temporary, path)?;
+    Ok(())
 }
 
 fn load_deferred_references(store: &StateStore) -> Result<HashMap<String, ReferenceValidation>> {
@@ -5257,6 +5486,20 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
             "coalesce_ms": WATCH_COALESCE_MS,
             "refreshes": engine.metrics.refreshes.load(Ordering::Relaxed),
+            "full_refreshes": engine.metrics.full_refreshes.load(Ordering::Relaxed),
+            "incremental_refreshes": engine.metrics.incremental_refreshes.load(Ordering::Relaxed),
+            "incremental_fallbacks": engine.metrics.incremental_fallbacks.load(Ordering::Relaxed),
+            "changed_path_count": engine.freshness.changed_paths.lock().map(|paths| paths.len()).unwrap_or_default(),
+            "journal_overflow": engine.freshness.journal_overflow.load(Ordering::Relaxed),
+            "lineage_git_checks": engine.metrics.lineage_git_checks.load(Ordering::Relaxed),
+            "phase_micros": {
+                "signature_scan": engine.metrics.signature_scan_micros.load(Ordering::Relaxed),
+                "refresh": engine.metrics.refresh_micros.load(Ordering::Relaxed),
+                "index_state_io": engine.metrics.index_state_io_micros.load(Ordering::Relaxed),
+                "retrieval": engine.metrics.retrieval_micros.load(Ordering::Relaxed),
+                "cache_state_io": engine.metrics.cache_state_io_micros.load(Ordering::Relaxed),
+                "serialization": engine.metrics.serialization_micros.load(Ordering::Relaxed)
+            }
         },
         "background": {"status": if engine.freshness.dirty.load(Ordering::Relaxed) {"change_pending"} else {"idle"}},
     }))
@@ -5367,6 +5610,13 @@ fn unloaded_metrics_snapshot(project_id: &str, now: &str, status: &str) -> Value
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
             "coalesce_ms": WATCH_COALESCE_MS,
             "refreshes": 0,
+            "full_refreshes": 0,
+            "incremental_refreshes": 0,
+            "incremental_fallbacks": 0,
+            "changed_path_count": 0,
+            "journal_overflow": false,
+            "lineage_git_checks": 0,
+            "phase_micros": {"signature_scan": 0, "refresh": 0, "index_state_io": 0, "retrieval": 0, "cache_state_io": 0, "serialization": 0}
         },
         "background": {"status": status},
     })
@@ -9212,6 +9462,65 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_ne!(first.evidence[0].0, second.evidence[0].0);
         assert_eq!(engine.freshness.generation.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            engine.metrics.incremental_refreshes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(engine.metrics.full_refreshes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn overflow_falls_back_to_full_and_readers_only_see_complete_generations() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempdir().expect("temporary repository");
+        let path = root.path().join("lib.rs");
+        std::fs::write(&path, "fn old_generation() {}\n").expect("old source");
+        let engine = Arc::new(ProjectEngine::build(root.path()).expect("engine"));
+        let old = engine.index().stats().refresh_signature.clone();
+        std::fs::write(&path, "fn new_generation() {}\n").expect("new source");
+        let new = ProjectIndex::build(root.path())
+            .expect("clean new generation")
+            .stats()
+            .refresh_signature
+            .clone();
+        engine.freshness.dirty.store(true, Ordering::Release);
+        engine.freshness.last_event_ms.store(0, Ordering::Release);
+        engine
+            .freshness
+            .journal_overflow
+            .store(true, Ordering::Release);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let invalid = Arc::new(AtomicBool::new(false));
+        let reader_engine = Arc::clone(&engine);
+        let reader_stop = Arc::clone(&stop);
+        let reader_invalid = Arc::clone(&invalid);
+        let expected_old = old.clone();
+        let expected_new = new.clone();
+        let reader = std::thread::spawn(move || {
+            while !reader_stop.load(Ordering::Acquire) {
+                let observed = reader_engine.index().stats().refresh_signature.clone();
+                if observed != expected_old && observed != expected_new {
+                    reader_invalid.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        });
+
+        assert_eq!(
+            engine.refresh_index(false).expect("overflow refresh"),
+            (true, true)
+        );
+        stop.store(true, Ordering::Release);
+        reader.join().expect("reader");
+        assert!(!invalid.load(Ordering::Acquire));
+        assert_eq!(engine.index().stats().refresh_signature, new);
+        assert_eq!(engine.metrics.full_refreshes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            engine.metrics.incremental_fallbacks.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -9628,10 +9937,76 @@ mod tests {
         let generated = repository.join(".workingdir/issue-29/target");
         std::fs::create_dir_all(&generated).expect("generated tree");
         let churn = generated.join("churn.rs");
-        std::fs::write(&churn, "fn churn() {}\n").expect("generated churn");
+        std::fs::write(&churn, "fn churn_initial() {}\n").expect("initial generated file");
+        let state = tempdir().expect("state root");
+        let shared = Arc::new(
+            SharedFrontierCache::open(state.path().join("shared")).expect("shared frontier"),
+        );
+        let engine = governed_engine(&repository, &state.path().join("engine"), "churn", shared);
+        let initial_deadline = Instant::now() + StdDuration::from_secs(3);
+        while !engine.freshness.dirty.load(Ordering::Relaxed) && Instant::now() < initial_deadline {
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+        engine.freshness.dirty.store(false, Ordering::Relaxed);
+        engine
+            .freshness
+            .changed_paths
+            .lock()
+            .expect("change journal")
+            .clear();
+        let generation = engine.freshness.generation.load(Ordering::Relaxed);
+        let refreshes = engine.metrics.refreshes.load(Ordering::Relaxed);
+        let git_checks = engine.metrics.lineage_git_checks.load(Ordering::Relaxed);
+        for revision in 0..20 {
+            std::fs::write(&churn, format!("fn churn_{revision}() {{}}\n"))
+                .expect("generated churn");
+            assert!(!source_event_path(&repository, &churn));
+        }
+        std::thread::sleep(StdDuration::from_millis(150));
 
-        assert!(!source_event_path(&repository, &churn));
         assert!(git_worktree_proof(&repository).is_ok());
+        assert!(
+            !engine.freshness.dirty.load(Ordering::Relaxed),
+            "unexpected journal: {:?}",
+            engine.freshness.changed_paths.lock().expect("journal")
+        );
+        assert_eq!(
+            engine.freshness.generation.load(Ordering::Relaxed),
+            generation
+        );
+        assert_eq!(engine.metrics.refreshes.load(Ordering::Relaxed), refreshes);
+        assert_eq!(
+            engine.metrics.lineage_git_checks.load(Ordering::Relaxed),
+            git_checks
+        );
+    }
+
+    #[test]
+    fn persisted_index_generation_recovers_from_crash_and_corruption() {
+        let root = tempdir().expect("repository root");
+        let state = tempdir().expect("state root");
+        std::fs::write(root.path().join("lib.rs"), "fn persisted_generation() {}\n")
+            .expect("source");
+        let engine = ProjectEngine::build_with_state(root.path(), state.path(), "persisted")
+            .expect("initial engine");
+        let expected = engine.index().stats().refresh_signature.clone();
+        let snapshot = engine.index_snapshot_path.clone();
+        drop(engine);
+
+        std::fs::write(snapshot.with_extension("json.pending"), b"partial").expect("crash residue");
+        let reopened = ProjectEngine::build_with_state(root.path(), state.path(), "persisted")
+            .expect("ignore incomplete generation");
+        assert_eq!(reopened.index().stats().refresh_signature, expected);
+        drop(reopened);
+
+        std::fs::write(&snapshot, b"corrupt").expect("corrupt manifest");
+        let rebuilt = ProjectEngine::build_with_state(root.path(), state.path(), "persisted")
+            .expect("corruption falls back to full rebuild");
+        assert_eq!(rebuilt.index().stats().refresh_signature, expected);
+        assert!(
+            serde_json::from_slice::<IndexSnapshot>(&std::fs::read(snapshot).expect("snapshot"))
+                .is_ok()
+        );
     }
 
     #[tokio::test]

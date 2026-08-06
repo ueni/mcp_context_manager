@@ -394,6 +394,12 @@ HTTP 503; MCP returns the stable retryable `context_pack busy` or
 `context_pack timed out` diagnostic with warmup/retry guidance.
 
 Use `context_admin(mode="warmup")` before a latency-sensitive normal request.
+The server also schedules the default project only after stdio/HTTP transport
+readiness. `context_admin(mode="warmup")`, `health`, `metrics`, and
+`measurement_report` expose its `queued`, `building`, `ready`, or `failed`
+lifecycle through `runtime.warmup.state`; startup never walks every allowed
+root.
+
 Increasing a client timeout can be a bounded fallback, but it does not replace
 the server concurrency cap or cancellation budget. Generated agent/build/cache
 trees such as `.workingdir/`, `.worktrees/`, `.openclaw/`, `target/`, and
@@ -426,8 +432,18 @@ The fast path uses:
 - deterministic reranking after approximate frontier reuse;
 - an optional 256 MiB persistent pool of path-free immutable frontier records for explicitly governed, clean worktrees that share one Git common directory, HEAD, source signature, and index signature;
 - a 50 ms coalescing filesystem watcher plus polling fallback;
-- synchronous refresh for `changed_files` and `cache_strategy="fresh"`;
+- a bounded changed-path journal and per-file fingerprints for atomic
+  incremental changed/deleted/renamed/untracked refresh;
+- a validated, atomically replaced index snapshot under generated project
+  state so a restart can reuse a complete warm generation;
 - direct serialization into a preallocated byte buffer.
+
+Every incremental result is checked against the independently computed source
+signature before publication. Journal overflow, unsafe paths, corpus/config
+changes, ambiguous events, mutation during refresh, and corrupt/incomplete
+persisted state fail closed to a clean full rebuild. Readers obtain one
+immutable index handle and therefore observe only the old or new complete
+generation.
 
 Cross-worktree reuse is disabled by default. A deployment may opt in with an
 operator-owned manifest such as:
@@ -459,6 +475,7 @@ Run validation inside the repository devcontainer:
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo run -p context-testkit --bin benchmark-context-pack-load --quiet
 cargo xtask license-check
 cargo audit --deny warnings
 cargo xtask sbom dist/mcp-context-manager.cdx.json
@@ -474,6 +491,12 @@ python3 scripts/smoke_native_mcp.py dist/mcp-context-manager-linux-x86_64-musl
 cmake --build --preset docker-image-archive
 python3 scripts/smoke_native_image.py mcp-context-manager:local
 ```
+
+The load benchmark gates cold start, warm L0, one-file refresh, an edit burst,
+a deterministic large-file disk-pressure case, concurrent same-project calls,
+multiple projects, and current-thread event-loop lag against the common
+60-second MCP SDK budget. A bounded reference run is recorded in
+[`benchmarks/results/issue-29-context-pack-load.json`](benchmarks/results/issue-29-context-pack-load.json).
 
 Record a release version with the Rust task runner:
 

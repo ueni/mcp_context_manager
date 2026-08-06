@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -51,10 +51,16 @@ pub struct ProjectRegistry {
     shared_frontiers: Option<Arc<SharedFrontierCache>>,
     governed_lineages: HashMap<PathBuf, GovernedFrontierLineage>,
     blocking: Arc<BlockingCoordinator>,
+    #[cfg(test)]
+    blocking_hook: Arc<Mutex<Option<BlockingHook>>>,
     state: Arc<Mutex<RegistryState>>,
 }
 
+#[cfg(test)]
+type BlockingHook = Arc<dyn Fn(&WorkControl) -> Result<()> + Send + Sync>;
+
 struct BlockingCoordinator {
+    limit: usize,
     permits: Arc<Semaphore>,
     request_timeout: Duration,
     cancellation_grace: Duration,
@@ -62,6 +68,19 @@ struct BlockingCoordinator {
     queued: AtomicUsize,
     cancellations: AtomicUsize,
     timeouts: AtomicUsize,
+    completed: AtomicUsize,
+    active_peak: AtomicUsize,
+    queued_peak: AtomicUsize,
+    singleflight_waiters: AtomicUsize,
+    singleflight_waiters_peak: AtomicUsize,
+    queue_wait_micros: AtomicU64,
+    engine_load_micros: AtomicU64,
+    pack_micros: AtomicU64,
+    total_micros: AtomicU64,
+    post_timeout_micros: AtomicU64,
+    deadline_remaining_ms_last: AtomicU64,
+    warmup_state: AtomicU8,
+    engine_builds: AtomicUsize,
 }
 
 struct CountGuard<'a>(&'a AtomicUsize);
@@ -72,11 +91,24 @@ impl Drop for CountGuard<'_> {
     }
 }
 
-struct CancelOnDrop(WorkControl);
+struct CancelOnDrop {
+    control: WorkControl,
+    blocking: Arc<BlockingCoordinator>,
+    finished: bool,
+}
+
+impl CancelOnDrop {
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.cancel();
+        self.control.cancel();
+        if !self.finished {
+            self.blocking.cancellations.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -232,6 +264,7 @@ impl ProjectRegistry {
             shared_frontiers,
             governed_lineages,
             blocking: Arc::new(BlockingCoordinator {
+                limit: blocking_limit,
                 permits: Arc::new(Semaphore::new(blocking_limit)),
                 request_timeout,
                 cancellation_grace,
@@ -239,7 +272,22 @@ impl ProjectRegistry {
                 queued: AtomicUsize::new(0),
                 cancellations: AtomicUsize::new(0),
                 timeouts: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
+                active_peak: AtomicUsize::new(0),
+                queued_peak: AtomicUsize::new(0),
+                singleflight_waiters: AtomicUsize::new(0),
+                singleflight_waiters_peak: AtomicUsize::new(0),
+                queue_wait_micros: AtomicU64::new(0),
+                engine_load_micros: AtomicU64::new(0),
+                pack_micros: AtomicU64::new(0),
+                total_micros: AtomicU64::new(0),
+                post_timeout_micros: AtomicU64::new(0),
+                deadline_remaining_ms_last: AtomicU64::new(0),
+                warmup_state: AtomicU8::new(0),
+                engine_builds: AtomicUsize::new(0),
             }),
+            #[cfg(test)]
+            blocking_hook: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(RegistryState {
                 clock: 1,
                 specs,
@@ -284,10 +332,17 @@ impl ProjectRegistry {
     ) -> Result<Arc<ProjectEngine>> {
         let usage_monitor = Arc::clone(&self.usage_monitor);
         let shared_frontiers = self.shared_frontiers.clone();
+        let blocking = Arc::clone(&self.blocking);
         let control = control.clone();
+        let singleflight_waiter = blocking.singleflight_waiters.fetch_add(1, Ordering::AcqRel) + 1;
+        blocking
+            .singleflight_waiters_peak
+            .fetch_max(singleflight_waiter, Ordering::Relaxed);
+        let _singleflight_waiter = CountGuard(&blocking.singleflight_waiters);
+        let build_metrics = Arc::clone(&blocking);
         self.engine_for_with_builder(project_id, root_uri, move |spec| {
             control.check()?;
-            match (&spec.governed_lineage, &shared_frontiers) {
+            let engine = match (&spec.governed_lineage, &shared_frontiers) {
                 (Some(lineage), Some(shared)) => {
                     ProjectEngine::build_with_governed_frontiers_controlled(
                         &spec.local_root,
@@ -306,13 +361,23 @@ impl ProjectRegistry {
                     usage_monitor,
                     Some(&control),
                 ),
-            }
+            }?;
+            build_metrics.engine_builds.fetch_add(1, Ordering::Relaxed);
+            Ok(engine)
         })
     }
 
     pub async fn context_pack_bounded(
         self: &Arc<Self>,
+        request: ContextPackRequest,
+    ) -> Result<Vec<u8>> {
+        self.context_pack_bounded_inner(request, false).await
+    }
+
+    async fn context_pack_bounded_inner(
+        self: &Arc<Self>,
         mut request: ContextPackRequest,
+        warmup: bool,
     ) -> Result<Vec<u8>> {
         let started = Instant::now();
         let work_budget = self
@@ -321,73 +386,261 @@ impl ProjectRegistry {
             .saturating_sub(self.blocking.cancellation_grace);
         let work_deadline = started + work_budget;
         let control = WorkControl::new(work_deadline);
-        let _cancel_on_drop = CancelOnDrop(control.clone());
+        let mut cancel_on_drop = CancelOnDrop {
+            control: control.clone(),
+            blocking: Arc::clone(&self.blocking),
+            finished: false,
+        };
 
-        self.blocking.queued.fetch_add(1, Ordering::AcqRel);
+        let queue_started = Instant::now();
+        let queued_now = self.blocking.queued.fetch_add(1, Ordering::AcqRel) + 1;
+        self.blocking
+            .queued_peak
+            .fetch_max(queued_now, Ordering::Relaxed);
         let queued = CountGuard(&self.blocking.queued);
-        let permit = tokio::time::timeout_at(
+        let permit = match tokio::time::timeout_at(
             tokio::time::Instant::from_std(work_deadline),
             Arc::clone(&self.blocking.permits).acquire_owned(),
         )
         .await
-        .map_err(|_| {
-            anyhow!("context_pack busy; retry after warmup or when queued work completes")
-        })?
-        .map_err(|_| anyhow!("context_pack blocking executor is unavailable"))?;
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                self.blocking.queue_wait_micros.fetch_add(
+                    u64::try_from(queue_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                self.blocking.total_micros.fetch_add(
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                cancel_on_drop.finish();
+                return Err(anyhow!("context_pack blocking executor is unavailable"));
+            }
+            Err(_) => {
+                self.blocking.timeouts.fetch_add(1, Ordering::Relaxed);
+                self.blocking.queue_wait_micros.fetch_add(
+                    u64::try_from(queue_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                self.blocking.total_micros.fetch_add(
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                self.blocking
+                    .deadline_remaining_ms_last
+                    .store(0, Ordering::Relaxed);
+                return Err(anyhow!(
+                    "context_pack busy; retry after warmup or when queued work completes"
+                ));
+            }
+        };
         drop(queued);
+        if warmup {
+            self.blocking.warmup_state.store(2, Ordering::Release);
+        }
+        self.blocking.queue_wait_micros.fetch_add(
+            u64::try_from(queue_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         if control.check().is_err() {
             self.blocking.timeouts.fetch_add(1, Ordering::Relaxed);
-            bail!("context_pack busy; retry after warmup or when queued work completes")
+            self.blocking.total_micros.fetch_add(
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            self.blocking
+                .deadline_remaining_ms_last
+                .store(0, Ordering::Relaxed);
+            return Err(anyhow!(
+                "context_pack busy; retry after warmup or when queued work completes"
+            ));
         }
 
         let registry = Arc::clone(self);
         let job_control = control.clone();
         let blocking = Arc::clone(&self.blocking);
+        #[cfg(test)]
+        let blocking_hook = self
+            .blocking_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut job = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            blocking.active.fetch_add(1, Ordering::AcqRel);
+            let active = blocking.active.fetch_add(1, Ordering::AcqRel) + 1;
+            blocking.active_peak.fetch_max(active, Ordering::Relaxed);
             let _active = CountGuard(&blocking.active);
             job_control.check()?;
+            let engine_started = Instant::now();
             let engine = registry.engine_for_controlled(
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
                 &job_control,
             )?;
+            blocking.engine_load_micros.fetch_add(
+                u64::try_from(engine_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             job_control.check()?;
+            #[cfg(test)]
+            if let Some(hook) = blocking_hook {
+                hook(&job_control)?;
+            }
             request.project_id = Some(engine.project_id().to_owned());
             request.root_uri = None;
-            tokio::runtime::Handle::current()
-                .block_on(engine.context_pack_cached_controlled(&request, Some(&job_control)))
+            let pack_started = Instant::now();
+            let result = tokio::runtime::Handle::current()
+                .block_on(engine.context_pack_cached_controlled(&request, Some(&job_control)));
+            blocking.pack_micros.fetch_add(
+                u64::try_from(pack_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            result
         });
 
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(work_deadline), &mut job).await
+        let result = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(work_deadline),
+            &mut job,
+        )
+        .await
         {
-            Ok(result) => match result
-                .map_err(|error| anyhow!("context_pack blocking job failed: {error}"))?
-            {
-                Ok(response) => Ok(response),
+            Ok(Ok(result)) => match result {
+                Ok(response) => {
+                    self.blocking.completed.fetch_add(1, Ordering::Relaxed);
+                    Ok(response)
+                }
                 Err(error) if error.to_string() == "repository work cancelled before commit" => {
                     self.blocking.timeouts.fetch_add(1, Ordering::Relaxed);
                     self.blocking.cancellations.fetch_add(1, Ordering::Relaxed);
-                    bail!("context_pack timed out before the server deadline; retry after warmup")
+                    Err(anyhow!(
+                        "context_pack timed out before the server deadline; retry after warmup"
+                    ))
                 }
                 Err(error) => Err(error),
             },
+            Ok(Err(error)) => Err(anyhow!("context_pack blocking job failed: {error}")),
             Err(_) => {
                 self.blocking.timeouts.fetch_add(1, Ordering::Relaxed);
                 self.blocking.cancellations.fetch_add(1, Ordering::Relaxed);
                 control.cancel();
-                match tokio::time::timeout(self.blocking.cancellation_grace, &mut job).await {
+                let timeout_started = Instant::now();
+                let result = match tokio::time::timeout(self.blocking.cancellation_grace, &mut job)
+                    .await
+                {
                     Ok(result) => {
                         let _ = result;
-                        bail!(
+                        Err(anyhow!(
                             "context_pack timed out before the server deadline; retry after warmup"
-                        )
+                        ))
                     }
-                    Err(_) => bail!("context_pack cancellation grace expired; retry after warmup"),
-                }
+                    Err(_) => {
+                        let _ = job.await;
+                        Err(anyhow!(
+                            "context_pack cancellation grace expired; retry after warmup"
+                        ))
+                    }
+                };
+                self.blocking.post_timeout_micros.fetch_add(
+                    u64::try_from(timeout_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                result
             }
+        };
+        self.blocking.total_micros.fetch_add(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.blocking.deadline_remaining_ms_last.store(
+            u64::try_from(
+                work_deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        cancel_on_drop.finish();
+        result
+    }
+
+    pub fn runtime_status(&self) -> Value {
+        let warmup = match self.blocking.warmup_state.load(Ordering::Acquire) {
+            1 => "queued",
+            2 => "building",
+            3 => "ready",
+            4 => "failed",
+            _ => "not_started",
+        };
+        json!({
+            "schema": "context_runtime.status.v1",
+            "blocking": {
+                "limit": self.blocking.limit,
+                "active": self.blocking.active.load(Ordering::Acquire),
+                "active_peak": self.blocking.active_peak.load(Ordering::Relaxed),
+                "queued": self.blocking.queued.load(Ordering::Acquire),
+                "queued_peak": self.blocking.queued_peak.load(Ordering::Relaxed),
+                "singleflight_waiters": self.blocking.singleflight_waiters.load(Ordering::Acquire),
+                "singleflight_waiters_peak": self.blocking.singleflight_waiters_peak.load(Ordering::Relaxed),
+                "completed": self.blocking.completed.load(Ordering::Relaxed),
+                "engine_builds": self.blocking.engine_builds.load(Ordering::Relaxed),
+                "cancellations": self.blocking.cancellations.load(Ordering::Relaxed),
+                "timeouts": self.blocking.timeouts.load(Ordering::Relaxed),
+                "queue_wait_micros_total": self.blocking.queue_wait_micros.load(Ordering::Relaxed),
+                "engine_load_micros_total": self.blocking.engine_load_micros.load(Ordering::Relaxed),
+                "pack_micros_total": self.blocking.pack_micros.load(Ordering::Relaxed),
+                "total_micros": self.blocking.total_micros.load(Ordering::Relaxed),
+                "post_timeout_micros_total": self.blocking.post_timeout_micros.load(Ordering::Relaxed),
+                "deadline_remaining_ms_last": self.blocking.deadline_remaining_ms_last.load(Ordering::Relaxed),
+                "request_timeout_ms": self.blocking.request_timeout.as_millis(),
+                "cancellation_grace_ms": self.blocking.cancellation_grace.as_millis()
+            },
+            "warmup": {"state": warmup}
+        })
+    }
+
+    pub fn start_post_readiness_warmup(self: &Arc<Self>) {
+        if self
+            .blocking
+            .warmup_state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
         }
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            let request = ContextPackRequest {
+                prompt: "repository warmup".to_owned(),
+                changed_files: Vec::new(),
+                focus_paths: Vec::new(),
+                memory_session: None,
+                client_profile: None,
+                model_profile: None,
+                project_id: None,
+                root_uri: None,
+                max_items: 1,
+                max_source_tokens: 0,
+                evidence_policy: Default::default(),
+                cache_strategy: Default::default(),
+                base_pack: None,
+                known_evidence: Vec::new(),
+            };
+            let state = if registry
+                .context_pack_bounded_inner(request, true)
+                .await
+                .is_ok()
+            {
+                3
+            } else {
+                4
+            };
+            registry
+                .blocking
+                .warmup_state
+                .store(state, Ordering::Release);
+        });
     }
 
     #[cfg(test)]
@@ -413,6 +666,7 @@ impl ProjectRegistry {
         cancellation_grace: Duration,
     ) -> Self {
         self.blocking = Arc::new(BlockingCoordinator {
+            limit: limit.max(1),
             permits: Arc::new(Semaphore::new(limit.max(1))),
             request_timeout,
             cancellation_grace,
@@ -420,8 +674,37 @@ impl ProjectRegistry {
             queued: AtomicUsize::new(0),
             cancellations: AtomicUsize::new(0),
             timeouts: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+            active_peak: AtomicUsize::new(0),
+            queued_peak: AtomicUsize::new(0),
+            singleflight_waiters: AtomicUsize::new(0),
+            singleflight_waiters_peak: AtomicUsize::new(0),
+            queue_wait_micros: AtomicU64::new(0),
+            engine_load_micros: AtomicU64::new(0),
+            pack_micros: AtomicU64::new(0),
+            total_micros: AtomicU64::new(0),
+            post_timeout_micros: AtomicU64::new(0),
+            deadline_remaining_ms_last: AtomicU64::new(0),
+            warmup_state: AtomicU8::new(0),
+            engine_builds: AtomicUsize::new(0),
         });
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_blocking_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.blocking.permits)
+            .acquire_owned()
+            .await
+            .expect("test semaphore remains open")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_blocking_hook(&self, hook: BlockingHook) {
+        *self
+            .blocking_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
     pub fn monitor_usage(&self, action: &str, project_id: Option<&str>) -> Result<Value> {
