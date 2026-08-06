@@ -362,6 +362,9 @@ Stdio remains the default transport when `MCP_TRANSPORT` is omitted.
 | `REPO_PATH` | Default repository root. |
 | `MCP_CONTEXT_STATE_DIR` | Project-state root; Rust creates an isolated `rust-v2` overlay. |
 | `MCP_CONTEXT_PROJECT_ID` | Optional explicit id for the default project. |
+| `MCP_CONTEXT_BLOCKING_CONCURRENCY` | Global cap for repository-heavy blocking jobs. Defaults to `max(1, min(2, available_parallelism / 2))`. |
+| `MCP_CONTEXT_REQUEST_TIMEOUT_SECS` | End-to-end `context_pack` server budget, default `48`, kept below the common 60-second client timeout. |
+| `MCP_CONTEXT_CANCELLATION_GRACE_SECS` | Portion of the server budget reserved for cooperative blocking-job cancellation, default `2`. |
 | `MCP_CONTEXT_FRONTIER_LINEAGES_FILE` | Absolute path to an operator-owned `context_frontier_lineages.v1` JSON manifest that explicitly groups 2–64 allowed Git worktree roots. Omit to disable cross-worktree frontier reuse. |
 | `MCP_CONTEXT_ALLOWED_ROOTS` | Host roots allowed for `root_uri` project selection. |
 | `MCP_CONTEXT_ROOT_MAPPINGS` | Comma-separated host-to-container mappings such as `/home/user/source=/workspace-roots`. |
@@ -381,6 +384,21 @@ paths, symlink roots, and roots outside the configured boundary are rejected.
 Repository content is treated as untrusted: prompt-injection signals are
 reported, while secrets and absolute host paths are redacted before output or
 persistence.
+
+Cold engine construction, freshness scans, Tantivy builds, cache/state access,
+and pack construction run behind the global blocking-job cap rather than on a
+Tokio async worker. Requests that expire while queued never start. Running
+requests receive cooperative cancellation between files and chunks and before
+an index commit or generation swap. REST reports queue/deadline exhaustion as
+HTTP 503; MCP returns the stable retryable `context_pack busy` or
+`context_pack timed out` diagnostic with warmup/retry guidance.
+
+Use `context_admin(mode="warmup")` before a latency-sensitive normal request.
+Increasing a client timeout can be a bounded fallback, but it does not replace
+the server concurrency cap or cancellation budget. Generated agent/build/cache
+trees such as `.workingdir/`, `.worktrees/`, `.openclaw/`, `target/`, and
+`node_modules/` are excluded consistently from discovery, watching,
+signatures, indexing, and governed Git lineage checks.
 
 ## Native architecture
 

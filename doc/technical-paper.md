@@ -440,14 +440,42 @@ client profile, without prompts, paths, ids, or source values.
 
 ## Freshness
 
-A `notify` watcher coalesces events for 50 ms. A content signature poll is the
-fallback when an event is unavailable. Fast-cache validity is bounded to two
-seconds. `changed_files` and `cache_strategy="fresh"` refresh synchronously and
-cannot return a response certified against an older generation.
+A `notify` watcher coalesces events for 50 ms and owns ordinary dirty-state
+transitions. There is no fixed two-second request-path content hash. PollWatcher
+is the event-source fallback when the native watcher is unavailable; watcher
+errors conservatively dirty the project. Explicit `changed_files` and
+`cache_strategy="fresh"` still force full signature verification and cannot
+return a response certified against an older generation.
+
+One shared generated-tree policy is consumed by project discovery, watcher
+filtering, signature traversal, index traversal, and governed Git pathspecs.
+This prevents churn under `.workingdir/` and equivalent agent/build/cache trees
+from triggering refresh or lineage discovery.
 
 Generation, source signature, and explicit-path signatures participate in
 cache validity. A cached response is served only when its certificate still
 matches the active index.
+
+## Blocking work, deadlines, and cancellation
+
+The transport computes one `context_pack` deadline at request entry (48 seconds
+by default) and reserves the final two seconds as a cooperative cancellation
+grace. Queue acquisition, cold engine construction, signature scan, full index
+build/refresh, Tantivy work, cache/state access, and serialization-heavy pack
+construction run in `spawn_blocking` behind one configurable global semaphore.
+The default permit count is `max(1, min(2, available_parallelism / 2))`.
+Existing per-project construction and refresh locks remain the singleflight
+boundary, so same-project cold callers share one build.
+
+A request dropped while queued drops its semaphore future and never starts.
+After a running request expires, its cancellation control is checked between
+files and chunks and before Tantivy commit or index-generation publication.
+Permits and active/queued counters use drop guards. Queue exhaustion and
+deadline expiry return stable retryable diagnostics before the usual 60-second
+MCP client budget. Phase measurements remain bounded and content-free: the
+existing request ledger records cache outcome, refresh checks/updates,
+retrieval, pack-build and total latency, while blocking-job tests assert queue
+and active counts return to baseline.
 
 ## References and memory
 

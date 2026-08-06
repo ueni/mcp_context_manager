@@ -6,7 +6,11 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -35,6 +39,14 @@ pub const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
 const IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
     ".mcp-context-manager",
+    ".workingdir",
+    ".worktrees",
+    ".agent",
+    ".agents",
+    ".codex",
+    ".openclaw",
+    ".cache",
+    ".venv",
     ".cmake-build",
     ".downloads",
     ".pytest_cache",
@@ -44,8 +56,57 @@ const IGNORED_DIRECTORIES: &[&str] = &[
     "dist",
     "node_modules",
     "target",
+    "venv",
     "wheelhouse",
 ];
+
+/// Shared cancellation/deadline state for repository-wide blocking work.
+///
+/// Scans and index construction check this between files and chunks so a
+/// timed-out request cannot publish a late generation after its caller left.
+#[derive(Clone)]
+pub struct WorkControl {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl WorkControl {
+    pub fn new(deadline: Instant) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline,
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+            bail!("repository work cancelled before commit")
+        }
+        Ok(())
+    }
+}
+
+/// Returns whether a repository-relative path belongs to generated state.
+/// Watchers, scanners, project discovery, and Git lineage use this policy.
+pub fn is_ignored_repository_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|name| {
+            IGNORED_DIRECTORIES.contains(&name) || name.ends_with('~') || name.starts_with(".#")
+        })
+    })
+}
+
+/// Git pathspec exclusions corresponding to the shared ignore policy.
+pub fn git_exclude_pathspecs() -> Vec<String> {
+    IGNORED_DIRECTORIES
+        .iter()
+        .map(|directory| format!(":(exclude){directory}/**"))
+        .collect()
+}
 
 const STOP_WORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "build", "by", "for", "from", "how", "in", "into",
@@ -163,6 +224,15 @@ impl ProjectIndex {
     }
 
     pub fn build_for_project(root: impl AsRef<Path>, project_scope: Option<&str>) -> Result<Self> {
+        Self::build_for_project_controlled(root, project_scope, None)
+    }
+
+    pub fn build_for_project_controlled(
+        root: impl AsRef<Path>,
+        project_scope: Option<&str>,
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
+        check_control(control)?;
         let root = root.as_ref().canonicalize().with_context(|| {
             format!(
                 "repository root does not exist: {}",
@@ -173,7 +243,7 @@ impl ProjectIndex {
             bail!("repository root is not a directory: {}", root.display());
         }
 
-        let (chunks, stats) = scan_repository(&root, project_scope)?;
+        let (chunks, stats) = scan_repository(&root, project_scope, control)?;
         let mut schema_builder = Schema::builder();
         let fields = Fields {
             id: schema_builder.add_text_field("id", STRING | STORED),
@@ -188,6 +258,7 @@ impl ProjectIndex {
         let index = Index::create_in_ram(schema);
         let mut writer = index.writer(50_000_000)?;
         for chunk in &chunks {
+            check_control(control)?;
             writer.add_document(doc!(
                 fields.id => chunk.id.clone(),
                 fields.path => chunk.path.clone(),
@@ -198,6 +269,7 @@ impl ProjectIndex {
                 fields.body => chunk.content.clone(),
             ))?;
         }
+        check_control(control)?;
         writer.commit()?;
         let reader = index
             .reader_builder()
@@ -209,6 +281,7 @@ impl ProjectIndex {
         let mut chunks_by_id = HashMap::new();
         let mut chunks_by_address = HashMap::new();
         for (index, chunk) in chunks.iter().enumerate() {
+            check_control(control)?;
             chunks_by_path
                 .entry(chunk.path.clone())
                 .or_default()
@@ -217,6 +290,7 @@ impl ProjectIndex {
             chunks_by_address.insert(immutable_candidate_address(&chunk.id), index);
         }
 
+        check_control(control)?;
         Ok(Self {
             root,
             index,
@@ -628,6 +702,15 @@ pub fn repository_signature_for_project(
     root: impl AsRef<Path>,
     project_scope: Option<&str>,
 ) -> Result<String> {
+    repository_signature_for_project_controlled(root, project_scope, None)
+}
+
+pub fn repository_signature_for_project_controlled(
+    root: impl AsRef<Path>,
+    project_scope: Option<&str>,
+    control: Option<&WorkControl>,
+) -> Result<String> {
+    check_control(control)?;
     let root = root.as_ref().canonicalize()?;
     let mut digest = Sha256::new();
     for entry in WalkDir::new(&root)
@@ -636,6 +719,7 @@ pub fn repository_signature_for_project(
         .into_iter()
         .filter_entry(should_visit)
     {
+        check_control(control)?;
         let entry = entry?;
         if entry.file_type().is_symlink() || !entry.file_type().is_file() {
             continue;
@@ -703,7 +787,11 @@ pub fn validate_relative_path(raw: &str) -> Result<String> {
     }
 }
 
-fn scan_repository(root: &Path, project_scope: Option<&str>) -> Result<(Vec<Chunk>, IndexStats)> {
+fn scan_repository(
+    root: &Path,
+    project_scope: Option<&str>,
+    control: Option<&WorkControl>,
+) -> Result<(Vec<Chunk>, IndexStats)> {
     let mut chunks = Vec::new();
     let mut source_digest = Sha256::new();
     let mut file_count = 0;
@@ -719,6 +807,7 @@ fn scan_repository(root: &Path, project_scope: Option<&str>) -> Result<(Vec<Chun
         .into_iter()
         .filter_entry(should_visit)
     {
+        check_control(control)?;
         let entry = entry?;
         if entry.file_type().is_symlink() {
             skipped_symlink += 1;
@@ -751,6 +840,7 @@ fn scan_repository(root: &Path, project_scope: Option<&str>) -> Result<(Vec<Chun
                 "",
             )
         };
+        check_control(control)?;
         symbol_chunks += file_chunks
             .iter()
             .filter(|chunk| !chunk.symbol.is_empty())
@@ -832,10 +922,18 @@ fn should_visit(entry: &DirEntry) -> bool {
         return false;
     }
     let name = entry.file_name().to_string_lossy();
-    if IGNORED_DIRECTORIES.contains(&name.as_ref()) || name == corpus::CORPUS_DIRECTORY {
+    if is_ignored_repository_path(Path::new(entry.file_name())) || name == corpus::CORPUS_DIRECTORY
+    {
         return false;
     }
     true
+}
+
+fn check_control(control: Option<&WorkControl>) -> Result<()> {
+    if let Some(control) = control {
+        control.check()?;
+    }
+    Ok(())
 }
 
 fn read_text(path: &Path) -> Result<Option<String>> {
@@ -1356,7 +1454,7 @@ mod tests {
         fs::write(root.path().join("artifact.bin"), b"binary\0payload")
             .expect("write binary fixture");
 
-        let (chunks, stats) = scan_repository(root.path(), None).expect("scan repository");
+        let (chunks, stats) = scan_repository(root.path(), None, None).expect("scan repository");
 
         assert!(chunks.iter().any(|chunk| chunk.path == "Cargo.lock"));
         assert!(!chunks.iter().any(|chunk| chunk.path == "artifact.bin"));
@@ -1370,7 +1468,7 @@ mod tests {
         let large = root.path().join("generated.min.js");
         fs::write(&large, vec![b'x'; MAX_READ_BYTES + 1]).expect("write oversized fixture");
 
-        let (chunks, _) = scan_repository(root.path(), None).expect("scan repository");
+        let (chunks, _) = scan_repository(root.path(), None, None).expect("scan repository");
         assert!(!chunks.iter().any(|chunk| chunk.path == "generated.min.js"));
 
         let index = ProjectIndex::build(root.path()).expect("build index");
@@ -1456,5 +1554,40 @@ mod tests {
             linked_index.stats().refresh_signature
         );
         assert!(!linked_index.all_paths().iter().any(|path| path == ".git"));
+    }
+
+    #[test]
+    fn generated_trees_do_not_affect_index_or_signature() {
+        let root = tempfile::tempdir().expect("repository root");
+        fs::write(root.path().join("anchor.rs"), "fn anchor() {}\n").expect("anchor");
+        let before = ProjectIndex::build(root.path()).expect("initial index");
+        let before_signature = repository_signature(root.path()).expect("initial signature");
+
+        let generated = root.path().join(".workingdir/agent-worktree/target/debug");
+        fs::create_dir_all(&generated).expect("generated tree");
+        fs::write(
+            generated.join("churn.rs"),
+            "fn generated_churn_must_not_be_indexed() {}\n",
+        )
+        .expect("generated churn");
+
+        let after = ProjectIndex::build(root.path()).expect("index after churn");
+        let after_signature = repository_signature(root.path()).expect("signature after churn");
+        assert_eq!(before.stats().file_count, after.stats().file_count);
+        assert_eq!(before_signature, after_signature);
+        assert!(
+            !after
+                .all_paths()
+                .iter()
+                .any(|path| path.contains(".workingdir"))
+        );
+        assert!(is_ignored_repository_path(Path::new(
+            ".workingdir/agent-worktree/target/debug/churn.rs"
+        )));
+        assert!(
+            git_exclude_pathspecs()
+                .iter()
+                .any(|path| path == ":(exclude).workingdir/**")
+        );
     }
 }

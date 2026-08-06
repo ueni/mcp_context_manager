@@ -800,7 +800,10 @@ async fn context_pack_http(State(state): State<HttpState>, Json(payload): Json<V
     context_pack_http_response(&state.registry, payload).await
 }
 
-async fn context_pack_http_response(registry: &ProjectRegistry, mut payload: Value) -> Response {
+async fn context_pack_http_response(
+    registry: &Arc<ProjectRegistry>,
+    mut payload: Value,
+) -> Response {
     let Some(object) = payload.as_object_mut() else {
         registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
         return rest_error(StatusCode::BAD_REQUEST, "JSON body must be an object");
@@ -823,32 +826,35 @@ async fn context_pack_http_response(registry: &ProjectRegistry, mut payload: Val
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(bytes))
             .expect("valid REST response"),
-        Err(error) => rest_error(StatusCode::BAD_REQUEST, &error),
+        Err(error) => {
+            let status = if error.starts_with("context_pack busy")
+                || error.starts_with("context_pack timed out")
+                || error.starts_with("context_pack cancellation grace")
+            {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            rest_error(status, &error)
+        }
     }
 }
 
 async fn run_context_pack_request(
-    registry: &ProjectRegistry,
-    mut request: ContextPackRequest,
+    registry: &Arc<ProjectRegistry>,
+    request: ContextPackRequest,
 ) -> Result<Vec<u8>, String> {
     if let Err(error) = request.validate_limits() {
         registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
         return Err(error.to_string());
     }
-    let engine =
-        match registry.engine_for(request.project_id.as_deref(), request.root_uri.as_deref()) {
-            Ok(engine) => engine,
-            Err(error) => {
-                registry.record_context_pack_rejection(classify_context_pack_rejection(&error));
-                return Err(error.to_string());
-            }
-        };
-    request.project_id = Some(engine.project_id().to_owned());
-    request.root_uri = None;
-    engine
-        .context_pack_cached(&request)
+    registry
+        .context_pack_bounded(request)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            registry.record_context_pack_rejection(classify_context_pack_rejection(&error));
+            error.to_string()
+        })
 }
 
 async fn reference_http(
@@ -1340,6 +1346,118 @@ mod tests {
             .to_bytes();
         let rest: Value = serde_json::from_slice(&body).expect("REST context_pack.v2 JSON");
         assert_eq!(rest, mcp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_context_pack_keeps_single_worker_runtime_responsive() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        for file in 0..300 {
+            let mut source = String::new();
+            for line in 0..80 {
+                source.push_str(&format!("fn fixture_{file}_{line}() {{}}\n"));
+            }
+            std::fs::write(root.path().join(format!("fixture-{file}.rs")), source)
+                .expect("source fixture");
+        }
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "find fixture implementation",
+            "max_items": 4
+        }))
+        .expect("pack request");
+        let pack_registry = Arc::clone(&registry);
+        let pack = tokio::spawn(async move { pack_registry.context_pack_bounded(request).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if registry.blocking_snapshot().1 > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking job starts");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await
+        .expect("runtime ticker remains responsive");
+        assert_eq!(ContextServer::new(Arc::clone(&registry)).health(), "ok");
+
+        let response = tokio::time::timeout(Duration::from_secs(20), pack)
+            .await
+            .expect("bounded pack deadline")
+            .expect("pack task")
+            .expect("context pack");
+        assert!(!response.is_empty());
+        assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_blocking_job_cooperatively_releases_permit() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        for file in 0..500 {
+            let source = (0..120)
+                .map(|line| format!("fn timeout_fixture_{file}_{line}() {{}}\n"))
+                .collect::<String>();
+            std::fs::write(root.path().join(format!("timeout-{file}.rs")), source)
+                .expect("source fixture");
+        }
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry")
+            .with_blocking_configuration(
+                1,
+                Duration::from_millis(20),
+                Duration::from_millis(15),
+            ),
+        );
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "find timeout fixture",
+            "max_items": 4
+        }))
+        .expect("pack request");
+
+        let error = registry
+            .context_pack_bounded(request)
+            .await
+            .expect_err("request must expire before the large cold build completes")
+            .to_string();
+        assert!(
+            error.starts_with("context_pack timed out")
+                || error.starts_with("context_pack cancellation grace")
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let (_, active, queued, _, timeouts) = registry.blocking_snapshot();
+                if active == 0 && queued == 0 && timeouts == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled job returns counters and permit to baseline");
     }
 
     #[tokio::test]

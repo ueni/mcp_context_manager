@@ -13,8 +13,9 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use context_index::{
-    IndexStats, ProjectIndex, SearchHit, SymbolRecord, immutable_candidate_address,
-    normalize_terms, repository_signature_for_project, validate_relative_path,
+    IndexStats, ProjectIndex, SearchHit, SymbolRecord, WorkControl, git_exclude_pathspecs,
+    immutable_candidate_address, is_ignored_repository_path, normalize_terms,
+    repository_signature_for_project_controlled, validate_relative_path,
 };
 use context_store::{ReferenceValidation, StateStore};
 use moka::future::Cache;
@@ -309,8 +310,10 @@ const L1_MEMORY_MAX_BYTES: usize = 128 * 1024 * 1024;
 const L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const SHARED_L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const WARM_MISS_TARGET_MICROS: u64 = 50_000;
-const FAST_POLL_INTERVAL_MS: u64 = 2_000;
 const WATCH_COALESCE_MS: u64 = 50;
+// Watcher-driven freshness avoids repository-wide request-path polling. Zero
+// is exposed in diagnostics to make the disabled fixed poll explicit.
+const FAST_POLL_INTERVAL_MS: u64 = 0;
 const NEGATIVE_FRONTIER_TTL_MS: u64 = 30_000;
 const POSITIVE_FRONTIER_ADMISSION_WINDOW_MS: u64 = 30 * 60 * 1_000;
 const FRONTIER_ADMISSION_TRACKER_MAX_ENTRIES: usize = 2_048;
@@ -2440,6 +2443,22 @@ impl ProjectEngine {
         project_id: impl Into<String>,
         usage_monitor: Arc<UsageMonitor>,
     ) -> Result<Self> {
+        Self::build_with_state_and_monitor_controlled(
+            root,
+            project_state,
+            project_id,
+            usage_monitor,
+            None,
+        )
+    }
+
+    pub fn build_with_state_and_monitor_controlled(
+        root: impl AsRef<std::path::Path>,
+        project_state: impl AsRef<std::path::Path>,
+        project_id: impl Into<String>,
+        usage_monitor: Arc<UsageMonitor>,
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
         Self::build_with_state_and_l0_idle(
             root,
             project_state,
@@ -2448,6 +2467,7 @@ impl ProjectEngine {
             usage_monitor,
             None,
             None,
+            control,
         )
     }
 
@@ -2459,6 +2479,26 @@ impl ProjectEngine {
         governed_lineage: GovernedFrontierLineage,
         shared_frontiers: Arc<SharedFrontierCache>,
     ) -> Result<Self> {
+        Self::build_with_governed_frontiers_controlled(
+            root,
+            project_state,
+            project_id,
+            usage_monitor,
+            governed_lineage,
+            shared_frontiers,
+            None,
+        )
+    }
+
+    pub fn build_with_governed_frontiers_controlled(
+        root: impl AsRef<std::path::Path>,
+        project_state: impl AsRef<std::path::Path>,
+        project_id: impl Into<String>,
+        usage_monitor: Arc<UsageMonitor>,
+        governed_lineage: GovernedFrontierLineage,
+        shared_frontiers: Arc<SharedFrontierCache>,
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
         Self::build_with_state_and_l0_idle(
             root,
             project_state,
@@ -2467,9 +2507,11 @@ impl ProjectEngine {
             usage_monitor,
             Some(governed_lineage),
             Some(shared_frontiers),
+            control,
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Internal constructor keeps public build variants explicit.
     fn build_with_state_and_l0_idle(
         root: impl AsRef<std::path::Path>,
         project_state: impl AsRef<std::path::Path>,
@@ -2478,9 +2520,17 @@ impl ProjectEngine {
         usage_monitor: Arc<UsageMonitor>,
         governed_lineage: Option<GovernedFrontierLineage>,
         shared_frontiers: Option<Arc<SharedFrontierCache>>,
+        control: Option<&WorkControl>,
     ) -> Result<Self> {
         let project_id = project_id.into();
-        let index = Arc::new(ProjectIndex::build_for_project(root, Some(&project_id))?);
+        let index = Arc::new(ProjectIndex::build_for_project_controlled(
+            root,
+            Some(&project_id),
+            control,
+        )?);
+        if let Some(control) = control {
+            control.check()?;
+        }
         let store = Arc::new(StateStore::open(project_state)?);
         let freshness = Arc::new(FreshnessState {
             last_poll_ms: AtomicU64::new(now_millis()),
@@ -2645,16 +2695,30 @@ impl ProjectEngine {
     }
 
     pub async fn context_pack_cached(&self, request: &ContextPackRequest) -> Result<Vec<u8>> {
+        self.context_pack_cached_controlled(request, None).await
+    }
+
+    pub async fn context_pack_cached_controlled(
+        &self,
+        request: &ContextPackRequest,
+        control: Option<&WorkControl>,
+    ) -> Result<Vec<u8>> {
         let started = Instant::now();
         let result = async {
+            if let Some(control) = control {
+                control.check()?;
+            }
             request.validate_limits()?;
             self.validate_project_selector(
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
-            let refresh = self.ensure_fresh(request)?;
+            let refresh = self.ensure_fresh_controlled(request, control)?;
             let admission = if request.memory_session.is_some() {
                 let pack = self.build_context_pack_entry(request)?;
+                if let Some(control) = control {
+                    control.check()?;
+                }
                 CachedAdmission {
                     cached: Arc::new(CachedPack {
                         bytes: Arc::new(pack.bytes),
@@ -2670,6 +2734,9 @@ impl ProjectEngine {
             } else {
                 self.admit_context_pack_cached(request).await?
             };
+            if let Some(control) = control {
+                control.check()?;
+            }
             Ok::<_, anyhow::Error>((admission, refresh))
         }
         .await;
@@ -3819,19 +3886,36 @@ impl ProjectEngine {
     }
 
     fn ensure_fresh(&self, request: &ContextPackRequest) -> Result<(bool, bool)> {
+        self.ensure_fresh_controlled(request, None)
+    }
+
+    fn ensure_fresh_controlled(
+        &self,
+        request: &ContextPackRequest,
+        control: Option<&WorkControl>,
+    ) -> Result<(bool, bool)> {
         let force =
             request.cache_strategy == CacheStrategy::Fresh || !request.changed_files.is_empty();
-        self.refresh_index(force)
+        self.refresh_index_controlled(force, control)
     }
 
     fn refresh_index(&self, force: bool) -> Result<(bool, bool)> {
+        self.refresh_index_controlled(force, None)
+    }
+
+    fn refresh_index_controlled(
+        &self,
+        force: bool,
+        control: Option<&WorkControl>,
+    ) -> Result<(bool, bool)> {
+        if let Some(control) = control {
+            control.check()?;
+        }
         let now = now_millis();
         let watcher_ready = self.freshness.dirty.load(Ordering::Acquire)
             && now.saturating_sub(self.freshness.last_event_ms.load(Ordering::Acquire))
                 >= WATCH_COALESCE_MS;
-        let poll_due = now.saturating_sub(self.freshness.last_poll_ms.load(Ordering::Acquire))
-            >= FAST_POLL_INTERVAL_MS;
-        if !force && !watcher_ready && !poll_due {
+        if !force && !watcher_ready {
             return Ok((false, false));
         }
 
@@ -3843,26 +3927,32 @@ impl ProjectEngine {
         let watcher_ready = self.freshness.dirty.load(Ordering::Acquire)
             && now.saturating_sub(self.freshness.last_event_ms.load(Ordering::Acquire))
                 >= WATCH_COALESCE_MS;
-        let poll_due = now.saturating_sub(self.freshness.last_poll_ms.load(Ordering::Acquire))
-            >= FAST_POLL_INTERVAL_MS;
-        if !force && !watcher_ready && !poll_due {
+        if !force && !watcher_ready {
             return Ok((false, false));
         }
 
         let current = self.index();
-        let signature = repository_signature_for_project(current.root(), Some(&self.project_id))?;
+        let signature = repository_signature_for_project_controlled(
+            current.root(),
+            Some(&self.project_id),
+            control,
+        )?;
         self.freshness.last_poll_ms.store(now, Ordering::Release);
         self.freshness.dirty.store(false, Ordering::Release);
         if signature == current.stats().refresh_signature {
             return Ok((true, false));
         }
 
-        let replacement = Arc::new(ProjectIndex::build_for_project(
+        let replacement = Arc::new(ProjectIndex::build_for_project_controlled(
             current.root(),
             Some(&self.project_id),
+            control,
         )?);
         if replacement.stats().refresh_signature != signature {
             bail!("repository changed while rebuilding the native index");
+        }
+        if let Some(control) = control {
+            control.check()?;
         }
         *self
             .index
@@ -4390,7 +4480,13 @@ fn watcher_loop<W: Watcher>(
                     .store(now_millis(), Ordering::Release);
                 freshness.dirty.store(true, Ordering::Release);
             }
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(Err(_)) => {
+                freshness
+                    .last_event_ms
+                    .store(now_millis(), Ordering::Release);
+                freshness.dirty.store(true, Ordering::Release);
+            }
+            Ok(Ok(_)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -4400,22 +4496,7 @@ fn source_event_path(root: &std::path::Path, path: &std::path::Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-    let ignored = [
-        ".git",
-        ".mcp-context-manager",
-        ".pytest_cache",
-        ".ruff_cache",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-        "target",
-    ];
-    !relative.components().any(|component| {
-        component.as_os_str().to_str().is_some_and(|name| {
-            ignored.contains(&name) || name.ends_with('~') || name.starts_with(".#")
-        })
-    })
+    !is_ignored_repository_path(relative)
 }
 
 fn load_frontiers(store: &StateStore, refresh_signature: &str) -> Result<FrontierState> {
@@ -4520,17 +4601,18 @@ fn git_output(root: &std::path::Path, args: &[&str]) -> Option<std::process::Out
 fn git_worktree_proof(
     root: &std::path::Path,
 ) -> std::result::Result<GitWorktreeProof, GitProofRejection> {
-    let status = git_output(
-        root,
-        &[
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ],
-    )
-    .ok_or(GitProofRejection::Unavailable)?;
+    let mut arguments = vec![
+        "status".to_owned(),
+        "--porcelain=v2".to_owned(),
+        "--branch".to_owned(),
+        "--untracked-files=all".to_owned(),
+        "--ignore-submodules=none".to_owned(),
+        "--".to_owned(),
+        ":(top)**".to_owned(),
+    ];
+    arguments.extend(git_exclude_pathspecs());
+    let borrowed = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let status = git_output(root, &borrowed).ok_or(GitProofRejection::Unavailable)?;
     let status = String::from_utf8(status.stdout).map_err(|_| GitProofRejection::Unavailable)?;
     if status.lines().any(|line| !line.starts_with("# ")) {
         return Err(GitProofRejection::Dirty);
@@ -7891,6 +7973,7 @@ mod tests {
             Arc::new(UsageMonitor::open(state.path().join("monitor")).expect("monitor")),
             None,
             None,
+            None,
         )
         .expect("engine");
         let request: ContextPackRequest =
@@ -9535,6 +9618,20 @@ mod tests {
         )
         .expect("prune response");
         assert_eq!(pruned["shared_frontier_removed"], 1);
+    }
+
+    #[test]
+    fn generated_worktree_churn_is_ignored_by_watcher_and_git_lineage() {
+        let fixture = tempdir().expect("fixture root");
+        let repository = fixture.path().join("repository");
+        init_git_repository(&repository);
+        let generated = repository.join(".workingdir/issue-29/target");
+        std::fs::create_dir_all(&generated).expect("generated tree");
+        let churn = generated.join("churn.rs");
+        std::fs::write(&churn, "fn churn() {}\n").expect("generated churn");
+
+        assert!(!source_event_path(&repository, &churn));
+        assert!(git_worktree_proof(&repository).is_ok());
     }
 
     #[tokio::test]

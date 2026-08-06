@@ -2,17 +2,23 @@ use std::{
     collections::HashMap,
     env,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use context_core::{
-    ContextAdminRequest, ContextPackRejectionClass, GovernedFrontierLineage, ProjectEngine,
-    ResultReferenceRequest, SharedFrontierCache, UsageMonitor,
+    ContextAdminRequest, ContextPackRejectionClass, ContextPackRequest, GovernedFrontierLineage,
+    ProjectEngine, ResultReferenceRequest, SharedFrontierCache, UsageMonitor,
 };
+use context_index::{WorkControl, is_ignored_repository_path};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use url::Url;
 use walkdir::{DirEntry, WalkDir};
 
@@ -20,6 +26,8 @@ const ENGINE_CAPACITY: usize = 8;
 const DISCOVERY_MAX_PROJECTS: usize = 100;
 const DEFAULT_DISCOVERY_MAX_DEPTH: usize = 4;
 const PROJECT_CATALOG_FILE: &str = "project-catalog.v1.json";
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 48;
+const DEFAULT_CANCELLATION_GRACE_SECS: u64 = 2;
 const DEFAULT_PROJECT_MARKERS: &[&str] = &[
     ".git",
     "pyproject.toml",
@@ -42,7 +50,34 @@ pub struct ProjectRegistry {
     usage_monitor: Arc<UsageMonitor>,
     shared_frontiers: Option<Arc<SharedFrontierCache>>,
     governed_lineages: HashMap<PathBuf, GovernedFrontierLineage>,
+    blocking: Arc<BlockingCoordinator>,
     state: Arc<Mutex<RegistryState>>,
+}
+
+struct BlockingCoordinator {
+    permits: Arc<Semaphore>,
+    request_timeout: Duration,
+    cancellation_grace: Duration,
+    active: AtomicUsize,
+    queued: AtomicUsize,
+    cancellations: AtomicUsize,
+    timeouts: AtomicUsize,
+}
+
+struct CountGuard<'a>(&'a AtomicUsize);
+
+impl Drop for CountGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct CancelOnDrop(WorkControl);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 struct RegistryState {
@@ -173,6 +208,18 @@ impl ProjectRegistry {
             .then(|| SharedFrontierCache::open(state_root.join("global-frontiers")))
             .transpose()?
             .map(Arc::new);
+        let blocking_limit = blocking_limit_from_env();
+        let request_timeout = duration_from_env(
+            "MCP_CONTEXT_REQUEST_TIMEOUT_SECS",
+            DEFAULT_REQUEST_TIMEOUT_SECS,
+        );
+        let cancellation_grace = duration_from_env(
+            "MCP_CONTEXT_CANCELLATION_GRACE_SECS",
+            DEFAULT_CANCELLATION_GRACE_SECS,
+        );
+        if cancellation_grace >= request_timeout {
+            bail!("MCP_CONTEXT_CANCELLATION_GRACE_SECS must be below the request timeout");
+        }
         Ok(Self {
             base_root,
             state_root,
@@ -184,6 +231,15 @@ impl ProjectRegistry {
             usage_monitor,
             shared_frontiers,
             governed_lineages,
+            blocking: Arc::new(BlockingCoordinator {
+                permits: Arc::new(Semaphore::new(blocking_limit)),
+                request_timeout,
+                cancellation_grace,
+                active: AtomicUsize::new(0),
+                queued: AtomicUsize::new(0),
+                cancellations: AtomicUsize::new(0),
+                timeouts: AtomicUsize::new(0),
+            }),
             state: Arc::new(Mutex::new(RegistryState {
                 clock: 1,
                 specs,
@@ -218,6 +274,154 @@ impl ProjectRegistry {
                 ),
             }
         })
+    }
+
+    fn engine_for_controlled(
+        &self,
+        project_id: Option<&str>,
+        root_uri: Option<&str>,
+        control: &WorkControl,
+    ) -> Result<Arc<ProjectEngine>> {
+        let usage_monitor = Arc::clone(&self.usage_monitor);
+        let shared_frontiers = self.shared_frontiers.clone();
+        let control = control.clone();
+        self.engine_for_with_builder(project_id, root_uri, move |spec| {
+            control.check()?;
+            match (&spec.governed_lineage, &shared_frontiers) {
+                (Some(lineage), Some(shared)) => {
+                    ProjectEngine::build_with_governed_frontiers_controlled(
+                        &spec.local_root,
+                        &spec.state_root,
+                        &spec.project_id,
+                        usage_monitor,
+                        lineage.clone(),
+                        Arc::clone(shared),
+                        Some(&control),
+                    )
+                }
+                _ => ProjectEngine::build_with_state_and_monitor_controlled(
+                    &spec.local_root,
+                    &spec.state_root,
+                    &spec.project_id,
+                    usage_monitor,
+                    Some(&control),
+                ),
+            }
+        })
+    }
+
+    pub async fn context_pack_bounded(
+        self: &Arc<Self>,
+        mut request: ContextPackRequest,
+    ) -> Result<Vec<u8>> {
+        let started = Instant::now();
+        let work_budget = self
+            .blocking
+            .request_timeout
+            .saturating_sub(self.blocking.cancellation_grace);
+        let work_deadline = started + work_budget;
+        let control = WorkControl::new(work_deadline);
+        let _cancel_on_drop = CancelOnDrop(control.clone());
+
+        self.blocking.queued.fetch_add(1, Ordering::AcqRel);
+        let queued = CountGuard(&self.blocking.queued);
+        let permit = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(work_deadline),
+            Arc::clone(&self.blocking.permits).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!("context_pack busy; retry after warmup or when queued work completes")
+        })?
+        .map_err(|_| anyhow!("context_pack blocking executor is unavailable"))?;
+        drop(queued);
+        if control.check().is_err() {
+            self.blocking.timeouts.fetch_add(1, Ordering::Relaxed);
+            bail!("context_pack busy; retry after warmup or when queued work completes")
+        }
+
+        let registry = Arc::clone(self);
+        let job_control = control.clone();
+        let blocking = Arc::clone(&self.blocking);
+        let mut job = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            blocking.active.fetch_add(1, Ordering::AcqRel);
+            let _active = CountGuard(&blocking.active);
+            job_control.check()?;
+            let engine = registry.engine_for_controlled(
+                request.project_id.as_deref(),
+                request.root_uri.as_deref(),
+                &job_control,
+            )?;
+            job_control.check()?;
+            request.project_id = Some(engine.project_id().to_owned());
+            request.root_uri = None;
+            tokio::runtime::Handle::current()
+                .block_on(engine.context_pack_cached_controlled(&request, Some(&job_control)))
+        });
+
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(work_deadline), &mut job).await
+        {
+            Ok(result) => match result
+                .map_err(|error| anyhow!("context_pack blocking job failed: {error}"))?
+            {
+                Ok(response) => Ok(response),
+                Err(error) if error.to_string() == "repository work cancelled before commit" => {
+                    self.blocking.timeouts.fetch_add(1, Ordering::Relaxed);
+                    self.blocking.cancellations.fetch_add(1, Ordering::Relaxed);
+                    bail!("context_pack timed out before the server deadline; retry after warmup")
+                }
+                Err(error) => Err(error),
+            },
+            Err(_) => {
+                self.blocking.timeouts.fetch_add(1, Ordering::Relaxed);
+                self.blocking.cancellations.fetch_add(1, Ordering::Relaxed);
+                control.cancel();
+                match tokio::time::timeout(self.blocking.cancellation_grace, &mut job).await {
+                    Ok(result) => {
+                        let _ = result;
+                        bail!(
+                            "context_pack timed out before the server deadline; retry after warmup"
+                        )
+                    }
+                    Err(_) => bail!("context_pack cancellation grace expired; retry after warmup"),
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocking_snapshot(&self) -> (usize, usize, usize, usize, usize) {
+        let active = self.blocking.active.load(Ordering::Acquire);
+        (
+            self.blocking
+                .permits
+                .available_permits()
+                .saturating_add(active),
+            active,
+            self.blocking.queued.load(Ordering::Acquire),
+            self.blocking.cancellations.load(Ordering::Relaxed),
+            self.blocking.timeouts.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_blocking_configuration(
+        mut self,
+        limit: usize,
+        request_timeout: Duration,
+        cancellation_grace: Duration,
+    ) -> Self {
+        self.blocking = Arc::new(BlockingCoordinator {
+            permits: Arc::new(Semaphore::new(limit.max(1))),
+            request_timeout,
+            cancellation_grace,
+            active: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
+            timeouts: AtomicUsize::new(0),
+        });
+        self
     }
 
     pub fn monitor_usage(&self, action: &str, project_id: Option<&str>) -> Result<Value> {
@@ -913,10 +1117,32 @@ fn discovery_entry(entry: &DirEntry) -> bool {
     if entry.file_type().is_symlink() {
         return false;
     }
-    let name = entry.file_name().to_string_lossy();
     !entry.file_type().is_dir()
-        || (!name.starts_with('.')
-            && !matches!(name.as_ref(), "build" | "dist" | "node_modules" | "target"))
+        || !is_ignored_repository_path(std::path::Path::new(entry.file_name()))
+}
+
+fn blocking_limit_from_env() -> usize {
+    env::var("MCP_CONTEXT_BLOCKING_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .saturating_div(2)
+                .clamp(1, 2)
+        })
+}
+
+fn duration_from_env(name: &str, default_seconds: u64) -> Duration {
+    Duration::from_secs(
+        env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default_seconds),
+    )
 }
 
 fn discovery_max_depth_from_env() -> usize {
