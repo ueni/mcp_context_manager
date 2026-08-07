@@ -47,7 +47,7 @@ Supported fields are:
 
 | Field | Contract |
 | --- | --- |
-| `prompt` | Required task text. |
+| `prompt` | Required task text after trimming. Empty or whitespace-only values are rejected by MCP and REST with `prompt is required`. |
 | `changed_files`, `focus_paths` | Repository-relative paths ranked first. |
 | `memory_session` | Optional explicit continuation key for iterative turns; project-local, 24-hour TTL. |
 | `client_profile`, `model_profile` | Client/provider hints. |

@@ -146,25 +146,9 @@ impl ContextServer {
     )]
     async fn context_pack(
         &self,
-        Parameters(mut request): Parameters<ContextPackRequest>,
+        Parameters(request): Parameters<ContextPackRequest>,
     ) -> Result<String, String> {
-        let engine = match self
-            .registry
-            .engine_for(request.project_id.as_deref(), request.root_uri.as_deref())
-        {
-            Ok(engine) => engine,
-            Err(error) => {
-                self.registry
-                    .record_context_pack_rejection(classify_context_pack_rejection(&error));
-                return Err(error.to_string());
-            }
-        };
-        request.project_id = Some(engine.project_id().to_owned());
-        request.root_uri = None;
-        let encoded = engine
-            .context_pack_cached(&request)
-            .await
-            .map_err(|error| error.to_string())?;
+        let encoded = run_context_pack_request(&self.registry, request).await?;
         String::from_utf8(encoded).map_err(|error| error.to_string())
     }
 
@@ -812,14 +796,13 @@ fn legacy_sse_messages(
     }
 }
 
-async fn context_pack_http(
-    State(state): State<HttpState>,
-    Json(mut payload): Json<Value>,
-) -> Response {
+async fn context_pack_http(State(state): State<HttpState>, Json(payload): Json<Value>) -> Response {
+    context_pack_http_response(&state.registry, payload).await
+}
+
+async fn context_pack_http_response(registry: &ProjectRegistry, mut payload: Value) -> Response {
     let Some(object) = payload.as_object_mut() else {
-        state
-            .registry
-            .record_context_pack_rejection(ContextPackRejectionClass::Schema);
+        registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
         return rest_error(StatusCode::BAD_REQUEST, "JSON body must be an object");
     };
     if !object.contains_key("prompt")
@@ -827,43 +810,45 @@ async fn context_pack_http(
     {
         object.insert("prompt".to_owned(), task);
     }
-    let mut request = match serde_json::from_value::<ContextPackRequest>(payload) {
-        Ok(request) if !request.prompt.trim().is_empty() => request,
-        Ok(_) => {
-            state
-                .registry
-                .record_context_pack_rejection(ContextPackRejectionClass::Schema);
-            return rest_error(StatusCode::BAD_REQUEST, "prompt is required");
-        }
+    let request = match serde_json::from_value::<ContextPackRequest>(payload) {
+        Ok(request) => request,
         Err(error) => {
-            state
-                .registry
-                .record_context_pack_rejection(ContextPackRejectionClass::Schema);
+            registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
             return rest_error(StatusCode::BAD_REQUEST, &error.to_string());
         }
     };
-    let engine = match state
-        .registry
-        .engine_for(request.project_id.as_deref(), request.root_uri.as_deref())
-    {
-        Ok(engine) => engine,
-        Err(error) => {
-            state
-                .registry
-                .record_context_pack_rejection(classify_context_pack_rejection(&error));
-            return rest_error(StatusCode::BAD_REQUEST, &error.to_string());
-        }
-    };
-    request.project_id = Some(engine.project_id().to_owned());
-    request.root_uri = None;
-    match engine.context_pack_cached(&request).await {
+    match run_context_pack_request(registry, request).await {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(bytes))
             .expect("valid REST response"),
-        Err(error) => rest_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        Err(error) => rest_error(StatusCode::BAD_REQUEST, &error),
     }
+}
+
+async fn run_context_pack_request(
+    registry: &ProjectRegistry,
+    mut request: ContextPackRequest,
+) -> Result<Vec<u8>, String> {
+    if let Err(error) = request.validate_limits() {
+        registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
+        return Err(error.to_string());
+    }
+    let engine =
+        match registry.engine_for(request.project_id.as_deref(), request.root_uri.as_deref()) {
+            Ok(engine) => engine,
+            Err(error) => {
+                registry.record_context_pack_rejection(classify_context_pack_rejection(&error));
+                return Err(error.to_string());
+            }
+        };
+    request.project_id = Some(engine.project_id().to_owned());
+    request.root_uri = None;
+    engine
+        .context_pack_cached(&request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn reference_http(
@@ -1294,6 +1279,68 @@ fn project_id_from_resource(uri: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn context_pack_prompt_validation_has_mcp_rest_parity() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("README.md"), "# prompt fixture\n")
+            .expect("project marker");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let server = ContextServer::new(Arc::clone(&registry));
+
+        for prompt in ["", " \t\r\n"] {
+            let request: ContextPackRequest =
+                serde_json::from_value(json!({"prompt": prompt})).expect("MCP request");
+            let mcp_error = server
+                .context_pack(Parameters(request))
+                .await
+                .expect_err("MCP must reject an empty prompt");
+            assert_eq!(mcp_error, "prompt is required");
+
+            let response = context_pack_http_response(&registry, json!({"prompt": prompt})).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("REST error body")
+                .to_bytes();
+            let body: Value = serde_json::from_slice(&body).expect("REST error JSON");
+            assert_eq!(body["message"], mcp_error);
+        }
+
+        let prompt = "Review prompt validation";
+        let request: ContextPackRequest =
+            serde_json::from_value(json!({"prompt": prompt})).expect("valid MCP request");
+        let mcp: Value = serde_json::from_str(
+            &server
+                .context_pack(Parameters(request))
+                .await
+                .expect("valid MCP response"),
+        )
+        .expect("MCP context_pack.v2 JSON");
+        assert_eq!(mcp["v"], 2);
+
+        let response = context_pack_http_response(&registry, json!({"prompt": prompt})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("REST context_pack body")
+            .to_bytes();
+        let rest: Value = serde_json::from_slice(&body).expect("REST context_pack.v2 JSON");
+        assert_eq!(rest, mcp);
+    }
 
     #[tokio::test]
     async fn metrics_admin_returns_an_unloaded_snapshot_without_constructing_an_engine() {

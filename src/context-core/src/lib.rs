@@ -219,6 +219,9 @@ impl ContractProfile {
 
 impl ContextPackRequest {
     pub fn validate_limits(&self) -> Result<(), ContractError> {
+        if self.prompt.trim().is_empty() {
+            return Err(ContractError::PromptRequired);
+        }
         if !(1..=32).contains(&self.max_items) {
             return Err(ContractError::MaxItems(self.max_items));
         }
@@ -245,6 +248,7 @@ impl ContextPackRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
+    PromptRequired,
     MaxItems(u8),
     MaxSourceTokens(u16),
     MemorySessionEmpty,
@@ -255,6 +259,7 @@ pub enum ContractError {
 impl std::fmt::Display for ContractError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PromptRequired => write!(formatter, "prompt is required"),
             Self::MaxItems(value) => write!(formatter, "max_items must be in 1..=32, got {value}"),
             Self::MaxSourceTokens(value) => {
                 write!(
@@ -2089,7 +2094,8 @@ fn normalized_client_profile(client_profile: Option<&str>) -> &'static str {
 
 pub fn classify_context_pack_rejection(error: &anyhow::Error) -> ContextPackRejectionClass {
     let message = error.to_string();
-    if message.starts_with("max_items ")
+    if message.starts_with("prompt ")
+        || message.starts_with("max_items ")
         || message.starts_with("max_source_tokens ")
         || message.starts_with("memory_session ")
     {
@@ -2604,6 +2610,7 @@ impl ProjectEngine {
     pub fn context_pack(&self, request: &ContextPackRequest) -> Result<Vec<u8>> {
         let started = Instant::now();
         let result = (|| {
+            request.validate_limits()?;
             let refresh = self.ensure_fresh(request)?;
             Ok::<_, anyhow::Error>((self.build_context_pack_entry(request)?, refresh))
         })();
@@ -5470,7 +5477,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
             "Build compact cited repository context using the clean-break v2 contract.",
             json!(["context_pack.v2"]),
             json!({
-                "prompt": "Task text.",
+                "prompt": "Required non-whitespace task text after trimming; invalid values return `prompt is required`.",
                 "changed_files": "Changed repository paths.",
                 "focus_paths": "Paths to prioritize.",
                 "memory_session": "Opt-in project-local continuation key; reuses the prior valid pack and evidence for 24 hours.",
@@ -7025,6 +7032,21 @@ mod tests {
         assert_eq!(request.evidence_policy, EvidencePolicy::Balanced);
         assert_eq!(request.cache_strategy, CacheStrategy::Fast);
         assert_eq!(request.validate_limits(), Ok(()));
+        for prompt in ["", " \t\r\n"] {
+            let invalid: ContextPackRequest =
+                serde_json::from_value(json!({"prompt": prompt})).expect("prompt request");
+            assert_eq!(
+                invalid.validate_limits(),
+                Err(ContractError::PromptRequired)
+            );
+            assert_eq!(
+                invalid
+                    .validate_limits()
+                    .expect_err("invalid prompt")
+                    .to_string(),
+                "prompt is required"
+            );
+        }
         let invalid: ContextPackRequest = serde_json::from_value(json!({
             "prompt": "debug it",
             "memory_session": "../not-a-session"
@@ -8692,6 +8714,10 @@ mod tests {
 
     #[test]
     fn rejection_classification_coalesces_errors_without_retaining_values() {
+        assert_eq!(
+            classify_context_pack_rejection(&anyhow!("prompt is required")),
+            ContextPackRejectionClass::Schema
+        );
         assert_eq!(
             classify_context_pack_rejection(&anyhow!("max_items must be in 1..=32, got 99")),
             ContextPackRejectionClass::Schema
