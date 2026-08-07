@@ -19,6 +19,14 @@ The production server has no Python runtime dependency. Releases contain a
 dynamic glibc executable, a static musl executable, a Docker image archive, a
 CycloneDX SBOM, checksums, and a Sigstore signature bundle.
 
+`context_lookup` line ranges for `snippet` and `chunk` modes are inclusive.
+Starts below line 1 normalize to line 1, ends before the normalized start
+normalize to that start, and partially overlapping ranges clamp to the final
+line. Empty files and ranges whose normalized start is past end-of-file return
+a validation error. Every successful range therefore satisfies
+`1 <= start_line <= end_line <= file_line_count`; chunk metadata and its
+`detail_lookup` use the same normalized interval.
+
 Implementation details are in [doc/technical-paper.md](doc/technical-paper.md).
 
 ## Context Pack v2
@@ -38,7 +46,7 @@ Supported fields are:
 
 | Field | Contract |
 | --- | --- |
-| `prompt` | Required task text. |
+| `prompt` | Required task text after trimming. Empty or whitespace-only values are rejected by MCP and REST with `prompt is required`. |
 | `changed_files`, `focus_paths` | Repository-relative paths ranked first. |
 | `memory_session` | Optional explicit continuation key for iterative turns; project-local, 24-hour TTL. |
 | `client_profile`, `model_profile` | Client/provider hints. |
@@ -118,6 +126,16 @@ external denominator is available. Raw profile values, prompts, responses,
 paths, root URIs, error values, credentials, and agent identifiers are never
 stored. Monitoring is disabled by default; the disabled request path is an
 atomic flag check and does not change context-pack behavior.
+
+`action="report"` returns `context_monitor_usage.report.v4`. `max_entries`
+defaults to 20 and bounds `buckets`, `rejection_buckets`, and every returned
+bucket's `client_profiles` rows. `max_output_chars` defaults to 12,000 and
+bounds the serialized inline report with a maximum 2,048-character allowance
+for truncation counts and retrieval metadata. The `truncation` object always
+states the effective limits, returned and omitted row counts, and reasons. If
+any rows are omitted, `truncation.retrieval.reference` identifies a complete
+v3 report retained in generated state for 24 hours; pass that object to
+`result_reference_resolve`. Source repositories remain read-only.
 
 Raw L0 hit rate uses all L0 hits and misses. Exact effectiveness uses only
 requests whose semantic L0 identity was observed earlier in the same project;

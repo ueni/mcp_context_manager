@@ -552,16 +552,21 @@ impl ProjectIndex {
         let text = read_text(&absolute)?
             .ok_or_else(|| anyhow::anyhow!("file is not UTF-8 text: {path}"))?;
         let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            bail!("cannot select a line range from an empty file: {path}");
+        }
         let start = start_line.max(1) as usize;
+        if start > lines.len() {
+            bail!(
+                "start_line {start} exceeds file line count {}: {path}",
+                lines.len()
+            );
+        }
         let end = end_line
-            .unwrap_or_else(|| start_line.saturating_add(19))
-            .max(start_line) as usize;
+            .unwrap_or_else(|| (start as u32).saturating_add(19))
+            .max(start as u32) as usize;
         let bounded_end = end.min(lines.len());
-        let content = if start > bounded_end || start > lines.len() {
-            String::new()
-        } else {
-            lines[start - 1..bounded_end].join("\n")
-        };
+        let content = lines[start - 1..bounded_end].join("\n");
         Ok(Chunk {
             id: chunk_id(&path, start as u32, bounded_end as u32, ""),
             path,
@@ -1303,6 +1308,41 @@ mod tests {
         let chunks = generic_chunks_for_range("notes.txt", &lines, 1, 100, "");
         assert_eq!((chunks[0].start_line, chunks[0].end_line), (1, 80));
         assert_eq!((chunks[1].start_line, chunks[1].end_line), (73, 100));
+    }
+
+    #[test]
+    fn snippets_clamp_partial_ranges_and_reject_ranges_without_lines() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        fs::write(root.path().join("lines.txt"), "one\ntwo\nthree\n").expect("write line fixture");
+        fs::write(root.path().join("empty.txt"), "").expect("write empty fixture");
+        let index = ProjectIndex::build(root.path()).expect("build index");
+
+        let final_line = index
+            .snippet("lines.txt", 3, Some(3))
+            .expect("select final line");
+        assert_eq!((final_line.start_line, final_line.end_line), (3, 3));
+        assert_eq!(final_line.content, "three");
+
+        let partial = index
+            .snippet("lines.txt", 2, Some(99))
+            .expect("clamp partially overlapping range");
+        assert_eq!((partial.start_line, partial.end_line), (2, 3));
+        assert_eq!(partial.content, "two\nthree");
+
+        let normalized = index
+            .snippet("lines.txt", 0, Some(0))
+            .expect("normalize coordinates below the first line");
+        assert_eq!((normalized.start_line, normalized.end_line), (1, 1));
+
+        let beyond_eof = index
+            .snippet("lines.txt", 99_999, Some(100_000))
+            .expect_err("reject a wholly out-of-range request");
+        assert!(beyond_eof.to_string().contains("exceeds file line count 3"));
+
+        let empty = index
+            .snippet("empty.txt", 1, Some(1))
+            .expect_err("reject a range from an empty file");
+        assert!(empty.to_string().contains("empty file"));
     }
 
     #[test]

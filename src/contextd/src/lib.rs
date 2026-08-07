@@ -146,25 +146,9 @@ impl ContextServer {
     )]
     async fn context_pack(
         &self,
-        Parameters(mut request): Parameters<ContextPackRequest>,
+        Parameters(request): Parameters<ContextPackRequest>,
     ) -> Result<String, String> {
-        let engine = match self
-            .registry
-            .engine_for(request.project_id.as_deref(), request.root_uri.as_deref())
-        {
-            Ok(engine) => engine,
-            Err(error) => {
-                self.registry
-                    .record_context_pack_rejection(classify_context_pack_rejection(&error));
-                return Err(error.to_string());
-            }
-        };
-        request.project_id = Some(engine.project_id().to_owned());
-        request.root_uri = None;
-        let encoded = engine
-            .context_pack_cached(&request)
-            .await
-            .map_err(|error| error.to_string())?;
+        let encoded = run_context_pack_request(&self.registry, request).await?;
         String::from_utf8(encoded).map_err(|error| error.to_string())
     }
 
@@ -211,15 +195,10 @@ impl ContextServer {
     )]
     fn result_reference_resolve(
         &self,
-        Parameters(mut request): Parameters<ResultReferenceRequest>,
+        Parameters(request): Parameters<ResultReferenceRequest>,
     ) -> Result<String, String> {
-        let engine = self
+        let encoded = self
             .registry
-            .engine_for(request.project_id.as_deref(), request.root_uri.as_deref())
-            .map_err(|error| error.to_string())?;
-        request.project_id = Some(engine.project_id().to_owned());
-        request.root_uri = None;
-        let encoded = engine
             .result_reference_resolve(&request)
             .map_err(|error| error.to_string())?;
         String::from_utf8(encoded).map_err(|error| error.to_string())
@@ -236,7 +215,7 @@ impl ContextServer {
             return serde_json::to_string(
                 &self
                     .registry
-                    .monitor_usage(&request.action, request.project_id.as_deref())
+                    .bounded_monitor_usage(&request)
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string());
@@ -817,14 +796,13 @@ fn legacy_sse_messages(
     }
 }
 
-async fn context_pack_http(
-    State(state): State<HttpState>,
-    Json(mut payload): Json<Value>,
-) -> Response {
+async fn context_pack_http(State(state): State<HttpState>, Json(payload): Json<Value>) -> Response {
+    context_pack_http_response(&state.registry, payload).await
+}
+
+async fn context_pack_http_response(registry: &ProjectRegistry, mut payload: Value) -> Response {
     let Some(object) = payload.as_object_mut() else {
-        state
-            .registry
-            .record_context_pack_rejection(ContextPackRejectionClass::Schema);
+        registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
         return rest_error(StatusCode::BAD_REQUEST, "JSON body must be an object");
     };
     if !object.contains_key("prompt")
@@ -832,43 +810,45 @@ async fn context_pack_http(
     {
         object.insert("prompt".to_owned(), task);
     }
-    let mut request = match serde_json::from_value::<ContextPackRequest>(payload) {
-        Ok(request) if !request.prompt.trim().is_empty() => request,
-        Ok(_) => {
-            state
-                .registry
-                .record_context_pack_rejection(ContextPackRejectionClass::Schema);
-            return rest_error(StatusCode::BAD_REQUEST, "prompt is required");
-        }
+    let request = match serde_json::from_value::<ContextPackRequest>(payload) {
+        Ok(request) => request,
         Err(error) => {
-            state
-                .registry
-                .record_context_pack_rejection(ContextPackRejectionClass::Schema);
+            registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
             return rest_error(StatusCode::BAD_REQUEST, &error.to_string());
         }
     };
-    let engine = match state
-        .registry
-        .engine_for(request.project_id.as_deref(), request.root_uri.as_deref())
-    {
-        Ok(engine) => engine,
-        Err(error) => {
-            state
-                .registry
-                .record_context_pack_rejection(classify_context_pack_rejection(&error));
-            return rest_error(StatusCode::BAD_REQUEST, &error.to_string());
-        }
-    };
-    request.project_id = Some(engine.project_id().to_owned());
-    request.root_uri = None;
-    match engine.context_pack_cached(&request).await {
+    match run_context_pack_request(registry, request).await {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(bytes))
             .expect("valid REST response"),
-        Err(error) => rest_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        Err(error) => rest_error(StatusCode::BAD_REQUEST, &error),
     }
+}
+
+async fn run_context_pack_request(
+    registry: &ProjectRegistry,
+    mut request: ContextPackRequest,
+) -> Result<Vec<u8>, String> {
+    if let Err(error) = request.validate_limits() {
+        registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
+        return Err(error.to_string());
+    }
+    let engine =
+        match registry.engine_for(request.project_id.as_deref(), request.root_uri.as_deref()) {
+            Ok(engine) => engine,
+            Err(error) => {
+                registry.record_context_pack_rejection(classify_context_pack_rejection(&error));
+                return Err(error.to_string());
+            }
+        };
+    request.project_id = Some(engine.project_id().to_owned());
+    request.root_uri = None;
+    engine
+        .context_pack_cached(&request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn reference_http(
@@ -876,21 +856,14 @@ async fn reference_http(
     Path(reference_id): Path<String>,
     Query(query): Query<ReferenceQuery>,
 ) -> Response {
-    let engine = match state
-        .registry
-        .engine_for(query.project_id.as_deref(), query.root_uri.as_deref())
-    {
-        Ok(engine) => engine,
-        Err(error) => return rest_error(StatusCode::BAD_REQUEST, &error.to_string()),
-    };
     let request = ResultReferenceRequest {
         reference_id,
         reference: None,
         expected_hash: String::new(),
-        project_id: Some(engine.project_id().to_owned()),
-        root_uri: None,
+        project_id: query.project_id,
+        root_uri: query.root_uri,
     };
-    match engine.result_reference_resolve(&request) {
+    match state.registry.result_reference_resolve(&request) {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
@@ -1308,6 +1281,68 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn context_pack_prompt_validation_has_mcp_rest_parity() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("README.md"), "# prompt fixture\n")
+            .expect("project marker");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let server = ContextServer::new(Arc::clone(&registry));
+
+        for prompt in ["", " \t\r\n"] {
+            let request: ContextPackRequest =
+                serde_json::from_value(json!({"prompt": prompt})).expect("MCP request");
+            let mcp_error = server
+                .context_pack(Parameters(request))
+                .await
+                .expect_err("MCP must reject an empty prompt");
+            assert_eq!(mcp_error, "prompt is required");
+
+            let response = context_pack_http_response(&registry, json!({"prompt": prompt})).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("REST error body")
+                .to_bytes();
+            let body: Value = serde_json::from_slice(&body).expect("REST error JSON");
+            assert_eq!(body["message"], mcp_error);
+        }
+
+        let prompt = "Review prompt validation";
+        let request: ContextPackRequest =
+            serde_json::from_value(json!({"prompt": prompt})).expect("valid MCP request");
+        let mcp: Value = serde_json::from_str(
+            &server
+                .context_pack(Parameters(request))
+                .await
+                .expect("valid MCP response"),
+        )
+        .expect("MCP context_pack.v2 JSON");
+        assert_eq!(mcp["v"], 2);
+
+        let response = context_pack_http_response(&registry, json!({"prompt": prompt})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("REST context_pack body")
+            .to_bytes();
+        let rest: Value = serde_json::from_slice(&body).expect("REST context_pack.v2 JSON");
+        assert_eq!(rest, mcp);
+    }
+
+    #[tokio::test]
     async fn metrics_admin_returns_an_unloaded_snapshot_without_constructing_an_engine() {
         let root = tempfile::tempdir().expect("repository root");
         let state = tempfile::tempdir().expect("state root");
@@ -1451,6 +1486,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_report_caps_inline_output_and_resolves_complete_report() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        std::fs::write(
+            root.path().join("lib.rs"),
+            "fn bounded_monitor_fixture() {}\n",
+        )
+        .expect("fixture source");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        registry
+            .monitor_usage("enable", None)
+            .expect("enable monitor");
+        let engine = registry.engine_for(None, None).expect("default engine");
+        engine
+            .context_pack_cached(
+                &serde_json::from_value(json!({
+                    "prompt": "bounded monitor fixture",
+                    "focus_paths": ["lib.rs"],
+                }))
+                .expect("pack request"),
+            )
+            .await
+            .expect("record monitored request");
+        let server = ContextServer::new(registry);
+        let response = server
+            .context_admin(Parameters(
+                serde_json::from_value(json!({
+                    "mode": "monitor_usage",
+                    "action": "report",
+                    "max_entries": 1,
+                    "max_output_chars": 1000,
+                }))
+                .expect("monitor request"),
+            ))
+            .await
+            .expect("monitor response");
+        assert!(response.len() <= 1_000 + context_core::MONITOR_REPORT_METADATA_ALLOWANCE_CHARS);
+        let response: Value = serde_json::from_str(&response).expect("monitor JSON");
+        assert_eq!(response["schema"], "context_monitor_usage.report.v4");
+        assert_eq!(response["truncation"]["truncated"], true);
+        let reference = response
+            .pointer("/truncation/retrieval/reference")
+            .cloned()
+            .expect("overflow reference");
+        let resolved = server
+            .result_reference_resolve(Parameters(ResultReferenceRequest {
+                reference_id: String::new(),
+                reference: Some(reference),
+                expected_hash: String::new(),
+                project_id: None,
+                root_uri: None,
+            }))
+            .expect("resolved reference");
+        let resolved: Value = serde_json::from_str(&resolved).expect("resolved JSON");
+        assert_eq!(resolved["status"], "resolved");
+        assert_eq!(
+            resolved["content"]["schema"],
+            "context_monitor_usage.report.v3"
+        );
+    }
+
+    #[tokio::test]
     async fn context_pack_rejections_are_counted_by_class_without_retaining_values() {
         let root = tempfile::tempdir().expect("repository root");
         let state = tempfile::tempdir().expect("state root");
@@ -1553,6 +1659,43 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn context_admin_tool_schema_enumerates_contract_profiles() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("marker");
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let server = ContextServer::new(registry);
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "context_admin")
+            .expect("context_admin tool");
+        let schema = Value::Object(tool.input_schema.as_ref().clone());
+
+        assert_eq!(
+            schema.pointer("/$defs/ContractProfile/enum"),
+            Some(&json!(["compact", "verbose"]))
+        );
+        assert_eq!(
+            schema.pointer("/properties/contract_profile/$ref"),
+            Some(&json!("#/$defs/ContractProfile"))
+        );
+        assert_eq!(
+            schema.pointer("/properties/contract_profile/default"),
+            Some(&json!("compact"))
+        );
     }
 
     #[test]

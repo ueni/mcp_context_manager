@@ -82,8 +82,19 @@ MCP returns the object as one raw JSON text item. REST returns the same encoded
 bytes. The tuple opcode is `0..2` for reference/balanced/source evidence and
 `3..5` for add/drop/replace session deltas. Line intervals are inclusive.
 
+Both transports require `prompt` to contain non-whitespace task text after
+trimming. Empty and whitespace-only values are rejected before project loading
+with the stable validation diagnostic `prompt is required`.
+
 Stable diagnostics and accounting are queried through `context_admin` rather
 than repeated in every response.
+
+`context_admin(mode="contracts")` accepts the exact lowercase
+`contract_profile` values `compact` and `verbose`. Omitting the field
+deterministically selects `compact`; values are not trimmed or case-normalized,
+and unsupported values are rejected before contract generation. The MCP input
+schema exposes the two accepted values as an enum, and the response's top-level
+`profile` always names the accepted profile used to produce it.
 
 `context_admin(mode="warmup")` performs one normal freshness refresh and
 optionally admits the supplied prompt through the shared L0 path without
@@ -105,6 +116,18 @@ contain fixed-name opportunity, effectiveness, miss-cause, and repeat-distance
 counters. Route
 shares use the fixed `debug`, `review`, `implementation`, and `explore`
 categories.
+
+The public report envelope is `context_monitor_usage.report.v4`. It keeps the
+newest rows while preserving chronological order, applies `max_entries`
+(default 20) independently to usage buckets, rejection buckets, and each
+returned client-profile collection, and applies `max_output_chars` (default
+12,000) to serialized inline output. Up to 2,048 additional characters are
+reserved solely for stable truncation counts, limits, reasons, and retrieval
+metadata. Character-pressure removal is deterministic: oldest rejection rows
+are removed first, then oldest usage rows. Any omitted evidence is stored as a
+complete `context_monitor_usage.report.v3` payload in generated global-monitor
+state behind a project-bound, hash-checked, 24-hour result reference. Report
+generation and resolution never write repository source.
 
 The denominators are explicit:
 

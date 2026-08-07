@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use context_core::{
-    ContextPackRejectionClass, GovernedFrontierLineage, ProjectEngine, SharedFrontierCache,
-    UsageMonitor,
+    ContextAdminRequest, ContextPackRejectionClass, GovernedFrontierLineage, ProjectEngine,
+    ResultReferenceRequest, SharedFrontierCache, UsageMonitor,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -222,6 +222,34 @@ impl ProjectRegistry {
 
     pub fn monitor_usage(&self, action: &str, project_id: Option<&str>) -> Result<Value> {
         self.usage_monitor.action(action, project_id)
+    }
+
+    pub fn bounded_monitor_usage(&self, request: &ContextAdminRequest) -> Result<Value> {
+        let reference_project_id = request
+            .project_id
+            .as_deref()
+            .unwrap_or(&self.default_project_id);
+        self.usage_monitor.bounded_action(
+            &request.action,
+            request.project_id.as_deref(),
+            reference_project_id,
+            request.max_entries,
+            request.max_output_chars,
+        )
+    }
+
+    pub fn result_reference_resolve(&self, request: &ResultReferenceRequest) -> Result<Vec<u8>> {
+        let engine = self.engine_for(request.project_id.as_deref(), request.root_uri.as_deref())?;
+        let mut scoped = request.clone();
+        scoped.project_id = Some(engine.project_id().to_owned());
+        scoped.root_uri = None;
+        if let Some(encoded) = self
+            .usage_monitor
+            .resolve_reference(&scoped, engine.project_id())?
+        {
+            return Ok(encoded);
+        }
+        engine.result_reference_resolve(&scoped)
     }
 
     pub fn record_context_pack_rejection(&self, class: ContextPackRejectionClass) {

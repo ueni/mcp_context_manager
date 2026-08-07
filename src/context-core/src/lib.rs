@@ -110,8 +110,10 @@ pub struct ContextLookupRequest {
     pub query: String,
     #[serde(default = "default_lookup_path")]
     pub path: String,
+    /// Inclusive first line. Values below one normalize to line one; starts past EOF are rejected.
     #[serde(default = "default_start_line")]
     pub start_line: u32,
+    /// Inclusive last line. Values before the start normalize to it; partial ranges clamp to EOF.
     pub end_line: Option<u32>,
     #[serde(default = "default_max_results")]
     pub max_results: u16,
@@ -182,14 +184,14 @@ pub struct ContextAdminRequest {
     pub max_files: Option<u32>,
     #[serde(default = "default_max_age_minutes")]
     pub max_age_minutes: u32,
-    #[serde(default = "default_memory_max_entries")]
+    #[serde(default = "default_admin_max_entries")]
     pub max_entries: u16,
     pub max_output_chars: Option<u32>,
     pub default_output_profile: Option<String>,
     #[serde(default)]
     pub tool_name: String,
     #[serde(default)]
-    pub contract_profile: String,
+    pub contract_profile: ContractProfile,
     #[serde(default)]
     pub state_prefix: String,
     #[serde(default)]
@@ -198,8 +200,28 @@ pub struct ContextAdminRequest {
     pub root_uri: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractProfile {
+    #[default]
+    Compact,
+    Verbose,
+}
+
+impl ContractProfile {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Verbose => "verbose",
+        }
+    }
+}
+
 impl ContextPackRequest {
     pub fn validate_limits(&self) -> Result<(), ContractError> {
+        if self.prompt.trim().is_empty() {
+            return Err(ContractError::PromptRequired);
+        }
         if !(1..=32).contains(&self.max_items) {
             return Err(ContractError::MaxItems(self.max_items));
         }
@@ -226,6 +248,7 @@ impl ContextPackRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
+    PromptRequired,
     MaxItems(u8),
     MaxSourceTokens(u16),
     MemorySessionEmpty,
@@ -236,6 +259,7 @@ pub enum ContractError {
 impl std::fmt::Display for ContractError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PromptRequired => write!(formatter, "prompt is required"),
             Self::MaxItems(value) => write!(formatter, "max_items must be in 1..=32, got {value}"),
             Self::MaxSourceTokens(value) => {
                 write!(
@@ -1021,6 +1045,10 @@ pub struct UsageMonitor {
     update_lock: Mutex<()>,
 }
 
+pub const MONITOR_REPORT_DEFAULT_MAX_OUTPUT_CHARS: u32 = 12_000;
+pub const MONITOR_REPORT_METADATA_ALLOWANCE_CHARS: usize = 2_048;
+const MONITOR_REPORT_REFERENCE_TTL_HOURS: i64 = 24;
+
 impl UsageMonitor {
     pub fn open(global_state: impl AsRef<std::path::Path>) -> Result<Self> {
         let store = StateStore::open(global_state)?;
@@ -1083,6 +1111,53 @@ impl UsageMonitor {
             "report" => self.report(project_id),
             unsupported => bail!("unsupported monitor_usage action: {unsupported}"),
         }
+    }
+
+    pub fn bounded_action(
+        &self,
+        action: &str,
+        project_id: Option<&str>,
+        reference_project_id: &str,
+        max_entries: u16,
+        max_output_chars: Option<u32>,
+    ) -> Result<Value> {
+        if action != "report" {
+            return self.action(action, project_id);
+        }
+        self.bounded_report(
+            project_id,
+            reference_project_id,
+            usize::from(max_entries),
+            usize::try_from(max_output_chars.unwrap_or(MONITOR_REPORT_DEFAULT_MAX_OUTPUT_CHARS))
+                .unwrap_or(usize::MAX),
+        )
+    }
+
+    pub fn resolve_reference(
+        &self,
+        request: &ResultReferenceRequest,
+        project_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let reference_id = request
+            .reference
+            .as_ref()
+            .and_then(|reference| reference.get("reference_id"))
+            .and_then(Value::as_str)
+            .unwrap_or(&request.reference_id);
+        let Some(record) = self.store.get_json(&format!("reference:{reference_id}"))? else {
+            return Ok(None);
+        };
+        if record.get("project_id").and_then(Value::as_str) != Some(project_id) {
+            bail!("result reference is outside the selected project boundary");
+        }
+        let expected_hash = request
+            .reference
+            .as_ref()
+            .and_then(|reference| reference.pointer("/content/sha256"))
+            .and_then(Value::as_str)
+            .unwrap_or(&request.expected_hash);
+        let value = self.store.resolve_reference(reference_id, expected_hash)?;
+        Ok(Some(serde_json::to_vec(&value)?))
     }
 
     fn status(&self) -> Result<Value> {
@@ -1634,6 +1709,189 @@ impl UsageMonitor {
             "rejection_buckets": rejection_buckets,
         }))
     }
+
+    fn bounded_report(
+        &self,
+        project_id: Option<&str>,
+        reference_project_id: &str,
+        max_entries: usize,
+        max_output_chars: usize,
+    ) -> Result<Value> {
+        let full = self.report(project_id)?;
+        let full_buckets = full["buckets"].as_array().cloned().unwrap_or_default();
+        let full_rejections = full["rejection_buckets"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut buckets = retain_latest_rows(&full_buckets, max_entries);
+        let mut rejection_buckets = retain_latest_rows(&full_rejections, max_entries);
+        let mut client_profiles_omitted = 0_usize;
+        let mut client_profile_buckets_truncated = 0_usize;
+        for bucket in &mut buckets {
+            let Some(profiles) = bucket
+                .get_mut("client_profiles")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            if profiles.len() > max_entries {
+                client_profiles_omitted =
+                    client_profiles_omitted.saturating_add(profiles.len() - max_entries);
+                client_profile_buckets_truncated =
+                    client_profile_buckets_truncated.saturating_add(1);
+                profiles.truncate(max_entries);
+            }
+        }
+        let entry_truncated = full_buckets.len() > buckets.len()
+            || full_rejections.len() > rejection_buckets.len()
+            || client_profiles_omitted > 0;
+        let mut output_truncated = false;
+        let mut reference = None;
+        let output_limit = max_output_chars.saturating_add(MONITOR_REPORT_METADATA_ALLOWANCE_CHARS);
+
+        let initial = monitor_report_response(
+            &full,
+            buckets.clone(),
+            rejection_buckets.clone(),
+            max_entries,
+            max_output_chars,
+            &full_buckets,
+            &full_rejections,
+            client_profiles_omitted,
+            client_profile_buckets_truncated,
+            entry_truncated,
+            output_truncated,
+            reference.clone(),
+        );
+        if serde_json::to_vec(&initial)?.len() > output_limit {
+            output_truncated = true;
+        }
+        if entry_truncated || output_truncated {
+            reference = Some(self.store.create_reference(
+                "context_admin.monitor_usage",
+                reference_project_id,
+                &full,
+                &json!({
+                    "kind": "complete_monitor_usage_report",
+                    "bucket_count": full_buckets.len(),
+                    "rejection_bucket_count": full_rejections.len(),
+                }),
+                MONITOR_REPORT_REFERENCE_TTL_HOURS,
+            )?);
+        }
+        loop {
+            let response = monitor_report_response(
+                &full,
+                buckets.clone(),
+                rejection_buckets.clone(),
+                max_entries,
+                max_output_chars,
+                &full_buckets,
+                &full_rejections,
+                client_profiles_omitted,
+                client_profile_buckets_truncated,
+                entry_truncated,
+                output_truncated,
+                reference.clone(),
+            );
+            if serde_json::to_vec(&response)?.len() <= output_limit {
+                return Ok(response);
+            }
+            output_truncated = true;
+            if reference.is_none() {
+                reference = Some(self.store.create_reference(
+                    "context_admin.monitor_usage",
+                    reference_project_id,
+                    &full,
+                    &json!({
+                        "kind": "complete_monitor_usage_report",
+                        "bucket_count": full_buckets.len(),
+                        "rejection_bucket_count": full_rejections.len(),
+                    }),
+                    MONITOR_REPORT_REFERENCE_TTL_HOURS,
+                )?);
+            }
+            if !rejection_buckets.is_empty() {
+                rejection_buckets.remove(0);
+            } else if !buckets.is_empty() {
+                buckets.remove(0);
+            } else {
+                bail!("monitor report metadata exceeds the documented output allowance");
+            }
+        }
+    }
+}
+
+fn retain_latest_rows(rows: &[Value], max_entries: usize) -> Vec<Value> {
+    rows.iter()
+        .skip(rows.len().saturating_sub(max_entries))
+        .cloned()
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_report_response(
+    full: &Value,
+    buckets: Vec<Value>,
+    rejection_buckets: Vec<Value>,
+    max_entries: usize,
+    max_output_chars: usize,
+    full_buckets: &[Value],
+    full_rejections: &[Value],
+    client_profiles_omitted: usize,
+    client_profile_buckets_truncated: usize,
+    entry_truncated: bool,
+    output_truncated: bool,
+    reference: Option<Value>,
+) -> Value {
+    let mut reasons = Vec::new();
+    if entry_truncated {
+        reasons.push("max_entries");
+    }
+    if output_truncated {
+        reasons.push("max_output_chars");
+    }
+    let returned_bucket_count = buckets.len();
+    let returned_rejection_count = rejection_buckets.len();
+    json!({
+        "schema": "context_monitor_usage.report.v4",
+        "enabled": full.get("enabled").cloned().unwrap_or_default(),
+        "retention_days": full.get("retention_days").cloned().unwrap_or_default(),
+        "global": full.get("global").cloned().unwrap_or_default(),
+        "project_id": full.get("project_id").cloned().unwrap_or_default(),
+        "buckets": buckets,
+        "rejection_buckets": rejection_buckets,
+        "truncation": {
+            "truncated": entry_truncated || output_truncated,
+            "reasons": reasons,
+            "limits": {
+                "max_entries_per_row_collection": max_entries,
+                "max_output_chars": max_output_chars,
+                "metadata_allowance_chars": MONITOR_REPORT_METADATA_ALLOWANCE_CHARS,
+            },
+            "row_collections": {
+                "buckets": {
+                    "total": full_buckets.len(),
+                    "returned": returned_bucket_count,
+                    "omitted": full_buckets.len().saturating_sub(returned_bucket_count),
+                },
+                "rejection_buckets": {
+                    "total": full_rejections.len(),
+                    "returned": returned_rejection_count,
+                    "omitted": full_rejections.len().saturating_sub(returned_rejection_count),
+                },
+                "client_profiles": {
+                    "max_returned_per_bucket": max_entries,
+                    "omitted": client_profiles_omitted,
+                    "truncated_bucket_count": client_profile_buckets_truncated,
+                },
+            },
+            "retrieval": reference.map(|value| json!({
+                "mode": "result_reference_resolve",
+                "reference": value,
+            })),
+        },
+    })
 }
 
 fn empty_reuse_state() -> Value {
@@ -1836,7 +2094,8 @@ fn normalized_client_profile(client_profile: Option<&str>) -> &'static str {
 
 pub fn classify_context_pack_rejection(error: &anyhow::Error) -> ContextPackRejectionClass {
     let message = error.to_string();
-    if message.starts_with("max_items ")
+    if message.starts_with("prompt ")
+        || message.starts_with("max_items ")
         || message.starts_with("max_source_tokens ")
         || message.starts_with("memory_session ")
     {
@@ -2351,6 +2610,7 @@ impl ProjectEngine {
     pub fn context_pack(&self, request: &ContextPackRequest) -> Result<Vec<u8>> {
         let started = Instant::now();
         let result = (|| {
+            request.validate_limits()?;
             let refresh = self.ensure_fresh(request)?;
             Ok::<_, anyhow::Error>((self.build_context_pack_entry(request)?, refresh))
         })();
@@ -4549,11 +4809,7 @@ async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -
         }
         "contracts" => Ok(contracts_payload(
             &request.tool_name,
-            if request.contract_profile.is_empty() {
-                "compact"
-            } else {
-                &request.contract_profile
-            },
+            request.contract_profile,
         )),
         "metrics" => metrics_snapshot(engine),
         "measurement_matrix" => measurement_matrix(engine, &now),
@@ -5111,7 +5367,7 @@ fn benchmark_admin(engine: &ProjectEngine, generated_at: &str) -> Result<Value> 
         "runs": runs,
         "elapsed_ms": started_all.elapsed().as_secs_f64() * 1000.0,
         "measurement_matrix": measurement_matrix(engine, generated_at)?,
-        "compact_contract_sample": contracts_payload("", "compact"),
+        "compact_contract_sample": contracts_payload("", ContractProfile::Compact),
     }))
 }
 
@@ -5174,7 +5430,7 @@ fn state_browser(
     }))
 }
 
-fn contracts_payload(tool_name: &str, profile: &str) -> Value {
+fn contracts_payload(tool_name: &str, profile: ContractProfile) -> Value {
     let names = [
         "context_pack",
         "context_lookup",
@@ -5189,9 +5445,9 @@ fn contracts_payload(tool_name: &str, profile: &str) -> Value {
         .collect::<serde_json::Map<_, _>>();
     let encoded = serde_json::to_vec(&contracts).unwrap_or_default();
     json!({
-        "schema": if profile == "compact" {"tool_output_contracts.compact.v1"} else {"tool_output_contracts.v1"},
+        "schema": if profile == ContractProfile::Compact {"tool_output_contracts.compact.v1"} else {"tool_output_contracts.v1"},
         "contract_version": 2,
-        "profile": profile,
+        "profile": profile.as_str(),
         "stability": "stable",
         "contracts": contracts,
         "metrics": {
@@ -5212,7 +5468,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
             "Build compact cited repository context using the clean-break v2 contract.",
             json!(["context_pack.v2"]),
             json!({
-                "prompt": "Task text.",
+                "prompt": "Required non-whitespace task text after trimming; invalid values return `prompt is required`.",
                 "changed_files": "Changed repository paths.",
                 "focus_paths": "Paths to prioritize.",
                 "memory_session": "Opt-in project-local continuation key; reuses the prior valid pack and evidence for 24 hours.",
@@ -5245,7 +5501,8 @@ fn contract_for_tool(tool_name: &str) -> Value {
             json!({
                 "mode": "search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, explain_cache.",
                 "query": "Search or symbol terms.", "path": "Repository-relative path.",
-                "start_line": "Snippet start line.", "end_line": "Snippet end line.",
+                "start_line": "Inclusive first line; values below 1 normalize to 1, while starts past EOF and empty files are rejected.",
+                "end_line": "Inclusive last line; values before start normalize to start, and partial ranges clamp to EOF.",
                 "max_results": "Maximum result rows.", "max_entries": "Maximum tree rows.",
                 "max_depth": "Tree depth.", "include_globs": "Result glob filters.",
                 "project_id": "Project selector.", "root_uri": "Repository file URI."
@@ -5283,6 +5540,8 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "context_cache.stats.v1",
                 "context_cache.prune.v1",
                 "context_cache.warmup.v1",
+                "context_monitor_usage.report.v4",
+                "context_monitor_usage.report.v3",
                 "context_budget.v1",
                 "tool_output_contracts.v1",
                 "context_metrics.v1",
@@ -5301,8 +5560,9 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "path": "Repository-relative path or resource URI.", "max_files": "Index file cap.",
                 "prompt": "Optional prompt to warm exact context_pack cache without echoing it.",
                 "max_age_minutes": "Cache prune age.",
-                "max_entries": "Maximum returned rows for projects, active_projects, cached_projects, and state_browser; project catalogue range 1..=1000.",
-                "max_output_chars": "Budget override.", "default_output_profile": "Budget profile.",
+                "max_entries": "Maximum returned rows for projects, active_projects, cached_projects, and state_browser (project catalogue range 1..=1000); monitor reports default to 20.",
+                "max_output_chars": "For monitor reports, inline JSON budget (default 12000) plus at most 2048 characters of truncation and retrieval metadata; otherwise a budget override.",
+                "default_output_profile": "Budget profile.",
                 "tool_name": "Filter to one tool.", "contract_profile": "compact or verbose.",
                 "state_prefix": "Generated state prefix.", "state_key": "Exact generated state key.",
                 "project_id": "Project selector.", "root_uri": "Repository file URI."
@@ -6634,6 +6894,10 @@ const fn default_memory_max_entries() -> u16 {
     100
 }
 
+const fn default_admin_max_entries() -> u16 {
+    20
+}
+
 fn default_admin_mode() -> String {
     "health".to_owned()
 }
@@ -6762,6 +7026,21 @@ mod tests {
         assert_eq!(request.evidence_policy, EvidencePolicy::Balanced);
         assert_eq!(request.cache_strategy, CacheStrategy::Fast);
         assert_eq!(request.validate_limits(), Ok(()));
+        for prompt in ["", " \t\r\n"] {
+            let invalid: ContextPackRequest =
+                serde_json::from_value(json!({"prompt": prompt})).expect("prompt request");
+            assert_eq!(
+                invalid.validate_limits(),
+                Err(ContractError::PromptRequired)
+            );
+            assert_eq!(
+                invalid
+                    .validate_limits()
+                    .expect_err("invalid prompt")
+                    .to_string(),
+                "prompt is required"
+            );
+        }
         let invalid: ContextPackRequest = serde_json::from_value(json!({
             "prompt": "debug it",
             "memory_session": "../not-a-session"
@@ -6934,6 +7213,70 @@ mod tests {
         assert!(filtered["results"].as_array().is_some_and(|rows| {
             !rows.is_empty() && rows.iter().all(|row| row["path"] == "tests/test_auth.py")
         }));
+    }
+
+    #[test]
+    fn chunk_lookup_returns_consistent_valid_intervals_or_rejects_the_request() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(root.path().join("lines.txt"), "one\ntwo\nthree\n").expect("line fixture");
+        std::fs::write(root.path().join("empty.txt"), "").expect("empty fixture");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let lookup = |request: Value| -> Result<Value> {
+            let request: ContextLookupRequest =
+                serde_json::from_value(request).expect("lookup request");
+            Ok(serde_json::from_slice(&engine.context_lookup(&request)?)?)
+        };
+        let assert_interval = |response: &Value, start: u64, end: u64| {
+            assert_eq!(response["chunk"]["start_line"], start);
+            assert_eq!(response["chunk"]["end_line"], end);
+            assert_eq!(response["detail_lookup"]["start_line"], start);
+            assert_eq!(response["detail_lookup"]["end_line"], end);
+            assert!(start >= 1 && start <= end && end <= 3);
+        };
+
+        let final_line = lookup(json!({
+            "mode": "chunk", "path": "lines.txt", "start_line": 3, "end_line": 3
+        }))
+        .expect("final-line chunk");
+        assert_interval(&final_line, 3, 3);
+        assert_eq!(final_line["content"], "three");
+
+        let partial = lookup(json!({
+            "mode": "chunk", "path": "lines.txt", "start_line": 2, "end_line": 100
+        }))
+        .expect("partially overlapping chunk");
+        assert_interval(&partial, 2, 3);
+        assert_eq!(partial["content"], "two\nthree");
+
+        let beyond_eof = lookup(json!({
+            "mode": "chunk",
+            "path": "lines.txt",
+            "start_line": 99_999,
+            "end_line": 100_000
+        }))
+        .expect_err("reject audited out-of-range coordinates");
+        assert!(beyond_eof.to_string().contains("exceeds file line count 3"));
+
+        let empty = lookup(json!({
+            "mode": "chunk", "path": "empty.txt", "start_line": 1, "end_line": 1
+        }))
+        .expect_err("reject empty-file coordinates");
+        assert!(empty.to_string().contains("empty file"));
+    }
+
+    #[test]
+    fn context_lookup_contract_documents_line_range_policy() {
+        let contract = contract_for_tool("context_lookup");
+        assert!(
+            contract["parameters"]["start_line"]
+                .as_str()
+                .is_some_and(|value| value.contains("starts past EOF"))
+        );
+        assert!(
+            contract["parameters"]["end_line"]
+                .as_str()
+                .is_some_and(|value| value.contains("partial ranges clamp to EOF"))
+        );
     }
 
     #[test]
@@ -7141,6 +7484,54 @@ mod tests {
             "context_projects.cached.v1",
         ] {
             assert!(schemas.iter().any(|candidate| candidate == schema));
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_profiles_are_strict_and_default_to_compact() {
+        let root = tempdir().expect("temporary repository");
+        std::fs::write(root.path().join("README.md"), "# Fixture\n").expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+
+        for (request, expected_profile, expected_schema) in [
+            (
+                json!({"mode": "contracts"}),
+                "compact",
+                "tool_output_contracts.compact.v1",
+            ),
+            (
+                json!({"mode": "contracts", "contract_profile": "compact"}),
+                "compact",
+                "tool_output_contracts.compact.v1",
+            ),
+            (
+                json!({"mode": "contracts", "contract_profile": "verbose"}),
+                "verbose",
+                "tool_output_contracts.v1",
+            ),
+        ] {
+            let request: ContextAdminRequest =
+                serde_json::from_value(request).expect("supported contract profile");
+            let response: Value = serde_json::from_slice(
+                &engine
+                    .context_admin(&request)
+                    .await
+                    .expect("contracts response"),
+            )
+            .expect("contracts JSON");
+            assert_eq!(response["profile"], expected_profile);
+            assert_eq!(response["schema"], expected_schema);
+        }
+
+        for unsupported in ["nope", "Compact", " compact", "compact "] {
+            let error = serde_json::from_value::<ContextAdminRequest>(json!({
+                "mode": "contracts",
+                "contract_profile": unsupported,
+            }))
+            .expect_err("unsupported contract profile must be rejected");
+            let message = error.to_string();
+            assert!(message.contains("compact"));
+            assert!(message.contains("verbose"));
         }
     }
 
@@ -8178,7 +8569,123 @@ mod tests {
     }
 
     #[test]
+    fn monitor_report_bounds_large_fixtures_and_preserves_overflow_reference() {
+        let state = tempdir().expect("temporary state");
+        let monitor = UsageMonitor::open(state.path().join("global")).expect("monitor");
+        for index in 0..40 {
+            monitor
+                .store
+                .put_json(
+                    &format!("monitor:usage:2099-01-01:project-{index:03}"),
+                    &json!({
+                        "schema": "context_monitor_usage.bucket.v3",
+                        "day": format!("2099-01-{:02}", (index % 28) + 1),
+                        "project_id": format!("project-{index:03}"),
+                        "request_count": index + 1,
+                    }),
+                )
+                .expect("usage fixture");
+            monitor
+                .store
+                .put_json(
+                    &format!("monitor:rejections:fixture-{index:03}"),
+                    &json!({
+                        "schema": "context_monitor_usage.rejections.v1",
+                        "day": format!("2099-02-{:02}", (index % 28) + 1),
+                        "error_classes": empty_rejection_classes(),
+                    }),
+                )
+                .expect("rejection fixture");
+        }
+
+        let report = monitor
+            .bounded_report(None, "default-project", 2, 1_000)
+            .expect("bounded report");
+        let encoded = serde_json::to_vec(&report).expect("encoded report");
+        assert!(encoded.len() <= 1_000 + MONITOR_REPORT_METADATA_ALLOWANCE_CHARS);
+        assert_eq!(report["schema"], "context_monitor_usage.report.v4");
+        assert_eq!(report["truncation"]["truncated"], true);
+        assert!(
+            report["truncation"]["reasons"]
+                .as_array()
+                .is_some_and(|reasons| reasons.contains(&json!("max_entries"))
+                    && reasons.contains(&json!("max_output_chars")))
+        );
+        assert!(
+            report["buckets"]
+                .as_array()
+                .is_some_and(|rows| rows.len() <= 2)
+        );
+        assert!(
+            report["rejection_buckets"]
+                .as_array()
+                .is_some_and(|rows| rows.len() <= 2)
+        );
+        for bucket in report["buckets"].as_array().expect("buckets") {
+            assert!(
+                bucket["client_profiles"]
+                    .as_array()
+                    .is_some_and(|rows| rows.len() <= 2)
+            );
+        }
+        let reference = report
+            .pointer("/truncation/retrieval/reference")
+            .cloned()
+            .expect("overflow reference");
+        let resolved = monitor
+            .resolve_reference(
+                &ResultReferenceRequest {
+                    reference_id: String::new(),
+                    reference: Some(reference),
+                    expected_hash: String::new(),
+                    project_id: Some("default-project".to_owned()),
+                    root_uri: None,
+                },
+                "default-project",
+            )
+            .expect("resolve reference")
+            .expect("monitor reference");
+        let resolved: Value = serde_json::from_slice(&resolved).expect("resolved JSON");
+        assert_eq!(resolved["status"], "resolved");
+        assert_eq!(
+            resolved["content"]["schema"],
+            "context_monitor_usage.report.v3"
+        );
+        assert_eq!(
+            resolved["content"]["buckets"].as_array().map(Vec::len),
+            Some(40)
+        );
+        assert_eq!(
+            resolved["content"]["rejection_buckets"]
+                .as_array()
+                .map(Vec::len),
+            Some(40)
+        );
+
+        let defaults = monitor
+            .bounded_action("report", None, "default-project", 20, None)
+            .expect("default bounded report");
+        assert!(
+            serde_json::to_vec(&defaults)
+                .expect("default encoded report")
+                .len()
+                <= usize::try_from(MONITOR_REPORT_DEFAULT_MAX_OUTPUT_CHARS)
+                    .expect("default budget")
+                    + MONITOR_REPORT_METADATA_ALLOWANCE_CHARS
+        );
+        assert!(
+            defaults["buckets"]
+                .as_array()
+                .is_some_and(|rows| rows.len() <= 20)
+        );
+    }
+
+    #[test]
     fn rejection_classification_coalesces_errors_without_retaining_values() {
+        assert_eq!(
+            classify_context_pack_rejection(&anyhow!("prompt is required")),
+            ContextPackRejectionClass::Schema
+        );
         assert_eq!(
             classify_context_pack_rejection(&anyhow!("max_items must be in 1..=32, got 99")),
             ContextPackRejectionClass::Schema
