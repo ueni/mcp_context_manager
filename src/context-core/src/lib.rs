@@ -4888,7 +4888,31 @@ fn opaque_scope_signature(scope: &[String]) -> Result<String> {
 
 const GIT_COMMAND_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const GIT_COMMAND_REAP_GRACE: StdDuration = StdDuration::from_millis(250);
-const GIT_OUTPUT_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
+const GIT_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+enum BoundedOutputCapture {
+    Complete(Vec<u8>),
+    LimitExceeded,
+    Failed,
+}
+
+fn capture_output_bounded(mut stdout: std::process::ChildStdout) -> BoundedOutputCapture {
+    use std::io::Read;
+
+    let mut bytes = Vec::with_capacity(GIT_OUTPUT_LIMIT_BYTES);
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = match stdout.read(&mut buffer) {
+            Ok(0) => return BoundedOutputCapture::Complete(bytes),
+            Ok(count) => count,
+            Err(_) => return BoundedOutputCapture::Failed,
+        };
+        if count > GIT_OUTPUT_LIMIT_BYTES.saturating_sub(bytes.len()) {
+            return BoundedOutputCapture::LimitExceeded;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
 
 fn terminate_child_bounded(child: &mut std::process::Child) {
     let _ = child.kill();
@@ -4901,42 +4925,85 @@ fn terminate_child_bounded(child: &mut std::process::Child) {
     }
 }
 
+fn terminate_child_and_capture_bounded(
+    child: &mut std::process::Child,
+    capture_receiver: &std::sync::mpsc::Receiver<BoundedOutputCapture>,
+    capture_thread: thread::JoinHandle<()>,
+) {
+    terminate_child_bounded(child);
+    let _ = capture_receiver.recv_timeout(GIT_COMMAND_REAP_GRACE);
+    if capture_thread.is_finished() {
+        let _ = capture_thread.join();
+    }
+}
+
 fn command_output_bounded(
     command: &mut Command,
     timeout: StdDuration,
 ) -> Option<std::process::Output> {
-    use std::io::{Read, Seek};
-
-    let mut stdout = tempfile::tempfile().ok()?;
-    command
-        .stdout(Stdio::from(stdout.try_clone().ok()?))
-        .stderr(Stdio::null());
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_child_bounded(&mut child);
+            return None;
+        }
+    };
+    let (capture_sender, capture_receiver) = std::sync::mpsc::sync_channel(1);
+    let capture_thread = match thread::Builder::new()
+        .name("governed-git-stdout".to_owned())
+        .spawn(move || {
+            let _ = capture_sender.send(capture_output_bounded(stdout));
+        }) {
+        Ok(thread) => thread,
+        Err(_) => {
+            terminate_child_bounded(&mut child);
+            return None;
+        }
+    };
     let deadline = Instant::now() + timeout;
+    let mut captured = None;
     let status = loop {
+        if captured.is_none() {
+            match capture_receiver.try_recv() {
+                Ok(BoundedOutputCapture::Complete(bytes)) => captured = Some(bytes),
+                Ok(BoundedOutputCapture::LimitExceeded | BoundedOutputCapture::Failed)
+                | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    terminate_child_and_capture_bounded(
+                        &mut child,
+                        &capture_receiver,
+                        capture_thread,
+                    );
+                    return None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(_) => {
-                terminate_child_bounded(&mut child);
+                terminate_child_and_capture_bounded(&mut child, &capture_receiver, capture_thread);
                 return None;
             }
         }
         if current_work_checkpoint().is_err() || Instant::now() >= deadline {
-            terminate_child_bounded(&mut child);
+            terminate_child_and_capture_bounded(&mut child, &capture_receiver, capture_thread);
             return None;
         }
         thread::sleep(StdDuration::from_millis(5));
     };
-    stdout.rewind().ok()?;
-    let mut bytes = Vec::new();
-    stdout
-        .take(GIT_OUTPUT_LIMIT_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if u64::try_from(bytes.len()).ok()? > GIT_OUTPUT_LIMIT_BYTES {
-        return None;
-    }
+    let bytes = match captured {
+        Some(bytes) => bytes,
+        None => match capture_receiver.recv_timeout(GIT_COMMAND_REAP_GRACE) {
+            Ok(BoundedOutputCapture::Complete(bytes)) => bytes,
+            Ok(BoundedOutputCapture::LimitExceeded | BoundedOutputCapture::Failed) | Err(_) => {
+                return None;
+            }
+        },
+    };
+    capture_thread.join().ok()?;
     Some(std::process::Output {
         status,
         stdout: bytes,
@@ -10283,6 +10350,60 @@ mod tests {
         let output = command_output_bounded(Command::new("sleep").arg("30"), GIT_COMMAND_TIMEOUT);
         assert!(output.is_none());
         assert!(started.elapsed() < StdDuration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn governed_git_output_is_hard_capped_and_oversized_child_is_reaped() {
+        let exact = command_output_bounded(
+            Command::new("head")
+                .arg("-c")
+                .arg(GIT_OUTPUT_LIMIT_BYTES.to_string())
+                .arg("/dev/zero"),
+            GIT_COMMAND_TIMEOUT,
+        )
+        .expect("output at the hard limit");
+        assert!(exact.status.success());
+        assert_eq!(exact.stdout.len(), GIT_OUTPUT_LIMIT_BYTES);
+
+        let fixture = tempdir().expect("capture fixture");
+        let pid_path = fixture.path().join("oversized.pid");
+        let oversized_bytes = GIT_OUTPUT_LIMIT_BYTES.saturating_add(1);
+        let started = Instant::now();
+        let output = command_output_bounded(
+            Command::new("sh")
+                .arg("-c")
+                .arg("printf '%s' \"$$\" > \"$1\"; head -c \"$2\" /dev/zero; exec sleep 30")
+                .arg("governed-git-output")
+                .arg(&pid_path)
+                .arg(oversized_bytes.to_string()),
+            StdDuration::from_secs(3),
+        );
+        assert!(output.is_none());
+        assert!(
+            started.elapsed() < StdDuration::from_millis(1500),
+            "oversized output must terminate the child before its command deadline"
+        );
+
+        let pid = std::fs::read_to_string(&pid_path).expect("oversized child pid");
+        let child_is_alive = Command::new("sh")
+            .arg("-c")
+            .arg("kill -0 \"$1\" 2>/dev/null")
+            .arg("governed-git-reap-check")
+            .arg(pid.trim())
+            .status()
+            .expect("child reap check")
+            .success();
+        assert!(!child_is_alive, "oversized output child was not reaped");
+
+        std::fs::remove_file(pid_path).expect("remove pid marker");
+        assert_eq!(
+            std::fs::read_dir(fixture.path())
+                .expect("capture fixture contents")
+                .count(),
+            0,
+            "stdout capture left a temporary artifact"
+        );
     }
 
     #[test]
