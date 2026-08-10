@@ -445,12 +445,15 @@ The fast path uses:
   state so a restart can reuse a complete warm generation;
 - direct serialization into a preallocated byte buffer.
 
-Every incremental result is checked against the independently computed source
-signature before publication. Journal overflow, unsafe paths, corpus/config
-changes, ambiguous events, mutation during refresh, and corrupt/incomplete
-persisted state fail closed to a clean full rebuild. Readers obtain one
-immutable index handle and therefore observe only the old or new complete
-generation.
+Watcher registration is established before the baseline index scan. Every
+incremental result is checked against a second independently computed source
+signature before publication, and a monotonic event epoch prevents a refresh
+from clearing events that arrive during its signature scan, index build, or
+snapshot write. Journal overflow, unsafe paths, corpus/config changes,
+ambiguous events, mutation during refresh, and corrupt/incomplete persisted
+state fail closed to a clean full rebuild or a bounded retryable freshness
+error. Readers obtain one immutable index handle and therefore observe only the
+old or new complete generation.
 
 Watcher thread startup, native and polling backend setup, runtime errors, and
 channel disconnection latch fail-closed freshness. Ordinary requests then run

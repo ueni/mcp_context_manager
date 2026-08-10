@@ -447,6 +447,15 @@ errors conservatively dirty the project. Explicit `changed_files` and
 `cache_strategy="fresh"` still force full signature verification and cannot
 return a response certified against an older generation.
 
+Native or polling registration becomes healthy (or latches fail-closed) before
+the baseline snapshot load/scan begins, eliminating the pre-registration
+mutation gap. Watcher events advance a monotonic epoch under the changed-path
+journal lock. Refresh consumes an epoch only after a stable initial signature,
+a complete replacement build, a second authoritative source signature, and the
+atomic generation swap. An epoch advance at any of those boundaries preserves
+the journal and retries from the current source; repeated churn ends in the
+bounded retryable freshness diagnostic instead of publishing stale evidence.
+
 Thread-spawn failure, failure of both native and polling watcher setup,
 runtime watcher errors, and event-channel disconnection persistently latch the
 project into fail-closed full verification for ordinary requests. A failed
@@ -500,12 +509,15 @@ queue, waiter, permit, and active counts return to baseline.
 The watcher maintains a coalesced 1,024-path journal. A refresh computes the
 authoritative source signature, applies changed/deleted/renamed/untracked file
 deltas to immutable chunks and fingerprints, builds a complete replacement
-Tantivy reader, verifies signature parity, persists a schema/version/generation
-snapshot by sync-plus-rename, and only then swaps the `Arc` visible to readers.
-Overflow, unsafe or corpus paths, ambiguous events, signature mismatch,
-mid-refresh mutation, missing state, incomplete `.pending` state, and corrupt
-snapshots all use the documented full-rebuild fallback. Persisted snapshots are
-accepted only after current source and fingerprint validation.
+Tantivy reader, recomputes the authoritative source signature, verifies event
+epoch and signature parity, persists a schema/version/generation snapshot by
+sync-plus-rename, and only then swaps the `Arc` visible to readers while holding
+the journal publication lock. Events from a consumed snapshot are cleared only
+after that swap; newer events remain dirty. Overflow, unsafe or corpus paths,
+ambiguous events, signature mismatch, mid-refresh mutation, missing state,
+incomplete `.pending` state, and corrupt snapshots all use the documented
+full-rebuild/retry fallback. Persisted snapshots are accepted only after current
+source and fingerprint validation.
 
 Transport startup schedules only the default project through the same bounded
 path after stdio service creation or HTTP listener binding. The public runtime

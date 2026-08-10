@@ -1087,6 +1087,7 @@ struct FreshnessState {
     last_event_ms: AtomicU64,
     last_poll_ms: AtomicU64,
     generation: AtomicU64,
+    event_epoch: AtomicU64,
     changed_paths: Mutex<BTreeSet<String>>,
     journal_overflow: AtomicBool,
     watcher_status: AtomicU8,
@@ -1095,6 +1096,8 @@ struct FreshnessState {
 const WATCHER_STARTING: u8 = 0;
 const WATCHER_HEALTHY: u8 = 1;
 const WATCHER_FAILED: u8 = 2;
+const WATCHER_STARTUP_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const REFRESH_STABILITY_ATTEMPTS: usize = 3;
 
 impl FreshnessState {
     fn watcher_requires_verification(&self) -> bool {
@@ -1107,10 +1110,15 @@ impl FreshnessState {
 }
 
 fn mark_watcher_failed(freshness: &FreshnessState) {
+    let _journal = freshness
+        .changed_paths
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     freshness
         .watcher_status
         .store(WATCHER_FAILED, Ordering::Release);
     freshness.journal_overflow.store(true, Ordering::Release);
+    freshness.event_epoch.fetch_add(1, Ordering::AcqRel);
     freshness
         .last_event_ms
         .store(now_millis(), Ordering::Release);
@@ -1126,10 +1134,33 @@ fn mark_watcher_healthy(freshness: &FreshnessState) {
     );
 }
 
+fn record_watcher_event(
+    freshness: &FreshnessState,
+    changed_paths: impl IntoIterator<Item = String>,
+    overflow: bool,
+) {
+    let mut journal = freshness
+        .changed_paths
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _epoch = freshness.event_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    journal.extend(changed_paths);
+    if journal.len() > CHANGE_JOURNAL_MAX_PATHS || overflow {
+        freshness.journal_overflow.store(true, Ordering::Release);
+    }
+    freshness
+        .last_event_ms
+        .store(now_millis(), Ordering::Release);
+    freshness.dirty.store(true, Ordering::Release);
+}
+
 struct WatchGuard {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
+
+#[cfg(test)]
+type RefreshHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 pub struct UsageMonitor {
     store: StateStore,
@@ -2467,13 +2498,35 @@ fn coarse_count_bucket(count: usize) -> &'static str {
 
 impl WatchGuard {
     fn start(root: std::path::PathBuf, freshness: Arc<FreshnessState>) -> Self {
+        Self::start_with_runner(root, freshness, watch_repository)
+    }
+
+    fn start_with_runner<F>(
+        root: std::path::PathBuf,
+        freshness: Arc<FreshnessState>,
+        runner: F,
+    ) -> Self
+    where
+        F: FnOnce(std::path::PathBuf, Arc<FreshnessState>, Arc<AtomicBool>) + Send + 'static,
+    {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let spawn_freshness = Arc::clone(&freshness);
         let handle = thread::Builder::new()
             .name("context-index-watch".to_owned())
-            .spawn(move || watch_repository(root, spawn_freshness, thread_stop));
-        Self::from_spawn_result(stop, freshness, handle)
+            .spawn(move || runner(root, spawn_freshness, thread_stop));
+        let guard = Self::from_spawn_result(stop, Arc::clone(&freshness), handle);
+        let startup_deadline = Instant::now() + WATCHER_STARTUP_TIMEOUT;
+        while guard.thread.is_some()
+            && freshness.watcher_status.load(Ordering::Acquire) == WATCHER_STARTING
+            && Instant::now() < startup_deadline
+        {
+            thread::sleep(StdDuration::from_millis(1));
+        }
+        if freshness.watcher_status.load(Ordering::Acquire) == WATCHER_STARTING {
+            mark_watcher_failed(&freshness);
+        }
+        guard
     }
 
     fn from_spawn_result(
@@ -2521,6 +2574,8 @@ pub struct ProjectEngine {
     governed_lineage: Option<GovernedFrontierLineage>,
     shared_frontiers: Option<Arc<SharedFrontierCache>>,
     index_snapshot_path: std::path::PathBuf,
+    #[cfg(test)]
+    refresh_hook: Mutex<Option<RefreshHook>>,
     _watcher: WatchGuard,
 }
 
@@ -2629,6 +2684,15 @@ impl ProjectEngine {
     ) -> Result<Self> {
         let project_id = project_id.into();
         let root = root.as_ref().canonicalize()?;
+        let freshness = Arc::new(FreshnessState {
+            last_poll_ms: AtomicU64::new(now_millis()),
+            watcher_status: AtomicU8::new(WATCHER_STARTING),
+            ..FreshnessState::default()
+        });
+        // Registration must complete (or fail closed) before the baseline scan.
+        // Otherwise a mutation between the scan and watcher registration can be
+        // missed permanently by ordinary watcher-driven freshness.
+        let watcher = WatchGuard::start(root.clone(), Arc::clone(&freshness));
         let store = Arc::new(StateStore::open(project_state)?);
         let index_snapshot_path = store.paths().index.join("context-index.snapshot.v1.json");
         let index = load_index_snapshot(&root, &project_id, &index_snapshot_path, control)
@@ -2640,11 +2704,6 @@ impl ProjectEngine {
         if let Some(control) = control {
             control.check()?;
         }
-        let freshness = Arc::new(FreshnessState {
-            last_poll_ms: AtomicU64::new(now_millis()),
-            watcher_status: AtomicU8::new(WATCHER_STARTING),
-            ..FreshnessState::default()
-        });
         let frontiers = load_frontiers(&store, &index.stats().refresh_signature)?;
         let pack_snapshots = load_pack_snapshots(&store)?;
         let deferred_references = load_deferred_references(&store)?;
@@ -2656,7 +2715,6 @@ impl ProjectEngine {
         metrics
             .total_references
             .store(total_references, Ordering::Relaxed);
-        let watcher = WatchGuard::start(index.root().to_path_buf(), Arc::clone(&freshness));
         let lineage_seed = repository_lineage_seed(index.root());
         let l0 = Cache::builder()
             .max_capacity(L0_MAX_BYTES)
@@ -2681,8 +2739,30 @@ impl ProjectEngine {
             governed_lineage,
             shared_frontiers,
             index_snapshot_path,
+            #[cfg(test)]
+            refresh_hook: Mutex::new(None),
             _watcher: watcher,
         })
+    }
+
+    #[cfg(test)]
+    fn set_refresh_hook(&self, hook: RefreshHook) {
+        *self
+            .refresh_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_refresh_hook(&self, phase: &'static str) {
+        let hook = self
+            .refresh_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(phase);
+        }
     }
 
     pub fn index(&self) -> Arc<ProjectIndex> {
@@ -4091,119 +4171,197 @@ impl ProjectEngine {
         }
 
         let refresh_started = Instant::now();
-        let current = self.index();
-        let mut changed_paths = self
-            .freshness
-            .changed_paths
-            .lock()
-            .map_err(|_| anyhow!("change journal lock poisoned"))?
-            .clone();
-        changed_paths.extend(explicit_paths.iter().cloned());
-        let overflow = self.freshness.journal_overflow.load(Ordering::Acquire);
-        let scan_started = Instant::now();
-        let signature = repository_signature_for_project_controlled(
-            current.root(),
-            Some(&self.project_id),
-            control,
-        )?;
-        self.metrics.signature_scan_micros.fetch_add(
-            u64::try_from(scan_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        self.freshness.last_poll_ms.store(now, Ordering::Release);
-        self.freshness.dirty.store(false, Ordering::Release);
-        if signature == current.stats().refresh_signature {
-            self.freshness
-                .changed_paths
-                .lock()
-                .map_err(|_| anyhow!("change journal lock poisoned"))?
-                .clear();
-            self.freshness
-                .journal_overflow
-                .store(self.freshness.watcher_failed(), Ordering::Release);
-            self.metrics.refresh_micros.fetch_add(
-                u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        let mut require_full_rebuild = false;
+        for _attempt in 0..REFRESH_STABILITY_ATTEMPTS {
+            if let Some(control) = control {
+                control.check()?;
+            }
+            let current = self.index();
+            let (snapshot_epoch, mut changed_paths) = {
+                let journal = self
+                    .freshness
+                    .changed_paths
+                    .lock()
+                    .map_err(|_| anyhow!("change journal lock poisoned"))?;
+                (
+                    self.freshness.event_epoch.load(Ordering::Acquire),
+                    journal.clone(),
+                )
+            };
+            changed_paths.extend(explicit_paths.iter().cloned());
+            let overflow = self.freshness.journal_overflow.load(Ordering::Acquire);
+            let scan_started = Instant::now();
+            let signature = repository_signature_for_project_controlled(
+                current.root(),
+                Some(&self.project_id),
+                control,
+            )?;
+            self.metrics.signature_scan_micros.fetch_add(
+                u64::try_from(scan_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            return Ok((true, false));
-        }
+            #[cfg(test)]
+            self.run_refresh_hook("after_signature_scan");
+            self.freshness.last_poll_ms.store(now, Ordering::Release);
 
-        let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
-        let replacement = if !overflow && !changed_paths.is_empty() {
-            match current.refresh_paths_controlled(&changed_paths, control) {
-                Ok(incremental) if incremental.stats().refresh_signature == signature => {
-                    self.metrics
-                        .incremental_refreshes
-                        .fetch_add(1, Ordering::Relaxed);
-                    incremental
-                }
-                _ => {
-                    self.metrics
-                        .incremental_fallbacks
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.metrics.full_refreshes.fetch_add(1, Ordering::Relaxed);
-                    ProjectIndex::build_for_project_controlled(
-                        current.root(),
-                        Some(&self.project_id),
-                        control,
-                    )?
-                }
+            // Never consume a journal snapshot if an event arrived while its
+            // authoritative signature was being computed.
+            if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+                require_full_rebuild = true;
+                continue;
             }
-        } else {
-            if overflow {
+            if signature == current.stats().refresh_signature {
+                let mut journal = self
+                    .freshness
+                    .changed_paths
+                    .lock()
+                    .map_err(|_| anyhow!("change journal lock poisoned"))?;
+                if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+                    require_full_rebuild = true;
+                    continue;
+                }
+                journal.clear();
+                let watcher_failed = self.freshness.watcher_failed();
+                self.freshness
+                    .journal_overflow
+                    .store(watcher_failed, Ordering::Release);
+                self.freshness
+                    .dirty
+                    .store(watcher_failed, Ordering::Release);
+                self.metrics.refresh_micros.fetch_add(
+                    u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                return Ok((true, false));
+            }
+
+            let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
+            let (replacement, incremental, fallback) =
+                if !require_full_rebuild && !overflow && !changed_paths.is_empty() {
+                    match current.refresh_paths_controlled(&changed_paths, control) {
+                        Ok(incremental) if incremental.stats().refresh_signature == signature => {
+                            (incremental, true, false)
+                        }
+                        _ => (
+                            ProjectIndex::build_for_project_controlled(
+                                current.root(),
+                                Some(&self.project_id),
+                                control,
+                            )?,
+                            false,
+                            true,
+                        ),
+                    }
+                } else {
+                    (
+                        ProjectIndex::build_for_project_controlled(
+                            current.root(),
+                            Some(&self.project_id),
+                            control,
+                        )?,
+                        false,
+                        overflow || require_full_rebuild,
+                    )
+                };
+            #[cfg(test)]
+            self.run_refresh_hook("after_index_build");
+            if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+                require_full_rebuild = true;
+                continue;
+            }
+
+            // Re-scan after Tantivy construction. Equality with the earlier
+            // signature alone cannot prove that the repository stayed stable
+            // throughout the build.
+            let verification_started = Instant::now();
+            let publication_signature = repository_signature_for_project_controlled(
+                current.root(),
+                Some(&self.project_id),
+                control,
+            )?;
+            self.metrics.signature_scan_micros.fetch_add(
+                u64::try_from(verification_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            if replacement.stats().refresh_signature != publication_signature
+                || self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch
+            {
+                require_full_rebuild = true;
+                continue;
+            }
+            let replacement = Arc::new(replacement);
+            if let Some(control) = control {
+                control.check()?;
+            }
+            let state_started = Instant::now();
+            persist_index_snapshot(&self.index_snapshot_path, &replacement, control)?;
+            self.metrics.index_state_io_micros.fetch_add(
+                u64::try_from(state_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            if let Some(control) = control {
+                control.check()?;
+            }
+
+            // Watcher event recording takes the same journal lock. Holding it
+            // across the final epoch check and generation swap prevents a late
+            // event from being cleared as part of the consumed snapshot.
+            let mut journal = self
+                .freshness
+                .changed_paths
+                .lock()
+                .map_err(|_| anyhow!("change journal lock poisoned"))?;
+            if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+                require_full_rebuild = true;
+                continue;
+            }
+            *self
+                .index
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
+            self.freshness.generation.fetch_add(1, Ordering::AcqRel);
+            self.metrics.refreshes.fetch_add(1, Ordering::Relaxed);
+            if incremental {
+                self.metrics
+                    .incremental_refreshes
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics.full_refreshes.fetch_add(1, Ordering::Relaxed);
+            }
+            if fallback {
                 self.metrics
                     .incremental_fallbacks
                     .fetch_add(1, Ordering::Relaxed);
             }
-            self.metrics.full_refreshes.fetch_add(1, Ordering::Relaxed);
-            ProjectIndex::build_for_project_controlled(
-                current.root(),
-                Some(&self.project_id),
-                control,
-            )?
-        };
-        let replacement = Arc::new(replacement);
-        if replacement.stats().refresh_signature != signature {
-            bail!("repository changed while rebuilding the native index");
+            journal.clear();
+            let watcher_failed = self.freshness.watcher_failed();
+            self.freshness
+                .journal_overflow
+                .store(watcher_failed, Ordering::Release);
+            self.freshness
+                .dirty
+                .store(watcher_failed, Ordering::Release);
+            drop(journal);
+
+            self.invalidate_l0();
+            let mut frontiers = self
+                .frontiers
+                .lock()
+                .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
+            frontiers.records.clear();
+            frontiers.bytes = 0;
+            self.metrics.refresh_micros.fetch_add(
+                u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            return Ok((true, true));
         }
-        if let Some(control) = control {
-            control.check()?;
-        }
-        let state_started = Instant::now();
-        persist_index_snapshot(&self.index_snapshot_path, &replacement, control)?;
-        self.metrics.index_state_io_micros.fetch_add(
-            u64::try_from(state_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        if let Some(control) = control {
-            control.check()?;
-        }
-        *self
-            .index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
-        self.freshness.generation.fetch_add(1, Ordering::AcqRel);
-        self.metrics.refreshes.fetch_add(1, Ordering::Relaxed);
-        self.freshness
-            .changed_paths
-            .lock()
-            .map_err(|_| anyhow!("change journal lock poisoned"))?
-            .clear();
-        self.freshness
-            .journal_overflow
-            .store(self.freshness.watcher_failed(), Ordering::Release);
-        self.invalidate_l0();
-        let mut frontiers = self
-            .frontiers
-            .lock()
-            .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
-        frontiers.records.clear();
-        frontiers.bytes = 0;
+
         self.metrics.refresh_micros.fetch_add(
             u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        Ok((true, true))
+        bail!("context_pack freshness unavailable; retry after repository stabilization or warmup")
     }
 
     pub fn context_lookup(&self, request: &ContextLookupRequest) -> Result<Vec<u8>> {
@@ -4753,26 +4911,18 @@ fn watcher_loop(
         match receiver.recv_timeout(StdDuration::from_millis(100)) {
             Ok(Ok(event)) if matches!(event.kind, EventKind::Access(_)) => {}
             Ok(Ok(event)) if event.paths.iter().any(|path| source_event_path(root, path)) => {
-                let mut journal = freshness
-                    .changed_paths
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut changed_paths = Vec::new();
+                let mut overflow = event.need_rescan();
                 for path in &event.paths {
                     let Ok(relative) = path.strip_prefix(root) else {
-                        freshness.journal_overflow.store(true, Ordering::Release);
+                        overflow = true;
                         continue;
                     };
                     if !is_ignored_repository_path(relative) {
-                        journal.insert(relative.to_string_lossy().replace('\\', "/"));
+                        changed_paths.push(relative.to_string_lossy().replace('\\', "/"));
                     }
                 }
-                if journal.len() > CHANGE_JOURNAL_MAX_PATHS || event.need_rescan() {
-                    freshness.journal_overflow.store(true, Ordering::Release);
-                }
-                freshness
-                    .last_event_ms
-                    .store(now_millis(), Ordering::Release);
-                freshness.dirty.store(true, Ordering::Release);
+                record_watcher_event(freshness, changed_paths, overflow);
             }
             Ok(Err(_)) => {
                 mark_watcher_failed(freshness);
@@ -10213,6 +10363,122 @@ mod tests {
             engine.metrics.lineage_git_checks.load(Ordering::Relaxed),
             git_checks
         );
+    }
+
+    #[test]
+    fn watcher_registration_precedes_the_baseline_scan() {
+        let root = tempdir().expect("repository root");
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn before_registration() {}\n").expect("initial source");
+        let freshness = Arc::new(FreshnessState {
+            watcher_status: AtomicU8::new(WATCHER_STARTING),
+            ..FreshnessState::default()
+        });
+        let registration_reached = Arc::new(std::sync::Barrier::new(2));
+        let allow_registration = Arc::new(std::sync::Barrier::new(2));
+        let build_root = root.path().to_path_buf();
+        let build_freshness = Arc::clone(&freshness);
+        let runner_reached = Arc::clone(&registration_reached);
+        let runner_allow = Arc::clone(&allow_registration);
+        let builder = thread::spawn(move || {
+            let guard = WatchGuard::start_with_runner(
+                build_root.clone(),
+                build_freshness,
+                move |_, runner_freshness, stop| {
+                    runner_reached.wait();
+                    runner_allow.wait();
+                    mark_watcher_healthy(&runner_freshness);
+                    while !stop.load(Ordering::Acquire) {
+                        thread::sleep(StdDuration::from_millis(1));
+                    }
+                },
+            );
+            let index = ProjectIndex::build(&build_root).expect("baseline index");
+            (guard, index)
+        });
+
+        registration_reached.wait();
+        fs::write(&source, "fn mutation_before_registration() {}\n")
+            .expect("pre-registration mutation");
+        allow_registration.wait();
+        let (guard, index) = builder.join().expect("baseline builder");
+        let (hits, _) = index
+            .search("mutation_before_registration", &[], 8)
+            .expect("baseline search");
+        assert!(hits.iter().any(|hit| hit.path == "lib.rs"));
+        assert_eq!(
+            freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_HEALTHY
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn events_during_signature_scan_or_build_are_not_lost() {
+        for phase in ["after_signature_scan", "after_index_build"] {
+            let root = tempdir().expect("repository root");
+            let state = tempdir().expect("state root");
+            let source = root.path().join("lib.rs");
+            fs::write(&source, "fn original_generation() {}\n").expect("initial source");
+            let engine = Arc::new(
+                ProjectEngine::build_with_state(root.path(), state.path(), phase)
+                    .expect("project engine"),
+            );
+            engine._watcher.stop.store(true, Ordering::Release);
+            thread::sleep(StdDuration::from_millis(150));
+
+            fs::write(&source, "fn first_pending_generation() {}\n").expect("first pending source");
+            record_watcher_event(&engine.freshness, ["lib.rs".to_owned()], false);
+            engine.freshness.last_event_ms.store(0, Ordering::Release);
+
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let triggered = Arc::new(AtomicBool::new(false));
+            let hook_entered = Arc::clone(&entered);
+            let hook_resume = Arc::clone(&resume);
+            let hook_triggered = Arc::clone(&triggered);
+            engine.set_refresh_hook(Arc::new(move |observed_phase| {
+                if observed_phase == phase && !hook_triggered.swap(true, Ordering::AcqRel) {
+                    hook_entered.wait();
+                    hook_resume.wait();
+                }
+            }));
+
+            let refresh_engine = Arc::clone(&engine);
+            let refresh = thread::spawn(move || refresh_engine.refresh_index(false));
+            entered.wait();
+            fs::write(&source, "fn mutation_during_refresh() {}\n").expect("mid-refresh mutation");
+            record_watcher_event(&engine.freshness, ["lib.rs".to_owned()], false);
+            resume.wait();
+
+            assert_eq!(
+                refresh
+                    .join()
+                    .expect("refresh worker")
+                    .expect("stable refresh"),
+                (true, true)
+            );
+            let authoritative =
+                repository_signature_for_project_controlled(root.path(), Some(phase), None)
+                    .expect("authoritative signature");
+            assert_eq!(engine.index().stats().refresh_signature, authoritative);
+            let (hits, _) = engine
+                .index()
+                .search("mutation_during_refresh", &[], 8)
+                .expect("refreshed search");
+            assert!(hits.iter().any(|hit| hit.path == "lib.rs"));
+            assert_eq!(engine.freshness.generation.load(Ordering::Acquire), 1);
+            assert!(engine.freshness.event_epoch.load(Ordering::Acquire) >= 2);
+            assert!(!engine.freshness.dirty.load(Ordering::Acquire));
+            assert!(
+                engine
+                    .freshness
+                    .changed_paths
+                    .lock()
+                    .expect("change journal")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
