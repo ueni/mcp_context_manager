@@ -9820,6 +9820,8 @@ mod tests {
         std::fs::write(&path, "def validate_token(token):\n    return token\n")
             .expect("fixture file");
         let engine = ProjectEngine::build(root.path()).expect("engine");
+        engine._watcher.stop.store(true, Ordering::Release);
+        thread::sleep(StdDuration::from_millis(150));
         let request: ContextPackRequest = serde_json::from_value(json!({
             "prompt": "validate_token",
             "focus_paths": ["auth.py"]
