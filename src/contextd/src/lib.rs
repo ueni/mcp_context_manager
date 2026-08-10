@@ -249,6 +249,14 @@ impl ContextServer {
             )
             .map_err(|error| error.to_string());
         }
+        if request.mode == "warmup" {
+            let encoded = self
+                .registry
+                .context_admin_warmup_bounded(request.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            return attach_runtime_status(encoded, &self.registry, &request.mode);
+        }
         if is_read_only_admin_mode(&request.mode) {
             let (project_id, engine, known) = self
                 .registry
@@ -1721,6 +1729,95 @@ mod tests {
         }
         assert!(!response.contains(prompt));
         assert!(!response.contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_warmup_queue_obeys_the_server_deadline_without_starting_repository_work() {
+        let (_root, _state, registry) =
+            bounded_fixture_registry(1, Duration::from_millis(100), Duration::from_millis(25), 1);
+        let permit = registry.hold_blocking_permit().await;
+        let server = ContextServer::new(Arc::clone(&registry));
+        let request: ContextAdminRequest =
+            serde_json::from_value(json!({"mode": "warmup"})).expect("warmup request");
+        let started = Instant::now();
+        let error = server
+            .context_admin(Parameters(request))
+            .await
+            .expect_err("queued warmup must expire before repository work starts");
+        let elapsed = started.elapsed();
+        drop(permit);
+
+        assert!(error.starts_with("context_admin warmup busy"));
+        assert!(elapsed >= Duration::from_millis(50));
+        assert!(elapsed < Duration::from_millis(100));
+        assert_eq!(registry.runtime_status()["blocking"]["engine_builds"], 0);
+        assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_warmup_uses_bounded_executor_and_keeps_async_runtime_responsive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_root, _state, registry) =
+            bounded_fixture_registry(20, Duration::from_secs(5), Duration::from_millis(100), 1);
+        let permit = registry.hold_blocking_permit().await;
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        registry.set_blocking_hook(Arc::new(move |control| {
+            hook_entered.store(true, Ordering::Release);
+            while !hook_release.load(Ordering::Acquire) {
+                control.check()?;
+                std::thread::yield_now();
+            }
+            Ok(())
+        }));
+
+        let server = ContextServer::new(Arc::clone(&registry));
+        let request: ContextAdminRequest =
+            serde_json::from_value(json!({"mode": "warmup"})).expect("warmup request");
+        let warmup = tokio::spawn(async move { server.context_admin(Parameters(request)).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.blocking_snapshot().2 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("manual warmup queues behind the shared permit");
+        assert_eq!(registry.runtime_status()["blocking"]["engine_builds"], 0);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await
+        .expect("ticker remains responsive while warmup is queued");
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("manual warmup enters blocking executor");
+        assert_eq!(registry.runtime_status()["blocking"]["active"], 1);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await
+        .expect("ticker remains responsive while warmup repository work is stalled");
+        release.store(true, Ordering::Release);
+        let response = warmup.await.expect("warmup task").expect("warmup response");
+        let response: Value = serde_json::from_str(&response).expect("warmup JSON");
+        assert_eq!(response["schema"], "context_cache.warmup.v1");
+        assert_eq!(registry.runtime_status()["blocking"]["engine_builds"], 1);
+        assert_eq!(registry.blocking_snapshot().0, 1);
+        assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

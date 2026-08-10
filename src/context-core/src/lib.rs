@@ -4437,14 +4437,29 @@ impl ProjectEngine {
     }
 
     pub async fn context_admin(&self, request: &ContextAdminRequest) -> Result<Vec<u8>> {
+        self.context_admin_controlled(request, None).await
+    }
+
+    pub async fn context_admin_controlled(
+        &self,
+        request: &ContextAdminRequest,
+        control: Option<&WorkControl>,
+    ) -> Result<Vec<u8>> {
+        let _control_scope = WorkControlScope::install(control);
         let started = Instant::now();
         let operation = admin_operation(&request.mode);
         let result = async {
+            if let Some(control) = control {
+                control.check()?;
+            }
             self.validate_project_selector(
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
-            let value = admin_dispatch(self, request).await?;
+            let value = admin_dispatch(self, request, control).await?;
+            if let Some(control) = control {
+                control.check()?;
+            }
             serde_json::to_vec(&value).map_err(Into::into)
         }
         .await;
@@ -5316,7 +5331,11 @@ fn concept_fingerprints(terms: &[String]) -> Vec<String> {
         .collect()
 }
 
-async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -> Result<Value> {
+async fn admin_dispatch(
+    engine: &ProjectEngine,
+    request: &ContextAdminRequest,
+    control: Option<&WorkControl>,
+) -> Result<Value> {
     let now = now_iso()?;
     let index = engine.index();
     let stats = index.stats();
@@ -5491,7 +5510,7 @@ async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -
                 "shared_frontier_removed": shared_removed,
             }))
         }
-        "warmup" => warmup_dispatch(engine, request, &now).await,
+        "warmup" => warmup_dispatch(engine, request, &now, control).await,
         "budget" => {
             let value = json!({
                 "schema": "context_budget.v1",
@@ -5557,6 +5576,7 @@ async fn warmup_dispatch(
     engine: &ProjectEngine,
     request: &ContextAdminRequest,
     generated_at: &str,
+    control: Option<&WorkControl>,
 ) -> Result<Value> {
     let started = Instant::now();
     let l0_before = engine.l0_storage_stats();
@@ -5571,17 +5591,23 @@ async fn warmup_dispatch(
     let misses_before = engine.metrics.retrieval_misses.load(Ordering::Relaxed);
 
     let refresh_started = Instant::now();
-    let (refresh_checked, refresh_updated) = engine.refresh_index(false)?;
+    let (refresh_checked, refresh_updated) = engine.refresh_index_controlled(false, control)?;
     let refresh_elapsed_ms = refresh_started.elapsed().as_secs_f64() * 1_000.0;
     let stats = engine.index().stats().clone();
 
     let prompt_warmed = !request.prompt.trim().is_empty();
     let prompt_started = Instant::now();
     if prompt_warmed {
+        if let Some(control) = control {
+            control.check()?;
+        }
         let focus_path = (!request.path.trim().is_empty() && request.path.trim() != ".")
             .then(|| request.path.trim());
         let prompt_request = warmup_prompt_request(&request.prompt, focus_path);
         engine.admit_context_pack_cached(&prompt_request).await?;
+        if let Some(control) = control {
+            control.check()?;
+        }
     }
     let prompt_elapsed_ms = prompt_started.elapsed().as_secs_f64() * 1_000.0;
 

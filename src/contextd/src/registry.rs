@@ -379,6 +379,71 @@ impl ProjectRegistry {
         mut request: ContextPackRequest,
         warmup: bool,
     ) -> Result<Vec<u8>> {
+        let registry = Arc::clone(self);
+        self.run_repository_work_bounded("context_pack", warmup, move |job_control| {
+            let engine_started = Instant::now();
+            let engine = registry.engine_for_controlled(
+                request.project_id.as_deref(),
+                request.root_uri.as_deref(),
+                &job_control,
+            )?;
+            registry.blocking.engine_load_micros.fetch_add(
+                u64::try_from(engine_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            job_control.check()?;
+            #[cfg(test)]
+            registry.run_blocking_hook(&job_control)?;
+            request.project_id = Some(engine.project_id().to_owned());
+            request.root_uri = None;
+            let pack_started = Instant::now();
+            let result = tokio::runtime::Handle::current()
+                .block_on(engine.context_pack_cached_controlled(&request, Some(&job_control)));
+            registry.blocking.pack_micros.fetch_add(
+                u64::try_from(pack_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            result
+        })
+        .await
+    }
+
+    pub async fn context_admin_warmup_bounded(
+        self: &Arc<Self>,
+        mut request: ContextAdminRequest,
+    ) -> Result<Vec<u8>> {
+        let registry = Arc::clone(self);
+        self.run_repository_work_bounded("context_admin warmup", false, move |job_control| {
+            let engine_started = Instant::now();
+            let engine = registry.engine_for_controlled(
+                request.project_id.as_deref(),
+                request.root_uri.as_deref(),
+                &job_control,
+            )?;
+            registry.blocking.engine_load_micros.fetch_add(
+                u64::try_from(engine_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            job_control.check()?;
+            #[cfg(test)]
+            registry.run_blocking_hook(&job_control)?;
+            request.project_id = Some(engine.project_id().to_owned());
+            request.root_uri = None;
+            tokio::runtime::Handle::current()
+                .block_on(engine.context_admin_controlled(&request, Some(&job_control)))
+        })
+        .await
+    }
+
+    async fn run_repository_work_bounded<F>(
+        self: &Arc<Self>,
+        operation: &'static str,
+        warmup: bool,
+        work: F,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnOnce(WorkControl) -> Result<Vec<u8>> + Send + 'static,
+    {
         let started = Instant::now();
         let work_budget = self
             .blocking
@@ -415,7 +480,7 @@ impl ProjectRegistry {
                     Ordering::Relaxed,
                 );
                 cancel_on_drop.finish();
-                return Err(anyhow!("context_pack blocking executor is unavailable"));
+                return Err(anyhow!("{operation} blocking executor is unavailable"));
             }
             Err(_) => {
                 self.blocking.timeouts.fetch_add(1, Ordering::Relaxed);
@@ -431,7 +496,7 @@ impl ProjectRegistry {
                     .deadline_remaining_ms_last
                     .store(0, Ordering::Relaxed);
                 return Err(anyhow!(
-                    "context_pack busy; retry after warmup or when queued work completes"
+                    "{operation} busy; retry after warmup or when queued work completes"
                 ));
             }
         };
@@ -453,50 +518,19 @@ impl ProjectRegistry {
                 .deadline_remaining_ms_last
                 .store(0, Ordering::Relaxed);
             return Err(anyhow!(
-                "context_pack busy; retry after warmup or when queued work completes"
+                "{operation} busy; retry after warmup or when queued work completes"
             ));
         }
 
-        let registry = Arc::clone(self);
         let job_control = control.clone();
         let blocking = Arc::clone(&self.blocking);
-        #[cfg(test)]
-        let blocking_hook = self
-            .blocking_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         let mut job = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let active = blocking.active.fetch_add(1, Ordering::AcqRel) + 1;
             blocking.active_peak.fetch_max(active, Ordering::Relaxed);
             let _active = CountGuard(&blocking.active);
             job_control.check()?;
-            let engine_started = Instant::now();
-            let engine = registry.engine_for_controlled(
-                request.project_id.as_deref(),
-                request.root_uri.as_deref(),
-                &job_control,
-            )?;
-            blocking.engine_load_micros.fetch_add(
-                u64::try_from(engine_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            job_control.check()?;
-            #[cfg(test)]
-            if let Some(hook) = blocking_hook {
-                hook(&job_control)?;
-            }
-            request.project_id = Some(engine.project_id().to_owned());
-            request.root_uri = None;
-            let pack_started = Instant::now();
-            let result = tokio::runtime::Handle::current()
-                .block_on(engine.context_pack_cached_controlled(&request, Some(&job_control)));
-            blocking.pack_micros.fetch_add(
-                u64::try_from(pack_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            result
+            work(job_control)
         });
 
         let result = match tokio::time::timeout_at(
@@ -514,7 +548,7 @@ impl ProjectRegistry {
                     self.blocking.timeouts.fetch_add(1, Ordering::Relaxed);
                     self.blocking.cancellations.fetch_add(1, Ordering::Relaxed);
                     Err(anyhow!(
-                        "context_pack timed out before the server deadline; retry after warmup"
+                        "{operation} timed out before the server deadline; retry after warmup"
                     ))
                 }
                 Err(error) => Err(error),
@@ -531,7 +565,7 @@ impl ProjectRegistry {
                     Ok(result) => {
                         let _ = result;
                         Err(anyhow!(
-                            "context_pack timed out before the server deadline; retry after warmup"
+                            "{operation} timed out before the server deadline; retry after warmup"
                         ))
                     }
                     Err(_) => {
@@ -541,7 +575,7 @@ impl ProjectRegistry {
                         // could starve every queued request.
                         let _ = (&mut job).await;
                         Err(anyhow!(
-                            "context_pack cancellation grace expired; retry after warmup"
+                            "{operation} cancellation grace expired; retry after warmup"
                         ))
                     }
                 };
@@ -705,6 +739,19 @@ impl ProjectRegistry {
             .blocking_hook
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_blocking_hook(&self, control: &WorkControl) -> Result<()> {
+        if let Some(hook) = self
+            .blocking_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            hook(control)?;
+        }
+        Ok(())
     }
 
     pub fn monitor_usage(&self, action: &str, project_id: Option<&str>) -> Result<Value> {
