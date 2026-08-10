@@ -5560,7 +5560,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "path": "Repository-relative path or resource URI.", "max_files": "Index file cap.",
                 "prompt": "Optional prompt to warm exact context_pack cache without echoing it.",
                 "max_age_minutes": "Cache prune age.",
-                "max_entries": "Maximum returned rows for projects, active_projects, cached_projects, and state_browser (project catalogue range 1..=1000); monitor reports default to 20.",
+                "max_entries": "Maximum returned rows for projects, active_projects, cached_projects, and state_browser (default 20; project catalogue range 1..=1000).",
                 "max_output_chars": "For monitor reports, inline JSON budget (default 12000) plus at most 2048 characters of truncation and retrieval metadata; otherwise a budget override.",
                 "default_output_profile": "Budget profile.",
                 "tool_name": "Filter to one tool.", "contract_profile": "compact or verbose.",
@@ -7472,6 +7472,7 @@ mod tests {
                 "missing max_entries mode {mode}"
             );
         }
+        assert!(max_entries.contains("default 20"));
         assert!(max_entries.contains("1..=1000"));
         assert!(!max_entries.contains("monitor_usage"));
 
@@ -7484,6 +7485,15 @@ mod tests {
             "context_projects.cached.v1",
         ] {
             assert!(schemas.iter().any(|candidate| candidate == schema));
+        }
+    }
+
+    #[test]
+    fn admin_catalogue_modes_default_max_entries_to_twenty() {
+        for mode in ["projects", "active_projects", "cached_projects"] {
+            let request: ContextAdminRequest = serde_json::from_value(json!({"mode": mode}))
+                .expect("catalogue request without max_entries");
+            assert_eq!(request.max_entries, 20, "unexpected default for {mode}");
         }
     }
 

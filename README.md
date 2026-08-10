@@ -104,7 +104,7 @@ Diagnostics, metrics, and token accounting are available through
 
 Project catalogue calls are explicitly row-bounded. For
 `context_admin(mode="projects")`, `active_projects`, and `cached_projects`,
-`max_entries` defaults to 100 and accepts `1..=1000`. The returned `projects`
+`max_entries` defaults to 20 and accepts `1..=1000`. The returned `projects`
 array never exceeds that cap. `count` remains the returned row count, while
 `total_count`, `returned_count`, `omitted_count`, and `truncated` distinguish the
 complete matching catalogue from the inline subset. Catalogue ordering remains

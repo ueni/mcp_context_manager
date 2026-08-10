@@ -1471,6 +1471,26 @@ mod tests {
             assert_eq!(response["truncated"], true);
         }
 
+        for mode in ["projects", "active_projects", "cached_projects"] {
+            let request: ContextAdminRequest = serde_json::from_value(json!({"mode": mode}))
+                .expect("catalogue request without max_entries");
+            assert_eq!(request.max_entries, 20);
+            let response: Value = serde_json::from_str(
+                &server
+                    .context_admin(Parameters(request))
+                    .await
+                    .expect("default-bounded catalogue response"),
+            )
+            .expect("catalogue JSON");
+            assert_eq!(response["projects"].as_array().map(Vec::len), Some(2));
+            assert_eq!(response["count"], 2);
+            assert_eq!(response["total_count"], 2);
+            assert_eq!(response["returned_count"], 2);
+            assert_eq!(response["omitted_count"], 0);
+            assert_eq!(response["max_entries"], 20);
+            assert_eq!(response["truncated"], false);
+        }
+
         for invalid in [0, 1001] {
             let request: ContextAdminRequest = serde_json::from_value(json!({
                 "mode": "projects",
