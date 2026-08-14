@@ -2,6 +2,9 @@
 
 mod registry;
 
+#[doc(hidden)]
+pub use registry::ProjectRegistry;
+
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -31,7 +34,6 @@ use context_core::{
     static_resource_text, unloaded_admin_response,
 };
 use http_body_util::{BodyExt, Limited};
-use registry::ProjectRegistry;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -247,6 +249,14 @@ impl ContextServer {
             )
             .map_err(|error| error.to_string());
         }
+        if request.mode == "warmup" {
+            let encoded = self
+                .registry
+                .context_admin_warmup_bounded(request.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            return attach_runtime_status(encoded, &self.registry, &request.mode);
+        }
         if is_read_only_admin_mode(&request.mode) {
             let (project_id, engine, known) = self
                 .registry
@@ -263,7 +273,7 @@ impl ContextServer {
                 ),
             }
             .map_err(|error| error.to_string())?;
-            return String::from_utf8(encoded).map_err(|error| error.to_string());
+            return attach_runtime_status(encoded, &self.registry, &request.mode);
         }
         let engine = self
             .registry
@@ -275,8 +285,22 @@ impl ContextServer {
             .context_admin(&request)
             .await
             .map_err(|error| error.to_string())?;
-        String::from_utf8(encoded).map_err(|error| error.to_string())
+        attach_runtime_status(encoded, &self.registry, &request.mode)
     }
+}
+
+fn attach_runtime_status(
+    encoded: Vec<u8>,
+    registry: &ProjectRegistry,
+    mode: &str,
+) -> Result<String, String> {
+    let mut value: Value = serde_json::from_slice(&encoded).map_err(|error| error.to_string())?;
+    if matches!(mode, "health" | "metrics" | "measurement_report" | "warmup")
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("runtime".to_owned(), registry.runtime_status());
+    }
+    serde_json::to_string(&value).map_err(|error| error.to_string())
 }
 
 fn is_read_only_admin_mode(mode: &str) -> bool {
@@ -411,7 +435,10 @@ pub async fn run_from_env() -> Result<()> {
 }
 
 async fn run_stdio(registry: Arc<ProjectRegistry>) -> Result<()> {
-    let service = ContextServer::new(registry).serve(stdio()).await?;
+    let service = ContextServer::new(Arc::clone(&registry))
+        .serve(stdio())
+        .await?;
+    registry.start_post_readiness_warmup();
     service.waiting().await?;
     Ok(())
 }
@@ -472,6 +499,7 @@ async fn run_http(registry: Arc<ProjectRegistry>) -> Result<()> {
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, validate_http_request));
     let listener = tokio::net::TcpListener::bind(address).await?;
+    registry.start_post_readiness_warmup();
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(cancellation))
@@ -800,7 +828,10 @@ async fn context_pack_http(State(state): State<HttpState>, Json(payload): Json<V
     context_pack_http_response(&state.registry, payload).await
 }
 
-async fn context_pack_http_response(registry: &ProjectRegistry, mut payload: Value) -> Response {
+async fn context_pack_http_response(
+    registry: &Arc<ProjectRegistry>,
+    mut payload: Value,
+) -> Response {
     let Some(object) = payload.as_object_mut() else {
         registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
         return rest_error(StatusCode::BAD_REQUEST, "JSON body must be an object");
@@ -823,32 +854,37 @@ async fn context_pack_http_response(registry: &ProjectRegistry, mut payload: Val
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(bytes))
             .expect("valid REST response"),
-        Err(error) => rest_error(StatusCode::BAD_REQUEST, &error),
+        Err(error) => rest_error(context_pack_http_error_status(&error), &error),
+    }
+}
+
+fn context_pack_http_error_status(error: &str) -> StatusCode {
+    if error.starts_with("context_pack busy")
+        || error.starts_with("context_pack timed out")
+        || error.starts_with("context_pack cancellation grace")
+        || error.starts_with("context_pack freshness unavailable")
+    {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
     }
 }
 
 async fn run_context_pack_request(
-    registry: &ProjectRegistry,
-    mut request: ContextPackRequest,
+    registry: &Arc<ProjectRegistry>,
+    request: ContextPackRequest,
 ) -> Result<Vec<u8>, String> {
     if let Err(error) = request.validate_limits() {
         registry.record_context_pack_rejection(ContextPackRejectionClass::Schema);
         return Err(error.to_string());
     }
-    let engine =
-        match registry.engine_for(request.project_id.as_deref(), request.root_uri.as_deref()) {
-            Ok(engine) => engine,
-            Err(error) => {
-                registry.record_context_pack_rejection(classify_context_pack_rejection(&error));
-                return Err(error.to_string());
-            }
-        };
-    request.project_id = Some(engine.project_id().to_owned());
-    request.root_uri = None;
-    engine
-        .context_pack_cached(&request)
+    registry
+        .context_pack_bounded(request)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            registry.record_context_pack_rejection(classify_context_pack_rejection(&error));
+            error.to_string()
+        })
 }
 
 async fn reference_http(
@@ -1280,6 +1316,16 @@ fn project_id_from_resource(uri: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn freshness_unavailable_is_a_retryable_http_error() {
+        assert_eq!(
+            context_pack_http_error_status(
+                "context_pack freshness unavailable; retry after repository stabilization or warmup"
+            ),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     #[tokio::test]
     async fn context_pack_prompt_validation_has_mcp_rest_parity() {
         let root = tempfile::tempdir().expect("repository root");
@@ -1340,6 +1386,639 @@ mod tests {
             .to_bytes();
         let rest: Value = serde_json::from_slice(&body).expect("REST context_pack.v2 JSON");
         assert_eq!(rest, mcp);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_context_pack_keeps_single_worker_runtime_responsive() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        for file in 0..300 {
+            let mut source = String::new();
+            for line in 0..80 {
+                source.push_str(&format!("fn fixture_{file}_{line}() {{}}\n"));
+            }
+            std::fs::write(root.path().join(format!("fixture-{file}.rs")), source)
+                .expect("source fixture");
+        }
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "find fixture implementation",
+            "max_items": 4
+        }))
+        .expect("pack request");
+        let pack_registry = Arc::clone(&registry);
+        let pack = tokio::spawn(async move { pack_registry.context_pack_bounded(request).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if registry.blocking_snapshot().1 > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking job starts");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await
+        .expect("runtime ticker remains responsive");
+        assert_eq!(ContextServer::new(Arc::clone(&registry)).health(), "ok");
+
+        let response = tokio::time::timeout(Duration::from_secs(20), pack)
+            .await
+            .expect("bounded pack deadline")
+            .expect("pack task")
+            .expect("context pack");
+        assert!(!response.is_empty());
+        assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_blocking_job_cooperatively_releases_permit() {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        for file in 0..500 {
+            let source = (0..120)
+                .map(|line| format!("fn timeout_fixture_{file}_{line}() {{}}\n"))
+                .collect::<String>();
+            std::fs::write(root.path().join(format!("timeout-{file}.rs")), source)
+                .expect("source fixture");
+        }
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry")
+            .with_blocking_configuration(
+                1,
+                Duration::from_millis(20),
+                Duration::from_millis(15),
+            ),
+        );
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "find timeout fixture",
+            "max_items": 4
+        }))
+        .expect("pack request");
+
+        let error = registry
+            .context_pack_bounded(request)
+            .await
+            .expect_err("request must expire before the large cold build completes")
+            .to_string();
+        assert!(
+            error.starts_with("context_pack timed out")
+                || error.starts_with("context_pack cancellation grace")
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let (_, active, queued, _, timeouts) = registry.blocking_snapshot();
+                if active == 0 && queued == 0 && timeouts == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled job returns counters and permit to baseline");
+    }
+
+    fn bounded_fixture_registry(
+        files: usize,
+        timeout: Duration,
+        grace: Duration,
+        limit: usize,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Arc<ProjectRegistry>) {
+        let root = tempfile::tempdir().expect("repository root");
+        let state = tempfile::tempdir().expect("state root");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        for file in 0..files {
+            std::fs::write(
+                root.path().join(format!("source-{file}.rs")),
+                format!("fn bounded_fixture_{file}() {{}}\n"),
+            )
+            .expect("source");
+        }
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("registry")
+            .with_blocking_configuration(limit, timeout, grace),
+        );
+        (root, state, registry)
+    }
+
+    fn bounded_request(prompt: &str) -> ContextPackRequest {
+        serde_json::from_value(json!({"prompt": prompt, "max_items": 2})).expect("pack request")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queue_deadline_is_stable_before_server_budget() {
+        let (_root, _state, registry) =
+            bounded_fixture_registry(1, Duration::from_millis(100), Duration::from_millis(25), 1);
+        let permit = registry.hold_blocking_permit().await;
+        let started = Instant::now();
+        let error = registry
+            .context_pack_bounded(bounded_request("queued timeout"))
+            .await
+            .expect_err("queue must time out")
+            .to_string();
+        let elapsed = started.elapsed();
+        drop(permit);
+        assert!(error.starts_with("context_pack busy"));
+        assert!(elapsed >= Duration::from_millis(50));
+        assert!(elapsed < Duration::from_millis(100));
+        assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_queue_waiter_never_starts_or_owns_singleflight() {
+        let (_root, _state, registry) =
+            bounded_fixture_registry(10, Duration::from_secs(10), Duration::from_millis(100), 1);
+        let permit = registry.hold_blocking_permit().await;
+        let waiting_registry = Arc::clone(&registry);
+        let waiter = tokio::spawn(async move {
+            waiting_registry
+                .context_pack_bounded(bounded_request("cancelled waiter"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.blocking_snapshot().2 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiter queued");
+        waiter.abort();
+        let _ = waiter.await;
+        drop(permit);
+        tokio::task::yield_now().await;
+        assert_eq!(registry.runtime_status()["blocking"]["engine_builds"], 0);
+        assert_eq!(registry.runtime_status()["blocking"]["cancellations"], 1);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+
+        registry
+            .context_pack_bounded(bounded_request("surviving waiter"))
+            .await
+            .expect("surviving request");
+        assert_eq!(registry.runtime_status()["blocking"]["engine_builds"], 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_bounded_path_limits_jobs_and_singleflights_cold_engine() {
+        let (_root, _state, registry) =
+            bounded_fixture_registry(200, Duration::from_secs(10), Duration::from_millis(100), 2);
+        let first_registry = Arc::clone(&registry);
+        let second_registry = Arc::clone(&registry);
+        let first = tokio::spawn(async move {
+            first_registry
+                .context_pack_bounded(bounded_request("same cold project one"))
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_registry
+                .context_pack_bounded(bounded_request("same cold project two"))
+                .await
+        });
+        first.await.expect("first task").expect("first pack");
+        second.await.expect("second task").expect("second pack");
+        let status = registry.runtime_status();
+        assert_eq!(status["blocking"]["engine_builds"], 1);
+        assert!(
+            status["blocking"]["active_peak"]
+                .as_u64()
+                .unwrap_or_default()
+                <= 2
+        );
+        assert_eq!(status["blocking"]["active"], 0);
+        assert_eq!(status["blocking"]["queued"], 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_readiness_warmup_reports_lifecycle_to_ready() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_root, _state, registry) =
+            bounded_fixture_registry(20, Duration::from_secs(10), Duration::from_millis(100), 1);
+        let permit = registry.hold_blocking_permit().await;
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        registry.set_blocking_hook(Arc::new(move |_| {
+            hook_entered.store(true, Ordering::Release);
+            while !hook_release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            Ok(())
+        }));
+        registry.start_post_readiness_warmup();
+        assert_eq!(registry.runtime_status()["warmup"]["state"], "queued");
+        tokio::task::yield_now().await;
+        assert_eq!(registry.runtime_status()["warmup"]["state"], "queued");
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("warmup enters build");
+        assert_eq!(registry.runtime_status()["warmup"]["state"], "building");
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match registry.runtime_status()["warmup"]["state"].as_str() {
+                    Some("ready") => break,
+                    Some("failed") => panic!("warmup failed"),
+                    _ => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("warmup reaches ready");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_readiness_warmup_reports_failed_state() {
+        let (_root, _state, registry) =
+            bounded_fixture_registry(20, Duration::from_secs(10), Duration::from_millis(100), 1);
+        registry.set_blocking_hook(Arc::new(|_| {
+            Err(anyhow::anyhow!("controlled warmup failure"))
+        }));
+        registry.start_post_readiness_warmup();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while registry.runtime_status()["warmup"]["state"] != "failed" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("warmup reaches failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_metrics_cover_bounded_phases_without_request_or_path_content() {
+        let (root, _state, registry) =
+            bounded_fixture_registry(20, Duration::from_secs(10), Duration::from_millis(100), 2);
+        let prompt = "private prompt sentinel must not enter metrics";
+        registry
+            .context_pack_bounded(bounded_request(prompt))
+            .await
+            .expect("bounded pack");
+        let server = ContextServer::new(Arc::clone(&registry));
+        let request: ContextAdminRequest =
+            serde_json::from_value(json!({"mode": "metrics"})).expect("metrics request");
+        let response = server
+            .context_admin(Parameters(request))
+            .await
+            .expect("metrics response");
+        let metrics: Value = serde_json::from_str(&response).expect("metrics JSON");
+        for field in [
+            "queue_wait_micros_total",
+            "engine_load_micros_total",
+            "pack_micros_total",
+            "total_micros",
+            "post_timeout_micros_total",
+            "deadline_remaining_ms_last",
+            "cancellations",
+            "timeouts",
+            "queued",
+            "singleflight_waiters",
+        ] {
+            assert!(
+                metrics["runtime"]["blocking"][field].as_u64().is_some(),
+                "{field}"
+            );
+        }
+        for field in [
+            "signature_scan",
+            "refresh",
+            "index_state_io",
+            "retrieval",
+            "cache_state_io",
+            "serialization",
+        ] {
+            assert!(
+                metrics["index_freshness"]["phase_micros"][field]
+                    .as_u64()
+                    .is_some(),
+                "{field}"
+            );
+        }
+        assert!(!response.contains(prompt));
+        assert!(!response.contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_warmup_queue_obeys_the_server_deadline_without_starting_repository_work() {
+        let (_root, _state, registry) =
+            bounded_fixture_registry(1, Duration::from_millis(100), Duration::from_millis(25), 1);
+        let permit = registry.hold_blocking_permit().await;
+        let server = ContextServer::new(Arc::clone(&registry));
+        let request: ContextAdminRequest =
+            serde_json::from_value(json!({"mode": "warmup"})).expect("warmup request");
+        let started = Instant::now();
+        let error = server
+            .context_admin(Parameters(request))
+            .await
+            .expect_err("queued warmup must expire before repository work starts");
+        let elapsed = started.elapsed();
+        drop(permit);
+
+        assert!(error.starts_with("context_admin warmup busy"));
+        assert!(elapsed >= Duration::from_millis(50));
+        assert!(elapsed < Duration::from_millis(100));
+        assert_eq!(registry.runtime_status()["blocking"]["engine_builds"], 0);
+        assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_warmup_uses_bounded_executor_and_keeps_async_runtime_responsive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_root, _state, registry) =
+            bounded_fixture_registry(20, Duration::from_secs(5), Duration::from_millis(100), 1);
+        let permit = registry.hold_blocking_permit().await;
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        registry.set_blocking_hook(Arc::new(move |control| {
+            hook_entered.store(true, Ordering::Release);
+            while !hook_release.load(Ordering::Acquire) {
+                control.check()?;
+                std::thread::yield_now();
+            }
+            Ok(())
+        }));
+
+        let server = ContextServer::new(Arc::clone(&registry));
+        let request: ContextAdminRequest =
+            serde_json::from_value(json!({"mode": "warmup"})).expect("warmup request");
+        let warmup = tokio::spawn(async move { server.context_admin(Parameters(request)).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.blocking_snapshot().2 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("manual warmup queues behind the shared permit");
+        assert_eq!(registry.runtime_status()["blocking"]["engine_builds"], 0);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await
+        .expect("ticker remains responsive while warmup is queued");
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("manual warmup enters blocking executor");
+        assert_eq!(registry.runtime_status()["blocking"]["active"], 1);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await
+        .expect("ticker remains responsive while warmup repository work is stalled");
+        release.store(true, Ordering::Release);
+        let response = warmup.await.expect("warmup task").expect("warmup response");
+        let response: Value = serde_json::from_str(&response).expect("warmup JSON");
+        assert_eq!(response["schema"], "context_cache.warmup.v1");
+        assert_eq!(registry.runtime_status()["blocking"]["engine_builds"], 1);
+        assert_eq!(registry.blocking_snapshot().0, 1);
+        assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controlled_stalled_job_leaves_ticker_health_and_lightweight_mcp_responsive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_root, _state, registry) =
+            bounded_fixture_registry(10, Duration::from_secs(5), Duration::from_millis(100), 1);
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        registry.set_blocking_hook(Arc::new(move |control| {
+            hook_entered.store(true, Ordering::Release);
+            while !hook_release.load(Ordering::Acquire) {
+                control.check()?;
+                std::thread::yield_now();
+            }
+            Ok(())
+        }));
+        let pack_registry = Arc::clone(&registry);
+        let pack = tokio::spawn(async move {
+            pack_registry
+                .context_pack_bounded(bounded_request("stalled build"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stalled phase entered");
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(5)),
+        )
+        .await
+        .expect("ticker responsive");
+        let server = ContextServer::new(Arc::clone(&registry));
+        assert_eq!(server.health(), "ok");
+        let metrics: ContextAdminRequest =
+            serde_json::from_value(json!({"mode": "metrics"})).expect("metrics request");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            server.context_admin(Parameters(metrics)),
+        )
+        .await
+        .expect("lightweight MCP responsive")
+        .expect("metrics response");
+
+        release.store(true, Ordering::Release);
+        pack.await.expect("pack task").expect("pack response");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn running_cancellation_stops_by_grace_without_late_persistent_commits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_root, _state, registry) =
+            bounded_fixture_registry(20, Duration::from_secs(2), Duration::from_secs(1), 1);
+        let entered = Arc::new(AtomicBool::new(false));
+        let hook_entered = Arc::clone(&entered);
+        registry.set_blocking_hook(Arc::new(move |control| {
+            hook_entered.store(true, Ordering::Release);
+            loop {
+                control.check()?;
+                std::thread::yield_now();
+            }
+        }));
+        let pack_registry = Arc::clone(&registry);
+        let pack = tokio::spawn(async move {
+            pack_registry
+                .context_pack_bounded(bounded_request("cancel running job"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("running phase entered");
+        let engine = registry.default_engine().expect("constructed engine");
+        let generation = engine.index().stats().refresh_signature.clone();
+        let pack_rows = engine.store().iter_json("pack:").expect("pack rows").len();
+        let frontier_rows = engine
+            .store()
+            .iter_json("frontier:")
+            .expect("frontier rows")
+            .len();
+
+        let error = pack
+            .await
+            .expect("pack task")
+            .expect_err("running job must cancel")
+            .to_string();
+        assert!(error.starts_with("context_pack timed out"));
+        assert_eq!(registry.blocking_snapshot().0, 1);
+        assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+        assert_eq!(engine.index().stats().refresh_signature, generation);
+        assert_eq!(
+            engine.store().iter_json("pack:").expect("pack rows").len(),
+            pack_rows
+        );
+        assert_eq!(
+            engine
+                .store()
+                .iter_json("frontier:")
+                .expect("frontier rows")
+                .len(),
+            frontier_rows
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_grace_expiry_waits_for_permit_and_counter_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_root, _state, registry) =
+            bounded_fixture_registry(5, Duration::from_millis(120), Duration::from_millis(40), 1);
+        let engine = registry.default_engine().expect("prebuilt engine");
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let hook_entered = Arc::clone(&entered);
+        let hook_release = Arc::clone(&release);
+        registry.set_blocking_hook(Arc::new(move |_| {
+            hook_entered.store(true, Ordering::Release);
+            let safety_deadline = Instant::now() + Duration::from_secs(2);
+            while !hook_release.load(Ordering::Acquire) && Instant::now() < safety_deadline {
+                std::thread::yield_now();
+            }
+            Ok(())
+        }));
+        let pack_registry = Arc::clone(&registry);
+        let pack = tokio::spawn(async move {
+            pack_registry
+                .context_pack_bounded(bounded_request("non-cooperative phase"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking hook entered");
+        let cancellation_started = Instant::now();
+        let generation = engine.index().stats().refresh_signature.clone();
+        let pack_rows = engine.store().iter_json("pack:").expect("pack rows").len();
+        let frontier_rows = engine
+            .store()
+            .iter_json("frontier:")
+            .expect("frontier rows")
+            .len();
+
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert!(
+            !pack.is_finished(),
+            "request returned while the live blocking job still owned capacity"
+        );
+        assert_eq!(registry.blocking_snapshot().0, 0);
+        assert_eq!(registry.blocking_snapshot().1, 1);
+        assert_eq!(
+            engine.store().iter_json("pack:").expect("pack rows").len(),
+            pack_rows
+        );
+        assert_eq!(
+            engine
+                .store()
+                .iter_json("frontier:")
+                .expect("frontier rows")
+                .len(),
+            frontier_rows
+        );
+
+        release.store(true, Ordering::Release);
+        let error = tokio::time::timeout(Duration::from_secs(1), pack)
+            .await
+            .expect("attached job returns after release")
+            .expect("pack task")
+            .expect_err("grace expiry must fail")
+            .to_string();
+        assert!(error.starts_with("context_pack cancellation grace expired"));
+        assert!(cancellation_started.elapsed() < Duration::from_secs(1));
+        assert_eq!(registry.blocking_snapshot().0, 1);
+        assert_eq!(registry.blocking_snapshot().1, 0);
+        assert_eq!(registry.blocking_snapshot().2, 0);
+        assert_eq!(engine.index().stats().refresh_signature, generation);
+        assert_eq!(
+            engine.store().iter_json("pack:").expect("pack rows").len(),
+            pack_rows
+        );
+        assert_eq!(
+            engine
+                .store()
+                .iter_json("frontier:")
+                .expect("frontier rows")
+                .len(),
+            frontier_rows
+        );
     }
 
     #[tokio::test]

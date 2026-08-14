@@ -3,10 +3,14 @@
 mod corpus;
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -35,6 +39,14 @@ pub const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
 const IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
     ".mcp-context-manager",
+    ".workingdir",
+    ".worktrees",
+    ".agent",
+    ".agents",
+    ".codex",
+    ".openclaw",
+    ".cache",
+    ".venv",
     ".cmake-build",
     ".downloads",
     ".pytest_cache",
@@ -44,15 +56,69 @@ const IGNORED_DIRECTORIES: &[&str] = &[
     "dist",
     "node_modules",
     "target",
+    "venv",
     "wheelhouse",
 ];
+
+/// Shared cancellation/deadline state for repository-wide blocking work.
+///
+/// Scans and index construction check this between files and chunks so a
+/// timed-out request cannot publish a late generation after its caller left.
+#[derive(Clone)]
+pub struct WorkControl {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl WorkControl {
+    pub fn new(deadline: Instant) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline,
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline {
+            bail!("repository work cancelled before commit")
+        }
+        Ok(())
+    }
+}
+
+/// Returns whether a repository-relative path belongs to generated state.
+/// Watchers, scanners, project discovery, and Git lineage use this policy.
+pub fn is_ignored_repository_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|name| {
+            IGNORED_DIRECTORIES.contains(&name) || name.ends_with('~') || name.starts_with(".#")
+        })
+    })
+}
+
+/// Git pathspec exclusions corresponding to the shared ignore policy.
+pub fn git_exclude_pathspecs() -> Vec<String> {
+    let mut pathspecs = IGNORED_DIRECTORIES
+        .iter()
+        .map(|directory| format!(":(exclude,glob)**/{directory}/**"))
+        .collect::<Vec<_>>();
+    for component in ["*~", ".#*"] {
+        pathspecs.push(format!(":(exclude,glob)**/{component}"));
+        pathspecs.push(format!(":(exclude,glob)**/{component}/**"));
+    }
+    pathspecs
+}
 
 const STOP_WORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "build", "by", "for", "from", "how", "in", "into",
     "is", "it", "of", "on", "or", "the", "this", "to", "update", "with",
 ];
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Chunk {
     pub id: String,
     pub path: String,
@@ -116,6 +182,33 @@ pub struct IndexStats {
     pub refresh_signature: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FileFingerprint {
+    len: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IndexSnapshot {
+    schema: String,
+    generation: String,
+    refresh_signature: String,
+    chunks: Vec<Chunk>,
+    fingerprints: BTreeMap<String, FileFingerprint>,
+    corpus_digest: String,
+    stats: SnapshotStats,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SnapshotStats {
+    skipped_binary: usize,
+    skipped_symlink: usize,
+    corpus_source_count: usize,
+    corpus_chunk_count: usize,
+    corpus_metadata_only_count: usize,
+    corpus_deduplicated_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TreeEntry {
     pub path: String,
@@ -154,6 +247,8 @@ pub struct ProjectIndex {
     chunks_by_path: Arc<HashMap<String, Vec<usize>>>,
     chunks_by_id: Arc<HashMap<String, usize>>,
     chunks_by_address: Arc<HashMap<String, usize>>,
+    fingerprints: Arc<BTreeMap<String, FileFingerprint>>,
+    corpus_digest: String,
     stats: IndexStats,
 }
 
@@ -163,6 +258,15 @@ impl ProjectIndex {
     }
 
     pub fn build_for_project(root: impl AsRef<Path>, project_scope: Option<&str>) -> Result<Self> {
+        Self::build_for_project_controlled(root, project_scope, None)
+    }
+
+    pub fn build_for_project_controlled(
+        root: impl AsRef<Path>,
+        project_scope: Option<&str>,
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
+        check_control(control)?;
         let root = root.as_ref().canonicalize().with_context(|| {
             format!(
                 "repository root does not exist: {}",
@@ -173,7 +277,25 @@ impl ProjectIndex {
             bail!("repository root is not a directory: {}", root.display());
         }
 
-        let (chunks, stats) = scan_repository(&root, project_scope)?;
+        let scanned = scan_repository(&root, project_scope, control)?;
+        Self::from_parts(
+            root,
+            scanned.chunks,
+            scanned.fingerprints,
+            scanned.corpus_digest,
+            scanned.stats,
+            control,
+        )
+    }
+
+    fn from_parts(
+        root: PathBuf,
+        chunks: Vec<Chunk>,
+        fingerprints: BTreeMap<String, FileFingerprint>,
+        corpus_digest: String,
+        stats: IndexStats,
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
         let mut schema_builder = Schema::builder();
         let fields = Fields {
             id: schema_builder.add_text_field("id", STRING | STORED),
@@ -188,6 +310,7 @@ impl ProjectIndex {
         let index = Index::create_in_ram(schema);
         let mut writer = index.writer(50_000_000)?;
         for chunk in &chunks {
+            check_control(control)?;
             writer.add_document(doc!(
                 fields.id => chunk.id.clone(),
                 fields.path => chunk.path.clone(),
@@ -198,6 +321,7 @@ impl ProjectIndex {
                 fields.body => chunk.content.clone(),
             ))?;
         }
+        check_control(control)?;
         writer.commit()?;
         let reader = index
             .reader_builder()
@@ -209,6 +333,7 @@ impl ProjectIndex {
         let mut chunks_by_id = HashMap::new();
         let mut chunks_by_address = HashMap::new();
         for (index, chunk) in chunks.iter().enumerate() {
+            check_control(control)?;
             chunks_by_path
                 .entry(chunk.path.clone())
                 .or_default()
@@ -217,6 +342,7 @@ impl ProjectIndex {
             chunks_by_address.insert(immutable_candidate_address(&chunk.id), index);
         }
 
+        check_control(control)?;
         Ok(Self {
             root,
             index,
@@ -226,8 +352,128 @@ impl ProjectIndex {
             chunks_by_path: Arc::new(chunks_by_path),
             chunks_by_id: Arc::new(chunks_by_id),
             chunks_by_address: Arc::new(chunks_by_address),
+            fingerprints: Arc::new(fingerprints),
+            corpus_digest,
             stats,
         })
+    }
+
+    pub fn snapshot(&self) -> IndexSnapshot {
+        IndexSnapshot {
+            schema: "context_index.snapshot.v1".to_owned(),
+            generation: self.stats.refresh_signature.clone(),
+            refresh_signature: self.stats.refresh_signature.clone(),
+            chunks: self.chunks.as_ref().clone(),
+            fingerprints: self.fingerprints.as_ref().clone(),
+            corpus_digest: self.corpus_digest.clone(),
+            stats: SnapshotStats {
+                skipped_binary: self.stats.skipped_binary,
+                skipped_symlink: self.stats.skipped_symlink,
+                corpus_source_count: self.stats.corpus_source_count,
+                corpus_chunk_count: self.stats.corpus_chunk_count,
+                corpus_metadata_only_count: self.stats.corpus_metadata_only_count,
+                corpus_deduplicated_count: self.stats.corpus_deduplicated_count,
+            },
+        }
+    }
+
+    pub fn from_snapshot_controlled(
+        root: impl AsRef<Path>,
+        snapshot: IndexSnapshot,
+        project_scope: Option<&str>,
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
+        if snapshot.schema != "context_index.snapshot.v1"
+            || snapshot.generation != snapshot.refresh_signature
+        {
+            bail!("unsupported persisted index snapshot")
+        }
+        let root = root.as_ref().canonicalize()?;
+        let current = repository_signature_for_project_controlled(&root, project_scope, control)?;
+        if current != snapshot.refresh_signature
+            || fingerprint_signature(&snapshot.fingerprints, &snapshot.corpus_digest) != current
+        {
+            bail!("persisted index snapshot is stale or corrupt")
+        }
+        let stats = stats_from_parts(
+            &snapshot.chunks,
+            &snapshot.fingerprints,
+            &snapshot.stats,
+            current,
+        );
+        Self::from_parts(
+            root,
+            snapshot.chunks,
+            snapshot.fingerprints,
+            snapshot.corpus_digest,
+            stats,
+            control,
+        )
+    }
+
+    pub fn refresh_paths_controlled(
+        &self,
+        paths: &[String],
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
+        if paths.is_empty() || paths.len() > 1_024 {
+            bail!("incremental refresh requires 1..=1024 changed paths")
+        }
+        let mut normalized = BTreeSet::new();
+        for path in paths {
+            let path = validate_relative_path(path)?;
+            if path == "."
+                || path.starts_with("reference-corpus/")
+                || is_ignored_repository_path(Path::new(&path))
+            {
+                bail!("incremental refresh state is unsafe")
+            }
+            normalized.insert(path);
+        }
+        let mut chunks = self
+            .chunks
+            .iter()
+            .filter(|chunk| !normalized.contains(&chunk.path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut fingerprints = self.fingerprints.as_ref().clone();
+        for path in &normalized {
+            check_control(control)?;
+            fingerprints.remove(path);
+            let absolute = self.root.join(path);
+            match fs::symlink_metadata(&absolute) {
+                Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
+                    bail!("incremental refresh encountered an unsafe path")
+                }
+                Ok(_) => {
+                    if let Some(text) = read_text(&absolute)? {
+                        fingerprints.insert(path.clone(), fingerprint(&text));
+                        chunks.extend(chunks_for_file(path, &absolute, &text)?);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        chunks.sort_by(chunk_order);
+        let signature = fingerprint_signature(&fingerprints, &self.corpus_digest);
+        let snapshot_stats = SnapshotStats {
+            skipped_binary: self.stats.skipped_binary,
+            skipped_symlink: self.stats.skipped_symlink,
+            corpus_source_count: self.stats.corpus_source_count,
+            corpus_chunk_count: self.stats.corpus_chunk_count,
+            corpus_metadata_only_count: self.stats.corpus_metadata_only_count,
+            corpus_deduplicated_count: self.stats.corpus_deduplicated_count,
+        };
+        let stats = stats_from_parts(&chunks, &fingerprints, &snapshot_stats, signature);
+        Self::from_parts(
+            self.root.clone(),
+            chunks,
+            fingerprints,
+            self.corpus_digest.clone(),
+            stats,
+            control,
+        )
     }
 
     pub fn root(&self) -> &Path {
@@ -628,6 +874,15 @@ pub fn repository_signature_for_project(
     root: impl AsRef<Path>,
     project_scope: Option<&str>,
 ) -> Result<String> {
+    repository_signature_for_project_controlled(root, project_scope, None)
+}
+
+pub fn repository_signature_for_project_controlled(
+    root: impl AsRef<Path>,
+    project_scope: Option<&str>,
+    control: Option<&WorkControl>,
+) -> Result<String> {
+    check_control(control)?;
     let root = root.as_ref().canonicalize()?;
     let mut digest = Sha256::new();
     for entry in WalkDir::new(&root)
@@ -636,6 +891,7 @@ pub fn repository_signature_for_project(
         .into_iter()
         .filter_entry(should_visit)
     {
+        check_control(control)?;
         let entry = entry?;
         if entry.file_type().is_symlink() || !entry.file_type().is_file() {
             continue;
@@ -703,9 +959,21 @@ pub fn validate_relative_path(raw: &str) -> Result<String> {
     }
 }
 
-fn scan_repository(root: &Path, project_scope: Option<&str>) -> Result<(Vec<Chunk>, IndexStats)> {
+struct ScannedRepository {
+    chunks: Vec<Chunk>,
+    fingerprints: BTreeMap<String, FileFingerprint>,
+    corpus_digest: String,
+    stats: IndexStats,
+}
+
+fn scan_repository(
+    root: &Path,
+    project_scope: Option<&str>,
+    control: Option<&WorkControl>,
+) -> Result<ScannedRepository> {
     let mut chunks = Vec::new();
     let mut source_digest = Sha256::new();
+    let mut fingerprints = BTreeMap::new();
     let mut file_count = 0;
     let mut python_symbol_chunks = 0;
     let mut symbol_chunks = 0;
@@ -719,6 +987,7 @@ fn scan_repository(root: &Path, project_scope: Option<&str>) -> Result<(Vec<Chun
         .into_iter()
         .filter_entry(should_visit)
     {
+        check_control(control)?;
         let entry = entry?;
         if entry.file_type().is_symlink() {
             skipped_symlink += 1;
@@ -738,19 +1007,10 @@ fn scan_repository(root: &Path, project_scope: Option<&str>) -> Result<(Vec<Chun
             .to_string_lossy()
             .replace('\\', "/");
         update_source_signature(&mut source_digest, &path, &text);
+        fingerprints.insert(path.clone(), fingerprint(&text));
         file_count += 1;
-        let extractor = extractor_for_path(entry.path());
-        let mut file_chunks = if let Some(extractor) = extractor.as_deref() {
-            language_chunks(&path, &text, extractor)?
-        } else {
-            generic_chunks_for_range(
-                &path,
-                &text.lines().collect::<Vec<_>>(),
-                1,
-                text.lines().count(),
-                "",
-            )
-        };
+        let mut file_chunks = chunks_for_file(&path, entry.path(), &text)?;
+        check_control(control)?;
         symbol_chunks += file_chunks
             .iter()
             .filter(|chunk| !chunk.symbol.is_empty())
@@ -773,16 +1033,12 @@ fn scan_repository(root: &Path, project_scope: Option<&str>) -> Result<(Vec<Chun
     source_digest.update(b"reference-corpus\0");
     source_digest.update(corpus.digest.as_bytes());
     chunks.extend(corpus.chunks);
-    chunks.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.start_line.cmp(&right.start_line))
-            .then_with(|| left.end_line.cmp(&right.end_line))
-            .then_with(|| left.symbol.cmp(&right.symbol))
-    });
-    Ok((
+    chunks.sort_by(chunk_order);
+    Ok(ScannedRepository {
         chunks,
-        IndexStats {
+        fingerprints,
+        corpus_digest: corpus.digest,
+        stats: IndexStats {
             schema: "context_index.native.v1",
             file_count,
             chunk_count: symbol_chunks + generic_chunks + corpus_chunk_count,
@@ -797,7 +1053,95 @@ fn scan_repository(root: &Path, project_scope: Option<&str>) -> Result<(Vec<Chun
             corpus_deduplicated_count: corpus.deduplicated_count,
             refresh_signature: format!("files:{}", digest_hex(source_digest)),
         },
-    ))
+    })
+}
+
+fn chunks_for_file(path: &str, absolute: &Path, text: &str) -> Result<Vec<Chunk>> {
+    let extractor = extractor_for_path(absolute);
+    if let Some(extractor) = extractor.as_deref() {
+        language_chunks(path, text, extractor)
+    } else {
+        Ok(generic_chunks_for_range(
+            path,
+            &text.lines().collect::<Vec<_>>(),
+            1,
+            text.lines().count(),
+            "",
+        ))
+    }
+}
+
+fn chunk_order(left: &Chunk, right: &Chunk) -> std::cmp::Ordering {
+    left.path
+        .cmp(&right.path)
+        .then_with(|| left.start_line.cmp(&right.start_line))
+        .then_with(|| left.end_line.cmp(&right.end_line))
+        .then_with(|| left.symbol.cmp(&right.symbol))
+}
+
+fn fingerprint(text: &str) -> FileFingerprint {
+    FileFingerprint {
+        len: text.len() as u64,
+        sha256: digest_hex(Sha256::new_with_prefix(text.as_bytes())),
+    }
+}
+
+fn fingerprint_signature(
+    fingerprints: &BTreeMap<String, FileFingerprint>,
+    corpus_digest: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for (path, fingerprint) in fingerprints {
+        digest.update((path.len() as u64).to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update(fingerprint.len.to_be_bytes());
+        for pair in fingerprint.sha256.as_bytes().chunks_exact(2) {
+            let byte = std::str::from_utf8(pair)
+                .ok()
+                .and_then(|value| u8::from_str_radix(value, 16).ok())
+                .unwrap_or_default();
+            digest.update([byte]);
+        }
+    }
+    digest.update(b"reference-corpus\0");
+    digest.update(corpus_digest.as_bytes());
+    format!("files:{}", digest_hex(digest))
+}
+
+fn stats_from_parts(
+    chunks: &[Chunk],
+    fingerprints: &BTreeMap<String, FileFingerprint>,
+    persisted: &SnapshotStats,
+    refresh_signature: String,
+) -> IndexStats {
+    let repository_chunks = chunks
+        .iter()
+        .filter(|chunk| !chunk.path.starts_with("@corpus/"));
+    let symbol_chunks = repository_chunks
+        .clone()
+        .filter(|chunk| !chunk.symbol.is_empty())
+        .count();
+    let generic_chunks = repository_chunks
+        .filter(|chunk| chunk.symbol.is_empty())
+        .count();
+    IndexStats {
+        schema: "context_index.native.v1",
+        file_count: fingerprints.len(),
+        chunk_count: chunks.len(),
+        symbol_chunks,
+        python_symbol_chunks: chunks
+            .iter()
+            .filter(|chunk| chunk.path.ends_with(".py") && !chunk.symbol.is_empty())
+            .count(),
+        generic_chunks,
+        skipped_binary: persisted.skipped_binary,
+        skipped_symlink: persisted.skipped_symlink,
+        corpus_source_count: persisted.corpus_source_count,
+        corpus_chunk_count: persisted.corpus_chunk_count,
+        corpus_metadata_only_count: persisted.corpus_metadata_only_count,
+        corpus_deduplicated_count: persisted.corpus_deduplicated_count,
+        refresh_signature,
+    }
 }
 
 fn update_source_signature(digest: &mut Sha256, path: &str, text: &str) {
@@ -832,10 +1176,18 @@ fn should_visit(entry: &DirEntry) -> bool {
         return false;
     }
     let name = entry.file_name().to_string_lossy();
-    if IGNORED_DIRECTORIES.contains(&name.as_ref()) || name == corpus::CORPUS_DIRECTORY {
+    if is_ignored_repository_path(Path::new(entry.file_name())) || name == corpus::CORPUS_DIRECTORY
+    {
         return false;
     }
     true
+}
+
+fn check_control(control: Option<&WorkControl>) -> Result<()> {
+    if let Some(control) = control {
+        control.check()?;
+    }
+    Ok(())
 }
 
 fn read_text(path: &Path) -> Result<Option<String>> {
@@ -1356,7 +1708,9 @@ mod tests {
         fs::write(root.path().join("artifact.bin"), b"binary\0payload")
             .expect("write binary fixture");
 
-        let (chunks, stats) = scan_repository(root.path(), None).expect("scan repository");
+        let scanned = scan_repository(root.path(), None, None).expect("scan repository");
+        let chunks = scanned.chunks;
+        let stats = scanned.stats;
 
         assert!(chunks.iter().any(|chunk| chunk.path == "Cargo.lock"));
         assert!(!chunks.iter().any(|chunk| chunk.path == "artifact.bin"));
@@ -1370,7 +1724,9 @@ mod tests {
         let large = root.path().join("generated.min.js");
         fs::write(&large, vec![b'x'; MAX_READ_BYTES + 1]).expect("write oversized fixture");
 
-        let (chunks, _) = scan_repository(root.path(), None).expect("scan repository");
+        let chunks = scan_repository(root.path(), None, None)
+            .expect("scan repository")
+            .chunks;
         assert!(!chunks.iter().any(|chunk| chunk.path == "generated.min.js"));
 
         let index = ProjectIndex::build(root.path()).expect("build index");
@@ -1456,5 +1812,130 @@ mod tests {
             linked_index.stats().refresh_signature
         );
         assert!(!linked_index.all_paths().iter().any(|path| path == ".git"));
+    }
+
+    #[test]
+    fn generated_trees_do_not_affect_index_or_signature() {
+        let root = tempfile::tempdir().expect("repository root");
+        fs::write(root.path().join("anchor.rs"), "fn anchor() {}\n").expect("anchor");
+        let before = ProjectIndex::build(root.path()).expect("initial index");
+        let before_signature = repository_signature(root.path()).expect("initial signature");
+
+        let generated = root.path().join(".workingdir/agent-worktree/target/debug");
+        fs::create_dir_all(&generated).expect("generated tree");
+        fs::write(
+            generated.join("churn.rs"),
+            "fn generated_churn_must_not_be_indexed() {}\n",
+        )
+        .expect("generated churn");
+
+        let after = ProjectIndex::build(root.path()).expect("index after churn");
+        let after_signature = repository_signature(root.path()).expect("signature after churn");
+        assert_eq!(before.stats().file_count, after.stats().file_count);
+        assert_eq!(before_signature, after_signature);
+        assert!(
+            !after
+                .all_paths()
+                .iter()
+                .any(|path| path.contains(".workingdir"))
+        );
+        assert!(is_ignored_repository_path(Path::new(
+            ".workingdir/agent-worktree/target/debug/churn.rs"
+        )));
+        assert!(
+            git_exclude_pathspecs()
+                .iter()
+                .any(|path| path == ":(exclude,glob)**/.workingdir/**")
+        );
+    }
+
+    fn assert_incremental_matches_full(root: &Path, incremental: &ProjectIndex) {
+        let full = ProjectIndex::build(root).expect("clean full build");
+        assert_eq!(
+            incremental.stats().refresh_signature,
+            full.stats().refresh_signature
+        );
+        assert_eq!(incremental.all_paths(), full.all_paths());
+        assert_eq!(incremental.chunks.as_ref(), full.chunks.as_ref());
+        for prompt in ["alpha changed", "beta", "renamed", "untracked"] {
+            let incremental_hits = incremental
+                .search(prompt, &[], 8)
+                .expect("incremental hits");
+            let full_hits = full.search(prompt, &[], 8).expect("full hits");
+            assert_eq!(
+                incremental_hits
+                    .0
+                    .iter()
+                    .map(|hit| (&hit.id, &hit.path))
+                    .collect::<Vec<_>>(),
+                full_hits
+                    .0
+                    .iter()
+                    .map(|hit| (&hit.id, &hit.path))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_refresh_matches_full_for_change_delete_rename_and_untracked() {
+        let root = tempfile::tempdir().expect("repository root");
+        fs::write(root.path().join("a.rs"), "fn alpha() {}\n").expect("a");
+        fs::write(root.path().join("b.rs"), "fn beta() {}\n").expect("b");
+        let mut index = ProjectIndex::build(root.path()).expect("initial index");
+
+        fs::write(root.path().join("a.rs"), "fn alpha_changed() {}\n").expect("change");
+        index = index
+            .refresh_paths_controlled(&["a.rs".to_owned()], None)
+            .expect("change");
+        assert_incremental_matches_full(root.path(), &index);
+
+        fs::remove_file(root.path().join("b.rs")).expect("delete");
+        index = index
+            .refresh_paths_controlled(&["b.rs".to_owned()], None)
+            .expect("delete");
+        assert_incremental_matches_full(root.path(), &index);
+
+        fs::rename(root.path().join("a.rs"), root.path().join("renamed.rs")).expect("rename");
+        index = index
+            .refresh_paths_controlled(&["a.rs".to_owned(), "renamed.rs".to_owned()], None)
+            .expect("rename");
+        assert_incremental_matches_full(root.path(), &index);
+
+        fs::write(root.path().join("untracked.rs"), "fn untracked() {}\n").expect("untracked");
+        index = index
+            .refresh_paths_controlled(&["untracked.rs".to_owned()], None)
+            .expect("untracked");
+        assert_incremental_matches_full(root.path(), &index);
+
+        assert!(
+            index
+                .refresh_paths_controlled(&["reference-corpus/manifest.json".to_owned()], None)
+                .is_err()
+        );
+        assert!(
+            index
+                .refresh_paths_controlled(
+                    &(0..1025).map(|i| format!("{i}.rs")).collect::<Vec<_>>(),
+                    None
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn persisted_snapshot_reuses_complete_generation_and_rejects_corruption() {
+        let root = tempfile::tempdir().expect("repository root");
+        fs::write(root.path().join("lib.rs"), "fn persisted_anchor() {}\n").expect("source");
+        let index = ProjectIndex::build(root.path()).expect("index");
+        let snapshot = index.snapshot();
+        let restored =
+            ProjectIndex::from_snapshot_controlled(root.path(), snapshot.clone(), None, None)
+                .expect("valid persisted generation");
+        assert_eq!(restored.chunks.as_ref(), index.chunks.as_ref());
+
+        let mut corrupt = snapshot;
+        corrupt.refresh_signature = "files:corrupt".to_owned();
+        assert!(ProjectIndex::from_snapshot_controlled(root.path(), corrupt, None, None).is_err());
     }
 }

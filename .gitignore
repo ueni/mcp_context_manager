@@ -1,4 +1,13 @@
 .mcp-context-manager/
+.workingdir/
+.worktrees/
+.agent/
+.agents/
+.codex/
+.openclaw/
+.cache/
+.venv/
+venv/
 .devcontainer/.host-ca/
 .downloads/
 .cmake-build/

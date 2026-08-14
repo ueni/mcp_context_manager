@@ -1,11 +1,11 @@
 //! Stable contracts and deterministic core behavior for the native server.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    process::Command,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
@@ -13,13 +13,15 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use context_index::{
-    IndexStats, ProjectIndex, SearchHit, SymbolRecord, immutable_candidate_address,
-    normalize_terms, repository_signature_for_project, validate_relative_path,
+    IndexSnapshot, IndexStats, ProjectIndex, SearchHit, SymbolRecord, WorkControl,
+    git_exclude_pathspecs, immutable_candidate_address, is_ignored_repository_path,
+    normalize_terms, repository_signature_for_project_controlled, validate_relative_path,
 };
 use context_store::{ReferenceValidation, StateStore};
 use moka::future::Cache;
 use notify::{
-    Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
+    Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
+    Watcher,
 };
 use regex::Regex;
 use schemars::JsonSchema;
@@ -28,6 +30,36 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
+
+thread_local! {
+    static CURRENT_WORK_CONTROL: std::cell::RefCell<Option<WorkControl>> = const { std::cell::RefCell::new(None) };
+}
+
+struct WorkControlScope(Option<WorkControl>);
+
+impl WorkControlScope {
+    fn install(control: Option<&WorkControl>) -> Self {
+        let previous = CURRENT_WORK_CONTROL.with(|slot| slot.replace(control.cloned()));
+        Self(previous)
+    }
+}
+
+impl Drop for WorkControlScope {
+    fn drop(&mut self) {
+        CURRENT_WORK_CONTROL.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+fn current_work_checkpoint() -> Result<()> {
+    CURRENT_WORK_CONTROL.with(|slot| {
+        if let Some(control) = slot.borrow().as_ref() {
+            control.check()?;
+        }
+        Ok(())
+    })
+}
 
 pub const CONTEXT_PACK_VERSION: u8 = 2;
 pub const DEFAULT_MAX_ITEMS: u8 = 8;
@@ -309,8 +341,11 @@ const L1_MEMORY_MAX_BYTES: usize = 128 * 1024 * 1024;
 const L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const SHARED_L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const WARM_MISS_TARGET_MICROS: u64 = 50_000;
-const FAST_POLL_INTERVAL_MS: u64 = 2_000;
 const WATCH_COALESCE_MS: u64 = 50;
+const CHANGE_JOURNAL_MAX_PATHS: usize = 1_024;
+// Watcher-driven freshness avoids repository-wide request-path polling. Zero
+// is exposed in diagnostics to make the disabled fixed poll explicit.
+const FAST_POLL_INTERVAL_MS: u64 = 0;
 const NEGATIVE_FRONTIER_TTL_MS: u64 = 30_000;
 const POSITIVE_FRONTIER_ADMISSION_WINDOW_MS: u64 = 30 * 60 * 1_000;
 const FRONTIER_ADMISSION_TRACKER_MAX_ENTRIES: usize = 2_048;
@@ -733,6 +768,8 @@ struct PackTelemetry {
     candidate_count: u32,
     selected_count: u32,
     retrieval_micros: u64,
+    cache_state_io_micros: u64,
+    serialization_micros: u64,
     pack_build_micros: u64,
     frontier_outcome: FrontierOutcome,
     base_pack_used: bool,
@@ -925,6 +962,16 @@ struct EngineMetrics {
     lineage_capacity_rejections: AtomicU64,
     retrieval_misses: AtomicU64,
     refreshes: AtomicU64,
+    full_refreshes: AtomicU64,
+    incremental_refreshes: AtomicU64,
+    incremental_fallbacks: AtomicU64,
+    lineage_git_checks: AtomicU64,
+    signature_scan_micros: AtomicU64,
+    refresh_micros: AtomicU64,
+    index_state_io_micros: AtomicU64,
+    retrieval_micros: AtomicU64,
+    cache_state_io_micros: AtomicU64,
+    serialization_micros: AtomicU64,
     pack_input_tokens_est: AtomicU64,
     pack_selected_source_tokens_est: AtomicU64,
     pack_evidence_card_tokens_est: AtomicU64,
@@ -1023,6 +1070,15 @@ impl EngineMetrics {
         self.pack_selected_count
             .fetch_add(u64::from(telemetry.selected_count), Ordering::Relaxed);
     }
+
+    fn record_pack_phase_telemetry(&self, telemetry: PackTelemetry) {
+        self.retrieval_micros
+            .fetch_add(telemetry.retrieval_micros, Ordering::Relaxed);
+        self.cache_state_io_micros
+            .fetch_add(telemetry.cache_state_io_micros, Ordering::Relaxed);
+        self.serialization_micros
+            .fetch_add(telemetry.serialization_micros, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -1031,12 +1087,80 @@ struct FreshnessState {
     last_event_ms: AtomicU64,
     last_poll_ms: AtomicU64,
     generation: AtomicU64,
+    event_epoch: AtomicU64,
+    changed_paths: Mutex<BTreeSet<String>>,
+    journal_overflow: AtomicBool,
+    watcher_status: AtomicU8,
+}
+
+const WATCHER_STARTING: u8 = 0;
+const WATCHER_HEALTHY: u8 = 1;
+const WATCHER_FAILED: u8 = 2;
+const WATCHER_STARTUP_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const REFRESH_STABILITY_ATTEMPTS: usize = 3;
+
+impl FreshnessState {
+    fn watcher_requires_verification(&self) -> bool {
+        self.watcher_status.load(Ordering::Acquire) != WATCHER_HEALTHY
+    }
+
+    fn watcher_failed(&self) -> bool {
+        self.watcher_status.load(Ordering::Acquire) == WATCHER_FAILED
+    }
+}
+
+fn mark_watcher_failed(freshness: &FreshnessState) {
+    let _journal = freshness
+        .changed_paths
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    freshness
+        .watcher_status
+        .store(WATCHER_FAILED, Ordering::Release);
+    freshness.journal_overflow.store(true, Ordering::Release);
+    freshness.event_epoch.fetch_add(1, Ordering::AcqRel);
+    freshness
+        .last_event_ms
+        .store(now_millis(), Ordering::Release);
+    freshness.dirty.store(true, Ordering::Release);
+}
+
+fn mark_watcher_healthy(freshness: &FreshnessState) {
+    let _ = freshness.watcher_status.compare_exchange(
+        WATCHER_STARTING,
+        WATCHER_HEALTHY,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+fn record_watcher_event(
+    freshness: &FreshnessState,
+    changed_paths: impl IntoIterator<Item = String>,
+    overflow: bool,
+) {
+    let mut journal = freshness
+        .changed_paths
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _epoch = freshness.event_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    journal.extend(changed_paths);
+    if journal.len() > CHANGE_JOURNAL_MAX_PATHS || overflow {
+        freshness.journal_overflow.store(true, Ordering::Release);
+    }
+    freshness
+        .last_event_ms
+        .store(now_millis(), Ordering::Release);
+    freshness.dirty.store(true, Ordering::Release);
 }
 
 struct WatchGuard {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
+
+#[cfg(test)]
+type RefreshHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 pub struct UsageMonitor {
     store: StateStore,
@@ -2374,15 +2498,51 @@ fn coarse_count_bucket(count: usize) -> &'static str {
 
 impl WatchGuard {
     fn start(root: std::path::PathBuf, freshness: Arc<FreshnessState>) -> Self {
+        Self::start_with_runner(root, freshness, watch_repository)
+    }
+
+    fn start_with_runner<F>(
+        root: std::path::PathBuf,
+        freshness: Arc<FreshnessState>,
+        runner: F,
+    ) -> Self
+    where
+        F: FnOnce(std::path::PathBuf, Arc<FreshnessState>, Arc<AtomicBool>) + Send + 'static,
+    {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let spawn_freshness = Arc::clone(&freshness);
         let handle = thread::Builder::new()
             .name("context-index-watch".to_owned())
-            .spawn(move || watch_repository(root, freshness, thread_stop))
-            .ok();
-        Self {
-            stop,
-            thread: handle,
+            .spawn(move || runner(root, spawn_freshness, thread_stop));
+        let guard = Self::from_spawn_result(stop, Arc::clone(&freshness), handle);
+        let startup_deadline = Instant::now() + WATCHER_STARTUP_TIMEOUT;
+        while guard.thread.is_some()
+            && freshness.watcher_status.load(Ordering::Acquire) == WATCHER_STARTING
+            && Instant::now() < startup_deadline
+        {
+            thread::sleep(StdDuration::from_millis(1));
+        }
+        if freshness.watcher_status.load(Ordering::Acquire) == WATCHER_STARTING {
+            mark_watcher_failed(&freshness);
+        }
+        guard
+    }
+
+    fn from_spawn_result(
+        stop: Arc<AtomicBool>,
+        freshness: Arc<FreshnessState>,
+        handle: std::io::Result<thread::JoinHandle<()>>,
+    ) -> Self {
+        match handle {
+            Ok(handle) => Self {
+                stop,
+                thread: Some(handle),
+            },
+            Err(_) => {
+                mark_watcher_failed(&freshness);
+                Self { stop, thread: None }
+            }
         }
     }
 }
@@ -2413,6 +2573,9 @@ pub struct ProjectEngine {
     lineage_seed: String,
     governed_lineage: Option<GovernedFrontierLineage>,
     shared_frontiers: Option<Arc<SharedFrontierCache>>,
+    index_snapshot_path: std::path::PathBuf,
+    #[cfg(test)]
+    refresh_hook: Mutex<Option<RefreshHook>>,
     _watcher: WatchGuard,
 }
 
@@ -2440,6 +2603,22 @@ impl ProjectEngine {
         project_id: impl Into<String>,
         usage_monitor: Arc<UsageMonitor>,
     ) -> Result<Self> {
+        Self::build_with_state_and_monitor_controlled(
+            root,
+            project_state,
+            project_id,
+            usage_monitor,
+            None,
+        )
+    }
+
+    pub fn build_with_state_and_monitor_controlled(
+        root: impl AsRef<std::path::Path>,
+        project_state: impl AsRef<std::path::Path>,
+        project_id: impl Into<String>,
+        usage_monitor: Arc<UsageMonitor>,
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
         Self::build_with_state_and_l0_idle(
             root,
             project_state,
@@ -2448,6 +2627,7 @@ impl ProjectEngine {
             usage_monitor,
             None,
             None,
+            control,
         )
     }
 
@@ -2459,6 +2639,26 @@ impl ProjectEngine {
         governed_lineage: GovernedFrontierLineage,
         shared_frontiers: Arc<SharedFrontierCache>,
     ) -> Result<Self> {
+        Self::build_with_governed_frontiers_controlled(
+            root,
+            project_state,
+            project_id,
+            usage_monitor,
+            governed_lineage,
+            shared_frontiers,
+            None,
+        )
+    }
+
+    pub fn build_with_governed_frontiers_controlled(
+        root: impl AsRef<std::path::Path>,
+        project_state: impl AsRef<std::path::Path>,
+        project_id: impl Into<String>,
+        usage_monitor: Arc<UsageMonitor>,
+        governed_lineage: GovernedFrontierLineage,
+        shared_frontiers: Arc<SharedFrontierCache>,
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
         Self::build_with_state_and_l0_idle(
             root,
             project_state,
@@ -2467,9 +2667,11 @@ impl ProjectEngine {
             usage_monitor,
             Some(governed_lineage),
             Some(shared_frontiers),
+            control,
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Internal constructor keeps public build variants explicit.
     fn build_with_state_and_l0_idle(
         root: impl AsRef<std::path::Path>,
         project_state: impl AsRef<std::path::Path>,
@@ -2478,14 +2680,30 @@ impl ProjectEngine {
         usage_monitor: Arc<UsageMonitor>,
         governed_lineage: Option<GovernedFrontierLineage>,
         shared_frontiers: Option<Arc<SharedFrontierCache>>,
+        control: Option<&WorkControl>,
     ) -> Result<Self> {
         let project_id = project_id.into();
-        let index = Arc::new(ProjectIndex::build_for_project(root, Some(&project_id))?);
-        let store = Arc::new(StateStore::open(project_state)?);
+        let root = root.as_ref().canonicalize()?;
         let freshness = Arc::new(FreshnessState {
             last_poll_ms: AtomicU64::new(now_millis()),
+            watcher_status: AtomicU8::new(WATCHER_STARTING),
             ..FreshnessState::default()
         });
+        // Registration must complete (or fail closed) before the baseline scan.
+        // Otherwise a mutation between the scan and watcher registration can be
+        // missed permanently by ordinary watcher-driven freshness.
+        let watcher = WatchGuard::start(root.clone(), Arc::clone(&freshness));
+        let store = Arc::new(StateStore::open(project_state)?);
+        let index_snapshot_path = store.paths().index.join("context-index.snapshot.v1.json");
+        let index = load_index_snapshot(&root, &project_id, &index_snapshot_path, control)
+            .or_else(|_| {
+                ProjectIndex::build_for_project_controlled(&root, Some(&project_id), control)
+            })?;
+        persist_index_snapshot(&index_snapshot_path, &index, control)?;
+        let index = Arc::new(index);
+        if let Some(control) = control {
+            control.check()?;
+        }
         let frontiers = load_frontiers(&store, &index.stats().refresh_signature)?;
         let pack_snapshots = load_pack_snapshots(&store)?;
         let deferred_references = load_deferred_references(&store)?;
@@ -2497,7 +2715,6 @@ impl ProjectEngine {
         metrics
             .total_references
             .store(total_references, Ordering::Relaxed);
-        let watcher = WatchGuard::start(index.root().to_path_buf(), Arc::clone(&freshness));
         let lineage_seed = repository_lineage_seed(index.root());
         let l0 = Cache::builder()
             .max_capacity(L0_MAX_BYTES)
@@ -2521,8 +2738,31 @@ impl ProjectEngine {
             lineage_seed,
             governed_lineage,
             shared_frontiers,
+            index_snapshot_path,
+            #[cfg(test)]
+            refresh_hook: Mutex::new(None),
             _watcher: watcher,
         })
+    }
+
+    #[cfg(test)]
+    fn set_refresh_hook(&self, hook: RefreshHook) {
+        *self
+            .refresh_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_refresh_hook(&self, phase: &'static str) {
+        let hook = self
+            .refresh_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(phase);
+        }
     }
 
     pub fn index(&self) -> Arc<ProjectIndex> {
@@ -2645,16 +2885,31 @@ impl ProjectEngine {
     }
 
     pub async fn context_pack_cached(&self, request: &ContextPackRequest) -> Result<Vec<u8>> {
+        self.context_pack_cached_controlled(request, None).await
+    }
+
+    pub async fn context_pack_cached_controlled(
+        &self,
+        request: &ContextPackRequest,
+        control: Option<&WorkControl>,
+    ) -> Result<Vec<u8>> {
+        let _control_scope = WorkControlScope::install(control);
         let started = Instant::now();
         let result = async {
+            if let Some(control) = control {
+                control.check()?;
+            }
             request.validate_limits()?;
             self.validate_project_selector(
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
-            let refresh = self.ensure_fresh(request)?;
+            let refresh = self.ensure_fresh_controlled(request, control)?;
             let admission = if request.memory_session.is_some() {
                 let pack = self.build_context_pack_entry(request)?;
+                if let Some(control) = control {
+                    control.check()?;
+                }
                 CachedAdmission {
                     cached: Arc::new(CachedPack {
                         bytes: Arc::new(pack.bytes),
@@ -2670,6 +2925,9 @@ impl ProjectEngine {
             } else {
                 self.admit_context_pack_cached(request).await?
             };
+            if let Some(control) = control {
+                control.check()?;
+            }
             Ok::<_, anyhow::Error>((admission, refresh))
         }
         .await;
@@ -2677,6 +2935,7 @@ impl ProjectEngine {
             Ok((admission, (refresh_checked, refresh_updated))) => {
                 self.record_context_pack(started, &admission.cached.telemetry);
                 if self.usage_monitor.enabled() {
+                    current_work_checkpoint()?;
                     let _ = self.usage_monitor.record(
                         &self.project_id,
                         self.usage_sample(
@@ -2693,7 +2952,7 @@ impl ProjectEngine {
             }
             Err(error) => {
                 self.record_operation("context_pack", started, false, 0);
-                if self.usage_monitor.enabled() {
+                if self.usage_monitor.enabled() && control.is_none_or(|work| work.check().is_ok()) {
                     let _ = self
                         .usage_monitor
                         .record_rejection(classify_context_pack_rejection(&error));
@@ -2746,6 +3005,7 @@ impl ProjectEngine {
                     .into_iter()
                     .map(|reference_id| self.cached_reference_validation(&reference_id))
                     .collect::<Result<Vec<_>>>()?;
+                current_work_checkpoint()?;
                 Ok::<Arc<CachedPack>, anyhow::Error>(Arc::new(CachedPack {
                     bytes: Arc::new(pack.bytes),
                     reference_validations: Arc::new(reference_validations),
@@ -2838,6 +3098,7 @@ impl ProjectEngine {
     }
 
     fn advance_continuation(&self, state_key: &str, bytes: &[u8]) -> Result<()> {
+        current_work_checkpoint()?;
         let response: ContextPackV2 = serde_json::from_slice(bytes)?;
         let snapshot = self
             .load_pack_snapshot(&response.id)?
@@ -2853,6 +3114,7 @@ impl ProjectEngine {
             expires_at_unix_seconds: now.saturating_add(CONTINUATION_TTL_SECONDS),
         };
         self.prune_continuations(state_key, now)?;
+        current_work_checkpoint()?;
         self.store
             .put_json(state_key, &serde_json::to_value(record)?)?;
         Ok(())
@@ -3044,6 +3306,7 @@ impl ProjectEngine {
             evidence_card_tokens_est.saturating_sub(returned_evidence_tokens_est);
         reuse.delta_applied = reuse.wire_tokens_avoided_est > 0
             && matches!(reuse.source.as_str(), "continuation" | "explicit");
+        let state_io_started = Instant::now();
         let snapshot = Arc::new(PackSnapshot {
             schema: "context_pack.snapshot.v1".to_owned(),
             pack_id: pack_id.clone(),
@@ -3052,6 +3315,7 @@ impl ProjectEngine {
             evidence: snapshots,
             refresh_signature: index.stats().refresh_signature.clone(),
         });
+        current_work_checkpoint()?;
         let new_snapshot = self
             .pack_snapshots
             .lock()
@@ -3059,6 +3323,7 @@ impl ProjectEngine {
             .insert(pack_id.clone(), Arc::clone(&snapshot))
             .is_none();
         if new_snapshot {
+            current_work_checkpoint()?;
             self.store.put_json_if_changed(
                 &format!("pack:{pack_id}"),
                 &serde_json::to_value(&*snapshot)?,
@@ -3070,6 +3335,9 @@ impl ProjectEngine {
             &terms,
             usize::from(request.max_items),
         )?;
+        let cache_state_io_micros =
+            u64::try_from(state_io_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        current_work_checkpoint()?;
         let response = ContextPackV2 {
             v: CONTEXT_PACK_VERSION,
             id: pack_id,
@@ -3079,42 +3347,49 @@ impl ProjectEngine {
             more,
             reuse: reuse.clone(),
         };
+        let serialization_started = Instant::now();
         let mut encoded = Vec::with_capacity(512);
         serde_json::to_writer(&mut encoded, &response)?;
+        let serialization_micros =
+            u64::try_from(serialization_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let wire_tokens_est = std::str::from_utf8(&encoded)
             .map(estimate_tokens)
             .unwrap_or_else(|_| u32::try_from(encoded.len().div_ceil(4)).unwrap_or(u32::MAX));
+        let telemetry = PackTelemetry {
+            input_tokens_est: estimate_tokens(&request.prompt),
+            selected_source_tokens_est,
+            evidence_card_tokens_est,
+            returned_evidence_tokens_est,
+            wire_tokens_est,
+            wire_bytes: encoded.len(),
+            tokens_saved_est: selected_source_tokens_est.saturating_sub(wire_tokens_est),
+            delta_tokens_saved_est: evidence_card_tokens_est
+                .saturating_sub(returned_evidence_tokens_est),
+            candidate_count: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+            selected_count: u32::try_from(selected.len()).unwrap_or(u32::MAX),
+            retrieval_micros,
+            cache_state_io_micros,
+            serialization_micros,
+            pack_build_micros: u64::try_from(pack_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX)
+                .saturating_sub(retrieval_micros),
+            frontier_outcome,
+            base_pack_used: request.base_pack.is_some(),
+            known_evidence_used: !request.known_evidence.is_empty(),
+            continuation_requested: reuse.source == "continuation"
+                || reuse.status == "explicit_override",
+            continuation_reused: reuse.source == "continuation" && reuse.status == "reused",
+            continuation_fallback: reuse.source == "continuation"
+                && matches!(
+                    reuse.status.as_str(),
+                    "missing" | "expired" | "stale_generation" | "missing_pack"
+                ),
+            explicit_delta_override: reuse.status == "explicit_override",
+            lineage,
+        };
+        self.metrics.record_pack_phase_telemetry(telemetry);
         Ok(BuiltPack {
-            telemetry: PackTelemetry {
-                input_tokens_est: estimate_tokens(&request.prompt),
-                selected_source_tokens_est,
-                evidence_card_tokens_est,
-                returned_evidence_tokens_est,
-                wire_tokens_est,
-                wire_bytes: encoded.len(),
-                tokens_saved_est: selected_source_tokens_est.saturating_sub(wire_tokens_est),
-                delta_tokens_saved_est: evidence_card_tokens_est
-                    .saturating_sub(returned_evidence_tokens_est),
-                candidate_count: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
-                selected_count: u32::try_from(selected.len()).unwrap_or(u32::MAX),
-                retrieval_micros,
-                pack_build_micros: u64::try_from(pack_started.elapsed().as_micros())
-                    .unwrap_or(u64::MAX)
-                    .saturating_sub(retrieval_micros),
-                frontier_outcome,
-                base_pack_used: request.base_pack.is_some(),
-                known_evidence_used: !request.known_evidence.is_empty(),
-                continuation_requested: reuse.source == "continuation"
-                    || reuse.status == "explicit_override",
-                continuation_reused: reuse.source == "continuation" && reuse.status == "reused",
-                continuation_fallback: reuse.source == "continuation"
-                    && matches!(
-                        reuse.status.as_str(),
-                        "missing" | "expired" | "stale_generation" | "missing_pack"
-                    ),
-                explicit_delta_override: reuse.status == "explicit_override",
-                lineage,
-            },
+            telemetry,
             bytes: encoded,
         })
     }
@@ -3181,6 +3456,7 @@ impl ProjectEngine {
                 })
             })
             .collect::<Vec<_>>();
+        current_work_checkpoint()?;
         let reference = self.store.create_reference(
             "context_pack",
             &self.project_id,
@@ -3203,6 +3479,7 @@ impl ProjectEngine {
         self.metrics
             .total_references
             .fetch_add(1, Ordering::Relaxed);
+        current_work_checkpoint()?;
         self.store.put_json_if_changed(
             &format!("deferred:{key}"),
             &json!({
@@ -3215,6 +3492,7 @@ impl ProjectEngine {
             .store
             .reference_validation(&reference_id)?
             .ok_or_else(|| anyhow!("reference store produced an invalid reference"))?;
+        current_work_checkpoint()?;
         self.deferred_references
             .lock()
             .map_err(|_| anyhow!("deferred reference lock poisoned"))?
@@ -3262,6 +3540,7 @@ impl ProjectEngine {
     )> {
         let retrieval = self.retrieve_candidates_deferred(index, request, explicit_paths)?;
         if let Some(record) = retrieval.pending {
+            current_work_checkpoint()?;
             self.admit_frontier_batch(&[record])?;
         }
         Ok((
@@ -3532,6 +3811,9 @@ impl ProjectEngine {
         if index.stats().corpus_source_count > 0 {
             return Err(GitProofRejection::Unavailable);
         }
+        self.metrics
+            .lineage_git_checks
+            .fetch_add(1, Ordering::Relaxed);
         let git = git_worktree_proof(index.root())?;
         let lineage_identity = format!(
             "ln:{}",
@@ -3819,19 +4101,59 @@ impl ProjectEngine {
     }
 
     fn ensure_fresh(&self, request: &ContextPackRequest) -> Result<(bool, bool)> {
+        self.ensure_fresh_controlled(request, None)
+    }
+
+    fn ensure_fresh_controlled(
+        &self,
+        request: &ContextPackRequest,
+        control: Option<&WorkControl>,
+    ) -> Result<(bool, bool)> {
         let force =
             request.cache_strategy == CacheStrategy::Fresh || !request.changed_files.is_empty();
-        self.refresh_index(force)
+        let watcher_requires_verification = self.freshness.watcher_requires_verification();
+        let result = self.refresh_index_with_paths(force, &request.changed_files, control);
+        match result {
+            Err(error)
+                if (watcher_requires_verification
+                    || self.freshness.watcher_requires_verification())
+                    && error.to_string() != "repository work cancelled before commit" =>
+            {
+                bail!(
+                    "context_pack freshness unavailable; retry after repository stabilization or warmup"
+                );
+            }
+            result => result,
+        }
     }
 
     fn refresh_index(&self, force: bool) -> Result<(bool, bool)> {
+        self.refresh_index_controlled(force, None)
+    }
+
+    fn refresh_index_controlled(
+        &self,
+        force: bool,
+        control: Option<&WorkControl>,
+    ) -> Result<(bool, bool)> {
+        self.refresh_index_with_paths(force, &[], control)
+    }
+
+    fn refresh_index_with_paths(
+        &self,
+        force: bool,
+        explicit_paths: &[String],
+        control: Option<&WorkControl>,
+    ) -> Result<(bool, bool)> {
+        if let Some(control) = control {
+            control.check()?;
+        }
         let now = now_millis();
+        let watcher_requires_verification = self.freshness.watcher_requires_verification();
         let watcher_ready = self.freshness.dirty.load(Ordering::Acquire)
             && now.saturating_sub(self.freshness.last_event_ms.load(Ordering::Acquire))
                 >= WATCH_COALESCE_MS;
-        let poll_due = now.saturating_sub(self.freshness.last_poll_ms.load(Ordering::Acquire))
-            >= FAST_POLL_INTERVAL_MS;
-        if !force && !watcher_ready && !poll_due {
+        if !force && !watcher_requires_verification && !watcher_ready {
             return Ok((false, false));
         }
 
@@ -3840,44 +4162,206 @@ impl ProjectEngine {
             .lock()
             .map_err(|_| anyhow!("index refresh lock poisoned"))?;
         let now = now_millis();
+        let watcher_requires_verification = self.freshness.watcher_requires_verification();
         let watcher_ready = self.freshness.dirty.load(Ordering::Acquire)
             && now.saturating_sub(self.freshness.last_event_ms.load(Ordering::Acquire))
                 >= WATCH_COALESCE_MS;
-        let poll_due = now.saturating_sub(self.freshness.last_poll_ms.load(Ordering::Acquire))
-            >= FAST_POLL_INTERVAL_MS;
-        if !force && !watcher_ready && !poll_due {
+        if !force && !watcher_requires_verification && !watcher_ready {
             return Ok((false, false));
         }
 
-        let current = self.index();
-        let signature = repository_signature_for_project(current.root(), Some(&self.project_id))?;
-        self.freshness.last_poll_ms.store(now, Ordering::Release);
-        self.freshness.dirty.store(false, Ordering::Release);
-        if signature == current.stats().refresh_signature {
-            return Ok((true, false));
+        let refresh_started = Instant::now();
+        let mut require_full_rebuild = false;
+        for _attempt in 0..REFRESH_STABILITY_ATTEMPTS {
+            if let Some(control) = control {
+                control.check()?;
+            }
+            let current = self.index();
+            let (snapshot_epoch, mut changed_paths) = {
+                let journal = self
+                    .freshness
+                    .changed_paths
+                    .lock()
+                    .map_err(|_| anyhow!("change journal lock poisoned"))?;
+                (
+                    self.freshness.event_epoch.load(Ordering::Acquire),
+                    journal.clone(),
+                )
+            };
+            changed_paths.extend(explicit_paths.iter().cloned());
+            let overflow = self.freshness.journal_overflow.load(Ordering::Acquire);
+            let scan_started = Instant::now();
+            let signature = repository_signature_for_project_controlled(
+                current.root(),
+                Some(&self.project_id),
+                control,
+            )?;
+            self.metrics.signature_scan_micros.fetch_add(
+                u64::try_from(scan_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            #[cfg(test)]
+            self.run_refresh_hook("after_signature_scan");
+            self.freshness.last_poll_ms.store(now, Ordering::Release);
+
+            // Never consume a journal snapshot if an event arrived while its
+            // authoritative signature was being computed.
+            if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+                require_full_rebuild = true;
+                continue;
+            }
+            if signature == current.stats().refresh_signature {
+                let mut journal = self
+                    .freshness
+                    .changed_paths
+                    .lock()
+                    .map_err(|_| anyhow!("change journal lock poisoned"))?;
+                if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+                    require_full_rebuild = true;
+                    continue;
+                }
+                journal.clear();
+                let watcher_failed = self.freshness.watcher_failed();
+                self.freshness
+                    .journal_overflow
+                    .store(watcher_failed, Ordering::Release);
+                self.freshness
+                    .dirty
+                    .store(watcher_failed, Ordering::Release);
+                self.metrics.refresh_micros.fetch_add(
+                    u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                return Ok((true, false));
+            }
+
+            let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
+            let (replacement, incremental, fallback) =
+                if !require_full_rebuild && !overflow && !changed_paths.is_empty() {
+                    match current.refresh_paths_controlled(&changed_paths, control) {
+                        Ok(incremental) if incremental.stats().refresh_signature == signature => {
+                            (incremental, true, false)
+                        }
+                        _ => (
+                            ProjectIndex::build_for_project_controlled(
+                                current.root(),
+                                Some(&self.project_id),
+                                control,
+                            )?,
+                            false,
+                            true,
+                        ),
+                    }
+                } else {
+                    (
+                        ProjectIndex::build_for_project_controlled(
+                            current.root(),
+                            Some(&self.project_id),
+                            control,
+                        )?,
+                        false,
+                        overflow || require_full_rebuild,
+                    )
+                };
+            #[cfg(test)]
+            self.run_refresh_hook("after_index_build");
+            if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+                require_full_rebuild = true;
+                continue;
+            }
+
+            // Re-scan after Tantivy construction. Equality with the earlier
+            // signature alone cannot prove that the repository stayed stable
+            // throughout the build.
+            let verification_started = Instant::now();
+            let publication_signature = repository_signature_for_project_controlled(
+                current.root(),
+                Some(&self.project_id),
+                control,
+            )?;
+            self.metrics.signature_scan_micros.fetch_add(
+                u64::try_from(verification_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            if replacement.stats().refresh_signature != publication_signature
+                || self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch
+            {
+                require_full_rebuild = true;
+                continue;
+            }
+            let replacement = Arc::new(replacement);
+            if let Some(control) = control {
+                control.check()?;
+            }
+            let state_started = Instant::now();
+            persist_index_snapshot(&self.index_snapshot_path, &replacement, control)?;
+            self.metrics.index_state_io_micros.fetch_add(
+                u64::try_from(state_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            if let Some(control) = control {
+                control.check()?;
+            }
+
+            // Watcher event recording takes the same journal lock. Holding it
+            // across the final epoch check and generation swap prevents a late
+            // event from being cleared as part of the consumed snapshot.
+            let mut journal = self
+                .freshness
+                .changed_paths
+                .lock()
+                .map_err(|_| anyhow!("change journal lock poisoned"))?;
+            if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+                require_full_rebuild = true;
+                continue;
+            }
+            *self
+                .index
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
+            self.freshness.generation.fetch_add(1, Ordering::AcqRel);
+            self.metrics.refreshes.fetch_add(1, Ordering::Relaxed);
+            if incremental {
+                self.metrics
+                    .incremental_refreshes
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics.full_refreshes.fetch_add(1, Ordering::Relaxed);
+            }
+            if fallback {
+                self.metrics
+                    .incremental_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            journal.clear();
+            let watcher_failed = self.freshness.watcher_failed();
+            self.freshness
+                .journal_overflow
+                .store(watcher_failed, Ordering::Release);
+            self.freshness
+                .dirty
+                .store(watcher_failed, Ordering::Release);
+            drop(journal);
+
+            self.invalidate_l0();
+            let mut frontiers = self
+                .frontiers
+                .lock()
+                .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
+            frontiers.records.clear();
+            frontiers.bytes = 0;
+            self.metrics.refresh_micros.fetch_add(
+                u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            return Ok((true, true));
         }
 
-        let replacement = Arc::new(ProjectIndex::build_for_project(
-            current.root(),
-            Some(&self.project_id),
-        )?);
-        if replacement.stats().refresh_signature != signature {
-            bail!("repository changed while rebuilding the native index");
-        }
-        *self
-            .index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
-        self.freshness.generation.fetch_add(1, Ordering::AcqRel);
-        self.metrics.refreshes.fetch_add(1, Ordering::Relaxed);
-        self.invalidate_l0();
-        let mut frontiers = self
-            .frontiers
-            .lock()
-            .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
-        frontiers.records.clear();
-        frontiers.bytes = 0;
-        Ok((true, true))
+        self.metrics.refresh_micros.fetch_add(
+            u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        bail!("context_pack freshness unavailable; retry after repository stabilization or warmup")
     }
 
     pub fn context_lookup(&self, request: &ContextLookupRequest) -> Result<Vec<u8>> {
@@ -3953,14 +4437,29 @@ impl ProjectEngine {
     }
 
     pub async fn context_admin(&self, request: &ContextAdminRequest) -> Result<Vec<u8>> {
+        self.context_admin_controlled(request, None).await
+    }
+
+    pub async fn context_admin_controlled(
+        &self,
+        request: &ContextAdminRequest,
+        control: Option<&WorkControl>,
+    ) -> Result<Vec<u8>> {
+        let _control_scope = WorkControlScope::install(control);
         let started = Instant::now();
         let operation = admin_operation(&request.mode);
         let result = async {
+            if let Some(control) = control {
+                control.check()?;
+            }
             self.validate_project_selector(
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
-            let value = admin_dispatch(self, request).await?;
+            let value = admin_dispatch(self, request, control).await?;
+            if let Some(control) = control {
+                control.check()?;
+            }
             serde_json::to_vec(&value).map_err(Into::into)
         }
         .await;
@@ -4355,6 +4854,36 @@ fn watch_repository(
     freshness: Arc<FreshnessState>,
     stop: Arc<AtomicBool>,
 ) {
+    watch_repository_with_attempts(
+        &root,
+        &freshness,
+        &stop,
+        try_recommended_watcher,
+        try_polling_watcher,
+    );
+}
+
+fn watch_repository_with_attempts<R, P>(
+    root: &std::path::Path,
+    freshness: &Arc<FreshnessState>,
+    stop: &Arc<AtomicBool>,
+    recommended: R,
+    polling: P,
+) where
+    R: FnOnce(&std::path::Path, &Arc<FreshnessState>, &Arc<AtomicBool>) -> bool,
+    P: FnOnce(&std::path::Path, &Arc<FreshnessState>, &Arc<AtomicBool>) -> bool,
+{
+    if recommended(root, freshness, stop) || polling(root, freshness, stop) {
+        return;
+    }
+    mark_watcher_failed(freshness);
+}
+
+fn try_recommended_watcher(
+    root: &std::path::Path,
+    freshness: &Arc<FreshnessState>,
+    stop: &Arc<AtomicBool>,
+) -> bool {
     let (sender, receiver) = std::sync::mpsc::channel();
     let callback_sender = sender.clone();
     let recommended = RecommendedWatcher::new(
@@ -4364,12 +4893,21 @@ fn watch_repository(
         NotifyConfig::default(),
     );
     if let Ok(mut watcher) = recommended
-        && watcher.watch(&root, RecursiveMode::Recursive).is_ok()
+        && watcher.watch(root, RecursiveMode::Recursive).is_ok()
     {
-        watcher_loop(watcher, &receiver, &root, &freshness, &stop);
-        return;
+        mark_watcher_healthy(freshness);
+        drop(sender);
+        watcher_loop(&receiver, root, freshness, stop);
+        return true;
     }
+    false
+}
 
+fn try_polling_watcher(
+    root: &std::path::Path,
+    freshness: &Arc<FreshnessState>,
+    stop: &Arc<AtomicBool>,
+) -> bool {
     let (sender, receiver) = std::sync::mpsc::channel();
     let polling = PollWatcher::new(
         move |event| {
@@ -4378,14 +4916,16 @@ fn watch_repository(
         NotifyConfig::default().with_poll_interval(StdDuration::from_secs(2)),
     );
     if let Ok(mut watcher) = polling
-        && watcher.watch(&root, RecursiveMode::Recursive).is_ok()
+        && watcher.watch(root, RecursiveMode::Recursive).is_ok()
     {
-        watcher_loop(watcher, &receiver, &root, &freshness, &stop);
+        mark_watcher_healthy(freshness);
+        watcher_loop(&receiver, root, freshness, stop);
+        return true;
     }
+    false
 }
 
-fn watcher_loop<W: Watcher>(
-    _watcher: W,
+fn watcher_loop(
     receiver: &std::sync::mpsc::Receiver<notify::Result<Event>>,
     root: &std::path::Path,
     freshness: &FreshnessState,
@@ -4393,14 +4933,31 @@ fn watcher_loop<W: Watcher>(
 ) {
     while !stop.load(Ordering::Acquire) {
         match receiver.recv_timeout(StdDuration::from_millis(100)) {
+            Ok(Ok(event)) if matches!(event.kind, EventKind::Access(_)) => {}
             Ok(Ok(event)) if event.paths.iter().any(|path| source_event_path(root, path)) => {
-                freshness
-                    .last_event_ms
-                    .store(now_millis(), Ordering::Release);
-                freshness.dirty.store(true, Ordering::Release);
+                let mut changed_paths = Vec::new();
+                let mut overflow = event.need_rescan();
+                for path in &event.paths {
+                    let Ok(relative) = path.strip_prefix(root) else {
+                        overflow = true;
+                        continue;
+                    };
+                    if !is_ignored_repository_path(relative) {
+                        changed_paths.push(relative.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+                record_watcher_event(freshness, changed_paths, overflow);
             }
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Err(_)) => {
+                mark_watcher_failed(freshness);
+            }
+            Ok(Ok(_)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if !stop.load(Ordering::Acquire) {
+                    mark_watcher_failed(freshness);
+                }
+                break;
+            }
         }
     }
 }
@@ -4409,22 +4966,10 @@ fn source_event_path(root: &std::path::Path, path: &std::path::Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-    let ignored = [
-        ".git",
-        ".mcp-context-manager",
-        ".pytest_cache",
-        ".ruff_cache",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-        "target",
-    ];
-    !relative.components().any(|component| {
-        component.as_os_str().to_str().is_some_and(|name| {
-            ignored.contains(&name) || name.ends_with('~') || name.starts_with(".#")
-        })
-    })
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
+    !is_ignored_repository_path(relative)
 }
 
 fn load_frontiers(store: &StateStore, refresh_signature: &str) -> Result<FrontierState> {
@@ -4515,31 +5060,158 @@ fn opaque_scope_signature(scope: &[String]) -> Result<String> {
     ))
 }
 
+const GIT_COMMAND_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const GIT_COMMAND_REAP_GRACE: StdDuration = StdDuration::from_millis(250);
+const GIT_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+enum BoundedOutputCapture {
+    Complete(Vec<u8>),
+    LimitExceeded,
+    Failed,
+}
+
+fn capture_output_bounded(mut stdout: std::process::ChildStdout) -> BoundedOutputCapture {
+    use std::io::Read;
+
+    let mut bytes = Vec::with_capacity(GIT_OUTPUT_LIMIT_BYTES);
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = match stdout.read(&mut buffer) {
+            Ok(0) => return BoundedOutputCapture::Complete(bytes),
+            Ok(count) => count,
+            Err(_) => return BoundedOutputCapture::Failed,
+        };
+        if count > GIT_OUTPUT_LIMIT_BYTES.saturating_sub(bytes.len()) {
+            return BoundedOutputCapture::LimitExceeded;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn terminate_child_bounded(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let deadline = Instant::now() + GIT_COMMAND_REAP_GRACE;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(StdDuration::from_millis(5)),
+        }
+    }
+}
+
+fn terminate_child_and_capture_bounded(
+    child: &mut std::process::Child,
+    capture_receiver: &std::sync::mpsc::Receiver<BoundedOutputCapture>,
+    capture_thread: thread::JoinHandle<()>,
+) {
+    terminate_child_bounded(child);
+    let _ = capture_receiver.recv_timeout(GIT_COMMAND_REAP_GRACE);
+    if capture_thread.is_finished() {
+        let _ = capture_thread.join();
+    }
+}
+
+fn command_output_bounded(
+    command: &mut Command,
+    timeout: StdDuration,
+) -> Option<std::process::Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_child_bounded(&mut child);
+            return None;
+        }
+    };
+    let (capture_sender, capture_receiver) = std::sync::mpsc::sync_channel(1);
+    let capture_thread = match thread::Builder::new()
+        .name("governed-git-stdout".to_owned())
+        .spawn(move || {
+            let _ = capture_sender.send(capture_output_bounded(stdout));
+        }) {
+        Ok(thread) => thread,
+        Err(_) => {
+            terminate_child_bounded(&mut child);
+            return None;
+        }
+    };
+    let deadline = Instant::now() + timeout;
+    let mut captured = None;
+    let status = loop {
+        if captured.is_none() {
+            match capture_receiver.try_recv() {
+                Ok(BoundedOutputCapture::Complete(bytes)) => captured = Some(bytes),
+                Ok(BoundedOutputCapture::LimitExceeded | BoundedOutputCapture::Failed)
+                | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    terminate_child_and_capture_bounded(
+                        &mut child,
+                        &capture_receiver,
+                        capture_thread,
+                    );
+                    return None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(_) => {
+                terminate_child_and_capture_bounded(&mut child, &capture_receiver, capture_thread);
+                return None;
+            }
+        }
+        if current_work_checkpoint().is_err() || Instant::now() >= deadline {
+            terminate_child_and_capture_bounded(&mut child, &capture_receiver, capture_thread);
+            return None;
+        }
+        thread::sleep(StdDuration::from_millis(5));
+    };
+    let bytes = match captured {
+        Some(bytes) => bytes,
+        None => match capture_receiver.recv_timeout(GIT_COMMAND_REAP_GRACE) {
+            Ok(BoundedOutputCapture::Complete(bytes)) => bytes,
+            Ok(BoundedOutputCapture::LimitExceeded | BoundedOutputCapture::Failed) | Err(_) => {
+                return None;
+            }
+        },
+    };
+    capture_thread.join().ok()?;
+    Some(std::process::Output {
+        status,
+        stdout: bytes,
+        stderr: Vec::new(),
+    })
+}
+
 fn git_output(root: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    Command::new("git")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
+    command_output_bounded(
+        Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .arg("-C")
+            .arg(root)
+            .args(args),
+        GIT_COMMAND_TIMEOUT,
+    )
+    .filter(|output| output.status.success())
 }
 
 fn git_worktree_proof(
     root: &std::path::Path,
 ) -> std::result::Result<GitWorktreeProof, GitProofRejection> {
-    let status = git_output(
-        root,
-        &[
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ],
-    )
-    .ok_or(GitProofRejection::Unavailable)?;
+    let mut arguments = vec![
+        "status".to_owned(),
+        "--porcelain=v2".to_owned(),
+        "--branch".to_owned(),
+        "--untracked-files=all".to_owned(),
+        "--ignore-submodules=none".to_owned(),
+        "--".to_owned(),
+        ":(top)**".to_owned(),
+    ];
+    arguments.extend(git_exclude_pathspecs());
+    let borrowed = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let status = git_output(root, &borrowed).ok_or(GitProofRejection::Unavailable)?;
     let status = String::from_utf8(status.stdout).map_err(|_| GitProofRejection::Unavailable)?;
     if status.lines().any(|line| !line.starts_with("# ")) {
         return Err(GitProofRejection::Dirty);
@@ -4567,6 +5239,44 @@ fn load_pack_snapshots(store: &StateStore) -> Result<HashMap<String, Arc<PackSna
         .filter_map(|(_, value)| serde_json::from_value::<PackSnapshot>(value).ok())
         .map(|snapshot| (snapshot.pack_id.clone(), Arc::new(snapshot)))
         .collect())
+}
+
+fn load_index_snapshot(
+    root: &std::path::Path,
+    project_id: &str,
+    path: &std::path::Path,
+    control: Option<&WorkControl>,
+) -> Result<ProjectIndex> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > 128 * 1024 * 1024
+    {
+        bail!("persisted index snapshot is unsafe")
+    }
+    let snapshot: IndexSnapshot = serde_json::from_slice(&std::fs::read(path)?)?;
+    ProjectIndex::from_snapshot_controlled(root, snapshot, Some(project_id), control)
+}
+
+fn persist_index_snapshot(
+    path: &std::path::Path,
+    index: &ProjectIndex,
+    control: Option<&WorkControl>,
+) -> Result<()> {
+    if let Some(control) = control {
+        control.check()?;
+    }
+    let bytes = serde_json::to_vec(&index.snapshot())?;
+    let temporary = path.with_extension("json.pending");
+    let mut file = std::fs::File::create(&temporary)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    if let Some(control) = control {
+        control.check()?;
+    }
+    std::fs::rename(temporary, path)?;
+    Ok(())
 }
 
 fn load_deferred_references(store: &StateStore) -> Result<HashMap<String, ReferenceValidation>> {
@@ -4630,7 +5340,11 @@ fn concept_fingerprints(terms: &[String]) -> Vec<String> {
         .collect()
 }
 
-async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -> Result<Value> {
+async fn admin_dispatch(
+    engine: &ProjectEngine,
+    request: &ContextAdminRequest,
+    control: Option<&WorkControl>,
+) -> Result<Value> {
     let now = now_iso()?;
     let index = engine.index();
     let stats = index.stats();
@@ -4805,7 +5519,7 @@ async fn admin_dispatch(engine: &ProjectEngine, request: &ContextAdminRequest) -
                 "shared_frontier_removed": shared_removed,
             }))
         }
-        "warmup" => warmup_dispatch(engine, request, &now).await,
+        "warmup" => warmup_dispatch(engine, request, &now, control).await,
         "budget" => {
             let value = json!({
                 "schema": "context_budget.v1",
@@ -4871,6 +5585,7 @@ async fn warmup_dispatch(
     engine: &ProjectEngine,
     request: &ContextAdminRequest,
     generated_at: &str,
+    control: Option<&WorkControl>,
 ) -> Result<Value> {
     let started = Instant::now();
     let l0_before = engine.l0_storage_stats();
@@ -4885,17 +5600,23 @@ async fn warmup_dispatch(
     let misses_before = engine.metrics.retrieval_misses.load(Ordering::Relaxed);
 
     let refresh_started = Instant::now();
-    let (refresh_checked, refresh_updated) = engine.refresh_index(false)?;
+    let (refresh_checked, refresh_updated) = engine.refresh_index_controlled(false, control)?;
     let refresh_elapsed_ms = refresh_started.elapsed().as_secs_f64() * 1_000.0;
     let stats = engine.index().stats().clone();
 
     let prompt_warmed = !request.prompt.trim().is_empty();
     let prompt_started = Instant::now();
     if prompt_warmed {
+        if let Some(control) = control {
+            control.check()?;
+        }
         let focus_path = (!request.path.trim().is_empty() && request.path.trim() != ".")
             .then(|| request.path.trim());
         let prompt_request = warmup_prompt_request(&request.prompt, focus_path);
         engine.admit_context_pack_cached(&prompt_request).await?;
+        if let Some(control) = control {
+            control.check()?;
+        }
     }
     let prompt_elapsed_ms = prompt_started.elapsed().as_secs_f64() * 1_000.0;
 
@@ -5184,6 +5905,20 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
             "coalesce_ms": WATCH_COALESCE_MS,
             "refreshes": engine.metrics.refreshes.load(Ordering::Relaxed),
+            "full_refreshes": engine.metrics.full_refreshes.load(Ordering::Relaxed),
+            "incremental_refreshes": engine.metrics.incremental_refreshes.load(Ordering::Relaxed),
+            "incremental_fallbacks": engine.metrics.incremental_fallbacks.load(Ordering::Relaxed),
+            "changed_path_count": engine.freshness.changed_paths.lock().map(|paths| paths.len()).unwrap_or_default(),
+            "journal_overflow": engine.freshness.journal_overflow.load(Ordering::Relaxed),
+            "lineage_git_checks": engine.metrics.lineage_git_checks.load(Ordering::Relaxed),
+            "phase_micros": {
+                "signature_scan": engine.metrics.signature_scan_micros.load(Ordering::Relaxed),
+                "refresh": engine.metrics.refresh_micros.load(Ordering::Relaxed),
+                "index_state_io": engine.metrics.index_state_io_micros.load(Ordering::Relaxed),
+                "retrieval": engine.metrics.retrieval_micros.load(Ordering::Relaxed),
+                "cache_state_io": engine.metrics.cache_state_io_micros.load(Ordering::Relaxed),
+                "serialization": engine.metrics.serialization_micros.load(Ordering::Relaxed)
+            }
         },
         "background": {"status": if engine.freshness.dirty.load(Ordering::Relaxed) {"change_pending"} else {"idle"}},
     }))
@@ -5294,6 +6029,13 @@ fn unloaded_metrics_snapshot(project_id: &str, now: &str, status: &str) -> Value
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
             "coalesce_ms": WATCH_COALESCE_MS,
             "refreshes": 0,
+            "full_refreshes": 0,
+            "incremental_refreshes": 0,
+            "incremental_fallbacks": 0,
+            "changed_path_count": 0,
+            "journal_overflow": false,
+            "lineage_git_checks": 0,
+            "phase_micros": {"signature_scan": 0, "refresh": 0, "index_state_io": 0, "retrieval": 0, "cache_state_io": 0, "serialization": 0}
         },
         "background": {"status": status},
     })
@@ -8003,6 +8745,7 @@ mod tests {
             Arc::new(UsageMonitor::open(state.path().join("monitor")).expect("monitor")),
             None,
             None,
+            None,
         )
         .expect("engine");
         let request: ContextPackRequest =
@@ -9215,6 +9958,8 @@ mod tests {
         std::fs::write(&path, "def validate_token(token):\n    return token\n")
             .expect("fixture file");
         let engine = ProjectEngine::build(root.path()).expect("engine");
+        engine._watcher.stop.store(true, Ordering::Release);
+        thread::sleep(StdDuration::from_millis(150));
         let request: ContextPackRequest = serde_json::from_value(json!({
             "prompt": "validate_token",
             "focus_paths": ["auth.py"]
@@ -9241,6 +9986,65 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_ne!(first.evidence[0].0, second.evidence[0].0);
         assert_eq!(engine.freshness.generation.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            engine.metrics.incremental_refreshes.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(engine.metrics.full_refreshes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn overflow_falls_back_to_full_and_readers_only_see_complete_generations() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = tempdir().expect("temporary repository");
+        let path = root.path().join("lib.rs");
+        std::fs::write(&path, "fn old_generation() {}\n").expect("old source");
+        let engine = Arc::new(ProjectEngine::build(root.path()).expect("engine"));
+        let old = engine.index().stats().refresh_signature.clone();
+        std::fs::write(&path, "fn new_generation() {}\n").expect("new source");
+        let new = ProjectIndex::build(root.path())
+            .expect("clean new generation")
+            .stats()
+            .refresh_signature
+            .clone();
+        engine.freshness.dirty.store(true, Ordering::Release);
+        engine.freshness.last_event_ms.store(0, Ordering::Release);
+        engine
+            .freshness
+            .journal_overflow
+            .store(true, Ordering::Release);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let invalid = Arc::new(AtomicBool::new(false));
+        let reader_engine = Arc::clone(&engine);
+        let reader_stop = Arc::clone(&stop);
+        let reader_invalid = Arc::clone(&invalid);
+        let expected_old = old.clone();
+        let expected_new = new.clone();
+        let reader = std::thread::spawn(move || {
+            while !reader_stop.load(Ordering::Acquire) {
+                let observed = reader_engine.index().stats().refresh_signature.clone();
+                if observed != expected_old && observed != expected_new {
+                    reader_invalid.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        });
+
+        assert_eq!(
+            engine.refresh_index(false).expect("overflow refresh"),
+            (true, true)
+        );
+        stop.store(true, Ordering::Release);
+        reader.join().expect("reader");
+        assert!(!invalid.load(Ordering::Acquire));
+        assert_eq!(engine.index().stats().refresh_signature, new);
+        assert_eq!(engine.metrics.full_refreshes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            engine.metrics.incremental_fallbacks.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -9647,6 +10451,393 @@ mod tests {
         )
         .expect("prune response");
         assert_eq!(pruned["shared_frontier_removed"], 1);
+    }
+
+    #[test]
+    fn generated_worktree_churn_is_ignored_by_watcher_and_git_lineage() {
+        let fixture = tempdir().expect("fixture root");
+        let repository = fixture.path().join("repository");
+        init_git_repository(&repository);
+        let generated = repository.join("nested/.workingdir/issue-29/target");
+        std::fs::create_dir_all(&generated).expect("generated tree");
+        let churn = generated.join("churn.rs");
+        std::fs::write(&churn, "fn churn_initial() {}\n").expect("initial generated file");
+        let state = tempdir().expect("state root");
+        let shared = Arc::new(
+            SharedFrontierCache::open(state.path().join("shared")).expect("shared frontier"),
+        );
+        let engine = governed_engine(&repository, &state.path().join("engine"), "churn", shared);
+        let initial_deadline = Instant::now() + StdDuration::from_secs(3);
+        while !engine.freshness.dirty.load(Ordering::Relaxed) && Instant::now() < initial_deadline {
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+        engine.freshness.dirty.store(false, Ordering::Relaxed);
+        engine
+            .freshness
+            .changed_paths
+            .lock()
+            .expect("change journal")
+            .clear();
+        let generation = engine.freshness.generation.load(Ordering::Relaxed);
+        let refreshes = engine.metrics.refreshes.load(Ordering::Relaxed);
+        let git_checks = engine.metrics.lineage_git_checks.load(Ordering::Relaxed);
+        for revision in 0..20 {
+            std::fs::write(&churn, format!("fn churn_{revision}() {{}}\n"))
+                .expect("generated churn");
+            assert!(!source_event_path(&repository, &churn));
+        }
+        std::thread::sleep(StdDuration::from_millis(150));
+
+        assert!(git_worktree_proof(&repository).is_ok());
+        assert!(
+            !engine.freshness.dirty.load(Ordering::Relaxed),
+            "unexpected journal: {:?}",
+            engine.freshness.changed_paths.lock().expect("journal")
+        );
+        assert_eq!(
+            engine.freshness.generation.load(Ordering::Relaxed),
+            generation
+        );
+        assert_eq!(engine.metrics.refreshes.load(Ordering::Relaxed), refreshes);
+        assert_eq!(
+            engine.metrics.lineage_git_checks.load(Ordering::Relaxed),
+            git_checks
+        );
+    }
+
+    #[test]
+    fn watcher_registration_precedes_the_baseline_scan() {
+        let root = tempdir().expect("repository root");
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn before_registration() {}\n").expect("initial source");
+        let freshness = Arc::new(FreshnessState {
+            watcher_status: AtomicU8::new(WATCHER_STARTING),
+            ..FreshnessState::default()
+        });
+        let registration_reached = Arc::new(std::sync::Barrier::new(2));
+        let allow_registration = Arc::new(std::sync::Barrier::new(2));
+        let build_root = root.path().to_path_buf();
+        let build_freshness = Arc::clone(&freshness);
+        let runner_reached = Arc::clone(&registration_reached);
+        let runner_allow = Arc::clone(&allow_registration);
+        let builder = thread::spawn(move || {
+            let guard = WatchGuard::start_with_runner(
+                build_root.clone(),
+                build_freshness,
+                move |_, runner_freshness, stop| {
+                    runner_reached.wait();
+                    runner_allow.wait();
+                    mark_watcher_healthy(&runner_freshness);
+                    while !stop.load(Ordering::Acquire) {
+                        thread::sleep(StdDuration::from_millis(1));
+                    }
+                },
+            );
+            let index = ProjectIndex::build(&build_root).expect("baseline index");
+            (guard, index)
+        });
+
+        registration_reached.wait();
+        fs::write(&source, "fn mutation_before_registration() {}\n")
+            .expect("pre-registration mutation");
+        allow_registration.wait();
+        let (guard, index) = builder.join().expect("baseline builder");
+        let (hits, _) = index
+            .search("mutation_before_registration", &[], 8)
+            .expect("baseline search");
+        assert!(hits.iter().any(|hit| hit.path == "lib.rs"));
+        assert_eq!(
+            freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_HEALTHY
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn events_during_signature_scan_or_build_are_not_lost() {
+        for phase in ["after_signature_scan", "after_index_build"] {
+            let root = tempdir().expect("repository root");
+            let state = tempdir().expect("state root");
+            let source = root.path().join("lib.rs");
+            fs::write(&source, "fn original_generation() {}\n").expect("initial source");
+            let engine = Arc::new(
+                ProjectEngine::build_with_state(root.path(), state.path(), phase)
+                    .expect("project engine"),
+            );
+            engine._watcher.stop.store(true, Ordering::Release);
+            thread::sleep(StdDuration::from_millis(150));
+
+            fs::write(&source, "fn first_pending_generation() {}\n").expect("first pending source");
+            record_watcher_event(&engine.freshness, ["lib.rs".to_owned()], false);
+            engine.freshness.last_event_ms.store(0, Ordering::Release);
+
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let triggered = Arc::new(AtomicBool::new(false));
+            let hook_entered = Arc::clone(&entered);
+            let hook_resume = Arc::clone(&resume);
+            let hook_triggered = Arc::clone(&triggered);
+            engine.set_refresh_hook(Arc::new(move |observed_phase| {
+                if observed_phase == phase && !hook_triggered.swap(true, Ordering::AcqRel) {
+                    hook_entered.wait();
+                    hook_resume.wait();
+                }
+            }));
+
+            let refresh_engine = Arc::clone(&engine);
+            let refresh = thread::spawn(move || refresh_engine.refresh_index(false));
+            entered.wait();
+            fs::write(&source, "fn mutation_during_refresh() {}\n").expect("mid-refresh mutation");
+            record_watcher_event(&engine.freshness, ["lib.rs".to_owned()], false);
+            resume.wait();
+
+            assert_eq!(
+                refresh
+                    .join()
+                    .expect("refresh worker")
+                    .expect("stable refresh"),
+                (true, true)
+            );
+            let authoritative =
+                repository_signature_for_project_controlled(root.path(), Some(phase), None)
+                    .expect("authoritative signature");
+            assert_eq!(engine.index().stats().refresh_signature, authoritative);
+            let (hits, _) = engine
+                .index()
+                .search("mutation_during_refresh", &[], 8)
+                .expect("refreshed search");
+            assert!(hits.iter().any(|hit| hit.path == "lib.rs"));
+            assert_eq!(engine.freshness.generation.load(Ordering::Acquire), 1);
+            assert!(engine.freshness.event_epoch.load(Ordering::Acquire) >= 2);
+            assert!(!engine.freshness.dirty.load(Ordering::Acquire));
+            assert!(
+                engine
+                    .freshness
+                    .changed_paths
+                    .lock()
+                    .expect("change journal")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_thread_and_backend_startup_fail_closed() {
+        let freshness = Arc::new(FreshnessState::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let guard = WatchGuard::from_spawn_result(
+            Arc::clone(&stop),
+            Arc::clone(&freshness),
+            Err(std::io::Error::other("controlled watcher thread failure")),
+        );
+        assert_eq!(
+            freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_FAILED
+        );
+        assert!(freshness.dirty.load(Ordering::Acquire));
+        assert!(freshness.journal_overflow.load(Ordering::Acquire));
+        drop(guard);
+
+        let fixture = tempdir().expect("fixture root");
+        let backend_freshness = Arc::new(FreshnessState::default());
+        watch_repository_with_attempts(
+            fixture.path(),
+            &backend_freshness,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _, _| false,
+            |_, _, _| false,
+        );
+        assert_eq!(
+            backend_freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_FAILED
+        );
+        assert!(backend_freshness.dirty.load(Ordering::Acquire));
+        assert!(backend_freshness.journal_overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn watcher_runtime_error_and_disconnect_fail_closed() {
+        let root = tempdir().expect("repository root");
+
+        let runtime_freshness = Arc::new(FreshnessState::default());
+        runtime_freshness
+            .watcher_status
+            .store(WATCHER_HEALTHY, Ordering::Release);
+        let runtime_stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let controller_freshness = Arc::clone(&runtime_freshness);
+        let controller_stop = Arc::clone(&runtime_stop);
+        let controller = thread::spawn(move || {
+            sender
+                .send(Err(notify::Error::generic("controlled watcher error")))
+                .expect("runtime watcher error");
+            while controller_freshness.watcher_status.load(Ordering::Acquire) != WATCHER_FAILED {
+                thread::yield_now();
+            }
+            controller_stop.store(true, Ordering::Release);
+        });
+        watcher_loop(&receiver, root.path(), &runtime_freshness, &runtime_stop);
+        controller.join().expect("runtime error controller");
+        assert!(runtime_freshness.dirty.load(Ordering::Acquire));
+        assert!(runtime_freshness.journal_overflow.load(Ordering::Acquire));
+
+        let disconnected_freshness = FreshnessState::default();
+        disconnected_freshness
+            .watcher_status
+            .store(WATCHER_HEALTHY, Ordering::Release);
+        let disconnected_stop = AtomicBool::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        watcher_loop(
+            &receiver,
+            root.path(),
+            &disconnected_freshness,
+            &disconnected_stop,
+        );
+        assert_eq!(
+            disconnected_freshness
+                .watcher_status
+                .load(Ordering::Acquire),
+            WATCHER_FAILED
+        );
+        assert!(disconnected_freshness.dirty.load(Ordering::Acquire));
+        assert!(
+            disconnected_freshness
+                .journal_overflow
+                .load(Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn failed_watcher_forces_ordinary_full_freshness_verification() {
+        let root = tempdir().expect("repository root");
+        let state = tempdir().expect("state root");
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn before_watcher_failure() {}\n").expect("initial source");
+        let engine = ProjectEngine::build_with_state(root.path(), state.path(), "watcher-failed")
+            .expect("project engine");
+        let initial_signature = engine.index().stats().refresh_signature.clone();
+
+        fs::write(&source, "fn after_watcher_failure() {}\n").expect("changed source");
+        mark_watcher_failed(&engine.freshness);
+        engine.freshness.dirty.store(false, Ordering::Release);
+        engine
+            .freshness
+            .changed_paths
+            .lock()
+            .expect("change journal")
+            .clear();
+
+        let (checked, updated) = engine.refresh_index(false).expect("ordinary refresh");
+        assert!(checked);
+        assert!(updated);
+        assert_ne!(engine.index().stats().refresh_signature, initial_signature);
+        assert_eq!(
+            engine.freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_FAILED
+        );
+        assert!(engine.freshness.journal_overflow.load(Ordering::Acquire));
+
+        let verified_signature = engine.index().stats().refresh_signature.clone();
+        let (checked, updated) = engine
+            .refresh_index(true)
+            .expect("explicit fresh verification");
+        assert!(checked);
+        assert!(!updated);
+        assert_eq!(engine.index().stats().refresh_signature, verified_signature);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn governed_git_process_obeys_the_work_deadline() {
+        let control = WorkControl::new(Instant::now() + StdDuration::from_millis(30));
+        let _scope = WorkControlScope::install(Some(&control));
+        let started = Instant::now();
+        let output = command_output_bounded(Command::new("sleep").arg("30"), GIT_COMMAND_TIMEOUT);
+        assert!(output.is_none());
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn governed_git_output_is_hard_capped_and_oversized_child_is_reaped() {
+        let exact = command_output_bounded(
+            Command::new("head")
+                .arg("-c")
+                .arg(GIT_OUTPUT_LIMIT_BYTES.to_string())
+                .arg("/dev/zero"),
+            GIT_COMMAND_TIMEOUT,
+        )
+        .expect("output at the hard limit");
+        assert!(exact.status.success());
+        assert_eq!(exact.stdout.len(), GIT_OUTPUT_LIMIT_BYTES);
+
+        let fixture = tempdir().expect("capture fixture");
+        let pid_path = fixture.path().join("oversized.pid");
+        let oversized_bytes = GIT_OUTPUT_LIMIT_BYTES.saturating_add(1);
+        let started = Instant::now();
+        let output = command_output_bounded(
+            Command::new("sh")
+                .arg("-c")
+                .arg("printf '%s' \"$$\" > \"$1\"; head -c \"$2\" /dev/zero; exec sleep 30")
+                .arg("governed-git-output")
+                .arg(&pid_path)
+                .arg(oversized_bytes.to_string()),
+            StdDuration::from_secs(3),
+        );
+        assert!(output.is_none());
+        assert!(
+            started.elapsed() < StdDuration::from_millis(1500),
+            "oversized output must terminate the child before its command deadline"
+        );
+
+        let pid = std::fs::read_to_string(&pid_path).expect("oversized child pid");
+        let child_is_alive = Command::new("sh")
+            .arg("-c")
+            .arg("kill -0 \"$1\" 2>/dev/null")
+            .arg("governed-git-reap-check")
+            .arg(pid.trim())
+            .status()
+            .expect("child reap check")
+            .success();
+        assert!(!child_is_alive, "oversized output child was not reaped");
+
+        std::fs::remove_file(pid_path).expect("remove pid marker");
+        assert_eq!(
+            std::fs::read_dir(fixture.path())
+                .expect("capture fixture contents")
+                .count(),
+            0,
+            "stdout capture left a temporary artifact"
+        );
+    }
+
+    #[test]
+    fn persisted_index_generation_recovers_from_crash_and_corruption() {
+        let root = tempdir().expect("repository root");
+        let state = tempdir().expect("state root");
+        std::fs::write(root.path().join("lib.rs"), "fn persisted_generation() {}\n")
+            .expect("source");
+        let engine = ProjectEngine::build_with_state(root.path(), state.path(), "persisted")
+            .expect("initial engine");
+        let expected = engine.index().stats().refresh_signature.clone();
+        let snapshot = engine.index_snapshot_path.clone();
+        drop(engine);
+
+        std::fs::write(snapshot.with_extension("json.pending"), b"partial").expect("crash residue");
+        let reopened = ProjectEngine::build_with_state(root.path(), state.path(), "persisted")
+            .expect("ignore incomplete generation");
+        assert_eq!(reopened.index().stats().refresh_signature, expected);
+        drop(reopened);
+
+        std::fs::write(&snapshot, b"corrupt").expect("corrupt manifest");
+        let rebuilt = ProjectEngine::build_with_state(root.path(), state.path(), "persisted")
+            .expect("corruption falls back to full rebuild");
+        assert_eq!(rebuilt.index().stats().refresh_signature, expected);
+        assert!(
+            serde_json::from_slice::<IndexSnapshot>(&std::fs::read(snapshot).expect("snapshot"))
+                .is_ok()
+        );
     }
 
     #[tokio::test]

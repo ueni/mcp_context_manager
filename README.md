@@ -372,6 +372,9 @@ Stdio remains the default transport when `MCP_TRANSPORT` is omitted.
 | `REPO_PATH` | Default repository root. |
 | `MCP_CONTEXT_STATE_DIR` | Project-state root; Rust creates an isolated `rust-v2` overlay. |
 | `MCP_CONTEXT_PROJECT_ID` | Optional explicit id for the default project. |
+| `MCP_CONTEXT_BLOCKING_CONCURRENCY` | Global cap for repository-heavy blocking jobs. Defaults to `max(1, min(2, available_parallelism / 2))`. |
+| `MCP_CONTEXT_REQUEST_TIMEOUT_SECS` | End-to-end `context_pack` server budget, default `48`, kept below the common 60-second client timeout. |
+| `MCP_CONTEXT_CANCELLATION_GRACE_SECS` | Portion of the server budget reserved for cooperative blocking-job cancellation, default `2`. |
 | `MCP_CONTEXT_FRONTIER_LINEAGES_FILE` | Absolute path to an operator-owned `context_frontier_lineages.v1` JSON manifest that explicitly groups 2–64 allowed Git worktree roots. Omit to disable cross-worktree frontier reuse. |
 | `MCP_CONTEXT_ALLOWED_ROOTS` | Host roots allowed for `root_uri` project selection. |
 | `MCP_CONTEXT_ROOT_MAPPINGS` | Comma-separated host-to-container mappings such as `/home/user/source=/workspace-roots`. |
@@ -391,6 +394,34 @@ paths, symlink roots, and roots outside the configured boundary are rejected.
 Repository content is treated as untrusted: prompt-injection signals are
 reported, while secrets and absolute host paths are redacted before output or
 persistence.
+
+Cold engine construction, freshness scans, Tantivy builds, cache/state access,
+and pack construction run behind the global blocking-job cap rather than on a
+Tokio async worker. Requests that expire while queued never start. Running
+requests receive cooperative cancellation between files and chunks and before
+an index commit or generation swap. Governed-lineage Git commands have a fixed
+five-second execution cap, bounded output, and are killed when request
+cancellation wins. Cooperative phases stop within cancellation grace. If a
+blocking phase unexpectedly outlives that grace, the response stays attached
+until the job releases its global permit and active-job counter; Tokio cannot
+abort a live `spawn_blocking` closure safely. Cancellation remains latched so
+the job cannot commit cache, frontier, manifest, or index state. REST reports
+queue/deadline or fail-closed freshness exhaustion as HTTP 503; MCP returns a
+stable retryable `context_pack busy`, `context_pack timed out`, or
+`context_pack freshness unavailable` diagnostic with warmup/retry guidance.
+
+Use `context_admin(mode="warmup")` before a latency-sensitive normal request.
+The server also schedules the default project only after stdio/HTTP transport
+readiness. `context_admin(mode="warmup")`, `health`, `metrics`, and
+`measurement_report` expose its `queued`, `building`, `ready`, or `failed`
+lifecycle through `runtime.warmup.state`; startup never walks every allowed
+root.
+
+Increasing a client timeout can be a bounded fallback, but it does not replace
+the server concurrency cap or cancellation budget. Generated agent/build/cache
+trees such as `.workingdir/`, `.worktrees/`, `.openclaw/`, `target/`, and
+`node_modules/` are excluded consistently from discovery, watching,
+signatures, indexing, and governed Git lineage checks at any directory depth.
 
 ## Native architecture
 
@@ -418,8 +449,27 @@ The fast path uses:
 - deterministic reranking after approximate frontier reuse;
 - an optional 256 MiB persistent pool of path-free immutable frontier records for explicitly governed, clean worktrees that share one Git common directory, HEAD, source signature, and index signature;
 - a 50 ms coalescing filesystem watcher plus polling fallback;
-- synchronous refresh for `changed_files` and `cache_strategy="fresh"`;
+- a bounded changed-path journal and per-file fingerprints for atomic
+  incremental changed/deleted/renamed/untracked refresh;
+- a validated, atomically replaced index snapshot under generated project
+  state so a restart can reuse a complete warm generation;
 - direct serialization into a preallocated byte buffer.
+
+Watcher registration is established before the baseline index scan. Every
+incremental result is checked against a second independently computed source
+signature before publication, and a monotonic event epoch prevents a refresh
+from clearing events that arrive during its signature scan, index build, or
+snapshot write. Journal overflow, unsafe paths, corpus/config changes,
+ambiguous events, mutation during refresh, and corrupt/incomplete persisted
+state fail closed to a clean full rebuild or a bounded retryable freshness
+error. Readers obtain one immutable index handle and therefore observe only the
+old or new complete generation.
+
+Watcher thread startup, native and polling backend setup, runtime errors, and
+channel disconnection latch fail-closed freshness. Ordinary requests then run
+authoritative full verification instead of serving a generation whose source
+events may have been missed; explicit `cache_strategy="fresh"` verification
+remains available.
 
 Cross-worktree reuse is disabled by default. A deployment may opt in with an
 operator-owned manifest such as:
@@ -451,6 +501,7 @@ Run validation inside the repository devcontainer:
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo run -p context-testkit --bin benchmark-context-pack-load --quiet
 cargo xtask license-check
 cargo audit --deny warnings
 cargo xtask sbom dist/mcp-context-manager.cdx.json
@@ -466,6 +517,12 @@ python3 scripts/smoke_native_mcp.py dist/mcp-context-manager-linux-x86_64-musl
 cmake --build --preset docker-image-archive
 python3 scripts/smoke_native_image.py mcp-context-manager:local
 ```
+
+The load benchmark gates cold start, warm L0, one-file refresh, an edit burst,
+a deterministic large-file disk-pressure case, concurrent same-project calls,
+multiple projects, and current-thread event-loop lag against the common
+60-second MCP SDK budget. A bounded reference run is recorded in
+[`benchmarks/results/issue-29-context-pack-load.json`](benchmarks/results/issue-29-context-pack-load.json).
 
 Record a release version with the Rust task runner:
 

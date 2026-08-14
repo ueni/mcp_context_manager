@@ -449,14 +449,89 @@ client profile, without prompts, paths, ids, or source values.
 
 ## Freshness
 
-A `notify` watcher coalesces events for 50 ms. A content signature poll is the
-fallback when an event is unavailable. Fast-cache validity is bounded to two
-seconds. `changed_files` and `cache_strategy="fresh"` refresh synchronously and
-cannot return a response certified against an older generation.
+A `notify` watcher coalesces events for 50 ms and owns ordinary dirty-state
+transitions. There is no fixed two-second request-path content hash. PollWatcher
+is the event-source fallback when the native watcher is unavailable; watcher
+errors conservatively dirty the project. Explicit `changed_files` and
+`cache_strategy="fresh"` still force full signature verification and cannot
+return a response certified against an older generation.
+
+Native or polling registration becomes healthy (or latches fail-closed) before
+the baseline snapshot load/scan begins, eliminating the pre-registration
+mutation gap. Watcher events advance a monotonic epoch under the changed-path
+journal lock. Refresh consumes an epoch only after a stable initial signature,
+a complete replacement build, a second authoritative source signature, and the
+atomic generation swap. An epoch advance at any of those boundaries preserves
+the journal and retries from the current source; repeated churn ends in the
+bounded retryable freshness diagnostic instead of publishing stale evidence.
+
+Thread-spawn failure, failure of both native and polling watcher setup,
+runtime watcher errors, and event-channel disconnection persistently latch the
+project into fail-closed full verification for ordinary requests. A failed
+verification returns the stable retryable `context_pack freshness unavailable`
+diagnostic instead of serving stale ordinary cache entries.
+
+One shared generated-tree policy is consumed by project discovery, watcher
+filtering, signature traversal, index traversal, and governed Git pathspecs.
+This prevents churn under `.workingdir/` and equivalent agent/build/cache trees
+from triggering refresh or lineage discovery.
 
 Generation, source signature, and explicit-path signatures participate in
 cache validity. A cached response is served only when its certificate still
 matches the active index.
+
+## Blocking work, deadlines, and cancellation
+
+The transport computes one `context_pack` deadline at request entry (48 seconds
+by default) and reserves the final two seconds as a cooperative cancellation
+grace. Queue acquisition, cold engine construction, signature scan, full index
+build/refresh, Tantivy work, cache/state access, and serialization-heavy pack
+construction run in `spawn_blocking` behind one configurable global semaphore.
+The default permit count is `max(1, min(2, available_parallelism / 2))`.
+Existing per-project construction and refresh locks remain the singleflight
+boundary, so same-project cold callers share one build.
+
+A request dropped while queued drops its semaphore future and never starts.
+After a running request expires, its cancellation control is checked between
+files and chunks and before Tantivy commit or index-generation publication.
+Governed-lineage Git execution is additionally limited to five seconds and 4
+MiB of output; cancellation kills the child and bounded reaping never extends
+the request indefinitely. Cooperative repository phases terminate within
+cancellation grace. If an unexpected operating-system or library phase
+outlives that grace, the async request remains attached to the blocking join
+until its permit and active-job drop guards have run; aborting a live
+`spawn_blocking` closure cannot stop it and would abandon executor capacity.
+The cancellation flag remains latched, so the closure cannot publish cache,
+frontier, manifest, or index state. Permits and active/queued counters use drop
+guards. Queue
+exhaustion and deadline expiry return stable retryable diagnostics before the
+usual 60-second MCP client budget. Phase measurements remain bounded and
+content-free: the existing request ledger records cache outcome, refresh
+checks/updates, retrieval, pack-build and total latency. Public runtime
+measurements add queue wait, engine load, queue/active/singleflight depth,
+cancellations, timeouts, deadline remaining, and post-timeout work; freshness
+measurements add signature scan, full/incremental refresh, index-state I/O,
+cache/state I/O, retrieval, and serialization totals. They contain neither
+prompts, contents, secrets, nor raw local paths. Blocking-job tests assert
+queue, waiter, permit, and active counts return to baseline.
+
+The watcher maintains a coalesced 1,024-path journal. A refresh computes the
+authoritative source signature, applies changed/deleted/renamed/untracked file
+deltas to immutable chunks and fingerprints, builds a complete replacement
+Tantivy reader, recomputes the authoritative source signature, verifies event
+epoch and signature parity, persists a schema/version/generation snapshot by
+sync-plus-rename, and only then swaps the `Arc` visible to readers while holding
+the journal publication lock. Events from a consumed snapshot are cleared only
+after that swap; newer events remain dirty. Overflow, unsafe or corpus paths,
+ambiguous events, signature mismatch, mid-refresh mutation, missing state,
+incomplete `.pending` state, and corrupt snapshots all use the documented
+full-rebuild/retry fallback. Persisted snapshots are accepted only after current
+source and fingerprint validation.
+
+Transport startup schedules only the default project through the same bounded
+path after stdio service creation or HTTP listener binding. The public runtime
+state progresses through `queued`, `building`, and `ready`, or terminates at
+`failed`; allowed roots are not enumerated by startup warmup.
 
 ## References and memory
 
@@ -509,6 +584,15 @@ The native performance gate measures:
 - required-anchor recall 100%;
 - noise ratio at most 30%;
 - relevant-evidence freshness at most two seconds.
+
+The issue-29 load gate additionally exercises cold start, warm cache, one-file
+refresh, edit burst, deterministic large-file disk pressure, concurrent
+same-project calls, and multiple projects on a current-thread Tokio runtime.
+Every normal request must remain below the SDK's 60-second default and maximum
+event-loop lag must remain below 250 ms. Run it with
+`cargo run -p context-testkit --bin benchmark-context-pack-load --quiet`; the
+bounded reference result is
+`benchmarks/results/issue-29-context-pack-load.json`.
 
 Release acceptance requires three consecutive complete devcontainer runs,
 stable-tool differential fixtures, randomized mutation cases, glibc and musl
