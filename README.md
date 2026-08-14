@@ -103,6 +103,15 @@ Diagnostics, metrics, and token accounting are available through
 
 ## Usage and efficiency reporting
 
+Project catalogue calls are explicitly row-bounded. For
+`context_admin(mode="projects")`, `active_projects`, and `cached_projects`,
+`max_entries` defaults to 20 and accepts `1..=1000`. The returned `projects`
+array never exceeds that cap. `count` remains the returned row count, while
+`total_count`, `returned_count`, `omitted_count`, and `truncated` distinguish the
+complete matching catalogue from the inline subset. Catalogue ordering remains
+deterministic by project id; explicit discovery persists the complete catalogue
+before bounding the response.
+
 `context_admin(mode="monitor_usage")` controls an opt-in, process-global
 30-day usage ledger. Successful `context_pack` requests are grouped into the
 bounded client profiles `codex`, `claude`, `copilot`, `generic`, `missing`, and

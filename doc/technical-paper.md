@@ -196,6 +196,15 @@ An eight-engine idle LRU limits open project resources. Engines held by an
 in-flight request remain alive through `Arc` ownership and cannot be evicted
 out from under that request.
 
+The global `projects`, `active_projects`, and `cached_projects` admin modes apply
+the request's `max_entries` value after deterministic project-id sorting. The
+value defaults to 20 and accepts `1..=1000`; zero and larger values are rejected
+before a catalogue is returned. Each response reports `count` and
+`returned_count` for the inline rows, `total_count` for all matching rows,
+`omitted_count` for the difference, the effective `max_entries`, and
+`truncated`. Project discovery still persists the full catalogue so a small
+response cap cannot discard cached project identities.
+
 ## Rollback-safe state
 
 Rust never opens the Python v1 LMDB environment for writing. Each project uses

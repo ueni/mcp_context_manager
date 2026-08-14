@@ -224,7 +224,7 @@ impl ContextServer {
             return serde_json::to_string(
                 &self
                     .registry
-                    .projects_payload()
+                    .projects_payload(request.max_entries)
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string());
@@ -233,7 +233,7 @@ impl ContextServer {
             return serde_json::to_string(
                 &self
                     .registry
-                    .active_projects_payload()
+                    .active_projects_payload(request.max_entries)
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string());
@@ -242,7 +242,7 @@ impl ContextServer {
             return serde_json::to_string(
                 &self
                     .registry
-                    .cached_projects_payload()
+                    .cached_projects_payload(request.max_entries)
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string());
@@ -1418,6 +1418,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_catalogue_admin_modes_honor_max_entries() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let state = tempfile::tempdir().expect("state root");
+        for name in ["alpha", "beta"] {
+            let project = root.path().join(name);
+            std::fs::create_dir_all(&project).expect("project directory");
+            std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("project marker");
+        }
+        let registry = Arc::new(
+            ProjectRegistry::new(
+                root.path().to_owned(),
+                state.path().to_owned(),
+                vec![root.path().to_owned()],
+                Vec::new(),
+            )
+            .expect("registry"),
+        );
+        let discovered = registry.projects_payload(100).expect("discover projects");
+        for project_id in discovered["projects"]
+            .as_array()
+            .expect("project rows")
+            .iter()
+            .filter_map(|project| project["project_id"].as_str())
+        {
+            drop(
+                registry
+                    .engine_for(Some(project_id), None)
+                    .expect("resident project engine"),
+            );
+        }
+        let server = ContextServer::new(Arc::clone(&registry));
+
+        for mode in ["projects", "active_projects", "cached_projects"] {
+            let request: ContextAdminRequest = serde_json::from_value(json!({
+                "mode": mode,
+                "max_entries": 1
+            }))
+            .expect("catalogue request");
+            let response: Value = serde_json::from_str(
+                &server
+                    .context_admin(Parameters(request))
+                    .await
+                    .expect("catalogue response"),
+            )
+            .expect("catalogue JSON");
+            assert_eq!(response["projects"].as_array().map(Vec::len), Some(1));
+            assert_eq!(response["count"], 1);
+            assert_eq!(response["total_count"], 2);
+            assert_eq!(response["returned_count"], 1);
+            assert_eq!(response["omitted_count"], 1);
+            assert_eq!(response["truncated"], true);
+        }
+
+        for mode in ["projects", "active_projects", "cached_projects"] {
+            let request: ContextAdminRequest = serde_json::from_value(json!({"mode": mode}))
+                .expect("catalogue request without max_entries");
+            assert_eq!(request.max_entries, 20);
+            let response: Value = serde_json::from_str(
+                &server
+                    .context_admin(Parameters(request))
+                    .await
+                    .expect("default-bounded catalogue response"),
+            )
+            .expect("catalogue JSON");
+            assert_eq!(response["projects"].as_array().map(Vec::len), Some(2));
+            assert_eq!(response["count"], 2);
+            assert_eq!(response["total_count"], 2);
+            assert_eq!(response["returned_count"], 2);
+            assert_eq!(response["omitted_count"], 0);
+            assert_eq!(response["max_entries"], 20);
+            assert_eq!(response["truncated"], false);
+        }
+
+        for invalid in [0, 1001] {
+            let request: ContextAdminRequest = serde_json::from_value(json!({
+                "mode": "projects",
+                "max_entries": invalid
+            }))
+            .expect("invalid catalogue request");
+            let error = server
+                .context_admin(Parameters(request))
+                .await
+                .expect_err("invalid cap must fail");
+            assert_eq!(error, "max_entries must be in 1..=1000");
+        }
+    }
+
+    #[tokio::test]
     async fn monitor_report_caps_inline_output_and_resolves_complete_report() {
         let root = tempfile::tempdir().expect("repository root");
         let state = tempfile::tempdir().expect("state root");
@@ -1652,7 +1740,7 @@ mod tests {
             .expect("static instructions");
         assert!(instructions.contains("context_pack"));
         assert_eq!(
-            registry.active_projects_payload().expect("active")["count"],
+            registry.active_projects_payload(100).expect("active")["count"],
             0
         );
         assert!(
