@@ -1,0 +1,193 @@
+{
+  "schema": "context_request_identity_evaluation.v1",
+  "corpus": {
+    "schema": "context_request_identity_corpus.v1",
+    "version": 1,
+    "case_count": 13,
+    "classes": [
+      "adversarial_near_match",
+      "ambiguous_query",
+      "changed_symbol_path",
+      "exact_repeat",
+      "negation",
+      "paraphrase",
+      "reordered_terms",
+      "security_query",
+      "whitespace_case_variant"
+    ],
+    "top_k": 3,
+    "frontier_capacity": 8,
+    "production_telemetry_sufficient": false
+  },
+  "strategies": [
+    {
+      "strategy": "exact_identity",
+      "status": "enabled",
+      "serving_enabled": true,
+      "eligible_opportunity_count": 4,
+      "eligible_opportunity_rate_millis": 307,
+      "hit_count": 4,
+      "hit_rate_millis": 307,
+      "candidate_recall_millis": 1000,
+      "top_k_overlap_millis": 1000,
+      "unsafe_candidate_count": 0,
+      "unsafe_candidate_rate_millis": 0,
+      "false_reuse_count": 0,
+      "false_reuse_rate_millis": 0,
+      "fallback_count": 9,
+      "fallback_rate_millis": 692,
+      "latency": {
+        "cold_search_micros_total": 23960,
+        "cold_search_micros_mean": 1843,
+        "candidate_rerank_micros_total": 383,
+        "candidate_rerank_micros_mean": 95
+      },
+      "guard_rejections": {}
+    },
+    {
+      "strategy": "inert_case_whitespace",
+      "status": "evaluated_disabled",
+      "serving_enabled": false,
+      "eligible_opportunity_count": 6,
+      "eligible_opportunity_rate_millis": 461,
+      "hit_count": 5,
+      "hit_rate_millis": 384,
+      "candidate_recall_millis": 944,
+      "top_k_overlap_millis": 944,
+      "unsafe_candidate_count": 1,
+      "unsafe_candidate_rate_millis": 166,
+      "false_reuse_count": 0,
+      "false_reuse_rate_millis": 0,
+      "fallback_count": 8,
+      "fallback_rate_millis": 615,
+      "latency": {
+        "cold_search_micros_total": 8240,
+        "cold_search_micros_mean": 633,
+        "candidate_rerank_micros_total": 235,
+        "candidate_rerank_micros_mean": 39
+      },
+      "guard_rejections": {
+        "capacity": 1,
+        "dependencies": 1,
+        "generation": 1,
+        "score_or_recall": 1,
+        "semantic_contract": 1,
+        "source_signature": 1
+      }
+    },
+    {
+      "strategy": "order_insensitive_terms",
+      "status": "evaluated_disabled",
+      "serving_enabled": false,
+      "eligible_opportunity_count": 7,
+      "eligible_opportunity_rate_millis": 538,
+      "hit_count": 6,
+      "hit_rate_millis": 461,
+      "candidate_recall_millis": 952,
+      "top_k_overlap_millis": 952,
+      "unsafe_candidate_count": 1,
+      "unsafe_candidate_rate_millis": 142,
+      "false_reuse_count": 0,
+      "false_reuse_rate_millis": 0,
+      "fallback_count": 7,
+      "fallback_rate_millis": 538,
+      "latency": {
+        "cold_search_micros_total": 6818,
+        "cold_search_micros_mean": 524,
+        "candidate_rerank_micros_total": 218,
+        "candidate_rerank_micros_mean": 31
+      },
+      "guard_rejections": {
+        "capacity": 1,
+        "dependencies": 1,
+        "generation": 1,
+        "score_or_recall": 1,
+        "semantic_contract": 1,
+        "source_signature": 1
+      }
+    },
+    {
+      "strategy": "lexical_jaccard",
+      "status": "evaluated_disabled",
+      "serving_enabled": false,
+      "eligible_opportunity_count": 12,
+      "eligible_opportunity_rate_millis": 923,
+      "hit_count": 6,
+      "hit_rate_millis": 461,
+      "candidate_recall_millis": 944,
+      "top_k_overlap_millis": 944,
+      "unsafe_candidate_count": 6,
+      "unsafe_candidate_rate_millis": 500,
+      "false_reuse_count": 0,
+      "false_reuse_rate_millis": 0,
+      "fallback_count": 7,
+      "fallback_rate_millis": 538,
+      "latency": {
+        "cold_search_micros_total": 6814,
+        "cold_search_micros_mean": 524,
+        "candidate_rerank_micros_total": 414,
+        "candidate_rerank_micros_mean": 34
+      },
+      "guard_rejections": {
+        "capacity": 1,
+        "dependencies": 1,
+        "generation": 1,
+        "safety_exact_only": 4,
+        "scope": 1,
+        "score_or_recall": 2,
+        "semantic_contract": 6,
+        "source_signature": 1
+      }
+    },
+    {
+      "strategy": "embedding_similarity",
+      "status": "unavailable_no_offline_model",
+      "serving_enabled": false,
+      "eligible_opportunity_count": 0,
+      "eligible_opportunity_rate_millis": 0,
+      "hit_count": 0,
+      "hit_rate_millis": 0,
+      "candidate_recall_millis": 0,
+      "top_k_overlap_millis": 0,
+      "unsafe_candidate_count": 0,
+      "unsafe_candidate_rate_millis": 0,
+      "false_reuse_count": 0,
+      "false_reuse_rate_millis": 0,
+      "fallback_count": 13,
+      "fallback_rate_millis": 1000,
+      "latency": {
+        "cold_search_micros_total": 6795,
+        "cold_search_micros_mean": 522,
+        "candidate_rerank_micros_total": 0,
+        "candidate_rerank_micros_mean": 0
+      },
+      "guard_rejections": {}
+    }
+  ],
+  "verdict": {
+    "decision": "exact_only",
+    "enabled_equivalence_classes": [
+      "exact_raw_request_identity"
+    ],
+    "evaluated_but_disabled": [
+      "case_and_whitespace_canonicalization",
+      "order_insensitive_terms",
+      "lexical_resemblance",
+      "embedding_similarity"
+    ],
+    "rollback_control": "No behavior flag is required: exact-only is the unchanged serving path. Remove a future non-exact identity mode or disable it by default to roll back.",
+    "reason": "The fixture demonstrates contract-equivalent inert variants, but production telemetry is insufficient and broader strategies produce unsafe or incomplete candidate matches. No non-exact class meets the release gate."
+  },
+  "gates": {
+    "corpus_required_classes_complete": true,
+    "current_prompt_reranked_for_every_non_exact_candidate": true,
+    "default_exact_only": true,
+    "enabled_classes_have_zero_false_reuse": true,
+    "exact_identity_remains_enabled": true,
+    "no_final_response_or_evidence_card_reuse": true,
+    "production_telemetry_sufficient": false,
+    "safety_negation_ambiguity_exact_only": true,
+    "scope_generation_capacity_dependency_signature_guards_evaluated": true,
+    "score_and_recall_zero_regression_guard_evaluated": true
+  }
+}

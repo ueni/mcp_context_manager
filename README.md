@@ -155,6 +155,31 @@ cargo run -p context-testkit --bin benchmark-reuse-opportunity --quiet
 cargo run -p context-testkit --bin benchmark-worktree-frontier --quiet
 ```
 
+Request-identity expansion is evaluated offline with:
+
+```bash
+cargo run -p context-testkit --bin benchmark-request-identity --quiet
+```
+
+The versioned corpus covers exact repeats, case/whitespace changes, reordered
+terms, paraphrases, negation, changed symbols and paths, security-sensitive
+requests, ambiguous requests, and adversarial near-matches. Each candidate is
+reranked for the current prompt and checked for scope, generation, capacity,
+dependencies, source signature, recall, score overlap, and safety. The recorded
+[request-identity evaluation](benchmarks/results/issue-14-request-identity.json)
+keeps serving exact-only: case/whitespace canonicalization, order-insensitive
+terms, lexical resemblance, and embedding similarity are evaluated but not
+enabled. The synthetic corpus shows possible contract-equivalent opportunities,
+but production telemetry is insufficient and broader identities produce unsafe
+or incomplete candidates. Those candidates are reported separately from the
+post-guard false-reuse rate, which remains zero. No final response or
+evidence-card reuse is involved.
+
+Exact-only is also the rollback control. Any future non-exact mode must remain
+disabled by default and can be removed or switched off without migrating cache
+state; safety-sensitive, negated, and ambiguous requests remain exact unless a
+separately recorded zero-regression gate proves otherwise.
+
 ## MCP-first workflow
 
 Use `repo://instructions/context-pack` as the portable source of

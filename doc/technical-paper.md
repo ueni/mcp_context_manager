@@ -408,6 +408,31 @@ generation, and sufficient candidate capacity; route is diagnostic only.
 Missing source candidates fall back to a new search. Negative entries expire
 after 30 seconds and are also exact-only.
 
+### Request-identity evaluation boundary
+
+The replayable `benchmark-request-identity` binary compares full exact identity,
+case-and-whitespace canonicalization, order-insensitive term sets, lexical
+Jaccard resemblance, and an explicitly unavailable embedding baseline over the
+versioned `context_request_identity_corpus.v1` fixture. It measures eligible
+opportunity, guarded hit and fallback rates, candidate recall, top-k overlap,
+unsafe-candidate and post-guard false-reuse rates, cold-search latency, and
+current-prompt rerank latency.
+
+Every evaluated non-exact candidate is reranked with the current prompt. A
+candidate is accepted in the counterfactual evaluation only when scope,
+generation, capacity, dependencies, source signature, candidate recall, top-k
+overlap, semantic contract, and safety checks all pass. Negated,
+safety-sensitive, and ambiguous cases fail closed. The evaluation never reuses
+encoded responses or evidence cards.
+
+The v1 result does not authorize serving changes. Only full exact request
+identity remains enabled because production opportunity telemetry is
+insufficient and the non-exact strategies produce stale, unsafe, or incomplete
+candidates in the corpus. A future strategy needs separately recorded
+zero-regression evidence before it can be enabled. Rollback is therefore the
+unchanged exact-only path: keep any future non-exact mode disabled by default or
+remove it, with no cache-state migration.
+
 ### Governed cross-worktree frontier pool
 
 Cross-worktree reuse is opt-in through an operator-owned lineage manifest; no

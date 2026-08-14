@@ -87,10 +87,20 @@
       "scope": []
     },
     {
+      "id": "negated-exact-repeat",
+      "class": "negation",
+      "seed_prompt": "do not reject expired access token",
+      "prompt": "do not reject expired access token",
+      "expected_equivalent": true,
+      "risk": "negated",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
       "id": "changed-symbol-and-path",
       "class": "changed_symbol_path",
-      "seed_prompt": "review validate_access_token",
-      "prompt": "review invalidate_user_session",
+      "seed_prompt": "review auth symbol validate_access_token",
+      "prompt": "review auth symbol invalidate_user_session",
       "expected_equivalent": false,
       "risk": "ordinary",
       "seed_scope": ["src/auth/token.rs"],
@@ -102,6 +112,16 @@
       "seed_prompt": "audit bearer token audience validation",
       "prompt": "audit bearer token bypass audience validation",
       "expected_equivalent": false,
+      "risk": "safety_sensitive",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "security-exact-repeat",
+      "class": "security_query",
+      "seed_prompt": "audit bearer token audience validation",
+      "prompt": "audit bearer token audience validation",
+      "expected_equivalent": true,
       "risk": "safety_sensitive",
       "seed_scope": [],
       "scope": []
@@ -127,6 +147,16 @@
       "scope": []
     },
     {
+      "id": "ambiguous-exact-repeat",
+      "class": "ambiguous_query",
+      "seed_prompt": "fix invalidation",
+      "prompt": "fix invalidation",
+      "expected_equivalent": true,
+      "risk": "ambiguous",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
       "id": "changed-source-signature",
       "class": "changed_symbol_path",
       "seed_prompt": "review frontier generation source signature",
@@ -136,7 +166,9 @@
       "seed_scope": [],
       "scope": [],
       "generation_match": false,
-      "source_signature_match": false
+      "source_signature_match": false,
+      "dependencies_available": false,
+      "candidate_capacity": 2
     }
   ]
 }

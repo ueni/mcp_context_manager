@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use context_index::ProjectIndex;
+use context_index::{ProjectIndex, validate_relative_path};
 use serde::{Deserialize, Serialize};
 
 pub const CORPUS_SCHEMA: &str = "context_request_identity_corpus.v1";
@@ -60,6 +60,8 @@ pub struct EvaluationCase {
     pub source_signature_match: bool,
     #[serde(default = "default_true")]
     pub dependencies_available: bool,
+    #[serde(default)]
+    pub candidate_capacity: Option<usize>,
 }
 
 const fn default_true() -> bool {
@@ -97,6 +99,8 @@ pub struct StrategyReport {
     pub hit_rate_millis: u64,
     pub candidate_recall_millis: u64,
     pub top_k_overlap_millis: u64,
+    pub unsafe_candidate_count: u64,
+    pub unsafe_candidate_rate_millis: u64,
     pub false_reuse_count: u64,
     pub false_reuse_rate_millis: u64,
     pub fallback_count: u64,
@@ -152,7 +156,13 @@ impl Strategy {
 
     fn matches(self, case: &EvaluationCase, lexical_threshold_millis: u64) -> bool {
         match self {
-            Self::Exact => case.seed_prompt == case.prompt,
+            Self::Exact => {
+                case.seed_prompt == case.prompt
+                    && case.seed_scope == case.scope
+                    && case.generation_match
+                    && case.source_signature_match
+                    && case.dependencies_available
+            }
             Self::InertCanonical => {
                 inert_canonical(&case.seed_prompt) == inert_canonical(&case.prompt)
             }
@@ -172,6 +182,7 @@ struct StrategyAccumulator {
     hits: u64,
     recall_total: u64,
     overlap_total: u64,
+    unsafe_candidates: u64,
     false_reuse: u64,
     cold_micros: u64,
     rerank_micros: u64,
@@ -200,6 +211,34 @@ pub fn validate_corpus(corpus: &EvaluationCorpus) -> Result<()> {
     );
     ensure!(!corpus.documents.is_empty(), "corpus needs documents");
     ensure!(!corpus.cases.is_empty(), "corpus needs cases");
+    let document_paths = corpus
+        .documents
+        .iter()
+        .map(|document| document.path.as_str())
+        .collect::<HashSet<_>>();
+    ensure!(
+        document_paths.len() == corpus.documents.len(),
+        "document paths must be unique"
+    );
+    for document in &corpus.documents {
+        ensure!(
+            validate_relative_path(&document.path)? == document.path,
+            "document path must be normalized"
+        );
+    }
+    ensure!(
+        corpus.cases.iter().all(|case| matches!(
+            case.risk.as_str(),
+            "ordinary" | "negated" | "safety_sensitive" | "ambiguous"
+        )),
+        "unsupported risk class"
+    );
+    ensure!(
+        corpus.cases.iter().all(|case| case
+            .candidate_capacity
+            .is_none_or(|capacity| capacity > 0 && capacity <= corpus.frontier_capacity)),
+        "candidate capacity must be in 1..=frontier_capacity"
+    );
     let ids = corpus
         .cases
         .iter()
@@ -251,12 +290,10 @@ pub fn evaluate(corpus: &EvaluationCorpus, index: &ProjectIndex) -> Result<Evalu
                 continue;
             }
 
-            let (mut seed, _) = index.search(
-                &case.seed_prompt,
-                &case.seed_scope,
-                corpus.frontier_capacity,
-            )?;
-            seed.truncate(corpus.frontier_capacity);
+            let candidate_capacity = case.candidate_capacity.unwrap_or(corpus.frontier_capacity);
+            let (mut seed, _) =
+                index.search(&case.seed_prompt, &case.seed_scope, candidate_capacity)?;
+            seed.truncate(candidate_capacity);
             let candidate_ids = seed.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>();
             let rerank_started = Instant::now();
             let (mut reranked, _) =
@@ -279,7 +316,7 @@ pub fn evaluate(corpus: &EvaluationCorpus, index: &ProjectIndex) -> Result<Evalu
                 .iter()
                 .map(|hit| hit.id.as_str())
                 .collect::<BTreeSet<_>>();
-            let recall = scaled_ratio(
+            let recall = scaled_set_ratio(
                 cold_ids
                     .iter()
                     .filter(|id| candidate_set.contains(**id))
@@ -287,17 +324,14 @@ pub fn evaluate(corpus: &EvaluationCorpus, index: &ProjectIndex) -> Result<Evalu
                 cold_ids.len(),
             );
             let overlap =
-                scaled_ratio(cold_ids.intersection(&reranked_ids).count(), cold_ids.len());
+                scaled_set_ratio(cold_ids.intersection(&reranked_ids).count(), cold_ids.len());
             accumulator.recall_total = accumulator.recall_total.saturating_add(recall);
             accumulator.overlap_total = accumulator.overlap_total.saturating_add(overlap);
 
             let guards = [
                 ("scope", case.seed_scope == case.scope),
                 ("generation", case.generation_match),
-                (
-                    "capacity",
-                    candidate_ids.len() >= corpus.top_k && corpus.frontier_capacity >= corpus.top_k,
-                ),
+                ("capacity", candidate_capacity >= corpus.top_k),
                 (
                     "dependencies",
                     case.dependencies_available
@@ -305,7 +339,16 @@ pub fn evaluate(corpus: &EvaluationCorpus, index: &ProjectIndex) -> Result<Evalu
                 ),
                 ("source_signature", case.source_signature_match),
                 ("score_or_recall", recall == 1_000 && overlap == 1_000),
-                ("safety_exact_only", case.risk == "ordinary"),
+                (
+                    "safety_exact_only",
+                    case.risk == "ordinary"
+                        || (case.seed_prompt == case.prompt
+                            && case.seed_scope == case.scope
+                            && case.generation_match
+                            && case.source_signature_match
+                            && case.dependencies_available
+                            && candidate_capacity >= corpus.top_k),
+                ),
                 ("semantic_contract", case.expected_equivalent),
             ];
             let safe = guards.iter().all(|(_, passed)| *passed);
@@ -314,11 +357,15 @@ pub fn evaluate(corpus: &EvaluationCorpus, index: &ProjectIndex) -> Result<Evalu
                     *accumulator.guard_rejections.entry(name).or_default() += 1;
                 }
             }
-            if !case.expected_equivalent || recall < 1_000 || overlap < 1_000 {
-                accumulator.false_reuse = accumulator.false_reuse.saturating_add(1);
+            let unsafe_candidate = !case.expected_equivalent || recall < 1_000 || overlap < 1_000;
+            if unsafe_candidate {
+                accumulator.unsafe_candidates = accumulator.unsafe_candidates.saturating_add(1);
             }
             if safe {
                 accumulator.hits = accumulator.hits.saturating_add(1);
+                if unsafe_candidate {
+                    accumulator.false_reuse = accumulator.false_reuse.saturating_add(1);
+                }
             }
         }
 
@@ -345,6 +392,11 @@ pub fn evaluate(corpus: &EvaluationCorpus, index: &ProjectIndex) -> Result<Evalu
             top_k_overlap_millis: scaled_ratio_u64(
                 accumulator.overlap_total,
                 accumulator.eligible.saturating_mul(1_000),
+            ),
+            unsafe_candidate_count: accumulator.unsafe_candidates,
+            unsafe_candidate_rate_millis: scaled_ratio_u64(
+                accumulator.unsafe_candidates,
+                accumulator.eligible,
             ),
             false_reuse_count: accumulator.false_reuse,
             false_reuse_rate_millis: scaled_ratio_u64(
@@ -470,12 +522,19 @@ fn scaled_ratio(numerator: usize, denominator: usize) -> u64 {
     )
 }
 
-fn scaled_ratio_u64(numerator: u64, denominator: u64) -> u64 {
+fn scaled_set_ratio(numerator: usize, denominator: usize) -> u64 {
     if denominator == 0 {
-        0
+        1_000
     } else {
-        numerator.saturating_mul(1_000) / denominator
+        scaled_ratio(numerator, denominator)
     }
+}
+
+fn scaled_ratio_u64(numerator: u64, denominator: u64) -> u64 {
+    numerator
+        .saturating_mul(1_000)
+        .checked_div(denominator)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -523,6 +582,13 @@ mod tests {
                 .filter(|strategy| strategy.serving_enabled)
                 .all(|strategy| strategy.false_reuse_count == 0)
         );
+        let exact = report
+            .strategies
+            .iter()
+            .find(|strategy| strategy.strategy == "exact_identity")
+            .expect("exact report");
+        assert_eq!(exact.eligible_opportunity_count, 4);
+        assert_eq!(exact.hit_count, 4);
         assert!(!report.gates["production_telemetry_sufficient"]);
     }
 
@@ -534,9 +600,54 @@ mod tests {
             .iter()
             .find(|strategy| strategy.strategy == "lexical_jaccard")
             .expect("lexical report");
-        assert!(lexical.false_reuse_count > 0);
+        assert!(lexical.unsafe_candidate_count > 0);
+        assert_eq!(lexical.false_reuse_count, 0);
         assert!(lexical.fallback_count > 0);
         assert!(lexical.guard_rejections["safety_exact_only"] > 0);
         assert!(lexical.guard_rejections["semantic_contract"] > 0);
+    }
+
+    #[test]
+    fn inert_variant_is_contract_equivalent_but_remains_disabled() {
+        let corpus = parse_corpus(CORPUS).expect("versioned corpus");
+        let inert = corpus
+            .cases
+            .iter()
+            .find(|case| case.class == "whitespace_case_variant")
+            .expect("inert fixture");
+        assert!(inert.expected_equivalent);
+        assert_eq!(
+            inert_canonical(&inert.seed_prompt),
+            inert_canonical(&inert.prompt)
+        );
+
+        let report = report();
+        let strategy = report
+            .strategies
+            .iter()
+            .find(|strategy| strategy.strategy == "inert_case_whitespace")
+            .expect("inert report");
+        assert_eq!(strategy.hit_count, 5);
+        assert!(!strategy.serving_enabled);
+    }
+
+    #[test]
+    fn non_exact_frontiers_exercise_every_validity_guard() {
+        let report = report();
+        let lexical = report
+            .strategies
+            .iter()
+            .find(|strategy| strategy.strategy == "lexical_jaccard")
+            .expect("lexical report");
+        for guard in [
+            "scope",
+            "generation",
+            "capacity",
+            "dependencies",
+            "source_signature",
+            "score_or_recall",
+        ] {
+            assert!(lexical.guard_rejections[guard] > 0, "missing {guard}");
+        }
     }
 }
