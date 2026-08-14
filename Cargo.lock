@@ -322,8 +322,10 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "context-core",
+ "context-index",
  "context-store",
  "contextd",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
