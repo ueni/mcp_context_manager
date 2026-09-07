@@ -452,9 +452,13 @@ client profile, without prompts, paths, ids, or source values.
 A `notify` watcher coalesces events for 50 ms and owns ordinary dirty-state
 transitions. There is no fixed two-second request-path content hash. PollWatcher
 is the event-source fallback when the native watcher is unavailable; watcher
-errors conservatively dirty the project. Explicit `changed_files` and
-`cache_strategy="fresh"` still force full signature verification and cannot
-return a response certified against an older generation.
+errors conservatively dirty the project. Explicit `changed_files` queues
+background verification and overlays current file chunks in the response.
+`cache_strategy="fresh"` waits for the shared refresh; cancelling that caller
+only cancels its wait. Fast/stable requests use the available snapshot and
+revalidate bounded candidate paths before creating cards or deferred evidence.
+The diagnostic `freshness` string is `current`, `refreshing`, or `unverified`;
+it describes retrieval completeness rather than a filesystem transaction.
 
 Native or polling registration becomes healthy (or latches fail-closed) before
 the baseline snapshot load/scan begins, eliminating the pre-registration
@@ -467,9 +471,17 @@ bounded retryable freshness diagnostic instead of publishing stale evidence.
 
 Thread-spawn failure, failure of both native and polling watcher setup,
 runtime watcher errors, and event-channel disconnection persistently latch the
-project into fail-closed full verification for ordinary requests. A failed
-verification returns the stable retryable `context_pack freshness unavailable`
-diagnostic instead of serving stale ordinary cache entries.
+project into background full verification. Ordinary cache reuse is disabled,
+and available-snapshot responses report `unverified`. A failed strict fresh
+verification returns the retryable `context_pack freshness unavailable` error.
+
+Each project coalesces requests into one detached refresh worker. A separate
+process-wide permit pool (`MCP_CONTEXT_REFRESH_CONCURRENCY`, default 2, capped
+at 32) avoids deadlock with requests waiting under request execution permits.
+Tantivy updates delete/add only changed-path documents; manual readers preserve
+the prior committed view. A writer-generation guard rejects updates based on
+an abandoned candidate, allowing a clean rebuild. Metadata copying, snapshot
+persistence, and signature scans remain proportional to repository size.
 
 One shared generated-tree policy is consumed by project discovery, watcher
 filtering, signature traversal, index traversal, and governed Git pathspecs.
@@ -493,7 +505,8 @@ boundary, so same-project cold callers share one build.
 
 A request dropped while queued drops its semaphore future and never starts.
 After a running request expires, its cancellation control is checked between
-files and chunks and before Tantivy commit or index-generation publication.
+files and chunks and before initial index publication. Background refreshes
+have independent lifetimes and may publish after a waiting request expires.
 Governed-lineage Git execution is additionally limited to five seconds and 4
 MiB of output; cancellation kills the child and bounded reaping never extends
 the request indefinitely. Cooperative repository phases terminate within

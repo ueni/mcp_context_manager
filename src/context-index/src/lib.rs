@@ -7,8 +7,8 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tantivy::{
-    Index, IndexReader, ReloadPolicy, TantivyDocument,
+    Index, IndexReader, ReloadPolicy, TantivyDocument, Term,
     collector::TopDocs,
     doc,
     query::{AllQuery, Query, QueryParser},
@@ -238,6 +238,18 @@ struct Fields {
     body: Field,
 }
 
+fn chunk_document(fields: Fields, chunk: &Chunk) -> TantivyDocument {
+    doc!(
+        fields.id => chunk.id.clone(),
+        fields.path => chunk.path.clone(),
+        fields.path_text => chunk.path.clone(),
+        fields.start_line => u64::from(chunk.start_line),
+        fields.end_line => u64::from(chunk.end_line),
+        fields.symbol => chunk.symbol.clone(),
+        fields.body => chunk.content.clone(),
+    )
+}
+
 pub struct ProjectIndex {
     root: PathBuf,
     index: Index,
@@ -250,6 +262,10 @@ pub struct ProjectIndex {
     fingerprints: Arc<BTreeMap<String, FileFingerprint>>,
     corpus_digest: String,
     stats: IndexStats,
+    last_incremental_document_count: Option<usize>,
+    writer_lock: Arc<Mutex<()>>,
+    writer_generation: Arc<AtomicU64>,
+    committed_generation: u64,
 }
 
 impl ProjectIndex {
@@ -311,15 +327,7 @@ impl ProjectIndex {
         let mut writer = index.writer(50_000_000)?;
         for chunk in &chunks {
             check_control(control)?;
-            writer.add_document(doc!(
-                fields.id => chunk.id.clone(),
-                fields.path => chunk.path.clone(),
-                fields.path_text => chunk.path.clone(),
-                fields.start_line => u64::from(chunk.start_line),
-                fields.end_line => u64::from(chunk.end_line),
-                fields.symbol => chunk.symbol.clone(),
-                fields.body => chunk.content.clone(),
-            ))?;
+            writer.add_document(chunk_document(fields, chunk))?;
         }
         check_control(control)?;
         writer.commit()?;
@@ -355,6 +363,10 @@ impl ProjectIndex {
             fingerprints: Arc::new(fingerprints),
             corpus_digest,
             stats,
+            last_incremental_document_count: None,
+            writer_lock: Arc::new(Mutex::new(())),
+            writer_generation: Arc::new(AtomicU64::new(0)),
+            committed_generation: 0,
         })
     }
 
@@ -416,6 +428,7 @@ impl ProjectIndex {
         paths: &[String],
         control: Option<&WorkControl>,
     ) -> Result<Self> {
+        let base_generation = self.committed_generation;
         if paths.is_empty() || paths.len() > 1_024 {
             bail!("incremental refresh requires 1..=1024 changed paths")
         }
@@ -466,14 +479,84 @@ impl ProjectIndex {
             corpus_deduplicated_count: self.stats.corpus_deduplicated_count,
         };
         let stats = stats_from_parts(&chunks, &fingerprints, &snapshot_stats, signature);
-        Self::from_parts(
-            self.root.clone(),
-            chunks,
-            fingerprints,
-            self.corpus_digest.clone(),
+
+        // Keep the existing committed segments and replace only documents for
+        // the changed paths.  The Index handle is cheap to clone; its writer
+        // creates new segments while this instance's manual reader remains
+        // pinned to the old committed view.  The caller serializes candidates
+        // and only publishes one after its signature and metadata agree with
+        // the commit, so a cancelled pre-commit writer cannot affect readers.
+        let index = self.index.clone();
+        let _writer_lock = self
+            .writer_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.writer_generation.load(Ordering::Acquire) != base_generation {
+            bail!("incremental refresh base changed during candidate construction")
+        }
+        let mut writer = index.writer(50_000_000)?;
+        for path in &normalized {
+            check_control(control)?;
+            let _ = writer.delete_term(Term::from_field_text(self.fields.path, path));
+        }
+        for chunk in &chunks {
+            if normalized.contains(&chunk.path) {
+                check_control(control)?;
+                writer.add_document(chunk_document(self.fields, chunk))?;
+            }
+        }
+        check_control(control)?;
+        // Even a failed commit may leave storage ahead of this reader. Mark
+        // the base consumed before committing so recovery cannot mix views.
+        self.writer_generation.fetch_add(1, Ordering::AcqRel);
+        writer.commit()?;
+
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        reader.reload()?;
+
+        let mut chunks_by_path: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut chunks_by_id = HashMap::new();
+        let mut chunks_by_address = HashMap::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            chunks_by_path
+                .entry(chunk.path.clone())
+                .or_default()
+                .push(index);
+            chunks_by_id.insert(chunk.id.clone(), index);
+            chunks_by_address.insert(immutable_candidate_address(&chunk.id), index);
+        }
+
+        let incremental_document_count = chunks
+            .iter()
+            .filter(|chunk| normalized.contains(&chunk.path))
+            .count();
+
+        Ok(Self {
+            root: self.root.clone(),
+            index,
+            reader,
+            fields: self.fields,
+            chunks: Arc::new(chunks),
+            chunks_by_path: Arc::new(chunks_by_path),
+            chunks_by_id: Arc::new(chunks_by_id),
+            chunks_by_address: Arc::new(chunks_by_address),
+            fingerprints: Arc::new(fingerprints),
+            corpus_digest: self.corpus_digest.clone(),
             stats,
-            control,
-        )
+            last_incremental_document_count: Some(incremental_document_count),
+            writer_lock: Arc::clone(&self.writer_lock),
+            writer_generation: Arc::clone(&self.writer_generation),
+            committed_generation: base_generation + 1,
+        })
+    }
+
+    /// Number of Tantivy documents written by the most recent incremental
+    /// refresh. `None` means the index was built from a complete scan.
+    pub fn last_incremental_document_count(&self) -> Option<usize> {
+        self.last_incremental_document_count
     }
 
     pub fn root(&self) -> &Path {
@@ -482,6 +565,72 @@ impl ProjectIndex {
 
     pub fn stats(&self) -> &IndexStats {
         &self.stats
+    }
+
+    /// Returns whether the on-disk text for a path still matches this
+    /// published snapshot. Errors and deleted or unsafe paths are treated as
+    /// mismatches so callers never reuse known-stale evidence.
+    pub fn path_matches_snapshot(&self, path: &str) -> bool {
+        let Ok(path) = validate_relative_path(path) else {
+            return false;
+        };
+        let Some(absolute) = self.regular_source_path(&path) else {
+            return false;
+        };
+        let Ok(metadata) = fs::symlink_metadata(&absolute) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || metadata.is_dir() {
+            return false;
+        }
+        let Ok(Some(text)) = read_text(&absolute) else {
+            return false;
+        };
+        self.fingerprints
+            .get(&path)
+            .is_some_and(|expected| *expected == fingerprint(&text))
+    }
+
+    /// Reads and chunks a current regular text file for a request-side
+    /// overlay while the published Tantivy snapshot is being refreshed.
+    pub fn current_chunks_for_path(&self, path: &str) -> Vec<Chunk> {
+        let Ok(path) = validate_relative_path(path) else {
+            return Vec::new();
+        };
+        if path == "."
+            || path.starts_with("reference-corpus/")
+            || is_ignored_repository_path(Path::new(&path))
+        {
+            return Vec::new();
+        }
+        let Some(absolute) = self.regular_source_path(&path) else {
+            return Vec::new();
+        };
+        let Ok(metadata) = fs::symlink_metadata(&absolute) else {
+            return Vec::new();
+        };
+        if metadata.file_type().is_symlink() || metadata.is_dir() {
+            return Vec::new();
+        }
+        let Ok(Some(text)) = read_text(&absolute) else {
+            return Vec::new();
+        };
+        chunks_for_file(&path, &absolute, &text).unwrap_or_default()
+    }
+
+    fn regular_source_path(&self, path: &str) -> Option<PathBuf> {
+        let mut absolute = self.root.clone();
+        for component in Path::new(path).components() {
+            absolute.push(component);
+            if fs::symlink_metadata(&absolute)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                return None;
+            }
+        }
+        fs::metadata(&absolute).ok()?.is_file().then_some(absolute)
     }
 
     pub fn all_paths(&self) -> Vec<String> {
@@ -1888,12 +2037,14 @@ mod tests {
         index = index
             .refresh_paths_controlled(&["a.rs".to_owned()], None)
             .expect("change");
+        assert_eq!(index.last_incremental_document_count(), Some(1));
         assert_incremental_matches_full(root.path(), &index);
 
         fs::remove_file(root.path().join("b.rs")).expect("delete");
         index = index
             .refresh_paths_controlled(&["b.rs".to_owned()], None)
             .expect("delete");
+        assert_eq!(index.last_incremental_document_count(), Some(0));
         assert_incremental_matches_full(root.path(), &index);
 
         fs::rename(root.path().join("a.rs"), root.path().join("renamed.rs")).expect("rename");
@@ -1921,6 +2072,54 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn incremental_refresh_keeps_old_reader_pinned() {
+        let root = tempfile::tempdir().expect("repository root");
+        fs::write(root.path().join("a.rs"), "fn before_marker() {}\n").expect("source");
+        let old = ProjectIndex::build(root.path()).expect("initial index");
+        fs::write(root.path().join("a.rs"), "fn after_marker() {}\n").expect("change");
+        let refreshed = old
+            .refresh_paths_controlled(&["a.rs".to_owned()], None)
+            .expect("incremental refresh");
+
+        let old_hits = old.search("before_marker", &[], 8).expect("old search").0;
+        let new_hits = refreshed
+            .search("after_marker", &[], 8)
+            .expect("new search")
+            .0;
+        assert!(
+            old_hits
+                .iter()
+                .any(|hit| hit.content.contains("before_marker"))
+        );
+        assert!(
+            new_hits
+                .iter()
+                .any(|hit| hit.content.contains("after_marker"))
+        );
+        assert_eq!(refreshed.last_incremental_document_count(), Some(1));
+    }
+
+    #[test]
+    fn discarded_incremental_candidate_forces_rebase() {
+        let root = tempfile::tempdir().expect("repository root");
+        fs::write(root.path().join("a.rs"), "fn a_before() {}\n").expect("a");
+        fs::write(root.path().join("b.rs"), "fn b_before() {}\n").expect("b");
+        let base = ProjectIndex::build(root.path()).expect("initial index");
+        fs::write(root.path().join("a.rs"), "fn a_after() {}\n").expect("a change");
+        let candidate = base
+            .refresh_paths_controlled(&["a.rs".to_owned()], None)
+            .expect("candidate refresh");
+        drop(candidate);
+        fs::write(root.path().join("b.rs"), "fn b_after() {}\n").expect("b change");
+
+        let error = match base.refresh_paths_controlled(&["b.rs".to_owned()], None) {
+            Ok(_) => panic!("stale base must not mix metadata with committed segments"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("base changed"));
     }
 
     #[test]

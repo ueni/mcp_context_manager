@@ -395,9 +395,10 @@ Repository content is treated as untrusted: prompt-injection signals are
 reported, while secrets and absolute host paths are redacted before output or
 persistence.
 
-Cold engine construction, freshness scans, Tantivy builds, cache/state access,
-and pack construction run behind the global blocking-job cap rather than on a
-Tokio async worker. Requests that expire while queued never start. Running
+Cold engine construction, cache/state access, and pack construction run behind
+the global blocking-job cap rather than on a Tokio async worker. Background
+refresh scans and Tantivy updates use the independent refresh cap described
+below. Requests that expire while queued never start. Running
 requests receive cooperative cancellation between files and chunks and before
 an index commit or generation swap. Governed-lineage Git commands have a fixed
 five-second execution cap, bounded output, and are killed when request
@@ -405,7 +406,8 @@ cancellation wins. Cooperative phases stop within cancellation grace. If a
 blocking phase unexpectedly outlives that grace, the response stays attached
 until the job releases its global permit and active-job counter; Tokio cannot
 abort a live `spawn_blocking` closure safely. Cancellation remains latched so
-the job cannot commit cache, frontier, manifest, or index state. REST reports
+the request job cannot commit cache, frontier, manifest, or initial index state.
+An already scheduled refresh may still publish after its caller leaves. REST reports
 queue/deadline or fail-closed freshness exhaustion as HTTP 503; MCP returns a
 stable retryable `context_pack busy`, `context_pack timed out`, or
 `context_pack freshness unavailable` diagnostic with warmup/retry guidance.
@@ -465,11 +467,26 @@ state fail closed to a clean full rebuild or a bounded retryable freshness
 error. Readers obtain one immutable index handle and therefore observe only the
 old or new complete generation.
 
-Watcher thread startup, native and polling backend setup, runtime errors, and
-channel disconnection latch fail-closed freshness. Ordinary requests then run
-authoritative full verification instead of serving a generation whose source
-events may have been missed; explicit `cache_strategy="fresh"` verification
-remains available.
+Refresh runs once per project in a background worker and survives request
+cancellation. `MCP_CONTEXT_REFRESH_CONCURRENCY` bounds concurrent refreshes
+across projects (default 2, maximum 32), independently of request permits.
+`fast` and `stable` packs use the available snapshot, revalidate candidate
+files, and overlay current contents of explicitly named files. Changed or
+deleted stale candidates are omitted, including from deferred evidence.
+`changed_files` queues work without waiting; `cache_strategy="fresh"` waits
+for shared verification within the caller deadline without cancelling it.
+
+The compact `freshness` response field is diagnostic: `current` means no
+known pending source changes, `refreshing` means retrieval may be incomplete,
+and `unverified` means the watcher cannot certify completeness. Watcher failure
+queues authoritative verification and prevents ordinary cache reuse. Use
+`fresh` when completeness is required. These states do not promise a filesystem
+transaction across concurrent editor writes.
+
+Incremental refresh replaces only changed paths' Tantivy documents and pins
+old readers until publication. Metadata copying and full signature scans still
+scale with repository size. A discarded candidate forces a clean rebase before
+another update can reuse its underlying writer.
 
 Cross-worktree reuse is disabled by default. A deployment may opt in with an
 operator-owned manifest such as:

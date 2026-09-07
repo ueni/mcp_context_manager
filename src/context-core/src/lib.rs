@@ -2,9 +2,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    panic::{AssertUnwindSafe, catch_unwind},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, Condvar, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread,
@@ -13,7 +14,7 @@ use std::{
 
 use anyhow::{Result, anyhow, bail};
 use context_index::{
-    IndexSnapshot, IndexStats, ProjectIndex, SearchHit, SymbolRecord, WorkControl,
+    Chunk, IndexSnapshot, IndexStats, ProjectIndex, SearchHit, SymbolRecord, WorkControl,
     git_exclude_pathspecs, immutable_candidate_address, is_ignored_repository_path,
     normalize_terms, repository_signature_for_project_controlled, validate_relative_path,
 };
@@ -324,6 +325,9 @@ pub struct ContextPackV2 {
     pub evidence: Vec<EvidenceCard>,
     pub more: Option<String>,
     pub reuse: ContextPackReuseV1,
+    /// Diagnostic: freshness of retrieval, not a filesystem transaction.
+    #[serde(default)]
+    pub freshness: String,
 }
 
 pub type EvidenceCard = (String, u8, u32, u32, String, String, u32);
@@ -343,6 +347,7 @@ const SHARED_L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const WARM_MISS_TARGET_MICROS: u64 = 50_000;
 const WATCH_COALESCE_MS: u64 = 50;
 const CHANGE_JOURNAL_MAX_PATHS: usize = 1_024;
+const MAX_REFRESH_CONCURRENCY: usize = 32;
 // Watcher-driven freshness avoids repository-wide request-path polling. Zero
 // is exposed in diagnostics to make the disabled fixed poll explicit.
 const FAST_POLL_INTERVAL_MS: u64 = 0;
@@ -379,6 +384,8 @@ struct CachedAdmission {
 struct ValidityCertificate {
     generation: u64,
     refresh_signature: String,
+    event_epoch: u64,
+    current: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -645,6 +652,10 @@ struct PackSnapshot {
     paths: Vec<String>,
     evidence: Vec<PackEvidenceSnapshot>,
     refresh_signature: String,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    event_epoch: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -662,6 +673,8 @@ struct ContinuationRecord {
     pack_id: String,
     evidence_ids: Vec<String>,
     generation: u64,
+    #[serde(default)]
+    event_epoch: u64,
     refresh_signature: String,
     updated_at_unix_seconds: i64,
     expires_at_unix_seconds: i64,
@@ -837,6 +850,7 @@ const REPEAT_DISTANCE_BUCKETS: [&str; 5] = [
 struct BuiltPack {
     bytes: Vec<u8>,
     telemetry: PackTelemetry,
+    validity: ValidityCertificate,
 }
 
 const CLIENT_PROFILE_BUCKETS: [&str; 6] =
@@ -1091,6 +1105,249 @@ struct FreshnessState {
     changed_paths: Mutex<BTreeSet<String>>,
     journal_overflow: AtomicBool,
     watcher_status: AtomicU8,
+}
+
+#[derive(Default)]
+struct RefreshCoordinatorState {
+    pending_paths: BTreeSet<String>,
+    pending_force: bool,
+    pending_job: u64,
+    next_job: u64,
+    completed_job: u64,
+    completed_epoch: u64,
+    running: bool,
+    last_error: Option<String>,
+}
+
+struct RefreshCoordinator {
+    state: Mutex<RefreshCoordinatorState>,
+    wake: Condvar,
+    shared: Arc<RefreshShared>,
+}
+
+struct RefreshShared {
+    index: Arc<RwLock<Arc<ProjectIndex>>>,
+    freshness: Arc<FreshnessState>,
+    project_id: String,
+    metrics: Arc<EngineMetrics>,
+    l0: WireCache<PackCacheKey, Arc<CachedPack>>,
+    frontiers: Arc<Mutex<FrontierState>>,
+    index_snapshot_path: std::path::PathBuf,
+    #[cfg(test)]
+    refresh_hook: Arc<Mutex<Option<RefreshHook>>>,
+}
+
+#[cfg(test)]
+impl RefreshShared {
+    fn run_refresh_hook(&self, phase: &'static str) {
+        let hook = self
+            .refresh_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(phase);
+        }
+    }
+}
+
+#[derive(Default)]
+struct RefreshLimiterState {
+    active: usize,
+}
+
+struct RefreshLimiter {
+    state: Mutex<RefreshLimiterState>,
+    wake: Condvar,
+    limit: usize,
+}
+
+struct RefreshPermit {
+    limiter: Arc<RefreshLimiter>,
+}
+
+impl RefreshLimiter {
+    fn global() -> Arc<Self> {
+        static GLOBAL: OnceLock<Arc<RefreshLimiter>> = OnceLock::new();
+        GLOBAL
+            .get_or_init(|| {
+                let limit = std::env::var("MCP_CONTEXT_REFRESH_CONCURRENCY")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| *value > 0)
+                    .map(|value| value.min(MAX_REFRESH_CONCURRENCY))
+                    .unwrap_or(2);
+                Arc::new(Self {
+                    state: Mutex::new(RefreshLimiterState::default()),
+                    wake: Condvar::new(),
+                    limit,
+                })
+            })
+            .clone()
+    }
+
+    fn acquire(self: &Arc<Self>) -> RefreshPermit {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.active >= self.limit {
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.active += 1;
+        RefreshPermit {
+            limiter: Arc::clone(self),
+        }
+    }
+}
+
+impl Drop for RefreshPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state.active.saturating_sub(1);
+        self.limiter.wake.notify_one();
+    }
+}
+
+impl RefreshCoordinator {
+    fn request(
+        self: &Arc<Self>,
+        force: bool,
+        explicit_paths: &[String],
+        control: Option<&WorkControl>,
+    ) -> Result<(bool, bool)> {
+        let starting_generation = self.shared.freshness.generation.load(Ordering::Acquire);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("refresh coordinator lock poisoned"))?;
+        let requested_job = if state.running
+            && state.pending_job > state.completed_job
+            && explicit_paths.is_empty()
+        {
+            state.pending_job
+        } else {
+            state.next_job = state.next_job.saturating_add(1);
+            state.pending_job = state.next_job;
+            state.pending_job
+        };
+        state.pending_force |= force || !explicit_paths.is_empty();
+        state.pending_paths.extend(explicit_paths.iter().cloned());
+        if state.pending_paths.len() > CHANGE_JOURNAL_MAX_PATHS {
+            state.pending_paths.clear();
+            state.pending_force = true;
+            self.shared
+                .freshness
+                .journal_overflow
+                .store(true, Ordering::Release);
+        }
+        if !state.running {
+            state.running = true;
+            let worker = Arc::clone(self);
+            thread::Builder::new()
+                .name("context-refresh".to_owned())
+                .spawn(move || worker.run())
+                .map_err(|error| {
+                    state.running = false;
+                    anyhow!("failed to start refresh worker: {error}")
+                })?;
+        }
+        self.wake.notify_one();
+        drop(state);
+
+        if !force {
+            return Ok((true, false));
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("refresh coordinator lock poisoned"))?;
+        loop {
+            if let Some(control) = control {
+                control.check()?;
+            }
+            if state.completed_job >= requested_job
+                && (!state.running || state.pending_job <= state.completed_job)
+            {
+                if let Some(error) = state.last_error.as_ref() {
+                    bail!("{error}");
+                }
+                return Ok((
+                    true,
+                    self.shared.freshness.generation.load(Ordering::Acquire) != starting_generation,
+                ));
+            }
+            let (next, _) = self
+                .wake
+                .wait_timeout(state, StdDuration::from_millis(20))
+                .map_err(|_| anyhow!("refresh coordinator wait poisoned"))?;
+            state = next;
+        }
+    }
+
+    fn run(self: Arc<Self>) {
+        loop {
+            let (job, force, paths, starting_epoch) = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while state.pending_job <= state.completed_job {
+                    let current_epoch = self.shared.freshness.event_epoch.load(Ordering::Acquire);
+                    if current_epoch > state.completed_epoch {
+                        state.next_job = state.next_job.saturating_add(1);
+                        state.pending_job = state.next_job;
+                        state.pending_force = true;
+                        break;
+                    }
+                    let (next, _) = self
+                        .wake
+                        .wait_timeout(state, StdDuration::from_millis(100))
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state = next;
+                    if state.pending_job <= state.completed_job {
+                        state.running = false;
+                        return;
+                    }
+                }
+                let job = state.pending_job;
+                let force = state.pending_force;
+                let starting_epoch = self.shared.freshness.event_epoch.load(Ordering::Acquire);
+                let paths = std::mem::take(&mut state.pending_paths)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                state.pending_force = false;
+                (job, force, paths, starting_epoch)
+            };
+
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let _permit = RefreshLimiter::global().acquire();
+                ProjectEngine::refresh_index_sync(&self.shared, force, &paths, None)
+            }))
+            .unwrap_or_else(|_| Err(anyhow!("refresh worker panicked")));
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.completed_job = state.completed_job.max(job);
+            state.completed_epoch = self.shared.freshness.event_epoch.load(Ordering::Acquire);
+            state.last_error = result.as_ref().err().map(ToString::to_string);
+            if self.shared.freshness.event_epoch.load(Ordering::Acquire) > starting_epoch {
+                state.next_job = state.next_job.saturating_add(1);
+                state.pending_job = state.next_job;
+                state.pending_force = true;
+            }
+            self.wake.notify_all();
+        }
+    }
 }
 
 const WATCHER_STARTING: u8 = 0;
@@ -2557,25 +2814,26 @@ impl Drop for WatchGuard {
 }
 
 pub struct ProjectEngine {
-    index: RwLock<Arc<ProjectIndex>>,
+    index: Arc<RwLock<Arc<ProjectIndex>>>,
     store: Arc<StateStore>,
     project_id: String,
     l0: Cache<PackCacheKey, Arc<CachedPack>>,
-    frontiers: Mutex<FrontierState>,
+    frontiers: Arc<Mutex<FrontierState>>,
     frontier_admissions: Mutex<FrontierAdmissionTracker>,
     pack_snapshots: Mutex<HashMap<String, Arc<PackSnapshot>>>,
     continuation_lock: Mutex<()>,
     deferred_references: Mutex<HashMap<String, ReferenceValidation>>,
     freshness: Arc<FreshnessState>,
-    refresh_lock: Mutex<()>,
-    metrics: EngineMetrics,
+    metrics: Arc<EngineMetrics>,
     usage_monitor: Arc<UsageMonitor>,
     lineage_seed: String,
     governed_lineage: Option<GovernedFrontierLineage>,
     shared_frontiers: Option<Arc<SharedFrontierCache>>,
+    #[cfg(test)]
     index_snapshot_path: std::path::PathBuf,
     #[cfg(test)]
-    refresh_hook: Mutex<Option<RefreshHook>>,
+    refresh_hook: Arc<Mutex<Option<RefreshHook>>>,
+    refresh_coordinator: Arc<RefreshCoordinator>,
     _watcher: WatchGuard,
 }
 
@@ -2708,7 +2966,7 @@ impl ProjectEngine {
         let pack_snapshots = load_pack_snapshots(&store)?;
         let deferred_references = load_deferred_references(&store)?;
         let (active_references, total_references) = reference_counts(&store)?;
-        let metrics = EngineMetrics::default();
+        let metrics = Arc::new(EngineMetrics::default());
         metrics
             .active_references
             .store(active_references, Ordering::Relaxed);
@@ -2721,26 +2979,47 @@ impl ProjectEngine {
             .weigher(|key: &PackCacheKey, value: &Arc<CachedPack>| l0_entry_weight(key, value))
             .time_to_idle(l0_idle)
             .build();
+        let index = Arc::new(RwLock::new(index));
+        let frontiers = Arc::new(Mutex::new(frontiers));
+        #[cfg(test)]
+        let refresh_hook = Arc::new(Mutex::new(None));
+        let refresh_shared = Arc::new(RefreshShared {
+            index: Arc::clone(&index),
+            freshness: Arc::clone(&freshness),
+            project_id: project_id.clone(),
+            metrics: Arc::clone(&metrics),
+            l0: l0.clone(),
+            frontiers: Arc::clone(&frontiers),
+            index_snapshot_path: index_snapshot_path.clone(),
+            #[cfg(test)]
+            refresh_hook: Arc::clone(&refresh_hook),
+        });
+        let refresh_coordinator = Arc::new(RefreshCoordinator {
+            state: Mutex::new(RefreshCoordinatorState::default()),
+            wake: Condvar::new(),
+            shared: refresh_shared,
+        });
         Ok(Self {
-            index: RwLock::new(index),
+            index,
             store,
             project_id,
             l0,
-            frontiers: Mutex::new(frontiers),
+            frontiers,
             frontier_admissions: Mutex::new(FrontierAdmissionTracker::default()),
             pack_snapshots: Mutex::new(pack_snapshots),
             continuation_lock: Mutex::new(()),
             deferred_references: Mutex::new(deferred_references),
             freshness,
-            refresh_lock: Mutex::new(()),
             metrics,
             usage_monitor,
             lineage_seed,
             governed_lineage,
             shared_frontiers,
+            #[cfg(test)]
             index_snapshot_path,
             #[cfg(test)]
-            refresh_hook: Mutex::new(None),
+            refresh_hook,
+            refresh_coordinator,
             _watcher: watcher,
         })
     }
@@ -2753,23 +3032,22 @@ impl ProjectEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
-    #[cfg(test)]
-    fn run_refresh_hook(&self, phase: &'static str) {
-        let hook = self
-            .refresh_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(hook) = hook {
-            hook(phase);
-        }
-    }
-
     pub fn index(&self) -> Arc<ProjectIndex> {
         self.index
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn index_generation(&self) -> (Arc<ProjectIndex>, u64) {
+        let index = self
+            .index
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            Arc::clone(&index),
+            self.freshness.generation.load(Ordering::Acquire),
+        )
     }
 
     fn l0_storage_stats(&self) -> L0StorageStats {
@@ -2914,10 +3192,7 @@ impl ProjectEngine {
                     cached: Arc::new(CachedPack {
                         bytes: Arc::new(pack.bytes),
                         reference_validations: Arc::new(Vec::new()),
-                        validity: ValidityCertificate {
-                            generation: self.freshness.generation.load(Ordering::Acquire),
-                            refresh_signature: self.index().stats().refresh_signature.clone(),
-                        },
+                        validity: pack.validity,
                         telemetry: pack.telemetry,
                     }),
                     outcome: PackCacheOutcome::Uncached,
@@ -2968,10 +3243,31 @@ impl ProjectEngine {
     ) -> Result<CachedAdmission> {
         request.validate_limits()?;
         self.validate_project_selector(request.project_id.as_deref(), request.root_uri.as_deref())?;
-        let index = self.index();
-        let generation = self.freshness.generation.load(Ordering::Acquire);
+        let (index, generation) = self.index_generation();
         let refresh_signature = index.stats().refresh_signature.clone();
         let explicit_paths = normalized_explicit_paths(request)?;
+        // A watcher event invalidates cached bytes immediately.  The
+        // background refresh may still be constructing the next snapshot, so
+        // serve an uncached pack from the currently published generation
+        // instead of repeatedly returning a cached pre-event response.
+        if self.freshness.dirty.load(Ordering::Acquire) {
+            let pack = self.build_context_pack(request, explicit_reuse_diagnostic(request))?;
+            let response: ContextPackV2 = serde_json::from_slice(&pack.bytes)?;
+            let reference_validations = response
+                .more
+                .into_iter()
+                .map(|reference_id| self.cached_reference_validation(&reference_id))
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(CachedAdmission {
+                cached: Arc::new(CachedPack {
+                    bytes: Arc::new(pack.bytes),
+                    reference_validations: Arc::new(reference_validations),
+                    validity: pack.validity,
+                    telemetry: pack.telemetry,
+                }),
+                outcome: PackCacheOutcome::Uncached,
+            });
+        }
         let key = l0_cache_key(request, &explicit_paths, generation, &refresh_signature)?;
         if let Some(cached) = self.l0.get(&key).await {
             match self.cached_pack_is_valid(&cached, generation, &refresh_signature) {
@@ -3009,10 +3305,7 @@ impl ProjectEngine {
                 Ok::<Arc<CachedPack>, anyhow::Error>(Arc::new(CachedPack {
                     bytes: Arc::new(pack.bytes),
                     reference_validations: Arc::new(reference_validations),
-                    validity: ValidityCertificate {
-                        generation,
-                        refresh_signature,
-                    },
+                    validity: pack.validity,
                     telemetry: pack.telemetry,
                 }))
             })
@@ -3056,9 +3349,23 @@ impl ProjectEngine {
             });
         }
 
+        if self.freshness.dirty.load(Ordering::Acquire) {
+            return Ok(PreparedContinuation {
+                request: request.clone(),
+                state_key,
+                reuse: ContextPackReuseV1 {
+                    delta_applied: false,
+                    source: "continuation".to_owned(),
+                    status: "stale_generation".to_owned(),
+                    wire_tokens_avoided_est: 0,
+                },
+            });
+        }
+
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let generation = self.freshness.generation.load(Ordering::Acquire);
-        let refresh_signature = self.index().stats().refresh_signature.clone();
+        let (index, generation) = self.index_generation();
+        let refresh_signature = index.stats().refresh_signature.clone();
+        let event_epoch = self.freshness.event_epoch.load(Ordering::Acquire);
         let stored = self
             .store
             .get_json(&state_key)?
@@ -3071,6 +3378,7 @@ impl ProjectEngine {
             Some(record) if record.expires_at_unix_seconds <= now => (None, "expired"),
             Some(record)
                 if record.generation != generation
+                    || record.event_epoch != event_epoch
                     || record.refresh_signature != refresh_signature =>
             {
                 (None, "stale_generation")
@@ -3108,7 +3416,8 @@ impl ProjectEngine {
             schema: "context_pack.continuation.v1".to_owned(),
             pack_id: response.id,
             evidence_ids: snapshot.evidence.into_iter().map(|item| item.id).collect(),
-            generation: self.freshness.generation.load(Ordering::Acquire),
+            generation: snapshot.generation,
+            event_epoch: snapshot.event_epoch,
             refresh_signature: snapshot.refresh_signature,
             updated_at_unix_seconds: now,
             expires_at_unix_seconds: now.saturating_add(CONTINUATION_TTL_SECONDS),
@@ -3170,8 +3479,14 @@ impl ProjectEngine {
         generation: u64,
         refresh_signature: &str,
     ) -> Result<bool> {
-        if cached.validity.generation != generation
+        let (current, current_generation) = self.index_generation();
+        if !cached.validity.current
+            || cached.validity.generation != generation
             || cached.validity.refresh_signature != refresh_signature
+            || generation != current_generation
+            || refresh_signature != current.stats().refresh_signature
+            || cached.validity.event_epoch != self.freshness.event_epoch.load(Ordering::Acquire)
+            || self.freshness.dirty.load(Ordering::Acquire)
         {
             return Ok(false);
         }
@@ -3222,10 +3537,50 @@ impl ProjectEngine {
         self.validate_project_selector(request.project_id.as_deref(), request.root_uri.as_deref())?;
 
         let explicit_paths = normalized_explicit_paths(request)?;
-        let index = self.index();
+        let (index, generation) = self.index_generation();
+        let event_epoch = self.freshness.event_epoch.load(Ordering::Acquire);
         let retrieval_started = Instant::now();
         let (candidates, terms, frontier_outcome, lineage) =
             self.retrieve_candidates(&index, request, &explicit_paths)?;
+        let mut checked_paths = HashMap::new();
+        let mut candidates = candidates
+            .into_iter()
+            .filter(|hit| {
+                *checked_paths.entry(hit.path.clone()).or_insert_with(|| {
+                    // Corpus evidence has its own provenance checks and cannot
+                    // be overlaid from a repository-relative source path.
+                    if hit.path.starts_with("@corpus/") {
+                        !self.freshness.dirty.load(Ordering::Acquire)
+                    } else {
+                        index.path_matches_snapshot(&hit.path)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for path in &explicit_paths {
+            if checked_paths.get(path) == Some(&true) {
+                continue;
+            }
+            let mut chunks = index.current_chunks_for_path(path);
+            chunks.sort_by_cached_key(|chunk| {
+                let body = chunk.content.to_lowercase();
+                let symbol = chunk.symbol.to_lowercase();
+                let relevance = terms
+                    .iter()
+                    .map(|term| {
+                        usize::from(body.contains(term.as_str()))
+                            + 4 * usize::from(symbol.contains(term.as_str()))
+                    })
+                    .sum::<usize>();
+                (std::cmp::Reverse(relevance), chunk.start_line)
+            });
+            for chunk in chunks.into_iter().take(usize::from(request.max_items)) {
+                if candidates.iter().any(|candidate| candidate.id == chunk.id) {
+                    continue;
+                }
+                candidates.push(search_hit_from_chunk(chunk));
+            }
+        }
         let retrieval_micros =
             u64::try_from(retrieval_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let selected = select_hits(
@@ -3314,6 +3669,8 @@ impl ProjectEngine {
             paths: paths.clone(),
             evidence: snapshots,
             refresh_signature: index.stats().refresh_signature.clone(),
+            generation,
+            event_epoch,
         });
         current_work_checkpoint()?;
         let new_snapshot = self
@@ -3346,6 +3703,24 @@ impl ProjectEngine {
             evidence,
             more,
             reuse: reuse.clone(),
+            freshness: if self.freshness.watcher_requires_verification()
+                || self
+                    .refresh_coordinator
+                    .state
+                    .lock()
+                    .map(|state| state.last_error.is_some())
+                    .unwrap_or(true)
+            {
+                "unverified"
+            } else if self.freshness.dirty.load(Ordering::Acquire)
+                || self.freshness.generation.load(Ordering::Acquire) != generation
+                || checked_paths.values().any(|matches| !matches)
+            {
+                "refreshing"
+            } else {
+                "current"
+            }
+            .to_owned(),
         };
         let serialization_started = Instant::now();
         let mut encoded = Vec::with_capacity(512);
@@ -3391,6 +3766,12 @@ impl ProjectEngine {
         Ok(BuiltPack {
             telemetry,
             bytes: encoded,
+            validity: ValidityCertificate {
+                generation,
+                event_epoch,
+                refresh_signature: index.stats().refresh_signature.clone(),
+                current: response.freshness == "current",
+            },
         })
     }
 
@@ -4109,10 +4490,33 @@ impl ProjectEngine {
         request: &ContextPackRequest,
         control: Option<&WorkControl>,
     ) -> Result<(bool, bool)> {
-        let force =
-            request.cache_strategy == CacheStrategy::Fresh || !request.changed_files.is_empty();
+        let force = request.cache_strategy == CacheStrategy::Fresh;
+        normalized_explicit_paths(request)?;
+        let index = self.index();
+        let changed_paths = request
+            .changed_files
+            .iter()
+            .filter(|path| !index.path_matches_snapshot(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !changed_paths.is_empty() {
+            let pending = self
+                .freshness
+                .changed_paths
+                .lock()
+                .map_err(|_| anyhow!("change journal lock poisoned"))?;
+            let newly_dirty = changed_paths
+                .iter()
+                .filter(|path| !pending.contains(*path))
+                .cloned()
+                .collect::<Vec<_>>();
+            drop(pending);
+            if !newly_dirty.is_empty() {
+                record_watcher_event(&self.freshness, newly_dirty, false);
+            }
+        }
         let watcher_requires_verification = self.freshness.watcher_requires_verification();
-        let result = self.refresh_index_with_paths(force, &request.changed_files, control);
+        let result = self.refresh_index_with_paths(force, &changed_paths, control);
         match result {
             Err(error)
                 if (watcher_requires_verification
@@ -4136,7 +4540,12 @@ impl ProjectEngine {
         force: bool,
         control: Option<&WorkControl>,
     ) -> Result<(bool, bool)> {
-        self.refresh_index_with_paths(force, &[], control)
+        // Lookup/admin callers retain their existing complete-index contract.
+        // Packs use ensure_fresh_controlled's available-snapshot policy.
+        let wait = force
+            || self.freshness.dirty.load(Ordering::Acquire)
+            || self.freshness.watcher_requires_verification();
+        self.refresh_index_with_paths(wait, &[], control)
     }
 
     fn refresh_index_with_paths(
@@ -4153,18 +4562,35 @@ impl ProjectEngine {
         let watcher_ready = self.freshness.dirty.load(Ordering::Acquire)
             && now.saturating_sub(self.freshness.last_event_ms.load(Ordering::Acquire))
                 >= WATCH_COALESCE_MS;
+        if !force && explicit_paths.is_empty() && !watcher_requires_verification && !watcher_ready {
+            return Ok((false, false));
+        }
+        self.refresh_coordinator
+            .request(force, explicit_paths, control)
+    }
+
+    fn refresh_index_sync(
+        shared: &RefreshShared,
+        force: bool,
+        explicit_paths: &[String],
+        control: Option<&WorkControl>,
+    ) -> Result<(bool, bool)> {
+        if let Some(control) = control {
+            control.check()?;
+        }
+        let now = now_millis();
+        let watcher_requires_verification = shared.freshness.watcher_requires_verification();
+        let watcher_ready = shared.freshness.dirty.load(Ordering::Acquire)
+            && now.saturating_sub(shared.freshness.last_event_ms.load(Ordering::Acquire))
+                >= WATCH_COALESCE_MS;
         if !force && !watcher_requires_verification && !watcher_ready {
             return Ok((false, false));
         }
 
-        let _refresh = self
-            .refresh_lock
-            .lock()
-            .map_err(|_| anyhow!("index refresh lock poisoned"))?;
         let now = now_millis();
-        let watcher_requires_verification = self.freshness.watcher_requires_verification();
-        let watcher_ready = self.freshness.dirty.load(Ordering::Acquire)
-            && now.saturating_sub(self.freshness.last_event_ms.load(Ordering::Acquire))
+        let watcher_requires_verification = shared.freshness.watcher_requires_verification();
+        let watcher_ready = shared.freshness.dirty.load(Ordering::Acquire)
+            && now.saturating_sub(shared.freshness.last_event_ms.load(Ordering::Acquire))
                 >= WATCH_COALESCE_MS;
         if !force && !watcher_requires_verification && !watcher_ready {
             return Ok((false, false));
@@ -4176,59 +4602,65 @@ impl ProjectEngine {
             if let Some(control) = control {
                 control.check()?;
             }
-            let current = self.index();
+            let current = shared
+                .index
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let (snapshot_epoch, mut changed_paths) = {
-                let journal = self
+                let journal = shared
                     .freshness
                     .changed_paths
                     .lock()
                     .map_err(|_| anyhow!("change journal lock poisoned"))?;
                 (
-                    self.freshness.event_epoch.load(Ordering::Acquire),
+                    shared.freshness.event_epoch.load(Ordering::Acquire),
                     journal.clone(),
                 )
             };
             changed_paths.extend(explicit_paths.iter().cloned());
-            let overflow = self.freshness.journal_overflow.load(Ordering::Acquire);
+            let overflow = shared.freshness.journal_overflow.load(Ordering::Acquire);
             let scan_started = Instant::now();
             let signature = repository_signature_for_project_controlled(
                 current.root(),
-                Some(&self.project_id),
+                Some(&shared.project_id),
                 control,
             )?;
-            self.metrics.signature_scan_micros.fetch_add(
+            shared.metrics.signature_scan_micros.fetch_add(
                 u64::try_from(scan_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
             #[cfg(test)]
-            self.run_refresh_hook("after_signature_scan");
-            self.freshness.last_poll_ms.store(now, Ordering::Release);
+            shared.run_refresh_hook("after_signature_scan");
+            shared.freshness.last_poll_ms.store(now, Ordering::Release);
 
             // Never consume a journal snapshot if an event arrived while its
             // authoritative signature was being computed.
-            if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+            if shared.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
                 require_full_rebuild = true;
                 continue;
             }
             if signature == current.stats().refresh_signature {
-                let mut journal = self
+                let mut journal = shared
                     .freshness
                     .changed_paths
                     .lock()
                     .map_err(|_| anyhow!("change journal lock poisoned"))?;
-                if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+                if shared.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
                     require_full_rebuild = true;
                     continue;
                 }
                 journal.clear();
-                let watcher_failed = self.freshness.watcher_failed();
-                self.freshness
+                let watcher_failed = shared.freshness.watcher_failed();
+                shared
+                    .freshness
                     .journal_overflow
                     .store(watcher_failed, Ordering::Release);
-                self.freshness
+                shared
+                    .freshness
                     .dirty
                     .store(watcher_failed, Ordering::Release);
-                self.metrics.refresh_micros.fetch_add(
+                shared.metrics.refresh_micros.fetch_add(
                     u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
@@ -4245,7 +4677,7 @@ impl ProjectEngine {
                         _ => (
                             ProjectIndex::build_for_project_controlled(
                                 current.root(),
-                                Some(&self.project_id),
+                                Some(&shared.project_id),
                                 control,
                             )?,
                             false,
@@ -4256,7 +4688,7 @@ impl ProjectEngine {
                     (
                         ProjectIndex::build_for_project_controlled(
                             current.root(),
-                            Some(&self.project_id),
+                            Some(&shared.project_id),
                             control,
                         )?,
                         false,
@@ -4264,8 +4696,8 @@ impl ProjectEngine {
                     )
                 };
             #[cfg(test)]
-            self.run_refresh_hook("after_index_build");
-            if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+            shared.run_refresh_hook("after_index_build");
+            if shared.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
                 require_full_rebuild = true;
                 continue;
             }
@@ -4276,15 +4708,15 @@ impl ProjectEngine {
             let verification_started = Instant::now();
             let publication_signature = repository_signature_for_project_controlled(
                 current.root(),
-                Some(&self.project_id),
+                Some(&shared.project_id),
                 control,
             )?;
-            self.metrics.signature_scan_micros.fetch_add(
+            shared.metrics.signature_scan_micros.fetch_add(
                 u64::try_from(verification_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
             if replacement.stats().refresh_signature != publication_signature
-                || self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch
+                || shared.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch
             {
                 require_full_rebuild = true;
                 continue;
@@ -4294,8 +4726,8 @@ impl ProjectEngine {
                 control.check()?;
             }
             let state_started = Instant::now();
-            persist_index_snapshot(&self.index_snapshot_path, &replacement, control)?;
-            self.metrics.index_state_io_micros.fetch_add(
+            persist_index_snapshot(&shared.index_snapshot_path, &replacement, control)?;
+            shared.metrics.index_state_io_micros.fetch_add(
                 u64::try_from(state_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
@@ -4306,58 +4738,67 @@ impl ProjectEngine {
             // Watcher event recording takes the same journal lock. Holding it
             // across the final epoch check and generation swap prevents a late
             // event from being cleared as part of the consumed snapshot.
-            let mut journal = self
+            let mut journal = shared
                 .freshness
                 .changed_paths
                 .lock()
                 .map_err(|_| anyhow!("change journal lock poisoned"))?;
-            if self.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
+            if shared.freshness.event_epoch.load(Ordering::Acquire) != snapshot_epoch {
                 require_full_rebuild = true;
                 continue;
             }
-            *self
+            let mut published = shared
                 .index
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
-            self.freshness.generation.fetch_add(1, Ordering::AcqRel);
-            self.metrics.refreshes.fetch_add(1, Ordering::Relaxed);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *published = replacement;
+            shared.freshness.generation.fetch_add(1, Ordering::AcqRel);
+            drop(published);
+            shared.metrics.refreshes.fetch_add(1, Ordering::Relaxed);
             if incremental {
-                self.metrics
+                shared
+                    .metrics
                     .incremental_refreshes
                     .fetch_add(1, Ordering::Relaxed);
             } else {
-                self.metrics.full_refreshes.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .metrics
+                    .full_refreshes
+                    .fetch_add(1, Ordering::Relaxed);
             }
             if fallback {
-                self.metrics
+                shared
+                    .metrics
                     .incremental_fallbacks
                     .fetch_add(1, Ordering::Relaxed);
             }
             journal.clear();
-            let watcher_failed = self.freshness.watcher_failed();
-            self.freshness
+            let watcher_failed = shared.freshness.watcher_failed();
+            shared
+                .freshness
                 .journal_overflow
                 .store(watcher_failed, Ordering::Release);
-            self.freshness
+            shared
+                .freshness
                 .dirty
                 .store(watcher_failed, Ordering::Release);
             drop(journal);
 
-            self.invalidate_l0();
-            let mut frontiers = self
+            shared.l0.invalidate_all();
+            let mut frontiers = shared
                 .frontiers
                 .lock()
                 .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
             frontiers.records.clear();
             frontiers.bytes = 0;
-            self.metrics.refresh_micros.fetch_add(
+            shared.metrics.refresh_micros.fetch_add(
                 u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
             return Ok((true, true));
         }
 
-        self.metrics.refresh_micros.fetch_add(
+        shared.metrics.refresh_micros.fetch_add(
             u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
@@ -6220,7 +6661,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
             json!(["context_pack.v2"]),
             json!({
                 "prompt": "Required non-whitespace task text after trimming; invalid values return `prompt is required`.",
-                "changed_files": "Changed repository paths.",
+                "changed_files": "Changed repository paths; queues background refresh and overlays current evidence without waiting unless cache_strategy is fresh.",
                 "focus_paths": "Paths to prioritize.",
                 "memory_session": "Opt-in project-local continuation key; reuses the prior valid pack and evidence for 24 hours.",
                 "client_profile": "codex, claude, copilot, generic.",
@@ -6230,7 +6671,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "max_items": "Range 1 to 32, default 8.",
                 "max_source_tokens": "Range 0 to 4096, default 512.",
                 "evidence_policy": "reference, balanced, source.",
-                "cache_strategy": "fast, stable, fresh.",
+                "cache_strategy": "fast/stable use revalidated available evidence; fresh waits for shared refresh. Response freshness is diagnostic: current, refreshing, or unverified.",
                 "base_pack": "Previous pack id for delta generation.",
                 "known_evidence": "Evidence ids already held by the client; non-empty explicit delta fields override continuation-derived state."
             }),
@@ -7002,6 +7443,19 @@ fn select_hits<'a>(
         }
     }
     selected
+}
+
+fn search_hit_from_chunk(chunk: Chunk) -> SearchHit {
+    SearchHit {
+        id: chunk.id,
+        path: chunk.path,
+        start_line: chunk.start_line,
+        end_line: chunk.end_line,
+        symbol: chunk.symbol,
+        content: chunk.content,
+        score: 0.0,
+        explicit: true,
+    }
 }
 
 fn delta_evidence(
@@ -10619,6 +11073,103 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn cancelled_fresh_waiter_does_not_cancel_background_refresh() {
+        let root = tempdir().expect("repository root");
+        let state = tempdir().expect("state root");
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn before_refresh() {}\n").expect("initial source");
+        let engine = Arc::new(
+            ProjectEngine::build_with_state(root.path(), state.path(), "cancelled-waiter")
+                .expect("project engine"),
+        );
+        engine._watcher.stop.store(true, Ordering::Release);
+        thread::sleep(StdDuration::from_millis(100));
+        let initial = engine.index().stats().refresh_signature.clone();
+        fs::write(&source, "fn after_refresh() {}\n").expect("changed source");
+        record_watcher_event(&engine.freshness, ["lib.rs".to_owned()], false);
+        engine.freshness.last_event_ms.store(0, Ordering::Release);
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let hook_entered = Arc::clone(&entered);
+        let hook_resume = Arc::clone(&resume);
+        let paused = AtomicBool::new(false);
+        engine.set_refresh_hook(Arc::new(move |phase| {
+            if phase == "after_signature_scan" && !paused.swap(true, Ordering::AcqRel) {
+                hook_entered.wait();
+                hook_resume.wait();
+            }
+        }));
+
+        let control = WorkControl::new(Instant::now() + StdDuration::from_secs(5));
+        let waiter_control = control.clone();
+        let waiter_engine = Arc::clone(&engine);
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "fresh refresh",
+            "cache_strategy": "fresh"
+        }))
+        .expect("fresh request");
+        let waiter = thread::spawn(move || {
+            waiter_engine.ensure_fresh_controlled(&request, Some(&waiter_control))
+        });
+        entered.wait();
+        let fast: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "after_refresh", "cache_strategy": "fast",
+            "changed_files": ["lib.rs"], "evidence_policy": "source"
+        }))
+        .expect("fast request");
+        let started = Instant::now();
+        let bytes = engine.context_pack(&fast).expect("available snapshot pack");
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+        let response: ContextPackV2 = serde_json::from_slice(&bytes).expect("pack");
+        assert_eq!(response.freshness, "refreshing");
+        assert!(
+            response
+                .evidence
+                .iter()
+                .any(|card| card.5.contains("after_refresh"))
+        );
+        assert!(
+            !response
+                .evidence
+                .iter()
+                .any(|card| card.5.contains("before_refresh"))
+        );
+        control.cancel();
+        assert!(waiter.join().expect("waiter").is_err());
+        resume.wait();
+
+        let deadline = Instant::now() + StdDuration::from_secs(2);
+        while engine.index().stats().refresh_signature == initial && Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert_ne!(engine.index().stats().refresh_signature, initial);
+    }
+
+    #[test]
+    fn refresh_limiter_bounds_workers_and_releases_permits() {
+        let limiter = Arc::new(RefreshLimiter {
+            state: Mutex::new(RefreshLimiterState::default()),
+            wake: Condvar::new(),
+            limit: 1,
+        });
+        let permit = limiter.acquire();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = Arc::clone(&limiter);
+        let worker = thread::spawn(move || {
+            let _permit = other.acquire();
+            tx.send(()).expect("signal acquired");
+        });
+        assert!(rx.recv_timeout(StdDuration::from_millis(30)).is_err());
+        assert_eq!(limiter.state.lock().expect("limiter").active, 1);
+        drop(permit);
+        rx.recv_timeout(StdDuration::from_secs(1))
+            .expect("released permit");
+        worker.join().expect("worker");
+        assert_eq!(limiter.state.lock().expect("limiter").active, 0);
     }
 
     #[test]
