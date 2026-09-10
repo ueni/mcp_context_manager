@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     sync::{
@@ -968,7 +968,7 @@ impl ProjectRegistry {
             // Python keeps this engine-only fallback out of the discovered
             // project list.  Otherwise a workspace parent appears alongside
             // the real projects found below it.
-            .filter(|spec| !spec.legacy || active_only)
+            .filter(|spec| !spec.legacy || active_only || spec.source != "repo_path")
             .filter(|spec| !active_only || state.engines.contains_key(&spec.project_id))
             .map(ProjectSpec::public_metadata)
             .collect::<Vec<_>>();
@@ -1034,6 +1034,8 @@ impl ProjectRegistry {
             let spec = self.project_from_uri(root_uri, "root_uri")?;
             if let Some(project_id) = project_id
                 && project_id != spec.project_id
+                && !(spec.project_id == self.default_project_id
+                    && self.default_project_id_aliases().contains(project_id))
             {
                 bail!("project_id and root_uri select different projects");
             }
@@ -1045,7 +1047,16 @@ impl ProjectRegistry {
                 .insert(selected.clone(), spec);
             Ok(selected)
         } else {
-            Ok(project_id.unwrap_or(&self.default_project_id).to_owned())
+            let Some(project_id) = project_id else {
+                return Ok(self.default_project_id.clone());
+            };
+            if project_id == self.default_project_id
+                || self.default_project_id_aliases().contains(project_id)
+            {
+                Ok(self.default_project_id.clone())
+            } else {
+                Ok(project_id.to_owned())
+            }
         }
     }
 
@@ -1090,14 +1101,33 @@ impl ProjectRegistry {
         {
             bail!("mapped project root escapes its configured local boundary");
         }
+        let governed_lineage = self.governed_lineage_for_host_root(&host_root);
+        if local_root == self.base_root {
+            let default_spec = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("project registry lock poisoned"))?
+                .specs
+                .get(&self.default_project_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("default project specification is missing"))?;
+            if compatible_lineages(
+                default_spec.governed_lineage.as_ref(),
+                governed_lineage.as_ref(),
+            ) {
+                let mut default_spec = default_spec;
+                default_spec.source = source.to_owned();
+                return Ok(default_spec);
+            }
+        }
         let canonical_uri = canonical_file_uri(&host_root)?;
+        let project_id = derived_project_id(&host_root, &canonical_uri);
         let root_hash = sha256_hex(canonical_uri.as_bytes());
         let name = host_root
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("project")
             .to_owned();
-        let project_id = format!("{}-{}", slug(&name), &root_hash[..12]);
         Ok(ProjectSpec {
             state_root: self.state_root.join("projects").join(&project_id),
             project_id,
@@ -1107,7 +1137,44 @@ impl ProjectRegistry {
             source: source.to_owned(),
             mapped,
             legacy: false,
-            governed_lineage: self.governed_lineages.get(&host_root).cloned(),
+            governed_lineage,
+        })
+    }
+
+    fn default_project_id_aliases(&self) -> HashSet<String> {
+        let mut aliases = HashSet::from([self.default_project_id.clone()]);
+        let Ok(default_uri) = canonical_file_uri(&self.base_root) else {
+            return aliases;
+        };
+        let default_lineage = self.governed_lineages.get(&self.base_root);
+        aliases.insert(derived_project_id(&self.base_root, &default_uri));
+        for (host_prefix, local_prefix) in &self.root_mappings {
+            let Ok(mapped_prefix) = local_prefix.canonicalize() else {
+                continue;
+            };
+            let Ok(relative) = self.base_root.strip_prefix(&mapped_prefix) else {
+                continue;
+            };
+            let host_root = host_prefix.join(relative);
+            let host_root = host_root
+                .canonicalize()
+                .unwrap_or_else(|_| host_root.clone());
+            let lineage = self.governed_lineage_for_host_root(&host_root);
+            if compatible_lineages(default_lineage, lineage.as_ref())
+                && let Ok(uri) = canonical_file_uri(&host_root)
+            {
+                aliases.insert(derived_project_id(&host_root, &uri));
+            }
+        }
+        aliases
+    }
+
+    fn governed_lineage_for_host_root(&self, host_root: &Path) -> Option<GovernedFrontierLineage> {
+        self.governed_lineages.get(host_root).cloned().or_else(|| {
+            host_root
+                .canonicalize()
+                .ok()
+                .and_then(|canonical| self.governed_lineages.get(&canonical).cloned())
         })
     }
 
@@ -1437,6 +1504,29 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn derived_project_id(root: &Path, canonical_uri: &str) -> String {
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    format!(
+        "{}-{}",
+        slug(name),
+        &sha256_hex(canonical_uri.as_bytes())[..12]
+    )
+}
+
+fn compatible_lineages(
+    left: Option<&GovernedFrontierLineage>,
+    right: Option<&GovernedFrontierLineage>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.identity() == right.identity(),
+        _ => false,
+    }
+}
+
 fn slug(value: &str) -> String {
     let mut slug = value
         .to_ascii_lowercase()
@@ -1710,6 +1800,122 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn mapped_default_root_reuses_default_engine_and_legacy_aliases() {
+        let fixture = tempfile::tempdir().expect("fixture root");
+        let local_root = fixture.path().join("workspace");
+        let host_root = fixture.path().join("host-workspace");
+        let unrelated_host_root = host_root.join("unrelated");
+        std::fs::create_dir_all(&local_root).expect("local root");
+        std::fs::create_dir_all(&host_root).expect("host root");
+        std::fs::create_dir_all(local_root.join("unrelated")).expect("unrelated local root");
+        std::fs::create_dir_all(&unrelated_host_root).expect("unrelated host root");
+        std::fs::write(local_root.join("Cargo.toml"), "[workspace]\n").expect("marker");
+        let registry = ProjectRegistry::new(
+            local_root.clone(),
+            fixture.path().join("state"),
+            vec![host_root.clone()],
+            vec![(host_root.clone(), local_root.clone())],
+        )
+        .expect("registry");
+
+        let default = registry.default_engine().expect("default engine");
+        let explicit_uri = canonical_file_uri(&host_root).expect("mapped URI");
+        let explicit = registry
+            .engine_for(None, Some(&explicit_uri))
+            .expect("mapped explicit engine");
+        assert!(Arc::ptr_eq(&default, &explicit));
+        assert_eq!(registry.cached_project_ids().expect("cached ids").len(), 1);
+        let projects = registry.projects_payload(100).expect("project catalogue");
+        assert_eq!(projects["count"], 1);
+        assert_eq!(projects["projects"][0]["project_id"], default.project_id());
+        assert_eq!(projects["projects"][0]["state"]["state_key"], "rust-v2");
+        assert!(
+            registry
+                .engine_for(Some("unrelated-project"), Some(&explicit_uri))
+                .is_err()
+        );
+        let unrelated_uri = canonical_file_uri(&unrelated_host_root).expect("unrelated URI");
+        assert!(
+            registry
+                .engine_for(Some(&registry.default_project_id), Some(&unrelated_uri))
+                .is_err()
+        );
+
+        let alias = derived_project_id(
+            &host_root,
+            &canonical_file_uri(&host_root).expect("alias URI"),
+        );
+        let aliased = registry
+            .engine_for(Some(&alias), None)
+            .expect("legacy alias engine");
+        assert!(Arc::ptr_eq(&default, &aliased));
+
+        let reverse_registry = ProjectRegistry::new(
+            local_root.clone(),
+            fixture.path().join("reverse-state"),
+            vec![host_root.clone()],
+            vec![(host_root.clone(), local_root.clone())],
+        )
+        .expect("reverse registry");
+        let explicit_first = reverse_registry
+            .engine_for(None, Some(&explicit_uri))
+            .expect("explicit-first engine");
+        let default_second = reverse_registry
+            .default_engine()
+            .expect("default-second engine");
+        assert!(Arc::ptr_eq(&explicit_first, &default_second));
+
+        let local_parent = fixture.path().join("local-parent");
+        let nested_local = local_parent.join("nested");
+        let host_parent = fixture.path().join("host-parent");
+        let nested_host = host_parent.join("nested");
+        std::fs::create_dir_all(&nested_local).expect("nested local root");
+        std::fs::create_dir_all(&nested_host).expect("nested host root");
+        let parent_registry = ProjectRegistry::new(
+            nested_local.clone(),
+            fixture.path().join("parent-state"),
+            vec![host_parent.clone()],
+            vec![(host_parent, local_parent)],
+        )
+        .expect("parent mapping registry");
+        let nested_uri = canonical_file_uri(&nested_host).expect("nested mapped URI");
+        assert_eq!(
+            parent_registry
+                .select_project(None, Some(&nested_uri))
+                .expect("nested default selection"),
+            parent_registry.default_project_id
+        );
+        let nested_alias = derived_project_id(
+            &nested_host,
+            &canonical_file_uri(&nested_host).expect("nested alias URI"),
+        );
+        assert_eq!(
+            parent_registry
+                .select_project(Some(&nested_alias), None)
+                .expect("nested alias selection"),
+            parent_registry.default_project_id
+        );
+
+        let lineage_a = GovernedFrontierLineage::new("a".repeat(16)).expect("lineage a");
+        let lineage_b = GovernedFrontierLineage::new("b".repeat(16)).expect("lineage b");
+        let incompatible_registry = ProjectRegistry::new_with_lineages(
+            local_root,
+            fixture.path().join("incompatible-state"),
+            vec![host_root.clone()],
+            vec![(host_root.clone(), fixture.path().join("workspace"))],
+            HashMap::from([
+                (fixture.path().join("workspace"), lineage_a),
+                (host_root.clone(), lineage_b),
+            ]),
+        )
+        .expect("incompatible lineage registry");
+        let incompatible_id = incompatible_registry
+            .select_project(None, Some(&explicit_uri))
+            .expect("incompatible selection");
+        assert_ne!(incompatible_id, incompatible_registry.default_project_id);
     }
 
     #[test]

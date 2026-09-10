@@ -277,6 +277,7 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

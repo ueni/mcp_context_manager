@@ -377,7 +377,8 @@ Stdio remains the default transport when `MCP_TRANSPORT` is omitted.
 | `MCP_CONTEXT_CANCELLATION_GRACE_SECS` | Portion of the server budget reserved for cooperative blocking-job cancellation, default `2`. |
 | `MCP_CONTEXT_FRONTIER_LINEAGES_FILE` | Absolute path to an operator-owned `context_frontier_lineages.v1` JSON manifest that explicitly groups 2–64 allowed Git worktree roots. Omit to disable cross-worktree frontier reuse. |
 | `MCP_CONTEXT_ALLOWED_ROOTS` | Host roots allowed for `root_uri` project selection. |
-| `MCP_CONTEXT_ROOT_MAPPINGS` | Comma-separated host-to-container mappings such as `/home/user/source=/workspace-roots`. |
+| `MCP_CONTEXT_ROOT_MAPPINGS` | Comma-separated host-to-container mappings such as `/home/user/source=/workspace-roots`. A mapped URI resolving to the configured default repository with compatible lineage reuses its engine and state. |
+| `MCP_CONTEXT_WATCH_POLL_INTERVAL_SECS` | Metadata-snapshot fallback interval when the native watcher cannot register, bounded to 1–300 seconds and defaulting to 2. |
 | `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host directory mounted at `/workspace-roots`. |
 | `MCP_CONTEXT_REPO_PATH` | Compose helper for a narrow default path below `/workspace-roots`. |
 | `MCP_CONTEXT_UID`, `MCP_CONTEXT_GID` | Compose image user ids, default `1000:1000`. |
@@ -450,7 +451,7 @@ The fast path uses:
 - a 128 MiB in-memory and 256 MiB LMDB frontier cache;
 - deterministic reranking after approximate frontier reuse;
 - an optional 256 MiB persistent pool of path-free immutable frontier records for explicitly governed, clean worktrees that share one Git common directory, HEAD, source signature, and index signature;
-- a 50 ms coalescing filesystem watcher plus polling fallback;
+- a 50 ms coalescing filesystem watcher plus a metadata-snapshot fallback that prunes generated directories before traversal;
 - a bounded changed-path journal and per-file fingerprints for atomic
   incremental changed/deleted/renamed/untracked refresh;
 - a validated, atomically replaced index snapshot under generated project
@@ -482,6 +483,12 @@ and `unverified` means the watcher cannot certify completeness. Watcher failure
 queues authoritative verification and prevents ordinary cache reuse. Use
 `fresh` when completeness is required. These states do not promise a filesystem
 transaction across concurrent editor writes.
+
+Administrative metrics expose the bounded watcher diagnostic under
+`index_freshness.watcher`: `backend` is `native`, `metadata_snapshot`, or
+`failed`; `status` is `starting`, `healthy`, or `failed`; and `failure` uses a
+small category such as `setup_create`, `setup_register`, `runtime`, or
+`disconnect`. Error text and repository paths are never included.
 
 Incremental refresh replaces only changed paths' Tantivy documents and pins
 old readers until publication. Metadata copying and full signature scans still

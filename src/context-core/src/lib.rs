@@ -21,8 +21,7 @@ use context_index::{
 use context_store::{ReferenceValidation, StateStore};
 use moka::future::Cache;
 use notify::{
-    Config as NotifyConfig, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode,
-    Watcher,
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use regex::Regex;
 use schemars::JsonSchema;
@@ -31,6 +30,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 thread_local! {
     static CURRENT_WORK_CONTROL: std::cell::RefCell<Option<WorkControl>> = const { std::cell::RefCell::new(None) };
@@ -1105,6 +1105,8 @@ struct FreshnessState {
     changed_paths: Mutex<BTreeSet<String>>,
     journal_overflow: AtomicBool,
     watcher_status: AtomicU8,
+    watcher_backend: AtomicU8,
+    watcher_failure: AtomicU8,
 }
 
 #[derive(Default)]
@@ -1353,7 +1355,19 @@ impl RefreshCoordinator {
 const WATCHER_STARTING: u8 = 0;
 const WATCHER_HEALTHY: u8 = 1;
 const WATCHER_FAILED: u8 = 2;
+const WATCHER_BACKEND_NATIVE: u8 = 1;
+const WATCHER_BACKEND_METADATA: u8 = 2;
+const WATCHER_BACKEND_FAILED: u8 = 3;
+const WATCHER_FAILURE_NONE: u8 = 0;
+const WATCHER_FAILURE_THREAD: u8 = 1;
+const WATCHER_FAILURE_SETUP_CREATE: u8 = 2;
+const WATCHER_FAILURE_SETUP_REGISTER: u8 = 3;
+const WATCHER_FAILURE_STARTUP_SNAPSHOT: u8 = 4;
+const WATCHER_FAILURE_RUNTIME: u8 = 5;
+const WATCHER_FAILURE_DISCONNECT: u8 = 6;
+const WATCHER_FAILURE_STARTUP_TIMEOUT: u8 = 7;
 const WATCHER_STARTUP_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const WATCHER_POLL_INTERVAL_SECS: u64 = 2;
 const REFRESH_STABILITY_ATTEMPTS: usize = 3;
 
 impl FreshnessState {
@@ -1367,6 +1381,22 @@ impl FreshnessState {
 }
 
 fn mark_watcher_failed(freshness: &FreshnessState) {
+    let reason = freshness.watcher_failure.load(Ordering::Acquire);
+    mark_watcher_failed_with_reason(
+        freshness,
+        if reason == WATCHER_FAILURE_NONE {
+            WATCHER_FAILURE_RUNTIME
+        } else {
+            reason
+        },
+    );
+}
+
+fn record_watcher_failure(freshness: &FreshnessState, reason: u8) {
+    freshness.watcher_failure.store(reason, Ordering::Release);
+}
+
+fn mark_watcher_failed_with_reason(freshness: &FreshnessState, reason: u8) {
     let _journal = freshness
         .changed_paths
         .lock()
@@ -1374,6 +1404,10 @@ fn mark_watcher_failed(freshness: &FreshnessState) {
     freshness
         .watcher_status
         .store(WATCHER_FAILED, Ordering::Release);
+    freshness
+        .watcher_backend
+        .store(WATCHER_BACKEND_FAILED, Ordering::Release);
+    freshness.watcher_failure.store(reason, Ordering::Release);
     freshness.journal_overflow.store(true, Ordering::Release);
     freshness.event_epoch.fetch_add(1, Ordering::AcqRel);
     freshness
@@ -1389,6 +1423,13 @@ fn mark_watcher_healthy(freshness: &FreshnessState) {
         Ordering::AcqRel,
         Ordering::Acquire,
     );
+}
+
+fn mark_watcher_backend(freshness: &FreshnessState, backend: u8) {
+    freshness.watcher_backend.store(backend, Ordering::Release);
+    freshness
+        .watcher_status
+        .store(WATCHER_HEALTHY, Ordering::Release);
 }
 
 fn record_watcher_event(
@@ -2781,7 +2822,7 @@ impl WatchGuard {
             thread::sleep(StdDuration::from_millis(1));
         }
         if freshness.watcher_status.load(Ordering::Acquire) == WATCHER_STARTING {
-            mark_watcher_failed(&freshness);
+            mark_watcher_failed_with_reason(&freshness, WATCHER_FAILURE_STARTUP_TIMEOUT);
         }
         guard
     }
@@ -2797,7 +2838,7 @@ impl WatchGuard {
                 thread: Some(handle),
             },
             Err(_) => {
-                mark_watcher_failed(&freshness);
+                mark_watcher_failed_with_reason(&freshness, WATCHER_FAILURE_THREAD);
                 Self { stop, thread: None }
             }
         }
@@ -5314,7 +5355,10 @@ fn watch_repository_with_attempts<R, P>(
     R: FnOnce(&std::path::Path, &Arc<FreshnessState>, &Arc<AtomicBool>) -> bool,
     P: FnOnce(&std::path::Path, &Arc<FreshnessState>, &Arc<AtomicBool>) -> bool,
 {
-    if recommended(root, freshness, stop) || polling(root, freshness, stop) {
+    if recommended(root, freshness, stop) {
+        return;
+    }
+    if polling(root, freshness, stop) {
         return;
     }
     mark_watcher_failed(freshness);
@@ -5333,15 +5377,21 @@ fn try_recommended_watcher(
         },
         NotifyConfig::default(),
     );
-    if let Ok(mut watcher) = recommended
-        && watcher.watch(root, RecursiveMode::Recursive).is_ok()
-    {
-        mark_watcher_healthy(freshness);
-        drop(sender);
-        watcher_loop(&receiver, root, freshness, stop);
-        return true;
+    let Ok(mut watcher) = recommended else {
+        record_watcher_failure(freshness, WATCHER_FAILURE_SETUP_CREATE);
+        return false;
+    };
+    if watcher.watch(root, RecursiveMode::Recursive).is_err() {
+        record_watcher_failure(freshness, WATCHER_FAILURE_SETUP_REGISTER);
+        return false;
     }
-    false
+    freshness
+        .watcher_backend
+        .store(WATCHER_BACKEND_NATIVE, Ordering::Release);
+    mark_watcher_healthy(freshness);
+    drop(sender);
+    watcher_loop(&receiver, root, freshness, stop);
+    true
 }
 
 fn try_polling_watcher(
@@ -5349,21 +5399,149 @@ fn try_polling_watcher(
     freshness: &Arc<FreshnessState>,
     stop: &Arc<AtomicBool>,
 ) -> bool {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let polling = PollWatcher::new(
-        move |event| {
-            let _ = sender.send(event);
-        },
-        NotifyConfig::default().with_poll_interval(StdDuration::from_secs(2)),
-    );
-    if let Ok(mut watcher) = polling
-        && watcher.watch(root, RecursiveMode::Recursive).is_ok()
-    {
-        mark_watcher_healthy(freshness);
-        watcher_loop(&receiver, root, freshness, stop);
-        return true;
+    metadata_polling_watcher(root, freshness, stop, watch_poll_interval())
+}
+
+fn metadata_polling_watcher(
+    root: &std::path::Path,
+    freshness: &Arc<FreshnessState>,
+    stop: &Arc<AtomicBool>,
+    interval: StdDuration,
+) -> bool {
+    let Ok(mut snapshot) = metadata_snapshot(root, stop) else {
+        mark_watcher_failed_with_reason(freshness, WATCHER_FAILURE_STARTUP_SNAPSHOT);
+        return false;
+    };
+    // A snapshot taken before the baseline index scan can race with a source
+    // mutation.  Force one authoritative verification epoch before declaring
+    // the fallback healthy so that the baseline cannot erase that race.
+    record_watcher_event(freshness, std::iter::empty(), true);
+    mark_watcher_backend(freshness, WATCHER_BACKEND_METADATA);
+    while !stop.load(Ordering::Acquire) {
+        if wait_for_watcher_stop(stop, interval) {
+            break;
+        }
+        let next = match metadata_snapshot(root, stop) {
+            Ok(next) => next,
+            Err(_) => {
+                mark_watcher_failed_with_reason(freshness, WATCHER_FAILURE_RUNTIME);
+                continue;
+            }
+        };
+        if freshness.watcher_status.load(Ordering::Acquire) == WATCHER_FAILED {
+            mark_watcher_backend(freshness, WATCHER_BACKEND_METADATA);
+        }
+        if next != snapshot {
+            let changed_paths = changed_snapshot_paths(&snapshot, &next);
+            record_watcher_event(freshness, changed_paths, false);
+            snapshot = next;
+        }
     }
-    false
+    true
+}
+
+fn changed_snapshot_paths(
+    before: &BTreeMap<String, WatchFileFingerprint>,
+    after: &BTreeMap<String, WatchFileFingerprint>,
+) -> Vec<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| before.get(path) != after.get(path))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WatchFileFingerprint {
+    size: u64,
+    modified_nanos: u128,
+    #[cfg(unix)]
+    changed_nanos: i128,
+}
+
+fn watch_poll_interval() -> StdDuration {
+    let seconds = std::env::var("MCP_CONTEXT_WATCH_POLL_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=300).contains(seconds))
+        .unwrap_or(WATCHER_POLL_INTERVAL_SECS);
+    StdDuration::from_secs(seconds)
+}
+
+fn wait_for_watcher_stop(stop: &AtomicBool, duration: StdDuration) -> bool {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(StdDuration::from_millis(100)));
+    }
+    true
+}
+
+fn metadata_snapshot(
+    root: &std::path::Path,
+    stop: &AtomicBool,
+) -> Result<BTreeMap<String, WatchFileFingerprint>> {
+    let mut snapshot = BTreeMap::new();
+    let entries = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
+            if entry.depth() == 0 {
+                return true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(root) else {
+                return false;
+            };
+            !is_ignored_repository_path(relative)
+        });
+    for entry in entries {
+        if stop.load(Ordering::Acquire) {
+            return Ok(snapshot);
+        }
+        let entry = entry.map_err(|error| anyhow!("watch metadata scan failed: {error}"))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|_| anyhow!("watch metadata path escaped repository"))?;
+        if is_ignored_repository_path(relative) {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|error| anyhow!("watch metadata read failed: {error}"))?;
+        let modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        #[cfg(unix)]
+        let changed_nanos = {
+            use std::os::unix::fs::MetadataExt;
+            i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec())
+        };
+        snapshot.insert(
+            relative.to_string_lossy().replace('\\', "/"),
+            WatchFileFingerprint {
+                size: metadata.len(),
+                modified_nanos,
+                #[cfg(unix)]
+                changed_nanos,
+            },
+        );
+    }
+    Ok(snapshot)
 }
 
 fn watcher_loop(
@@ -5390,12 +5568,12 @@ fn watcher_loop(
                 record_watcher_event(freshness, changed_paths, overflow);
             }
             Ok(Err(_)) => {
-                mark_watcher_failed(freshness);
+                mark_watcher_failed_with_reason(freshness, WATCHER_FAILURE_RUNTIME);
             }
             Ok(Ok(_)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if !stop.load(Ordering::Acquire) {
-                    mark_watcher_failed(freshness);
+                    mark_watcher_failed_with_reason(freshness, WATCHER_FAILURE_DISCONNECT);
                 }
                 break;
             }
@@ -6163,6 +6341,38 @@ fn warmup_prompt_request(prompt: &str, focus_path: Option<&str>) -> ContextPackR
     }
 }
 
+fn watcher_backend_name(value: u8) -> &'static str {
+    match value {
+        WATCHER_BACKEND_NATIVE => "native",
+        WATCHER_BACKEND_METADATA => "metadata_snapshot",
+        WATCHER_BACKEND_FAILED => "failed",
+        _ => "unknown",
+    }
+}
+
+fn watcher_status_name(value: u8) -> &'static str {
+    match value {
+        WATCHER_STARTING => "starting",
+        WATCHER_HEALTHY => "healthy",
+        WATCHER_FAILED => "failed",
+        _ => "unknown",
+    }
+}
+
+fn watcher_failure_name(value: u8) -> &'static str {
+    match value {
+        WATCHER_FAILURE_NONE => "none",
+        WATCHER_FAILURE_THREAD => "thread",
+        WATCHER_FAILURE_SETUP_CREATE => "setup_create",
+        WATCHER_FAILURE_SETUP_REGISTER => "setup_register",
+        WATCHER_FAILURE_STARTUP_SNAPSHOT => "startup_snapshot",
+        WATCHER_FAILURE_RUNTIME => "runtime",
+        WATCHER_FAILURE_DISCONNECT => "disconnect",
+        WATCHER_FAILURE_STARTUP_TIMEOUT => "startup_timeout",
+        _ => "unknown",
+    }
+}
+
 fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
     let now = now_iso()?;
     let operations = engine.metrics.operation_snapshots();
@@ -6340,10 +6550,16 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
         "warmup": {"runs": engine.metrics.warmup_runs.load(Ordering::Relaxed)},
         "benchmarks": {},
         "index_freshness": {
-            "strategy": "notify_with_polling_fallback",
+            "strategy": "notify_with_metadata_snapshot_fallback",
             "generation": engine.freshness.generation.load(Ordering::Relaxed),
             "dirty": engine.freshness.dirty.load(Ordering::Relaxed),
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
+            "watcher": {
+                "backend": watcher_backend_name(engine.freshness.watcher_backend.load(Ordering::Relaxed)),
+                "status": watcher_status_name(engine.freshness.watcher_status.load(Ordering::Relaxed)),
+                "failure": watcher_failure_name(engine.freshness.watcher_failure.load(Ordering::Relaxed)),
+                "poll_interval_ms": watch_poll_interval().as_millis(),
+            },
             "coalesce_ms": WATCH_COALESCE_MS,
             "refreshes": engine.metrics.refreshes.load(Ordering::Relaxed),
             "full_refreshes": engine.metrics.full_refreshes.load(Ordering::Relaxed),
@@ -6468,6 +6684,7 @@ fn unloaded_metrics_snapshot(project_id: &str, now: &str, status: &str) -> Value
             "generation": 0,
             "dirty": false,
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
+            "watcher": {"backend": "unloaded", "status": status, "failure": "none", "poll_interval_ms": watch_poll_interval().as_millis()},
             "coalesce_ms": WATCH_COALESCE_MS,
             "refreshes": 0,
             "full_refreshes": 0,
@@ -8655,6 +8872,10 @@ mod tests {
             metrics["requests"]["by_operation"]["result_reference_resolve"]["count"],
             1
         );
+        assert!(metrics["index_freshness"]["watcher"]["backend"].is_string());
+        assert!(metrics["index_freshness"]["watcher"]["status"].is_string());
+        assert!(metrics["index_freshness"]["watcher"]["failure"].is_string());
+        assert!(metrics["index_freshness"]["watcher"]["poll_interval_ms"].is_u64());
         assert_eq!(
             metrics["requests"]["by_operation"]["context_admin.index_refresh"]["count"],
             1
@@ -10960,6 +11181,109 @@ mod tests {
     }
 
     #[test]
+    fn metadata_snapshot_prunes_ignored_directories_and_detects_source_changes() {
+        let fixture = tempdir().expect("fixture root");
+        let source = fixture.path().join("src/lib.rs");
+        let ignored = fixture.path().join("target/generated.rs");
+        std::fs::create_dir_all(source.parent().expect("source parent")).expect("source dir");
+        std::fs::create_dir_all(ignored.parent().expect("ignored parent")).expect("ignored dir");
+        fs::write(&source, "fn before() {}\n").expect("source");
+        fs::write(&ignored, "fn generated_before() {}\n").expect("ignored source");
+        let stop = AtomicBool::new(false);
+        let before = metadata_snapshot(fixture.path(), &stop).expect("initial snapshot");
+        assert!(before.contains_key("src/lib.rs"));
+        assert!(!before.contains_key("target/generated.rs"));
+
+        fs::write(&source, "fn after_with_different_size() {}\n").expect("changed source");
+        fs::write(&ignored, "fn generated_after_with_different_size() {}\n")
+            .expect("changed ignored source");
+        let after = metadata_snapshot(fixture.path(), &stop).expect("updated snapshot");
+        let changed = changed_snapshot_paths(&before, &after);
+        assert_eq!(changed, vec!["src/lib.rs"]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = fixture.path().join("target/unreadable");
+            fs::create_dir_all(&unreadable).expect("unreadable ignored dir");
+            fs::write(unreadable.join("nested.rs"), "fn hidden() {}\n")
+                .expect("unreadable ignored file");
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+                .expect("hide ignored dir");
+            let result = metadata_snapshot(fixture.path(), &stop);
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755))
+                .expect("restore ignored dir");
+            assert!(result.is_ok(), "ignored subtree was traversed: {result:?}");
+        }
+    }
+
+    #[test]
+    fn metadata_polling_watcher_tracks_source_lifecycle_and_ignores_generated_churn() {
+        let fixture = tempdir().expect("fixture root");
+        let fixture_path = fixture.path().to_path_buf();
+        let source = fixture.path().join("lib.rs");
+        let added = fixture.path().join("added.rs");
+        let ignored = fixture.path().join("target/generated.rs");
+        fs::write(&source, "fn source() {}\n").expect("source");
+        fs::create_dir_all(ignored.parent().expect("ignored parent")).expect("ignored dir");
+        fs::write(&ignored, "fn generated() {}\n").expect("ignored source");
+        let freshness = Arc::new(FreshnessState::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_freshness = Arc::clone(&freshness);
+        let thread_stop = Arc::clone(&stop);
+        let watcher = thread::spawn(move || {
+            metadata_polling_watcher(
+                &fixture_path,
+                &thread_freshness,
+                &thread_stop,
+                StdDuration::from_millis(10),
+            )
+        });
+        let startup_deadline = Instant::now() + StdDuration::from_secs(1);
+        while freshness.watcher_status.load(Ordering::Acquire) != WATCHER_HEALTHY
+            && Instant::now() < startup_deadline
+        {
+            thread::sleep(StdDuration::from_millis(1));
+        }
+        assert_eq!(
+            freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_HEALTHY
+        );
+        let starting_epoch = freshness.event_epoch.load(Ordering::Acquire);
+        assert!(starting_epoch >= 1);
+        thread::sleep(StdDuration::from_millis(20));
+        fs::write(&source, "fn update() {}\n").expect("same-size source modification");
+        let modified_deadline = Instant::now() + StdDuration::from_secs(1);
+        while freshness.event_epoch.load(Ordering::Acquire) <= starting_epoch
+            && Instant::now() < modified_deadline
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        let modified_epoch = freshness.event_epoch.load(Ordering::Acquire);
+        assert!(modified_epoch > starting_epoch);
+        let ignored_epoch = modified_epoch;
+        fs::write(&ignored, "fn generated_changed() {}\n").expect("ignored churn");
+        thread::sleep(StdDuration::from_millis(50));
+        assert_eq!(freshness.event_epoch.load(Ordering::Acquire), ignored_epoch);
+
+        fs::remove_file(&source).expect("source deletion");
+        fs::write(&added, "fn added() {}\n").expect("source addition");
+        let lifecycle_deadline = Instant::now() + StdDuration::from_secs(1);
+        while freshness.event_epoch.load(Ordering::Acquire) <= modified_epoch
+            && Instant::now() < lifecycle_deadline
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        let journal = freshness.changed_paths.lock().expect("change journal");
+        assert!(journal.contains("lib.rs"));
+        assert!(journal.contains("added.rs"));
+        assert!(!journal.contains("target/generated.rs"));
+        drop(journal);
+        stop.store(true, Ordering::Release);
+        assert!(watcher.join().expect("watcher thread"));
+    }
+
+    #[test]
     fn watcher_registration_precedes_the_baseline_scan() {
         let root = tempdir().expect("repository root");
         let source = root.path().join("lib.rs");
@@ -11202,8 +11526,75 @@ mod tests {
             backend_freshness.watcher_status.load(Ordering::Acquire),
             WATCHER_FAILED
         );
+        assert_eq!(
+            watcher_backend_name(backend_freshness.watcher_backend.load(Ordering::Acquire)),
+            "failed"
+        );
+        assert_eq!(
+            watcher_failure_name(backend_freshness.watcher_failure.load(Ordering::Acquire)),
+            "runtime"
+        );
         assert!(backend_freshness.dirty.load(Ordering::Acquire));
         assert!(backend_freshness.journal_overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn native_watcher_setup_failure_keeps_fallback_starting_until_ready() {
+        let fixture = tempdir().expect("fixture root");
+        let fixture_path = fixture.path().to_path_buf();
+        let freshness = Arc::new(FreshnessState::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let fallback_entered = Arc::new(std::sync::Barrier::new(2));
+        let allow_fallback = Arc::new(std::sync::Barrier::new(2));
+        let thread_freshness = Arc::clone(&freshness);
+        let thread_stop = Arc::clone(&stop);
+        let entered = Arc::clone(&fallback_entered);
+        let allow = Arc::clone(&allow_fallback);
+        let watcher = thread::spawn(move || {
+            watch_repository_with_attempts(
+                &fixture_path,
+                &thread_freshness,
+                &thread_stop,
+                |_, freshness, _| {
+                    record_watcher_failure(freshness, WATCHER_FAILURE_SETUP_REGISTER);
+                    false
+                },
+                move |_, freshness, _| {
+                    entered.wait();
+                    allow.wait();
+                    mark_watcher_backend(freshness, WATCHER_BACKEND_METADATA);
+                    true
+                },
+            );
+        });
+        fallback_entered.wait();
+        assert_eq!(
+            freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_STARTING
+        );
+        allow_fallback.wait();
+        watcher.join().expect("watcher attempt");
+        assert_eq!(
+            freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_HEALTHY
+        );
+        assert_eq!(
+            watcher_failure_name(freshness.watcher_failure.load(Ordering::Acquire)),
+            "setup_register"
+        );
+
+        let failed = Arc::new(FreshnessState::default());
+        watch_repository_with_attempts(
+            fixture.path(),
+            &failed,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _, _| false,
+            |_, _, _| false,
+        );
+        assert_eq!(
+            failed.watcher_status.load(Ordering::Acquire),
+            WATCHER_FAILED
+        );
     }
 
     #[test]
@@ -11231,6 +11622,10 @@ mod tests {
         controller.join().expect("runtime error controller");
         assert!(runtime_freshness.dirty.load(Ordering::Acquire));
         assert!(runtime_freshness.journal_overflow.load(Ordering::Acquire));
+        assert_eq!(
+            watcher_failure_name(runtime_freshness.watcher_failure.load(Ordering::Acquire)),
+            "runtime"
+        );
 
         let disconnected_freshness = FreshnessState::default();
         disconnected_freshness
@@ -11256,6 +11651,14 @@ mod tests {
             disconnected_freshness
                 .journal_overflow
                 .load(Ordering::Acquire)
+        );
+        assert_eq!(
+            watcher_failure_name(
+                disconnected_freshness
+                    .watcher_failure
+                    .load(Ordering::Acquire)
+            ),
+            "disconnect"
         );
     }
 

@@ -450,8 +450,11 @@ client profile, without prompts, paths, ids, or source values.
 ## Freshness
 
 A `notify` watcher coalesces events for 50 ms and owns ordinary dirty-state
-transitions. There is no fixed two-second request-path content hash. PollWatcher
-is the event-source fallback when the native watcher is unavailable; watcher
+transitions. There is no fixed two-second request-path content hash. When the
+native watcher is unavailable, a metadata-snapshot fallback traverses only
+non-ignored regular files, does not follow symlinks, and compares bounded file
+metadata fingerprints at a two-second interval by default. The interval can be
+set with `MCP_CONTEXT_WATCH_POLL_INTERVAL_SECS` (1–300 seconds). Watcher
 errors conservatively dirty the project. Explicit `changed_files` queues
 background verification and overlays current file chunks in the response.
 `cache_strategy="fresh"` waits for the shared refresh; cancelling that caller
@@ -469,11 +472,15 @@ atomic generation swap. An epoch advance at any of those boundaries preserves
 the journal and retries from the current source; repeated churn ends in the
 bounded retryable freshness diagnostic instead of publishing stale evidence.
 
-Thread-spawn failure, failure of both native and polling watcher setup,
-runtime watcher errors, and event-channel disconnection persistently latch the
-project into background full verification. Ordinary cache reuse is disabled,
-and available-snapshot responses report `unverified`. A failed strict fresh
-verification returns the retryable `context_pack freshness unavailable` error.
+Thread-spawn failure, failure of both watcher backends, runtime watcher errors,
+and event-channel disconnection mark the project for background full
+verification. A later successful metadata snapshot may recover the fallback
+backend, while the dirty/overflow journal remains fail-closed until that full
+verification completes. Administrative metrics expose only bounded backend and
+failure categories, without raw errors or paths. Ordinary cache reuse is
+disabled while verification is pending, and available-snapshot responses
+report `unverified`. A failed strict fresh verification returns the retryable
+`context_pack freshness unavailable` error.
 
 Each project coalesces requests into one detached refresh worker. A separate
 process-wide permit pool (`MCP_CONTEXT_REFRESH_CONCURRENCY`, default 2, capped
