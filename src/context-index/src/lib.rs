@@ -53,6 +53,7 @@ const IGNORED_DIRECTORIES: &[&str] = &[
     ".ruff_cache",
     "__pycache__",
     "build",
+    "conan2",
     "dist",
     "node_modules",
     "target",
@@ -1970,13 +1971,18 @@ mod tests {
         let before = ProjectIndex::build(root.path()).expect("initial index");
         let before_signature = repository_signature(root.path()).expect("initial signature");
 
-        let generated = root.path().join(".workingdir/agent-worktree/target/debug");
-        fs::create_dir_all(&generated).expect("generated tree");
-        fs::write(
-            generated.join("churn.rs"),
-            "fn generated_churn_must_not_be_indexed() {}\n",
-        )
-        .expect("generated churn");
+        let generated_trees = [
+            root.path().join(".workingdir/agent-worktree/target/debug"),
+            root.path().join("conan2/p/abc/export"),
+        ];
+        for generated in &generated_trees {
+            fs::create_dir_all(generated).expect("generated tree");
+            fs::write(
+                generated.join("churn.rs"),
+                "fn generated_churn_must_not_be_indexed() {}\n",
+            )
+            .expect("generated churn");
+        }
 
         let after = ProjectIndex::build(root.path()).expect("index after churn");
         let after_signature = repository_signature(root.path()).expect("signature after churn");
@@ -1991,10 +1997,18 @@ mod tests {
         assert!(is_ignored_repository_path(Path::new(
             ".workingdir/agent-worktree/target/debug/churn.rs"
         )));
+        assert!(is_ignored_repository_path(Path::new(
+            "conan2/p/abc/export/churn.rs"
+        )));
         assert!(
             git_exclude_pathspecs()
                 .iter()
                 .any(|path| path == ":(exclude,glob)**/.workingdir/**")
+        );
+        assert!(
+            git_exclude_pathspecs()
+                .iter()
+                .any(|path| path == ":(exclude,glob)**/conan2/**")
         );
     }
 

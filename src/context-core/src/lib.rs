@@ -342,6 +342,7 @@ pub struct ContextPackReuseV1 {
 
 const L0_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const L1_MEMORY_MAX_BYTES: usize = 128 * 1024 * 1024;
+const INDEX_SNAPSHOT_MAX_BYTES: usize = 128 * 1024 * 1024;
 const L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const SHARED_L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const WARM_MISS_TARGET_MICROS: u64 = 50_000;
@@ -5869,7 +5870,7 @@ fn load_index_snapshot(
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
-        || metadata.len() > 128 * 1024 * 1024
+        || metadata.len() > INDEX_SNAPSHOT_MAX_BYTES as u64
     {
         bail!("persisted index snapshot is unsafe")
     }
@@ -5886,15 +5887,44 @@ fn persist_index_snapshot(
         control.check()?;
     }
     let bytes = serde_json::to_vec(&index.snapshot())?;
+    persist_index_snapshot_bytes(path, &bytes, control)
+}
+
+fn persist_index_snapshot_bytes(
+    path: &std::path::Path,
+    bytes: &[u8],
+    control: Option<&WorkControl>,
+) -> Result<()> {
+    if let Some(control) = control {
+        control.check()?;
+    }
+    if bytes.len() > INDEX_SNAPSHOT_MAX_BYTES {
+        // A snapshot is an optional startup optimization.  Keep a valid
+        // in-memory index usable when its serialized form exceeds the reader
+        // limit, and remove an older artifact that the reader would always
+        // reject.
+        remove_oversized_snapshot(path)?;
+        return Ok(());
+    }
     let temporary = path.with_extension("json.pending");
     let mut file = std::fs::File::create(&temporary)?;
     use std::io::Write;
-    file.write_all(&bytes)?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     if let Some(control) = control {
         control.check()?;
     }
     std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn remove_oversized_snapshot(path: &std::path::Path) -> Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.is_file()
+        && metadata.len() > INDEX_SNAPSHOT_MAX_BYTES as u64
+    {
+        std::fs::remove_file(path)?;
+    }
     Ok(())
 }
 
@@ -11184,19 +11214,35 @@ mod tests {
     fn metadata_snapshot_prunes_ignored_directories_and_detects_source_changes() {
         let fixture = tempdir().expect("fixture root");
         let source = fixture.path().join("src/lib.rs");
-        let ignored = fixture.path().join("target/generated.rs");
+        let ignored_paths = [
+            fixture.path().join("target/generated.rs"),
+            fixture.path().join("conan2/generated.rs"),
+        ];
         std::fs::create_dir_all(source.parent().expect("source parent")).expect("source dir");
-        std::fs::create_dir_all(ignored.parent().expect("ignored parent")).expect("ignored dir");
+        for ignored in &ignored_paths {
+            std::fs::create_dir_all(ignored.parent().expect("ignored parent"))
+                .expect("ignored dir");
+        }
         fs::write(&source, "fn before() {}\n").expect("source");
-        fs::write(&ignored, "fn generated_before() {}\n").expect("ignored source");
+        for ignored in &ignored_paths {
+            fs::write(ignored, "fn generated_before() {}\n").expect("ignored source");
+        }
         let stop = AtomicBool::new(false);
         let before = metadata_snapshot(fixture.path(), &stop).expect("initial snapshot");
         assert!(before.contains_key("src/lib.rs"));
-        assert!(!before.contains_key("target/generated.rs"));
+        for ignored in &ignored_paths {
+            let relative = ignored
+                .strip_prefix(fixture.path())
+                .expect("ignored path under fixture")
+                .to_string_lossy();
+            assert!(!before.contains_key(relative.as_ref()));
+        }
 
         fs::write(&source, "fn after_with_different_size() {}\n").expect("changed source");
-        fs::write(&ignored, "fn generated_after_with_different_size() {}\n")
-            .expect("changed ignored source");
+        for ignored in &ignored_paths {
+            fs::write(ignored, "fn generated_after_with_different_size() {}\n")
+                .expect("changed ignored source");
+        }
         let after = metadata_snapshot(fixture.path(), &stop).expect("updated snapshot");
         let changed = changed_snapshot_paths(&before, &after);
         assert_eq!(changed, vec!["src/lib.rs"]);
@@ -11791,6 +11837,39 @@ mod tests {
         assert!(
             serde_json::from_slice::<IndexSnapshot>(&std::fs::read(snapshot).expect("snapshot"))
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn oversized_index_snapshot_is_skipped_and_stale_artifact_removed() {
+        let state = tempdir().expect("state root");
+        let snapshot = state.path().join("context-index.snapshot.v1.json");
+        let old = std::fs::File::create(&snapshot).expect("old snapshot");
+        old.set_len(INDEX_SNAPSHOT_MAX_BYTES as u64 + 1)
+            .expect("oversized old snapshot");
+        let bytes = vec![0; INDEX_SNAPSHOT_MAX_BYTES + 1];
+
+        persist_index_snapshot_bytes(&snapshot, &bytes, None).expect("skip oversized snapshot");
+
+        assert!(!snapshot.exists());
+        assert!(!snapshot.with_extension("json.pending").exists());
+
+        fs::write(&snapshot, b"valid snapshot").expect("valid snapshot");
+        persist_index_snapshot_bytes(&snapshot, &bytes, None)
+            .expect("skip oversized snapshot without replacing valid artifact");
+        assert_eq!(
+            fs::read(&snapshot).expect("read valid snapshot"),
+            b"valid snapshot"
+        );
+
+        let old = std::fs::File::create(&snapshot).expect("oversized snapshot");
+        old.set_len(INDEX_SNAPSHOT_MAX_BYTES as u64 + 1)
+            .expect("oversized snapshot");
+        let cancelled = WorkControl::new(Instant::now());
+        assert!(persist_index_snapshot_bytes(&snapshot, &bytes, Some(&cancelled)).is_err());
+        assert!(
+            snapshot.exists(),
+            "cancellation must preserve the old artifact"
         );
     }
 
