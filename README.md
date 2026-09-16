@@ -91,15 +91,27 @@ estimated evidence-card wire tokens avoided. `base_pack` or a non-empty
 
 Continuation state stores only a hashed session key, pack/evidence identifiers,
 generation/signature, and timestamps. It is limited to 256 records per project
-and expires after 24 hours. Missing state (including first use or the same key
-in another project), expired state, a stale index generation, or a missing pack
-falls back to a full pack with status `missing`, `expired`,
-`stale_generation`, or `missing_pack`. No transport identity is inferred.
+and expires after 24 hours. A prior pack may survive an unrelated generation
+change when all of its source paths still match; changed dependencies or
+journal overflow fall back with `stale_dependencies`. Missing state (including
+first use or the same key in another project), expired state, an unverifiable
+generation, or a missing pack falls back to a full pack with status `missing`,
+`expired`, `stale_generation`, or `missing_pack`. No transport identity is
+inferred.
 
 The compact evidence tuple contains the evidence id, policy/delta opcode,
 inclusive line interval, symbol, evidence card, and estimated source tokens.
 Diagnostics, metrics, and token accounting are available through
 `context_admin` rather than being repeated in every pack.
+
+`knowledge` is an additive, stable pack field containing at most four compact
+project-memory records. A record is injected only when it is non-expired,
+non-redacted, and supported by `source_paths` whose persisted write-time
+fingerprints still match the current indexed files. `source_paths` is an
+additive `context_memory` write field accepting at most 16 paths; an explicit
+upsert refreshes that source basis. Legacy rows without a basis are reported
+as `unverified`, remain queryable, and are not injected into packs. Knowledge
+is bounded evidence, not an instruction channel.
 
 ## Usage and efficiency reporting
 
@@ -457,6 +469,15 @@ The fast path uses:
 - a validated, atomically replaced index snapshot under generated project
   state so a restart can reuse a complete warm generation;
 - direct serialization into a preallocated byte buffer.
+
+Lookup cache diagnostics are exposed in the per-result `cache` object and in
+metrics; they are diagnostic fields rather than retrieved project evidence.
+Lookup caching is bounded to 256 entries or 16 MiB with a 30-second idle TTL,
+and keys include the normalized request plus published generation/signature.
+L0 entries for explicitly focused requests retain source dependencies and may
+survive unrelated generation changes when those files remain current. Broad
+or unscoped packs remain generation/signature-bound because new files can
+change retrieval ranking even when prior selected paths are unchanged.
 
 Watcher registration is established before the baseline index scan. Every
 incremental result is checked against a second independently computed source

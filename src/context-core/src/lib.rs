@@ -172,6 +172,11 @@ pub struct ContextMemoryRequest {
     pub confidence: f64,
     #[serde(default = "default_memory_source")]
     pub source: String,
+    /// Repository-relative files supporting this fact.  Facts without source
+    /// paths remain available through memory tools but are not injected into
+    /// repository context packs.
+    #[serde(default)]
+    pub source_paths: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -328,6 +333,9 @@ pub struct ContextPackV2 {
     /// Diagnostic: freshness of retrieval, not a filesystem transaction.
     #[serde(default)]
     pub freshness: String,
+    /// Small, source-validated project facts selected from structured memory.
+    #[serde(default)]
+    pub knowledge: Vec<Value>,
 }
 
 pub type EvidenceCard = (String, u8, u32, u32, String, String, u32);
@@ -374,6 +382,53 @@ struct CachedPack {
     reference_validations: Arc<Vec<ReferenceValidation>>,
     validity: ValidityCertificate,
     telemetry: PackTelemetry,
+    dependencies: Arc<Vec<String>>,
+    scoped: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LookupCacheKey(String);
+
+struct LookupCacheEntry {
+    bytes: Arc<Vec<u8>>,
+    generation: u64,
+    refresh_signature: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct LookupCacheState {
+    entries: HashMap<LookupCacheKey, LookupCacheEntry>,
+    bytes: usize,
+}
+
+const LOOKUP_CACHE_MAX_ENTRIES: usize = 256;
+const LOOKUP_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const LOOKUP_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
+
+fn lookup_cache_key(
+    request: &ContextLookupRequest,
+    generation: u64,
+    refresh_signature: &str,
+) -> Result<LookupCacheKey> {
+    let mut include_globs = request.include_globs.clone();
+    include_globs.sort();
+    Ok(LookupCacheKey(digest_id(
+        "lk_",
+        &serde_json::to_vec(&json!({
+            "mode": request.mode,
+            "query": request.query,
+            "path": validate_relative_path(&request.path)?,
+            "start_line": request.start_line,
+            "end_line": request.end_line,
+            "max_results": request.max_results,
+            "max_entries": request.max_entries,
+            "max_depth": request.max_depth,
+            "include_globs": include_globs,
+            "generation": generation,
+            "refresh_signature": refresh_signature,
+        }))?,
+    )))
 }
 
 struct CachedAdmission {
@@ -385,7 +440,6 @@ struct CachedAdmission {
 struct ValidityCertificate {
     generation: u64,
     refresh_signature: String,
-    event_epoch: u64,
     current: bool,
 }
 
@@ -407,12 +461,7 @@ fn l0_entry_weight(key: &PackCacheKey, value: &CachedPack) -> u32 {
     u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 
-fn l0_cache_key(
-    request: &ContextPackRequest,
-    explicit_paths: &[String],
-    generation: u64,
-    refresh_signature: &str,
-) -> Result<PackCacheKey> {
+fn l0_cache_key(request: &ContextPackRequest, explicit_paths: &[String]) -> Result<PackCacheKey> {
     let mut known_evidence = request.known_evidence.clone();
     known_evidence.sort();
     known_evidence.dedup();
@@ -426,8 +475,6 @@ fn l0_cache_key(
             "evidence_policy": request.evidence_policy,
             "base_pack": &request.base_pack,
             "known_evidence": known_evidence,
-            "generation": generation,
-            "refresh_signature": refresh_signature,
         }))?,
     )))
 }
@@ -962,6 +1009,8 @@ struct EngineMetrics {
     l0_request_variant_misses: AtomicU64,
     l0_invalidations: AtomicU64,
     l0_invalidated_entries: AtomicU64,
+    lookup_cache_hits: AtomicU64,
+    lookup_cache_misses: AtomicU64,
     l1_exact_hits: AtomicU64,
     l1_approximate_hits: AtomicU64,
     lineage_eligible_opportunities: AtomicU64,
@@ -1133,7 +1182,6 @@ struct RefreshShared {
     freshness: Arc<FreshnessState>,
     project_id: String,
     metrics: Arc<EngineMetrics>,
-    l0: WireCache<PackCacheKey, Arc<CachedPack>>,
     frontiers: Arc<Mutex<FrontierState>>,
     index_snapshot_path: std::path::PathBuf,
     #[cfg(test)]
@@ -1418,12 +1466,15 @@ fn mark_watcher_failed_with_reason(freshness: &FreshnessState, reason: u8) {
 }
 
 fn mark_watcher_healthy(freshness: &FreshnessState) {
-    let _ = freshness.watcher_status.compare_exchange(
-        WATCHER_STARTING,
-        WATCHER_HEALTHY,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    // Registration can complete after the startup deadline.  A successful
+    // native watcher or polling snapshot is authoritative recovery and must
+    // clear the temporary FAILED/STARTING state.
+    freshness
+        .watcher_status
+        .store(WATCHER_HEALTHY, Ordering::Release);
+    freshness
+        .watcher_failure
+        .store(WATCHER_FAILURE_NONE, Ordering::Release);
 }
 
 fn mark_watcher_backend(freshness: &FreshnessState, backend: u8) {
@@ -2860,6 +2911,7 @@ pub struct ProjectEngine {
     store: Arc<StateStore>,
     project_id: String,
     l0: Cache<PackCacheKey, Arc<CachedPack>>,
+    lookup_cache: Mutex<LookupCacheState>,
     frontiers: Arc<Mutex<FrontierState>>,
     frontier_admissions: Mutex<FrontierAdmissionTracker>,
     pack_snapshots: Mutex<HashMap<String, Arc<PackSnapshot>>>,
@@ -3030,7 +3082,6 @@ impl ProjectEngine {
             freshness: Arc::clone(&freshness),
             project_id: project_id.clone(),
             metrics: Arc::clone(&metrics),
-            l0: l0.clone(),
             frontiers: Arc::clone(&frontiers),
             index_snapshot_path: index_snapshot_path.clone(),
             #[cfg(test)]
@@ -3046,6 +3097,7 @@ impl ProjectEngine {
             store,
             project_id,
             l0,
+            lookup_cache: Mutex::new(LookupCacheState::default()),
             frontiers,
             frontier_admissions: Mutex::new(FrontierAdmissionTracker::default()),
             pack_snapshots: Mutex::new(pack_snapshots),
@@ -3226,7 +3278,11 @@ impl ProjectEngine {
             )?;
             let refresh = self.ensure_fresh_controlled(request, control)?;
             let admission = if request.memory_session.is_some() {
+                if self.freshness.dirty.load(Ordering::Acquire) {
+                    self.refresh_index_with_paths(true, &[], control)?;
+                }
                 let pack = self.build_context_pack_entry(request)?;
+                let response: ContextPackV2 = serde_json::from_slice(&pack.bytes)?;
                 if let Some(control) = control {
                     control.check()?;
                 }
@@ -3236,6 +3292,8 @@ impl ProjectEngine {
                         reference_validations: Arc::new(Vec::new()),
                         validity: pack.validity,
                         telemetry: pack.telemetry,
+                        dependencies: Arc::new(response.paths),
+                        scoped: !request.focus_paths.is_empty(),
                     }),
                     outcome: PackCacheOutcome::Uncached,
                 }
@@ -3288,29 +3346,11 @@ impl ProjectEngine {
         let (index, generation) = self.index_generation();
         let refresh_signature = index.stats().refresh_signature.clone();
         let explicit_paths = normalized_explicit_paths(request)?;
-        // A watcher event invalidates cached bytes immediately.  The
-        // background refresh may still be constructing the next snapshot, so
-        // serve an uncached pack from the currently published generation
-        // instead of repeatedly returning a cached pre-event response.
-        if self.freshness.dirty.load(Ordering::Acquire) {
-            let pack = self.build_context_pack(request, explicit_reuse_diagnostic(request))?;
-            let response: ContextPackV2 = serde_json::from_slice(&pack.bytes)?;
-            let reference_validations = response
-                .more
-                .into_iter()
-                .map(|reference_id| self.cached_reference_validation(&reference_id))
-                .collect::<Result<Vec<_>>>()?;
-            return Ok(CachedAdmission {
-                cached: Arc::new(CachedPack {
-                    bytes: Arc::new(pack.bytes),
-                    reference_validations: Arc::new(reference_validations),
-                    validity: pack.validity,
-                    telemetry: pack.telemetry,
-                }),
-                outcome: PackCacheOutcome::Uncached,
-            });
-        }
-        let key = l0_cache_key(request, &explicit_paths, generation, &refresh_signature)?;
+        // The key is request-shaped rather than generation-shaped.  Scoped
+        // requests can validate only their source dependencies; unscoped
+        // retrieval remains generation/signature-bound below.
+        let key = l0_cache_key(request, &explicit_paths)?;
+        let mut needs_refresh = false;
         if let Some(cached) = self.l0.get(&key).await {
             match self.cached_pack_is_valid(&cached, generation, &refresh_signature) {
                 Ok(true) => {
@@ -3320,12 +3360,22 @@ impl ProjectEngine {
                         outcome: PackCacheOutcome::L0Hit,
                     });
                 }
-                Ok(false) => self.invalidate_l0_entry(&key).await,
+                Ok(false) => {
+                    needs_refresh = true;
+                    self.invalidate_l0_entry(&key).await;
+                }
                 Err(error) => {
                     self.invalidate_l0_entry(&key).await;
                     return Err(error);
                 }
             }
+        }
+
+        // A miss while the watcher has observed a change must not build from
+        // the old published snapshot.  Existing valid entries are handled
+        // above, so this refresh is paid only by requests that need new data.
+        if needs_refresh || self.freshness.dirty.load(Ordering::Acquire) {
+            self.refresh_index_with_paths(true, &[], None)?;
         }
 
         self.l0.run_pending_tasks().await;
@@ -3349,6 +3399,8 @@ impl ProjectEngine {
                     reference_validations: Arc::new(reference_validations),
                     validity: pack.validity,
                     telemetry: pack.telemetry,
+                    dependencies: Arc::new(response.paths),
+                    scoped: !request.focus_paths.is_empty(),
                 }))
             })
             .await
@@ -3391,23 +3443,8 @@ impl ProjectEngine {
             });
         }
 
-        if self.freshness.dirty.load(Ordering::Acquire) {
-            return Ok(PreparedContinuation {
-                request: request.clone(),
-                state_key,
-                reuse: ContextPackReuseV1 {
-                    delta_applied: false,
-                    source: "continuation".to_owned(),
-                    status: "stale_generation".to_owned(),
-                    wire_tokens_avoided_est: 0,
-                },
-            });
-        }
-
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let (index, generation) = self.index_generation();
-        let refresh_signature = index.stats().refresh_signature.clone();
-        let event_epoch = self.freshness.event_epoch.load(Ordering::Acquire);
         let stored = self
             .store
             .get_json(&state_key)?
@@ -3418,17 +3455,30 @@ impl ProjectEngine {
         let (record, status) = match stored {
             None => (None, "missing"),
             Some(record) if record.expires_at_unix_seconds <= now => (None, "expired"),
-            Some(record)
-                if record.generation != generation
-                    || record.event_epoch != event_epoch
-                    || record.refresh_signature != refresh_signature =>
-            {
-                (None, "stale_generation")
+            Some(record) => {
+                let snapshot = self.load_pack_snapshot(&record.pack_id)?;
+                let unchanged_index_with_mismatched_generation = record.generation != generation
+                    && snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.refresh_signature == index.stats().refresh_signature
+                    });
+                let dependencies_current = snapshot.as_ref().is_some_and(|snapshot| {
+                    !self.freshness.journal_overflow.load(Ordering::Acquire)
+                        && (!snapshot.paths.is_empty()
+                            && snapshot
+                                .paths
+                                .iter()
+                                .all(|path| index.path_matches_snapshot(path)))
+                });
+                if snapshot.is_none() {
+                    (None, "missing_pack")
+                } else if unchanged_index_with_mismatched_generation {
+                    (None, "stale_generation")
+                } else if !dependencies_current {
+                    (None, "stale_dependencies")
+                } else {
+                    (Some(record), "reused")
+                }
             }
-            Some(record) if self.load_pack_snapshot(&record.pack_id)?.is_none() => {
-                (None, "missing_pack")
-            }
-            Some(record) => (Some(record), "reused"),
         };
         let mut effective = request.clone();
         if let Some(record) = record {
@@ -3522,14 +3572,24 @@ impl ProjectEngine {
         refresh_signature: &str,
     ) -> Result<bool> {
         let (current, current_generation) = self.index_generation();
-        if !cached.validity.current
-            || cached.validity.generation != generation
-            || cached.validity.refresh_signature != refresh_signature
-            || generation != current_generation
-            || refresh_signature != current.stats().refresh_signature
-            || cached.validity.event_epoch != self.freshness.event_epoch.load(Ordering::Acquire)
-            || self.freshness.dirty.load(Ordering::Acquire)
-        {
+        if !cached.validity.current {
+            return Ok(false);
+        }
+        let signature_matches = cached.validity.refresh_signature == refresh_signature
+            && refresh_signature == current.stats().refresh_signature;
+        let generation_matches =
+            cached.validity.generation == generation && generation == current_generation;
+        let dependencies_current = if !cached.scoped {
+            generation_matches && signature_matches
+        } else if cached.dependencies.is_empty() {
+            signature_matches
+        } else {
+            cached
+                .dependencies
+                .iter()
+                .all(|path| current.path_matches_snapshot(path))
+        };
+        if !dependencies_current {
             return Ok(false);
         }
         for validation in cached.reference_validations.iter() {
@@ -3672,10 +3732,17 @@ impl ProjectEngine {
             });
         }
 
+        let knowledge = self.current_project_knowledge(
+            &index,
+            &request.prompt,
+            usize::from(request.max_items).min(4),
+        )?;
+
         let route = classify_route(&request.prompt).to_owned();
         let identity = serde_json::to_vec(&json!({
             "paths": &paths,
             "evidence": full_evidence.iter().map(|card| &card.0).collect::<Vec<_>>(),
+            "knowledge": &knowledge,
             "route": &route,
             "policy": request.evidence_policy,
             "signature": &index.stats().refresh_signature,
@@ -3763,6 +3830,7 @@ impl ProjectEngine {
                 "current"
             }
             .to_owned(),
+            knowledge,
         };
         let serialization_started = Instant::now();
         let mut encoded = Vec::with_capacity(512);
@@ -3799,7 +3867,11 @@ impl ProjectEngine {
             continuation_fallback: reuse.source == "continuation"
                 && matches!(
                     reuse.status.as_str(),
-                    "missing" | "expired" | "stale_generation" | "missing_pack"
+                    "missing"
+                        | "expired"
+                        | "stale_generation"
+                        | "stale_dependencies"
+                        | "missing_pack"
                 ),
             explicit_delta_override: reuse.status == "explicit_override",
             lineage,
@@ -3810,7 +3882,6 @@ impl ProjectEngine {
             bytes: encoded,
             validity: ValidityCertificate {
                 generation,
-                event_epoch,
                 refresh_signature: index.stats().refresh_signature.clone(),
                 current: response.freshness == "current",
             },
@@ -4826,7 +4897,9 @@ impl ProjectEngine {
                 .store(watcher_failed, Ordering::Release);
             drop(journal);
 
-            shared.l0.invalidate_all();
+            // Cached packs are retained across generations.  Their source
+            // dependencies are checked against the newly published index on
+            // access, allowing unrelated edits to reuse existing responses.
             let mut frontiers = shared
                 .frontiers
                 .lock()
@@ -4856,6 +4929,27 @@ impl ProjectEngine {
                 request.root_uri.as_deref(),
             )?;
             self.refresh_index(false)?;
+            let (index, generation) = self.index_generation();
+            let refresh_signature = index.stats().refresh_signature.clone();
+            let cache_key = if lookup_cacheable_mode(&request.mode) {
+                Some(lookup_cache_key(request, generation, &refresh_signature)?)
+            } else {
+                None
+            };
+            if let Some(cache_key) = cache_key.as_ref()
+                && let Some(bytes) =
+                    self.lookup_cache_get(cache_key, generation, &refresh_signature)?
+            {
+                self.metrics
+                    .lookup_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return mark_lookup_cache_hit(&bytes);
+            }
+            if cache_key.is_some() {
+                self.metrics
+                    .lookup_cache_misses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let value = match request.mode.as_str() {
                 "search" => self.lookup_search(request)?,
                 "snippet" => self.lookup_snippet(request)?,
@@ -4872,10 +4966,100 @@ impl ProjectEngine {
                 }),
                 unsupported => bail!("unsupported context_lookup mode: {unsupported}"),
             };
-            serde_json::to_vec(&value).map_err(Into::into)
+            let mut value = value;
+            if cache_key.is_some()
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert(
+                    "cache".to_owned(),
+                    json!({
+                        "schema": "context_cache.lookup.v1",
+                        "namespace": operation,
+                        "hit": false,
+                        "reason": "native_miss",
+                    }),
+                );
+            }
+            let bytes = serde_json::to_vec(&value)?;
+            if let Some(cache_key) = cache_key {
+                self.lookup_cache_insert(cache_key, bytes.clone(), generation, refresh_signature)?;
+            }
+            Ok(bytes)
         })();
         self.record_result(operation, started, &result);
         result
+    }
+
+    fn lookup_cache_get(
+        &self,
+        key: &LookupCacheKey,
+        generation: u64,
+        refresh_signature: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let now = Instant::now();
+        let mut state = self
+            .lookup_cache
+            .lock()
+            .map_err(|_| anyhow!("lookup cache lock poisoned"))?;
+        let Some(entry) = state.entries.get(key) else {
+            return Ok(None);
+        };
+        let valid = entry.expires_at > now
+            && entry.generation == generation
+            && entry.refresh_signature == refresh_signature;
+        if !valid {
+            let removed = state
+                .entries
+                .remove(key)
+                .expect("lookup cache entry exists");
+            state.bytes = state.bytes.saturating_sub(removed.bytes.len());
+            return Ok(None);
+        }
+        Ok(Some(entry.bytes.as_ref().clone()))
+    }
+
+    fn lookup_cache_insert(
+        &self,
+        key: LookupCacheKey,
+        bytes: Vec<u8>,
+        generation: u64,
+        refresh_signature: String,
+    ) -> Result<()> {
+        if bytes.len() > LOOKUP_CACHE_MAX_BYTES {
+            return Ok(());
+        }
+        let mut state = self
+            .lookup_cache
+            .lock()
+            .map_err(|_| anyhow!("lookup cache lock poisoned"))?;
+        if let Some(previous) = state.entries.remove(&key) {
+            state.bytes = state.bytes.saturating_sub(previous.bytes.len());
+        }
+        state.entries.insert(
+            key,
+            LookupCacheEntry {
+                bytes: Arc::new(bytes.clone()),
+                generation,
+                refresh_signature,
+                expires_at: Instant::now() + LOOKUP_CACHE_TTL,
+            },
+        );
+        state.bytes = state.bytes.saturating_add(bytes.len());
+        while state.entries.len() > LOOKUP_CACHE_MAX_ENTRIES || state.bytes > LOOKUP_CACHE_MAX_BYTES
+        {
+            let Some(oldest) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = state.entries.remove(&oldest) {
+                state.bytes = state.bytes.saturating_sub(removed.bytes.len());
+            }
+        }
+        Ok(())
     }
 
     pub fn context_memory(&self, request: &ContextMemoryRequest) -> Result<Vec<u8>> {
@@ -4886,7 +5070,19 @@ impl ProjectEngine {
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
-            let value = memory_dispatch(&self.store, request)?;
+            let value = memory_dispatch(&self.store, request, &self.index())?;
+            if matches!(
+                request.mode.as_str(),
+                "upsert" | "summary_upsert" | "decision_record" | "compact"
+            ) {
+                self.l0.invalidate_all();
+                let mut lookup_cache = self
+                    .lookup_cache
+                    .lock()
+                    .map_err(|_| anyhow!("lookup cache lock poisoned"))?;
+                lookup_cache.entries.clear();
+                lookup_cache.bytes = 0;
+            }
             serde_json::to_vec(&value).map_err(Into::into)
         })();
         self.record_result(operation, started, &result);
@@ -5032,6 +5228,76 @@ impl ProjectEngine {
             }).collect::<Vec<_>>(),
             "index": index_status(index.stats()),
         }))
+    }
+
+    fn current_project_knowledge(
+        &self,
+        index: &ProjectIndex,
+        prompt: &str,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let document = load_memory(&self.store)?;
+        let terms = normalize_terms(prompt, 8);
+        let mut candidates = Vec::new();
+        for (kind, rows) in [
+            ("fact", document.entries),
+            ("summary", document.summaries),
+            ("decision", document.decisions),
+        ] {
+            for row in rows {
+                if memory_row_expired(&row)
+                    || row
+                        .get("sensitivity")
+                        .and_then(|value| value.get("redacted"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    || !memory_row_source_valid(&row, index)
+                {
+                    continue;
+                }
+                let mut content = row
+                    .get("summary")
+                    .or_else(|| row.get("value"))
+                    .or_else(|| row.get("decision"))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string();
+                truncate_string(&mut content, 600);
+                let relevance = terms
+                    .iter()
+                    .filter(|term| content.to_ascii_lowercase().contains(term.as_str()))
+                    .count();
+                candidates.push((
+                    relevance,
+                    row.get("confidence")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0),
+                    row.get("updated_at")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    json!({
+                        "kind": kind,
+                        "key": row.get("key").or_else(|| row.get("focus")).or_else(|| row.get("topic")),
+                        "content": content,
+                        "source_paths": row.get("source_paths").cloned().unwrap_or_default(),
+                        "confidence": row.get("confidence").cloned().unwrap_or(json!(0.0)),
+                    }),
+                ));
+            }
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.total_cmp(&left.1))
+                .then_with(|| right.2.cmp(&left.2))
+        });
+        Ok(candidates
+            .into_iter()
+            .take(limit.min(8))
+            .map(|(_, _, _, value)| value)
+            .collect())
     }
 
     fn lookup_search(&self, request: &ContextLookupRequest) -> Result<Value> {
@@ -6436,6 +6702,8 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
         .metrics
         .l0_invalidated_entries
         .load(Ordering::Relaxed);
+    let lookup_cache_hits = engine.metrics.lookup_cache_hits.load(Ordering::Relaxed);
+    let lookup_cache_misses = engine.metrics.lookup_cache_misses.load(Ordering::Relaxed);
     let l0_storage = engine.l0_storage_stats();
     let l1_exact = engine.metrics.l1_exact_hits.load(Ordering::Relaxed);
     let l1_approximate = engine.metrics.l1_approximate_hits.load(Ordering::Relaxed);
@@ -6540,6 +6808,13 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
                 },
                 "invalidations": l0_invalidations,
                 "invalidated_entries": l0_invalidated_entries,
+            },
+            "lookup": {
+                "hits": lookup_cache_hits,
+                "misses": lookup_cache_misses,
+                "hit_ratio": if lookup_cache_hits + lookup_cache_misses == 0 { 0.0 } else { lookup_cache_hits as f64 / (lookup_cache_hits + lookup_cache_misses) as f64 },
+                "max_entries": LOOKUP_CACHE_MAX_ENTRIES,
+                "ttl_seconds": LOOKUP_CACHE_TTL.as_secs(),
             },
             "l1": {
                 "exact_hits": l1_exact,
@@ -6673,6 +6948,13 @@ fn unloaded_metrics_snapshot(project_id: &str, now: &str, status: &str) -> Value
                 "miss_reasons": {"cold_or_invalidated": 0, "request_variant": 0},
                 "invalidations": 0,
                 "invalidated_entries": 0,
+            },
+            "lookup": {
+                "hits": 0,
+                "misses": 0,
+                "hit_ratio": 0.0,
+                "max_entries": LOOKUP_CACHE_MAX_ENTRIES,
+                "ttl_seconds": LOOKUP_CACHE_TTL.as_secs(),
             },
             "l1": {
                 "exact_hits": 0,
@@ -7082,7 +7364,7 @@ fn instructions_payload() -> Value {
             "ttl_seconds": CONTINUATION_TTL_SECONDS,
             "max_entries": CONTINUATION_MAX_ENTRIES,
             "explicit_override": ["base_pack", "known_evidence"],
-            "fallback_statuses": ["missing", "expired", "stale_generation", "missing_pack"]
+            "fallback_statuses": ["missing", "expired", "stale_generation", "stale_dependencies", "missing_pack"]
         },
         "resource_uris": [
             "repo://instructions/context-pack",
@@ -7128,17 +7410,21 @@ impl Default for MemoryDocument {
     }
 }
 
-fn memory_dispatch(store: &StateStore, request: &ContextMemoryRequest) -> Result<Value> {
+fn memory_dispatch(
+    store: &StateStore,
+    request: &ContextMemoryRequest,
+    index: &ProjectIndex,
+) -> Result<Value> {
     if request.max_entries == 0 || request.max_entries > 1000 {
         bail!("max_entries must be in 1..=1000");
     }
     match request.mode.as_str() {
-        "get" => memory_get(store, request),
-        "upsert" => memory_upsert(store, request),
-        "summary_upsert" => memory_summary_upsert(store, request),
-        "decision_record" => memory_decision_record(store, request),
-        "validate" => memory_validate(store),
-        "compact" => memory_compact(store, request),
+        "get" => memory_get(store, request, index),
+        "upsert" => memory_upsert(store, request, index),
+        "summary_upsert" => memory_summary_upsert(store, request, index),
+        "decision_record" => memory_decision_record(store, request, index),
+        "validate" => memory_validate(store, index),
+        "compact" => memory_compact(store, request, index),
         unsupported => bail!("unsupported context_memory mode: {unsupported}"),
     }
 }
@@ -7154,10 +7440,16 @@ fn save_memory(store: &StateStore, document: &MemoryDocument) -> Result<()> {
     store.put_json("memory:store", &serde_json::to_value(document)?)
 }
 
-fn memory_upsert(store: &StateStore, request: &ContextMemoryRequest) -> Result<Value> {
+fn memory_upsert(
+    store: &StateStore,
+    request: &ContextMemoryRequest,
+    index: &ProjectIndex,
+) -> Result<Value> {
     validate_confidence(request.confidence)?;
     let namespace = safe_identifier("namespace", request.namespace.as_deref(), true)?;
     let key = safe_identifier("key", request.key.as_deref(), true)?;
+    let source_paths = normalized_memory_source_paths(&request.source_paths)?;
+    let source_basis = memory_source_basis(index, &source_paths)?;
     let (value, sensitivity) = sanitize_json_value(request.value.clone().unwrap_or(Value::Null));
     let (source, source_sensitivity) = sanitize_json_value(json!(request.source));
     let (tags, tags_sensitivity) = sanitize_json_value(json!(request.tags));
@@ -7176,6 +7468,8 @@ fn memory_upsert(store: &StateStore, request: &ContextMemoryRequest) -> Result<V
             "value": value,
             "confidence": request.confidence,
             "source": source,
+            "source_paths": source_paths,
+            "source_basis": source_basis,
             "tags": tags,
             "created_at": created_at,
             "updated_at": now,
@@ -7189,6 +7483,8 @@ fn memory_upsert(store: &StateStore, request: &ContextMemoryRequest) -> Result<V
             "value": value,
             "confidence": request.confidence,
             "source": source,
+            "source_paths": source_paths,
+            "source_basis": source_basis,
             "tags": tags,
             "created_at": now,
             "updated_at": now,
@@ -7208,10 +7504,16 @@ fn memory_upsert(store: &StateStore, request: &ContextMemoryRequest) -> Result<V
     }))
 }
 
-fn memory_summary_upsert(store: &StateStore, request: &ContextMemoryRequest) -> Result<Value> {
+fn memory_summary_upsert(
+    store: &StateStore,
+    request: &ContextMemoryRequest,
+    index: &ProjectIndex,
+) -> Result<Value> {
     validate_confidence(request.confidence)?;
     let namespace = safe_identifier("namespace", request.namespace.as_deref(), true)?;
     let focus = safe_identifier("focus", Some(&request.focus), true)?;
+    let source_paths = normalized_memory_source_paths(&request.source_paths)?;
+    let source_basis = memory_source_basis(index, &source_paths)?;
     let (summary, summary_sensitivity) = sanitize_json_value(json!(request.summary));
     let (source, source_sensitivity) = sanitize_json_value(json!(request.source));
     let (tags, tags_sensitivity) = sanitize_json_value(json!(request.tags));
@@ -7226,6 +7528,8 @@ fn memory_summary_upsert(store: &StateStore, request: &ContextMemoryRequest) -> 
         "summary": summary,
         "confidence": request.confidence,
         "source": source,
+        "source_paths": source_paths,
+        "source_basis": source_basis,
         "tags": tags,
         "created_at": now,
         "updated_at": now,
@@ -7255,13 +7559,19 @@ fn memory_summary_upsert(store: &StateStore, request: &ContextMemoryRequest) -> 
     }))
 }
 
-fn memory_decision_record(store: &StateStore, request: &ContextMemoryRequest) -> Result<Value> {
+fn memory_decision_record(
+    store: &StateStore,
+    request: &ContextMemoryRequest,
+    index: &ProjectIndex,
+) -> Result<Value> {
     validate_confidence(request.confidence)?;
     if !matches!(request.decided_by.as_str(), "human" | "llm") {
         bail!("decided_by must be human or llm");
     }
     let namespace = safe_identifier("namespace", request.namespace.as_deref(), true)?;
     let topic = safe_identifier("topic", Some(&request.topic), false)?;
+    let source_paths = normalized_memory_source_paths(&request.source_paths)?;
+    let source_basis = memory_source_basis(index, &source_paths)?;
     let (decision, decision_sensitivity) =
         sanitize_json_value(request.decision.clone().unwrap_or(Value::Null));
     let (rationale, rationale_sensitivity) = sanitize_json_value(json!(request.rationale));
@@ -7284,6 +7594,8 @@ fn memory_decision_record(store: &StateStore, request: &ContextMemoryRequest) ->
         "rationale": rationale,
         "confidence": request.confidence,
         "source": source,
+        "source_paths": source_paths,
+        "source_basis": source_basis,
         "tags": tags,
         "created_at": now,
         "updated_at": now,
@@ -7303,20 +7615,35 @@ fn memory_decision_record(store: &StateStore, request: &ContextMemoryRequest) ->
     }))
 }
 
-fn memory_get(store: &StateStore, request: &ContextMemoryRequest) -> Result<Value> {
+fn memory_get(
+    store: &StateStore,
+    request: &ContextMemoryRequest,
+    index: &ProjectIndex,
+) -> Result<Value> {
     let document = load_memory(store)?;
     let namespace = request.namespace.as_deref();
     let limit = usize::from(request.max_entries);
-    let entries = filter_memory_rows(&document.entries, namespace, request.include_expired, limit);
+    let entries = filter_memory_rows(
+        &document.entries,
+        namespace,
+        request.include_expired,
+        limit,
+        index,
+    );
     let summaries = filter_memory_rows(
         &document.summaries,
         namespace,
         request.include_expired,
         limit,
+        index,
     );
     let decisions = effective_decisions(&document, namespace, None, request.include_expired)
         .into_iter()
         .take(limit)
+        .map(|mut row| {
+            row["source_validity"] = json!(memory_row_source_status(&row, index));
+            row
+        })
         .collect::<Vec<_>>();
     Ok(json!({
         "schema": "context_memory.get.v1",
@@ -7330,11 +7657,16 @@ fn memory_get(store: &StateStore, request: &ContextMemoryRequest) -> Result<Valu
     }))
 }
 
-fn memory_validate(store: &StateStore) -> Result<Value> {
+fn memory_validate(store: &StateStore, index: &ProjectIndex) -> Result<Value> {
     let document = load_memory(store)?;
     let mut stale_entries = Vec::new();
     let mut missing_metadata = Vec::new();
-    for row in &document.entries {
+    for row in document
+        .entries
+        .iter()
+        .chain(document.summaries.iter())
+        .chain(document.decisions.iter())
+    {
         if memory_row_expired(row) {
             stale_entries.push(json!({
                 "namespace": row.get("namespace").cloned().unwrap_or_default(),
@@ -7342,7 +7674,21 @@ fn memory_validate(store: &StateStore) -> Result<Value> {
                 "reason": "expired",
             }));
         }
-        for required in ["source", "confidence", "created_at", "updated_at"] {
+        let source_status = memory_row_source_status(row, index);
+        if source_status != "current" {
+            stale_entries.push(json!({
+                "namespace": row.get("namespace").cloned().unwrap_or_default(),
+                "key": row.get("key").or_else(|| row.get("focus")).or_else(|| row.get("topic")).cloned().unwrap_or_default(),
+                "reason": source_status,
+            }));
+        }
+        for required in [
+            "source",
+            "source_paths",
+            "confidence",
+            "created_at",
+            "updated_at",
+        ] {
             if row.get(required).is_none() {
                 missing_metadata.push(json!({
                     "kind": "entry",
@@ -7363,7 +7709,11 @@ fn memory_validate(store: &StateStore) -> Result<Value> {
     }))
 }
 
-fn memory_compact(store: &StateStore, request: &ContextMemoryRequest) -> Result<Value> {
+fn memory_compact(
+    store: &StateStore,
+    request: &ContextMemoryRequest,
+    index: &ProjectIndex,
+) -> Result<Value> {
     let document = load_memory(store)?;
     let mut rows = document
         .entries
@@ -7432,7 +7782,7 @@ fn memory_compact(store: &StateStore, request: &ContextMemoryRequest) -> Result<
     summary_request.confidence = 0.9;
     summary_request.source = "context_memory.compact".to_owned();
     summary_request.tags = vec!["auto".to_owned(), "compact".to_owned()];
-    memory_summary_upsert(store, &summary_request)?;
+    memory_summary_upsert(store, &summary_request, index)?;
     Ok(json!({
         "schema": "context_memory.compact.v1",
         "compacted": true,
@@ -7447,6 +7797,7 @@ fn filter_memory_rows(
     namespace: Option<&str>,
     include_expired: bool,
     limit: usize,
+    index: &ProjectIndex,
 ) -> Vec<Value> {
     rows.iter()
         .filter(|row| {
@@ -7458,9 +7809,35 @@ fn filter_memory_rows(
         .cloned()
         .map(|mut row| {
             row["expired"] = json!(memory_row_expired(&row));
+            row["source_validity"] = json!(memory_row_source_status(&row, index));
             row
         })
         .collect()
+}
+
+fn memory_row_source_status(row: &Value, index: &ProjectIndex) -> &'static str {
+    let Some(paths) = row.get("source_paths").and_then(Value::as_array) else {
+        return "unverified";
+    };
+    if paths.is_empty() {
+        return "unverified";
+    }
+    let Some(basis) = row.get("source_basis").and_then(Value::as_object) else {
+        return "unverified";
+    };
+    if paths.iter().all(|path| {
+        path.as_str().is_some_and(|path| {
+            basis.get(path).and_then(Value::as_str) == index.snapshot_fingerprint(path).as_deref()
+        })
+    }) {
+        "current"
+    } else {
+        "stale"
+    }
+}
+
+fn memory_row_source_valid(row: &Value, index: &ProjectIndex) -> bool {
+    memory_row_source_status(row, index) == "current"
 }
 
 fn effective_decisions(
@@ -7544,6 +7921,30 @@ fn safe_identifier(field: &str, value: Option<&str>, required: bool) -> Result<S
         bail!("unsafe memory identifier: {field} contains sensitive content");
     }
     Ok(normalized.to_owned())
+}
+
+fn normalized_memory_source_paths(paths: &[String]) -> Result<Vec<String>> {
+    let mut normalized = paths
+        .iter()
+        .map(|path| validate_relative_path(path))
+        .collect::<Result<Vec<_>>>()?;
+    normalized.sort();
+    normalized.dedup();
+    if normalized.len() > 16 {
+        bail!("source_paths must contain at most 16 paths");
+    }
+    Ok(normalized)
+}
+
+fn memory_source_basis(index: &ProjectIndex, paths: &[String]) -> Result<Value> {
+    let mut basis = serde_json::Map::new();
+    for path in paths {
+        let fingerprint = index
+            .snapshot_fingerprint(path)
+            .ok_or_else(|| anyhow!("source path is not present in the published index: {path}"))?;
+        basis.insert(path.clone(), Value::String(fingerprint));
+    }
+    Ok(Value::Object(basis))
 }
 
 fn sanitize_json_value(value: Value) -> (Value, Value) {
@@ -7643,6 +8044,22 @@ fn memory_row_expired(row: &Value) -> bool {
         .and_then(Value::as_str)
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
         .is_some_and(|expiry| expiry < OffsetDateTime::now_utc())
+}
+
+fn mark_lookup_cache_hit(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(bytes)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "cache".to_owned(),
+            json!({
+                "schema": "context_cache.lookup.v1",
+                "namespace": "context_lookup",
+                "hit": true,
+                "reason": "memory_hit",
+            }),
+        );
+    }
+    serde_json::to_vec(&value).map_err(Into::into)
 }
 
 fn normalized_explicit_paths(request: &ContextPackRequest) -> Result<Vec<String>> {
@@ -8228,6 +8645,20 @@ const fn default_max_source_tokens() -> u16 {
 
 fn default_lookup_mode() -> String {
     "search".to_owned()
+}
+
+fn lookup_cacheable_mode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "search"
+            | "snippet"
+            | "tree"
+            | "symbols"
+            | "impact"
+            | "related_symbols"
+            | "test_owners"
+            | "chunk"
+    )
 }
 
 fn lookup_operation(mode: &str) -> &'static str {
@@ -9267,6 +9698,108 @@ mod tests {
     }
 
     #[test]
+    fn lookup_cache_returns_observable_hit_for_repeated_request() {
+        let root = tempdir().expect("temporary repository");
+        fs::write(root.path().join("notes.txt"), "cache marker\n").expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let request: ContextLookupRequest = serde_json::from_value(json!({
+            "mode": "search",
+            "query": "cache marker"
+        }))
+        .expect("lookup request");
+        let first: Value =
+            serde_json::from_slice(&engine.context_lookup(&request).expect("first lookup"))
+                .expect("first JSON");
+        let second: Value =
+            serde_json::from_slice(&engine.context_lookup(&request).expect("second lookup"))
+                .expect("second JSON");
+        assert_eq!(first["cache"]["hit"], false);
+        assert_eq!(second["cache"]["hit"], true);
+        assert_eq!(engine.metrics.lookup_cache_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn mutable_lookup_modes_remain_uncached() {
+        let root = tempdir().expect("temporary repository");
+        fs::write(root.path().join("notes.txt"), "reference marker\n").expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let request: ContextLookupRequest = serde_json::from_value(json!({
+            "mode": "references"
+        }))
+        .expect("lookup request");
+        let first: Value =
+            serde_json::from_slice(&engine.context_lookup(&request).expect("first lookup"))
+                .expect("first JSON");
+        let second: Value =
+            serde_json::from_slice(&engine.context_lookup(&request).expect("second lookup"))
+                .expect("second JSON");
+        assert_eq!(first["schema"], "context_references.list.v1");
+        assert_eq!(second["schema"], "context_references.list.v1");
+        assert!(first.get("cache").is_none());
+        assert!(second.get("cache").is_none());
+        assert_eq!(engine.metrics.lookup_cache_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            engine.metrics.lookup_cache_misses.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn packs_inject_only_current_source_linked_memory() {
+        let root = tempdir().expect("temporary repository");
+        fs::write(root.path().join("architecture.md"), "service ownership\n")
+            .expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let upsert: ContextMemoryRequest = serde_json::from_value(json!({
+            "mode": "upsert",
+            "namespace": "project",
+            "key": "ownership",
+            "value": "service ownership is documented here",
+            "source_paths": ["architecture.md"]
+        }))
+        .expect("memory request");
+        engine.context_memory(&upsert).expect("memory upsert");
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "service ownership",
+            "focus_paths": ["architecture.md"]
+        }))
+        .expect("pack request");
+        let first: ContextPackV2 =
+            serde_json::from_slice(&engine.context_pack(&request).expect("first pack"))
+                .expect("first JSON");
+        assert_eq!(first.knowledge.len(), 1);
+        fs::write(root.path().join("architecture.md"), "changed ownership\n")
+            .expect("changed source");
+        let changed: ContextPackV2 = serde_json::from_slice(
+            &engine
+                .context_pack(&ContextPackRequest {
+                    changed_files: vec!["architecture.md".to_owned()],
+                    cache_strategy: CacheStrategy::Fresh,
+                    ..request
+                })
+                .expect("changed pack"),
+        )
+        .expect("changed JSON");
+        assert!(changed.knowledge.is_empty());
+        engine
+            .context_memory(&upsert)
+            .expect("refresh memory source basis");
+        let refreshed: ContextPackV2 = serde_json::from_slice(
+            &engine
+                .context_pack(&ContextPackRequest {
+                    ..serde_json::from_value(json!({
+                        "prompt": "service ownership",
+                        "focus_paths": ["architecture.md"]
+                    }))
+                    .expect("refreshed pack request")
+                })
+                .expect("refreshed pack"),
+        )
+        .expect("refreshed JSON");
+        assert_eq!(refreshed.knowledge.len(), 1);
+    }
+
+    #[test]
     fn l0_singleflight_remains_correct_for_concurrent_non_continuation_requests() {
         let root = tempdir().expect("temporary repository");
         let source = (0..400)
@@ -9359,6 +9892,29 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn unscoped_l0_entry_misses_after_generation_change() {
+        let root = tempdir().expect("temporary repository");
+        fs::write(root.path().join("existing.txt"), "ranking marker\n").expect("fixture file");
+        let engine = ProjectEngine::build(root.path()).expect("engine");
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "ranking marker",
+            "cache_strategy": "fresh"
+        }))
+        .expect("pack request");
+        engine
+            .context_pack_cached(&request)
+            .await
+            .expect("first response");
+        fs::write(root.path().join("new.txt"), "new ranking marker\n").expect("new source");
+        engine
+            .context_pack_cached(&request)
+            .await
+            .expect("second response");
+        assert_eq!(engine.metrics.l0_misses.load(Ordering::Relaxed), 2);
+        assert_eq!(engine.metrics.l0_hits.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

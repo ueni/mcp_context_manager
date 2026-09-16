@@ -363,9 +363,12 @@ project resolves as project-local missing state; no global identity registry is
 consulted.
 
 Fallback is deterministic and visible in the response-level `reuse` object:
-`missing`, `expired`, `stale_generation`, and `missing_pack` all produce a full
-pack and advance the continuation only after that pack succeeds. `reused`
-reports valid derived delta state. `delta_applied` and
+`missing`, `expired`, `stale_generation`, `stale_dependencies`, and
+`missing_pack` all produce a full pack and advance the continuation only after
+that pack succeeds. A prior pack may survive an unrelated generation change
+when its recorded source paths still match; changed dependencies and journal
+overflow produce `stale_dependencies`. `reused` reports valid derived delta
+state. `delta_applied` and
 `wire_tokens_avoided_est` are emitted once at the response level, not copied
 into evidence cards.
 
@@ -391,9 +394,16 @@ turns. The retained issue run is
 L0 is a 64 MiB weighted Moka future cache of immutable encoded response bytes,
 reference ids, and a validity certificate. It uses 30-minute time-to-idle
 expiry and `try_get_with` singleflight, so concurrent identical misses perform
-one build. Every apparent hit revalidates its generation, refresh signature,
-and referenced bodies (existence, expiry, and content hash) before serving the
-cached bytes.
+one build. Explicitly focused packs retain source dependencies and may be
+reused across unrelated published generations after those paths are
+revalidated. Broad or unscoped packs remain bound to the cached generation
+and refresh signature because new files can change retrieval ranking. Every
+apparent hit also revalidates referenced bodies (existence, expiry, and content
+hash) before serving cached bytes.
+
+The short-lived `context_lookup` cache is separate from L0 and is bounded to
+256 entries or 16 MiB with a 30-second idle TTL. Its generation/signature-keyed
+`cache` response object and metrics are diagnostic, not repository evidence.
 
 ### L1 frontier cache
 
@@ -563,7 +573,15 @@ inlined only after path validation against the Python reference directory.
 Memory supports facts, summaries, decisions, validation, and compaction under
 project-local namespaces. Values are sanitized before persistence. Secrets,
 bearer tokens, raw prompts, raw model responses, and host absolute paths are not
-valid durable memory.
+valid durable memory. `source_paths` is an additive write field accepting at
+most 16 repository-relative paths; each write stores its opaque path-to-
+fingerprint source basis. Pack `knowledge` is an additive stable field,
+bounded to four records; only non-expired, non-redacted records whose stored
+basis still matches indexed fingerprints are injected. An explicit upsert is
+required to refresh a changed fact. Legacy rows without a basis are reported
+as `unverified` and excluded from packs. Source validity is reported as
+current, stale, or unverified by memory reads/validation, while cache and
+freshness indicators remain diagnostic fields.
 
 ## Redaction and untrusted repository content
 

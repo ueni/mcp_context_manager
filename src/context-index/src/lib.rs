@@ -592,6 +592,16 @@ impl ProjectIndex {
             .is_some_and(|expected| *expected == fingerprint(&text))
     }
 
+    /// Returns an opaque, repository-relative fingerprint from this published
+    /// snapshot. Callers can persist it as provenance without depending on
+    /// the private fingerprint representation.
+    pub fn snapshot_fingerprint(&self, path: &str) -> Option<String> {
+        let path = validate_relative_path(path).ok()?;
+        self.fingerprints
+            .get(&path)
+            .map(|fingerprint| format!("{}:{}", fingerprint.len, fingerprint.sha256))
+    }
+
     /// Reads and chunks a current regular text file for a request-side
     /// overlay while the published Tantivy snapshot is being refreshed.
     pub fn current_chunks_for_path(&self, path: &str) -> Vec<Chunk> {
