@@ -35,7 +35,11 @@ schemars = "1.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
-tantivy = "=0.26.1"
+# Tantivy 0.26.1 constrains `lru` to the RustSec-advised 0.16 line. Upstream
+# merged the patched `lru` 0.18.2 in quickwit-oss/tantivy#3034, but has not yet
+# published a compatible release. Keep this immutable revision until the first
+# crates.io Tantivy release containing that upstream change is available.
+tantivy = { git = "https://github.com/quickwit-oss/tantivy.git", rev = "5ca39332002c2c87fb5d2abc707cf527b3319d42" }
 time = { version = "0.3.53", features = ["formatting", "parsing"] }
 tree-sitter = "0.26.11"
 tree-sitter-c = "0.24.2"
