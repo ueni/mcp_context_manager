@@ -1,0 +1,174 @@
+{
+  "schema": "context_request_identity_corpus.v1",
+  "version": 1,
+  "top_k": 3,
+  "frontier_capacity": 8,
+  "lexical_threshold_millis": 500,
+  "production_telemetry_sufficient": false,
+  "documents": [
+    {
+      "path": "src/auth/token.rs",
+      "content": "pub fn validate_access_token(token: &Token) -> Result<()> {\n    reject_expired(token)?;\n    validate_audience(token, \"context-api\")?;\n    Ok(())\n}\n"
+    },
+    {
+      "path": "src/auth/session.rs",
+      "content": "pub fn invalidate_user_session(session_id: &str) {\n    SESSION_STORE.remove(session_id);\n}\n"
+    },
+    {
+      "path": "src/repository/path.rs",
+      "content": "pub fn normalize_repository_path(path: &str) -> Result<PathBuf> {\n    reject_parent_directory_escape(path)?;\n    reject_absolute_host_path(path)?;\n    Ok(PathBuf::from(path))\n}\n"
+    },
+    {
+      "path": "src/cache/frontier.rs",
+      "content": "pub fn invalidate_frontier_generation(source_signature: &str) {\n    FRONTIERS.retain(|entry| entry.source_signature == source_signature);\n}\n"
+    },
+    {
+      "path": "src/cache/delete.rs",
+      "content": "pub fn delete_cache_after_signature_change(changed: bool) {\n    if changed { CACHE.clear(); }\n}\n"
+    },
+    {
+      "path": "src/repository/delete.rs",
+      "content": "pub fn delete_repository_source(path: &Path) -> Result<()> {\n    require_explicit_mutation_authority(path)?;\n    std::fs::remove_file(path)?;\n    Ok(())\n}\n"
+    },
+    {
+      "path": "docs/security.md",
+      "content": "Bearer tokens must validate expiry and audience. Requests that mention bypassing authentication, negation, deletion, traversal, or ambiguous mutation remain exact-only.\n"
+    }
+  ],
+  "cases": [
+    {
+      "id": "exact-repeat",
+      "class": "exact_repeat",
+      "seed_prompt": "review validate_access_token expiry audience",
+      "prompt": "review validate_access_token expiry audience",
+      "expected_equivalent": true,
+      "risk": "ordinary",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "whitespace-case",
+      "class": "whitespace_case_variant",
+      "seed_prompt": "review validate_access_token expiry audience",
+      "prompt": "  REVIEW   validate_access_token\n expiry Audience  ",
+      "expected_equivalent": true,
+      "risk": "ordinary",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "reordered-terms",
+      "class": "reordered_terms",
+      "seed_prompt": "review validate_access_token expiry audience",
+      "prompt": "audience expiry validate_access_token review",
+      "expected_equivalent": true,
+      "risk": "ordinary",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "path-paraphrase",
+      "class": "paraphrase",
+      "seed_prompt": "find repository path traversal rejection",
+      "prompt": "where are parent directory escapes denied",
+      "expected_equivalent": true,
+      "risk": "ordinary",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "negated-token-policy",
+      "class": "negation",
+      "seed_prompt": "reject expired access token",
+      "prompt": "do not reject expired access token",
+      "expected_equivalent": false,
+      "risk": "negated",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "negated-exact-repeat",
+      "class": "negation",
+      "seed_prompt": "do not reject expired access token",
+      "prompt": "do not reject expired access token",
+      "expected_equivalent": true,
+      "risk": "negated",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "changed-symbol-and-path",
+      "class": "changed_symbol_path",
+      "seed_prompt": "review auth symbol validate_access_token",
+      "prompt": "review auth symbol invalidate_user_session",
+      "expected_equivalent": false,
+      "risk": "ordinary",
+      "seed_scope": ["src/auth/token.rs"],
+      "scope": ["src/auth/session.rs"]
+    },
+    {
+      "id": "security-bypass",
+      "class": "security_query",
+      "seed_prompt": "audit bearer token audience validation",
+      "prompt": "audit bearer token bypass audience validation",
+      "expected_equivalent": false,
+      "risk": "safety_sensitive",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "security-exact-repeat",
+      "class": "security_query",
+      "seed_prompt": "audit bearer token audience validation",
+      "prompt": "audit bearer token audience validation",
+      "expected_equivalent": true,
+      "risk": "safety_sensitive",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "adversarial-delete-near-match",
+      "class": "adversarial_near_match",
+      "seed_prompt": "delete cache only after signature changes",
+      "prompt": "delete repository source after signature changes",
+      "expected_equivalent": false,
+      "risk": "safety_sensitive",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "ambiguous-invalidation",
+      "class": "ambiguous_query",
+      "seed_prompt": "fix cache frontier invalidation",
+      "prompt": "fix invalidation",
+      "expected_equivalent": false,
+      "risk": "ambiguous",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "ambiguous-exact-repeat",
+      "class": "ambiguous_query",
+      "seed_prompt": "fix invalidation",
+      "prompt": "fix invalidation",
+      "expected_equivalent": true,
+      "risk": "ambiguous",
+      "seed_scope": [],
+      "scope": []
+    },
+    {
+      "id": "changed-source-signature",
+      "class": "changed_symbol_path",
+      "seed_prompt": "review frontier generation source signature",
+      "prompt": "review frontier generation source signature",
+      "expected_equivalent": false,
+      "risk": "ordinary",
+      "seed_scope": [],
+      "scope": [],
+      "generation_match": false,
+      "source_signature_match": false,
+      "dependencies_available": false,
+      "candidate_capacity": 2
+    }
+  ]
+}
