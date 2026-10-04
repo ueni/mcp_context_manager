@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    fs,
     panic::{AssertUnwindSafe, catch_unwind},
     process::{Command, Stdio},
     sync::{
@@ -100,15 +101,6 @@ pub enum EvidencePolicy {
     Source,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheStrategy {
-    #[default]
-    Fast,
-    Stable,
-    Fresh,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextPackRequest {
@@ -128,8 +120,6 @@ pub struct ContextPackRequest {
     pub max_source_tokens: u16,
     #[serde(default)]
     pub evidence_policy: EvidencePolicy,
-    #[serde(default)]
-    pub cache_strategy: CacheStrategy,
     pub base_pack: Option<String>,
     #[serde(default)]
     pub known_evidence: Vec<String>,
@@ -365,6 +355,8 @@ const POSITIVE_FRONTIER_ADMISSION_WINDOW_MS: u64 = 30 * 60 * 1_000;
 const FRONTIER_ADMISSION_TRACKER_MAX_ENTRIES: usize = 2_048;
 const OPERATION_SAMPLE_LIMIT: usize = 128;
 const REUSE_IDENTITY_VERSION: &str = "v1";
+const USAGE_CONFIG_SCHEMA: &str = "context_monitor_usage.config.v2";
+const USAGE_BUCKET_SCHEMA: &str = "context_monitor_usage.bucket.v3";
 const REUSE_TRACKER_MAX_ENTRIES: usize = 2_048;
 const REUSE_SLOT_MINUTES: i64 = 15;
 const REUSE_IDLE_SLOTS: u64 = 2;
@@ -1031,6 +1023,14 @@ struct EngineMetrics {
     incremental_fallbacks: AtomicU64,
     lineage_git_checks: AtomicU64,
     signature_scan_micros: AtomicU64,
+    git_diff_hits: AtomicU64,
+    git_diff_misses: AtomicU64,
+    git_diff_regenerations: AtomicU64,
+    git_diff_invalidations: AtomicU64,
+    git_diff_patch_eligible: AtomicU64,
+    git_diff_reload_fallbacks: AtomicU64,
+    git_diff_bytes: AtomicU64,
+    git_diff_micros: AtomicU64,
     refresh_micros: AtomicU64,
     index_state_io_micros: AtomicU64,
     retrieval_micros: AtomicU64,
@@ -1184,8 +1184,30 @@ struct RefreshShared {
     metrics: Arc<EngineMetrics>,
     frontiers: Arc<Mutex<FrontierState>>,
     index_snapshot_path: std::path::PathBuf,
+    git_diff_cache: Arc<Mutex<GitDiffCache>>,
     #[cfg(test)]
     refresh_hook: Arc<Mutex<Option<RefreshHook>>>,
+}
+
+const GIT_DIFF_CACHE_MAX_ENTRIES: usize = 256;
+const GIT_DIFF_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const GIT_DIFF_PATCH_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GitDiffCacheKey {
+    index_generation: u64,
+    head: String,
+    git_index_len: u64,
+    git_index_modified_nanos: u128,
+    path: String,
+    file_len: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Default)]
+struct GitDiffCache {
+    entries: BTreeMap<GitDiffCacheKey, Vec<u8>>,
+    bytes: usize,
 }
 
 #[cfg(test)]
@@ -1268,6 +1290,37 @@ impl Drop for RefreshPermit {
 }
 
 impl RefreshCoordinator {
+    fn request_background(self: &Arc<Self>, explicit_paths: &[String]) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("refresh coordinator lock poisoned"))?;
+        state.next_job = state.next_job.saturating_add(1);
+        state.pending_job = state.next_job;
+        state.pending_force = false;
+        state.pending_paths.extend(explicit_paths.iter().cloned());
+        if state.pending_paths.len() > CHANGE_JOURNAL_MAX_PATHS {
+            state.pending_paths.clear();
+            self.shared
+                .freshness
+                .journal_overflow
+                .store(true, Ordering::Release);
+        }
+        if !state.running {
+            state.running = true;
+            let worker = Arc::clone(self);
+            thread::Builder::new()
+                .name("context-refresh".to_owned())
+                .spawn(move || worker.run())
+                .map_err(|error| {
+                    state.running = false;
+                    anyhow!("failed to start refresh worker: {error}")
+                })?;
+        }
+        self.wake.notify_one();
+        Ok(())
+    }
+
     fn request(
         self: &Arc<Self>,
         force: bool,
@@ -1378,6 +1431,17 @@ impl RefreshCoordinator {
                 state.pending_force = false;
                 (job, force, paths, starting_epoch)
             };
+
+            while !force && self.shared.freshness.dirty.load(Ordering::Acquire) {
+                let elapsed = now_millis()
+                    .saturating_sub(self.shared.freshness.last_event_ms.load(Ordering::Acquire));
+                if elapsed >= WATCH_COALESCE_MS {
+                    break;
+                }
+                thread::sleep(StdDuration::from_millis(
+                    WATCH_COALESCE_MS.saturating_sub(elapsed).min(10),
+                ));
+            }
 
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let _permit = RefreshLimiter::global().acquire();
@@ -1526,21 +1590,31 @@ const MONITOR_REPORT_REFERENCE_TTL_HOURS: i64 = 24;
 impl UsageMonitor {
     pub fn open(global_state: impl AsRef<std::path::Path>) -> Result<Self> {
         let store = StateStore::open(global_state)?;
-        let mut config = store
-            .get_json("monitor:config")?
-            .unwrap_or_else(|| json!({}));
-        let enabled = config
-            .get("enabled")
+        let current_config = store.get_json("monitor:config")?.filter(|config| {
+            config.get("schema").and_then(Value::as_str) == Some(USAGE_CONFIG_SCHEMA)
+                && config.get("enabled").and_then(Value::as_bool).is_some()
+                && config.get("identity_salt_version").and_then(Value::as_str)
+                    == Some(REUSE_IDENTITY_VERSION)
+                && config
+                    .get("identity_salt")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| {
+                        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+        });
+        let enabled = current_config
+            .as_ref()
+            .and_then(|config| config.get("enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let identity_salt = config
-            .get("identity_salt")
+        let identity_salt = current_config
+            .as_ref()
+            .and_then(|config| config.get("identity_salt"))
             .and_then(Value::as_str)
-            .filter(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .map(str::to_owned)
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
-        config = json!({
-            "schema": "context_monitor_usage.config.v2",
+        let config = json!({
+            "schema": USAGE_CONFIG_SCHEMA,
             "enabled": enabled,
             "identity_salt_version": REUSE_IDENTITY_VERSION,
             "identity_salt": identity_salt,
@@ -1573,7 +1647,7 @@ impl UsageMonitor {
                 self.store.put_json(
                     "monitor:config",
                     &json!({
-                        "schema":"context_monitor_usage.config.v2",
+                        "schema":USAGE_CONFIG_SCHEMA,
                         "enabled":enabled,
                         "identity_salt_version": REUSE_IDENTITY_VERSION,
                         "identity_salt": self.identity_salt,
@@ -1663,37 +1737,40 @@ impl UsageMonitor {
         let day = observed_at.date().to_string();
         let key = format!("monitor:usage:{day}:{project_id}");
         let reuse = self.classify_and_record_reuse(project_id, &sample, observed_at)?;
-        let mut value = self.store.get_json(&key)?.unwrap_or_else(|| {
-            json!({
-                "schema": "context_monitor_usage.bucket.v3",
-                "day": day,
-                "project_id": project_id,
-                "request_count": 0,
-                "elapsed_micros_total": 0,
-                "elapsed_micros_max": 0,
-                "input_tokens_est": 0,
-                "wire_tokens_est": 0,
-                "candidate_count": 0,
-                "selected_count": 0,
-                "tokens_saved_est": 0,
-                "delta_tokens_saved_est": 0,
-                "cache_outcomes": {},
-                "frontier_outcomes": {},
-                "lineage_frontier": {},
-                "index": {},
-                "delta": {},
-                "routes": {},
-                "term_count_buckets": {},
-                "scope_count_buckets": {},
-                "stages_micros": {},
-                "client_profiles": empty_client_profile_buckets(),
-                "reuse_opportunities": {},
-                "reuse_effectiveness": {},
-                "miss_causes": empty_named_counters(&REUSE_MISS_CAUSES),
-                "repeat_distance_buckets": empty_named_counters(&REPEAT_DISTANCE_BUCKETS),
-            })
-        });
-        migrate_usage_bucket(&mut value);
+        let mut value = self
+            .store
+            .get_json(&key)?
+            .filter(|bucket| is_current_usage_bucket(bucket))
+            .unwrap_or_else(|| {
+                json!({
+                    "schema": USAGE_BUCKET_SCHEMA,
+                    "day": day,
+                    "project_id": project_id,
+                    "request_count": 0,
+                    "elapsed_micros_total": 0,
+                    "elapsed_micros_max": 0,
+                    "input_tokens_est": 0,
+                    "wire_tokens_est": 0,
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "tokens_saved_est": 0,
+                    "delta_tokens_saved_est": 0,
+                    "cache_outcomes": {},
+                    "frontier_outcomes": {},
+                    "lineage_frontier": {},
+                    "index": {},
+                    "delta": {},
+                    "routes": {},
+                    "term_count_buckets": {},
+                    "scope_count_buckets": {},
+                    "stages_micros": {},
+                    "client_profiles": empty_client_profile_buckets(),
+                    "reuse_opportunities": {},
+                    "reuse_effectiveness": {},
+                    "miss_causes": empty_named_counters(&REUSE_MISS_CAUSES),
+                    "repeat_distance_buckets": empty_named_counters(&REPEAT_DISTANCE_BUCKETS),
+                })
+            });
         let telemetry = sample.telemetry;
         let elapsed_micros = u64::try_from(sample.elapsed.as_micros()).unwrap_or(u64::MAX);
         increment_json_u64(&mut value, "request_count", 1);
@@ -2079,11 +2156,12 @@ impl UsageMonitor {
         rows.extend(self.store.iter_json("monitor:rejections:")?);
         let mut remove = rows
             .iter()
-            .filter(|(_, value)| {
-                value
-                    .get("day")
-                    .and_then(Value::as_str)
-                    .is_none_or(|day| day < cutoff.as_str())
+            .filter(|(key, value)| {
+                (key.starts_with("monitor:usage:") && !is_current_usage_bucket(value))
+                    || value
+                        .get("day")
+                        .and_then(Value::as_str)
+                        .is_none_or(|day| day < cutoff.as_str())
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
@@ -2147,9 +2225,10 @@ impl UsageMonitor {
             .into_iter()
             .map(|(_, value)| value)
             .filter(|value| {
-                project_id.is_none_or(|selected| {
-                    value.get("project_id").and_then(Value::as_str) == Some(selected)
-                })
+                is_current_usage_bucket(value)
+                    && project_id.is_none_or(|selected| {
+                        value.get("project_id").and_then(Value::as_str) == Some(selected)
+                    })
             })
             .collect::<Vec<_>>();
         buckets.sort_by(|left, right| {
@@ -2158,7 +2237,6 @@ impl UsageMonitor {
                 .cmp(&right.get("day").and_then(Value::as_str))
         });
         for bucket in &mut buckets {
-            migrate_usage_bucket(bucket);
             add_reuse_report(bucket);
             add_client_profile_report(bucket);
         }
@@ -2416,36 +2494,8 @@ fn empty_named_counters(names: &[&str]) -> Value {
     Value::Object(counters)
 }
 
-fn migrate_usage_bucket(bucket: &mut Value) {
-    bucket["schema"] = Value::String("context_monitor_usage.bucket.v3".to_owned());
-    ensure_reuse_sections(bucket);
-}
-
-fn ensure_reuse_sections(bucket: &mut Value) {
-    if !bucket.get("lineage_frontier").is_some_and(Value::is_object) {
-        bucket["lineage_frontier"] = json!({});
-    }
-    if !bucket
-        .get("reuse_opportunities")
-        .is_some_and(Value::is_object)
-    {
-        bucket["reuse_opportunities"] = json!({});
-    }
-    if !bucket
-        .get("reuse_effectiveness")
-        .is_some_and(Value::is_object)
-    {
-        bucket["reuse_effectiveness"] = json!({});
-    }
-    if !bucket.get("miss_causes").is_some_and(Value::is_object) {
-        bucket["miss_causes"] = empty_named_counters(&REUSE_MISS_CAUSES);
-    }
-    if !bucket
-        .get("repeat_distance_buckets")
-        .is_some_and(Value::is_object)
-    {
-        bucket["repeat_distance_buckets"] = empty_named_counters(&REPEAT_DISTANCE_BUCKETS);
-    }
+fn is_current_usage_bucket(bucket: &Value) -> bool {
+    bucket.get("schema").and_then(Value::as_str) == Some(USAGE_BUCKET_SCHEMA)
 }
 
 fn record_reuse_outcome(bucket: &mut Value, outcome: ReuseOutcome) {
@@ -2725,7 +2775,6 @@ fn add_client_profile_report(bucket: &mut Value) {
                 .get(*profile)
                 .cloned()
                 .unwrap_or_else(|| empty_client_profile_bucket(profile));
-            ensure_reuse_sections(&mut value);
             add_reuse_report(&mut value);
             let requests = value
                 .get("request_count")
@@ -3046,7 +3095,7 @@ impl ProjectEngine {
         // missed permanently by ordinary watcher-driven freshness.
         let watcher = WatchGuard::start(root.clone(), Arc::clone(&freshness));
         let store = Arc::new(StateStore::open(project_state)?);
-        let index_snapshot_path = store.paths().index.join("context-index.snapshot.v1.json");
+        let index_snapshot_path = store.paths().index.join("context-index.snapshot.v2.json");
         let index = load_index_snapshot(&root, &project_id, &index_snapshot_path, control)
             .or_else(|_| {
                 ProjectIndex::build_for_project_controlled(&root, Some(&project_id), control)
@@ -3084,6 +3133,7 @@ impl ProjectEngine {
             metrics: Arc::clone(&metrics),
             frontiers: Arc::clone(&frontiers),
             index_snapshot_path: index_snapshot_path.clone(),
+            git_diff_cache: Arc::new(Mutex::new(GitDiffCache::default())),
             #[cfg(test)]
             refresh_hook: Arc::clone(&refresh_hook),
         });
@@ -3462,12 +3512,11 @@ impl ProjectEngine {
                         snapshot.refresh_signature == index.stats().refresh_signature
                     });
                 let dependencies_current = snapshot.as_ref().is_some_and(|snapshot| {
-                    !self.freshness.journal_overflow.load(Ordering::Acquire)
-                        && (!snapshot.paths.is_empty()
-                            && snapshot
-                                .paths
-                                .iter()
-                                .all(|path| index.path_matches_snapshot(path)))
+                    !self.freshness.dirty.load(Ordering::Acquire)
+                        && !self.freshness.journal_overflow.load(Ordering::Acquire)
+                        && snapshot.generation == generation
+                        && snapshot.event_epoch
+                            == self.freshness.event_epoch.load(Ordering::Acquire)
                 });
                 if snapshot.is_none() {
                     (None, "missing_pack")
@@ -3579,16 +3628,10 @@ impl ProjectEngine {
             && refresh_signature == current.stats().refresh_signature;
         let generation_matches =
             cached.validity.generation == generation && generation == current_generation;
-        let dependencies_current = if !cached.scoped {
-            generation_matches && signature_matches
-        } else if cached.dependencies.is_empty() {
-            signature_matches
-        } else {
-            cached
-                .dependencies
-                .iter()
-                .all(|path| current.path_matches_snapshot(path))
-        };
+        let dependencies_current = generation_matches
+            && signature_matches
+            && !self.freshness.dirty.load(Ordering::Acquire)
+            && !self.freshness.journal_overflow.load(Ordering::Acquire);
         if !dependencies_current {
             return Ok(false);
         }
@@ -3645,25 +3688,17 @@ impl ProjectEngine {
         let (candidates, terms, frontier_outcome, lineage) =
             self.retrieve_candidates(&index, request, &explicit_paths)?;
         let mut checked_paths = HashMap::new();
-        let mut candidates = candidates
-            .into_iter()
-            .filter(|hit| {
-                *checked_paths.entry(hit.path.clone()).or_insert_with(|| {
-                    // Corpus evidence has its own provenance checks and cannot
-                    // be overlaid from a repository-relative source path.
-                    if hit.path.starts_with("@corpus/") {
-                        !self.freshness.dirty.load(Ordering::Acquire)
-                    } else {
-                        index.path_matches_snapshot(&hit.path)
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
+        let snapshot_current = !self.freshness.dirty.load(Ordering::Acquire)
+            && !self.freshness.watcher_requires_verification();
+        let mut candidates = candidates;
+        for candidate in &candidates {
+            checked_paths.insert(candidate.path.clone(), snapshot_current);
+        }
         for path in &explicit_paths {
             if checked_paths.get(path) == Some(&true) {
                 continue;
             }
-            let mut chunks = index.current_chunks_for_path(path);
+            let mut chunks = index.chunks_for_path(path).unwrap_or_default();
             chunks.sort_by_cached_key(|chunk| {
                 let body = chunk.content.to_lowercase();
                 let symbol = chunk.symbol.to_lowercase();
@@ -4603,45 +4638,24 @@ impl ProjectEngine {
         request: &ContextPackRequest,
         control: Option<&WorkControl>,
     ) -> Result<(bool, bool)> {
-        let force = request.cache_strategy == CacheStrategy::Fresh;
+        if let Some(control) = control {
+            control.check()?;
+        }
         normalized_explicit_paths(request)?;
-        let index = self.index();
-        let changed_paths = request
-            .changed_files
-            .iter()
-            .filter(|path| !index.path_matches_snapshot(path))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !changed_paths.is_empty() {
-            let pending = self
-                .freshness
-                .changed_paths
-                .lock()
-                .map_err(|_| anyhow!("change journal lock poisoned"))?;
-            let newly_dirty = changed_paths
-                .iter()
-                .filter(|path| !pending.contains(*path))
-                .cloned()
-                .collect::<Vec<_>>();
-            drop(pending);
-            if !newly_dirty.is_empty() {
-                record_watcher_event(&self.freshness, newly_dirty, false);
-            }
+        if !request.changed_files.is_empty() {
+            record_watcher_event(
+                &self.freshness,
+                request.changed_files.iter().cloned(),
+                false,
+            );
+            self.refresh_coordinator
+                .request_background(&request.changed_files)?;
+        } else if self.freshness.dirty.load(Ordering::Acquire)
+            || self.freshness.watcher_requires_verification()
+        {
+            self.refresh_index_controlled(false, control)?;
         }
-        let watcher_requires_verification = self.freshness.watcher_requires_verification();
-        let result = self.refresh_index_with_paths(force, &changed_paths, control);
-        match result {
-            Err(error)
-                if (watcher_requires_verification
-                    || self.freshness.watcher_requires_verification())
-                    && error.to_string() != "repository work cancelled before commit" =>
-            {
-                bail!(
-                    "context_pack freshness unavailable; retry after repository stabilization or warmup"
-                );
-            }
-            result => result,
-        }
+        Ok((false, false))
     }
 
     fn refresh_index(&self, force: bool) -> Result<(bool, bool)> {
@@ -4653,12 +4667,15 @@ impl ProjectEngine {
         force: bool,
         control: Option<&WorkControl>,
     ) -> Result<(bool, bool)> {
-        // Lookup/admin callers retain their existing complete-index contract.
-        // Packs use ensure_fresh_controlled's available-snapshot policy.
-        let wait = force
-            || self.freshness.dirty.load(Ordering::Acquire)
-            || self.freshness.watcher_requires_verification();
-        self.refresh_index_with_paths(wait, &[], control)
+        if force {
+            return self.refresh_index_with_paths(true, &[], control);
+        }
+        if self.freshness.dirty.load(Ordering::Acquire)
+            || self.freshness.watcher_requires_verification()
+        {
+            self.refresh_coordinator.request_background(&[])?;
+        }
+        Ok((false, false))
     }
 
     fn refresh_index_with_paths(
@@ -4733,6 +4750,9 @@ impl ProjectEngine {
             };
             changed_paths.extend(explicit_paths.iter().cloned());
             let overflow = shared.freshness.journal_overflow.load(Ordering::Acquire);
+            if !overflow && !changed_paths.is_empty() {
+                Self::cache_git_diffs(shared, &current, &changed_paths);
+            }
             let scan_started = Instant::now();
             let signature = repository_signature_for_project_controlled(
                 current.root(),
@@ -4918,6 +4938,209 @@ impl ProjectEngine {
             Ordering::Relaxed,
         );
         bail!("context_pack freshness unavailable; retry after repository stabilization or warmup")
+    }
+
+    fn cache_git_diffs(shared: &RefreshShared, index: &ProjectIndex, paths: &BTreeSet<String>) {
+        let head = Command::new("git")
+            .current_dir(index.root())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        let Some(head) = head.filter(|head| !head.is_empty()) else {
+            shared
+                .metrics
+                .git_diff_misses
+                .fetch_add(paths.len() as u64, Ordering::Relaxed);
+            shared
+                .metrics
+                .git_diff_reload_fallbacks
+                .fetch_add(paths.len() as u64, Ordering::Relaxed);
+            return;
+        };
+        let git_index = Command::new("git")
+            .current_dir(index.root())
+            .args(["rev-parse", "--git-path", "index"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                let path = std::path::PathBuf::from(path);
+                if path.is_absolute() {
+                    path
+                } else {
+                    index.root().join(path)
+                }
+            })
+            .and_then(|path| fs::metadata(path).ok());
+        let git_index_modified_nanos = git_index
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        let generation = shared.freshness.generation.load(Ordering::Acquire);
+        for raw_path in paths {
+            let Ok(path) = validate_relative_path(raw_path) else {
+                shared
+                    .metrics
+                    .git_diff_reload_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            if path == "." || path.starts_with("reference-corpus/") {
+                continue;
+            }
+            let metadata = fs::metadata(index.root().join(&path)).ok();
+            let modified_nanos = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos());
+            let key = GitDiffCacheKey {
+                index_generation: generation,
+                head: head.clone(),
+                git_index_len: git_index.as_ref().map_or(0, fs::Metadata::len),
+                git_index_modified_nanos,
+                path: path.clone(),
+                file_len: metadata.as_ref().map_or(0, fs::Metadata::len),
+                modified_nanos,
+            };
+            let started = Instant::now();
+            let cached = {
+                let cache = shared
+                    .git_diff_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.entries.get(&key).cloned()
+            };
+            let diff = if let Some(diff) = cached {
+                shared.metrics.git_diff_hits.fetch_add(1, Ordering::Relaxed);
+                diff
+            } else {
+                shared
+                    .metrics
+                    .git_diff_misses
+                    .fetch_add(1, Ordering::Relaxed);
+                let tracked = Command::new("git")
+                    .current_dir(index.root())
+                    .args(["ls-files", "--error-unmatch", "--", path.as_str()])
+                    .output()
+                    .ok()
+                    .is_some_and(|output| output.status.success());
+                if !tracked {
+                    shared
+                        .metrics
+                        .git_diff_reload_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let Ok(output) = Command::new("git")
+                    .current_dir(index.root())
+                    .args([
+                        "diff",
+                        "--no-ext-diff",
+                        "--binary",
+                        "HEAD",
+                        "--",
+                        path.as_str(),
+                    ])
+                    .output()
+                else {
+                    shared
+                        .metrics
+                        .git_diff_reload_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                if !output.status.success() {
+                    shared
+                        .metrics
+                        .git_diff_reload_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let diff = output.stdout;
+                shared
+                    .metrics
+                    .git_diff_regenerations
+                    .fetch_add(1, Ordering::Relaxed);
+                shared.metrics.git_diff_bytes.fetch_add(
+                    u64::try_from(diff.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                if diff.len() <= GIT_DIFF_CACHE_MAX_BYTES {
+                    let mut cache = shared
+                        .git_diff_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let stale_keys = cache
+                        .entries
+                        .keys()
+                        .filter(|existing| existing.path == path && **existing != key)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for stale in stale_keys {
+                        if let Some(previous) = cache.entries.remove(&stale) {
+                            cache.bytes = cache.bytes.saturating_sub(previous.len());
+                            shared
+                                .metrics
+                                .git_diff_invalidations
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    cache.bytes = cache.bytes.saturating_add(diff.len());
+                    cache.entries.insert(key, diff.clone());
+                    while cache.entries.len() > GIT_DIFF_CACHE_MAX_ENTRIES
+                        || cache.bytes > GIT_DIFF_CACHE_MAX_BYTES
+                    {
+                        let Some(oldest) = cache.entries.keys().next().cloned() else {
+                            break;
+                        };
+                        if let Some(previous) = cache.entries.remove(&oldest) {
+                            cache.bytes = cache.bytes.saturating_sub(previous.len());
+                            shared
+                                .metrics
+                                .git_diff_invalidations
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                diff
+            };
+            let file_bytes = index
+                .file_content(&path, usize::MAX)
+                .map(|(content, _)| content.len())
+                .unwrap_or(0);
+            let changed_bytes = diff
+                .split(|byte| *byte == b'\n')
+                .filter(|line| {
+                    (line.starts_with(b"+") && !line.starts_with(b"+++"))
+                        || (line.starts_with(b"-") && !line.starts_with(b"---"))
+                })
+                .map(|line| line.len().saturating_add(1))
+                .sum::<usize>();
+            if changed_bytes <= GIT_DIFF_PATCH_MAX_BYTES
+                && file_bytes > 0
+                && changed_bytes.saturating_mul(4) <= file_bytes
+            {
+                shared
+                    .metrics
+                    .git_diff_patch_eligible
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                shared
+                    .metrics
+                    .git_diff_reload_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            shared.metrics.git_diff_micros.fetch_add(
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
     }
 
     pub fn context_lookup(&self, request: &ContextLookupRequest) -> Result<Vec<u8>> {
@@ -6631,7 +6854,6 @@ fn warmup_prompt_request(prompt: &str, focus_path: Option<&str>) -> ContextPackR
         max_items: default_max_items(),
         max_source_tokens: default_max_source_tokens(),
         evidence_policy: EvidencePolicy::Balanced,
-        cache_strategy: CacheStrategy::Fast,
         base_pack: None,
         known_evidence: Vec::new(),
     }
@@ -6704,7 +6926,25 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
         .load(Ordering::Relaxed);
     let lookup_cache_hits = engine.metrics.lookup_cache_hits.load(Ordering::Relaxed);
     let lookup_cache_misses = engine.metrics.lookup_cache_misses.load(Ordering::Relaxed);
+    let (
+        file_hits,
+        file_misses,
+        file_micros,
+        symbol_queries,
+        symbol_hits,
+        symbol_candidates,
+        symbol_micros,
+        file_entries,
+        file_bytes,
+    ) = engine.index().cache_diagnostics();
     let l0_storage = engine.l0_storage_stats();
+    let git_diff_storage = engine
+        .refresh_coordinator
+        .shared
+        .git_diff_cache
+        .lock()
+        .map(|cache| (cache.entries.len(), cache.bytes))
+        .unwrap_or_default();
     let l1_exact = engine.metrics.l1_exact_hits.load(Ordering::Relaxed);
     let l1_approximate = engine.metrics.l1_approximate_hits.load(Ordering::Relaxed);
     let retrieval_misses = engine.metrics.retrieval_misses.load(Ordering::Relaxed);
@@ -6758,6 +6998,10 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
     } else {
         wire_tokens_est as f64 / selected_source_tokens_est as f64
     };
+    let git_diff_hits = engine.metrics.git_diff_hits.load(Ordering::Relaxed);
+    let git_diff_misses = engine.metrics.git_diff_misses.load(Ordering::Relaxed);
+    let git_diff_samples = git_diff_hits + git_diff_misses;
+    let git_diff_micros = engine.metrics.git_diff_micros.load(Ordering::Relaxed);
     Ok(json!({
         "schema": "context_metrics.v1",
         "project_id": engine.project_id,
@@ -6816,6 +7060,40 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
                 "max_entries": LOOKUP_CACHE_MAX_ENTRIES,
                 "ttl_seconds": LOOKUP_CACHE_TTL.as_secs(),
             },
+            "file": {
+                "hits": file_hits,
+                "misses": file_misses,
+                "hit_ratio": if file_hits + file_misses == 0 { 0.0 } else { file_hits as f64 / (file_hits + file_misses) as f64 },
+                "entries": file_entries,
+                "bytes": file_bytes,
+                "latency_total_micros": file_micros,
+                "avg_latency_micros": if file_hits + file_misses == 0 { 0.0 } else { file_micros as f64 / (file_hits + file_misses) as f64 },
+            },
+            "git_diff": {
+                "hits": git_diff_hits,
+                "misses": git_diff_misses,
+                "hit_ratio": if git_diff_samples == 0 { 0.0 } else { git_diff_hits as f64 / git_diff_samples as f64 },
+                "regenerations": engine.metrics.git_diff_regenerations.load(Ordering::Relaxed),
+                "invalidations": engine.metrics.git_diff_invalidations.load(Ordering::Relaxed),
+                "patch_eligible": engine.metrics.git_diff_patch_eligible.load(Ordering::Relaxed),
+                "reload_fallbacks": engine.metrics.git_diff_reload_fallbacks.load(Ordering::Relaxed),
+                "bytes_generated": engine.metrics.git_diff_bytes.load(Ordering::Relaxed),
+                "latency_total_micros": git_diff_micros,
+                "avg_latency_micros": if git_diff_samples == 0 { 0.0 } else { git_diff_micros as f64 / git_diff_samples as f64 },
+                "entries": git_diff_storage.0,
+                "bytes": git_diff_storage.1,
+                "max_entries": GIT_DIFF_CACHE_MAX_ENTRIES,
+                "max_bytes": GIT_DIFF_CACHE_MAX_BYTES,
+            },
+            "symbols": {
+                "queries": symbol_queries,
+                "posting_hits": symbol_hits,
+                "posting_misses": symbol_queries.saturating_sub(symbol_hits),
+                "candidate_count": symbol_candidates,
+                "latency_total_micros": symbol_micros,
+                "avg_latency_micros": if symbol_queries == 0 { 0.0 } else { symbol_micros as f64 / symbol_queries as f64 },
+                "entries": engine.index().stats().symbol_chunks,
+            },
             "l1": {
                 "exact_hits": l1_exact,
                 "approximate_hits": l1_approximate,
@@ -6855,7 +7133,7 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
         "warmup": {"runs": engine.metrics.warmup_runs.load(Ordering::Relaxed)},
         "benchmarks": {},
         "index_freshness": {
-            "strategy": "notify_with_metadata_snapshot_fallback",
+            "strategy": "watcher_driven_published_generations",
             "generation": engine.freshness.generation.load(Ordering::Relaxed),
             "dirty": engine.freshness.dirty.load(Ordering::Relaxed),
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
@@ -6956,6 +7234,15 @@ fn unloaded_metrics_snapshot(project_id: &str, now: &str, status: &str) -> Value
                 "max_entries": LOOKUP_CACHE_MAX_ENTRIES,
                 "ttl_seconds": LOOKUP_CACHE_TTL.as_secs(),
             },
+            "file": {"hits": 0, "misses": 0, "hit_ratio": 0.0, "entries": 0, "bytes": 0, "latency_total_micros": 0, "avg_latency_micros": 0.0},
+            "git_diff": {
+                "hits": 0, "misses": 0, "hit_ratio": 0.0, "regenerations": 0,
+                "invalidations": 0, "patch_eligible": 0, "reload_fallbacks": 0,
+                "bytes_generated": 0, "latency_total_micros": 0, "avg_latency_micros": 0.0,
+                "entries": 0, "bytes": 0,
+                "max_entries": GIT_DIFF_CACHE_MAX_ENTRIES, "max_bytes": GIT_DIFF_CACHE_MAX_BYTES,
+            },
+            "symbols": {"queries": 0, "posting_hits": 0, "posting_misses": 0, "candidate_count": 0, "latency_total_micros": 0, "avg_latency_micros": 0.0, "entries": 0},
             "l1": {
                 "exact_hits": 0,
                 "approximate_hits": 0,
@@ -7190,7 +7477,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
             json!(["context_pack.v2"]),
             json!({
                 "prompt": "Required non-whitespace task text after trimming; invalid values return `prompt is required`.",
-                "changed_files": "Changed repository paths; queues background refresh and overlays current evidence without waiting unless cache_strategy is fresh.",
+                "changed_files": "Changed repository paths; queues background refresh and overlays current evidence without waiting.",
                 "focus_paths": "Paths to prioritize.",
                 "memory_session": "Opt-in project-local continuation key; reuses the prior valid pack and evidence for 24 hours.",
                 "client_profile": "codex, claude, copilot, generic.",
@@ -7200,7 +7487,6 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "max_items": "Range 1 to 32, default 8.",
                 "max_source_tokens": "Range 0 to 4096, default 512.",
                 "evidence_policy": "reference, balanced, source.",
-                "cache_strategy": "fast/stable use revalidated available evidence; fresh waits for shared refresh. Response freshness is diagnostic: current, refreshing, or unverified.",
                 "base_pack": "Previous pack id for delta generation.",
                 "known_evidence": "Evidence ids already held by the client; non-empty explicit delta fields override continuation-derived state."
             }),
@@ -7318,7 +7604,7 @@ fn profile_calibration() -> Value {
         "schema": "context_profile_calibration.v1",
         "defaults": {
             "client_profile": "generic", "model_profile": "unknown",
-            "evidence_policy": "balanced", "cache_strategy": "fast"
+            "evidence_policy": "balanced"
         },
         "profiles": {
             "codex": {"output_profile": "minimal", "diagnostics": "admin_only"},
@@ -8907,7 +9193,12 @@ mod tests {
         assert_eq!(request.max_items, 8);
         assert_eq!(request.max_source_tokens, 512);
         assert_eq!(request.evidence_policy, EvidencePolicy::Balanced);
-        assert_eq!(request.cache_strategy, CacheStrategy::Fast);
+        assert!(
+            serde_json::from_str::<ContextPackRequest>(
+                r#"{"prompt":"debug it","obsolete_option":true}"#
+            )
+            .is_err()
+        );
         assert_eq!(request.validate_limits(), Ok(()));
         for prompt in ["", " \t\r\n"] {
             let invalid: ContextPackRequest =
@@ -9774,7 +10065,6 @@ mod tests {
             &engine
                 .context_pack(&ContextPackRequest {
                     changed_files: vec!["architecture.md".to_owned()],
-                    cache_strategy: CacheStrategy::Fresh,
                     ..request
                 })
                 .expect("changed pack"),
@@ -9854,7 +10144,6 @@ mod tests {
             "prompt": "debug validate_token guard",
             "focus_paths": ["auth.py"],
             "client_profile": "codex",
-            "cache_strategy": "fast",
         }))
         .expect("first request");
         let second: ContextPackRequest = serde_json::from_value(json!({
@@ -9862,7 +10151,6 @@ mod tests {
             "changed_files": ["auth.py"],
             "client_profile": "generic",
             "model_profile": "unknown",
-            "cache_strategy": "fresh",
         }))
         .expect("second request");
 
@@ -9901,7 +10189,6 @@ mod tests {
         let engine = ProjectEngine::build(root.path()).expect("engine");
         let request: ContextPackRequest = serde_json::from_value(json!({
             "prompt": "ranking marker",
-            "cache_strategy": "fresh"
         }))
         .expect("pack request");
         engine
@@ -10191,7 +10478,6 @@ mod tests {
         delta.client_profile = Some("private-agent-identifier".to_owned());
         delta.base_pack = Some(disabled_pack.id);
         delta.known_evidence = vec!["client-two".to_owned()];
-        delta.cache_strategy = CacheStrategy::Fresh;
         engine
             .context_pack_cached(&delta)
             .await
@@ -10527,7 +10813,7 @@ mod tests {
     }
 
     #[test]
-    fn reuse_state_is_restart_stable_migrated_redacted_and_bounded() {
+    fn reuse_state_is_restart_stable_discards_old_usage_schemas_redacted_and_bounded() {
         let state = tempdir().expect("temporary state");
         let store = StateStore::open(state.path().join("global")).expect("store");
         store
@@ -10545,8 +10831,23 @@ mod tests {
             .expect("config read")
             .expect("config");
         assert_eq!(config["schema"], "context_monitor_usage.config.v2");
+        assert_eq!(config["enabled"], false);
         let salt = config["identity_salt"].as_str().expect("salt").to_owned();
         assert_eq!(salt.len(), 32);
+        let current_report = monitor.report(Some("legacy")).expect("current report");
+        assert!(
+            current_report["buckets"]
+                .as_array()
+                .expect("buckets")
+                .is_empty()
+        );
+        assert!(
+            monitor
+                .store
+                .get_json("monitor:usage:2099-01-01:legacy")
+                .expect("old bucket read")
+                .is_none()
+        );
         drop(monitor);
         let monitor = UsageMonitor::open(state.path().join("global")).expect("reopen");
         assert_eq!(monitor.identity_salt, salt);
@@ -10593,15 +10894,6 @@ mod tests {
         ] {
             assert!(!encoded.contains(forbidden));
         }
-        let migrated = monitor.report(Some("legacy")).expect("legacy report");
-        assert_eq!(
-            migrated["buckets"][0]["schema"],
-            "context_monitor_usage.bucket.v3"
-        );
-        assert_eq!(
-            migrated["buckets"][0]["opportunity_normalized"]["raw_l0_hit_rate_millis"],
-            0
-        );
     }
 
     #[test]
@@ -11238,7 +11530,6 @@ mod tests {
             "prompt": "validate_token",
             "focus_paths": ["auth.py"],
             "changed_files": ["auth.py"],
-            "cache_strategy": "fresh"
         }))
         .expect("changed request");
         let second: ContextPackV2 =
@@ -12035,7 +12326,6 @@ mod tests {
         let waiter_engine = Arc::clone(&engine);
         let request: ContextPackRequest = serde_json::from_value(json!({
             "prompt": "fresh refresh",
-            "cache_strategy": "fresh"
         }))
         .expect("fresh request");
         let waiter = thread::spawn(move || {
@@ -12043,7 +12333,7 @@ mod tests {
         });
         entered.wait();
         let fast: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "after_refresh", "cache_strategy": "fast",
+            "prompt": "after_refresh",
             "changed_files": ["lib.rs"], "evidence_policy": "source"
         }))
         .expect("fast request");
@@ -12399,7 +12689,7 @@ mod tests {
     #[test]
     fn oversized_index_snapshot_is_skipped_and_stale_artifact_removed() {
         let state = tempdir().expect("state root");
-        let snapshot = state.path().join("context-index.snapshot.v1.json");
+        let snapshot = state.path().join("context-index.snapshot.v2.json");
         let old = std::fs::File::create(&snapshot).expect("old snapshot");
         old.set_len(INDEX_SNAPSHOT_MAX_BYTES as u64 + 1)
             .expect("oversized old snapshot");

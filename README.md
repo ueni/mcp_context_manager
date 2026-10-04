@@ -55,7 +55,6 @@ Supported fields are:
 | `max_items` | Default `8`, range `1..32`. |
 | `max_source_tokens` | Default `512`, range `0..4096`. |
 | `evidence_policy` | `reference`, `balanced`, or `source`. |
-| `cache_strategy` | `fast`, `stable`, or `fresh`. |
 | `base_pack`, `known_evidence` | Optional manual delta inputs; non-empty explicit values override continuation-derived state. |
 
 The MCP tool returns one raw JSON text item. The direct REST endpoint returns
@@ -264,8 +263,7 @@ The repository devcontainer does not start `mcp-context-manager`. On each
 startup, it looks for an already-running Compose service with the
 `mcp-context-manager` service label and connects to that service's network when
 needed. If the service is not running, startup remains usable with a warning.
-From inside the devcontainer, use `http://mcp-context-manager:8000/mcp`; legacy
-SSE clients can use `http://mcp-context-manager:8000/legacy/sse`.
+From inside the devcontainer, use `http://mcp-context-manager:8000/mcp`.
 
 The mapping is then:
 
@@ -286,13 +284,10 @@ state volume is owned by another user:
 MCP_CONTEXT_UID=$(id -u) MCP_CONTEXT_GID=$(id -g) docker compose up --build
 ```
 
-Do not remove the named state volume during an upgrade or rollback. Native Rust
-state is isolated beside the Python v1 layout under each project:
+Keep the named state volume when upgrading so native project state persists:
 
 ```text
 <project-state>/
-  store/                    # untouched Python v1 LMDB, when present
-  references/               # untouched Python v1 external references
   rust-v2/
     state.lmdb/
     index/
@@ -331,14 +326,11 @@ Use `--version` to inspect the embedded release version.
 
 ## HTTP transport and security
 
-Streamable HTTP clients connect to `http://localhost:8000/mcp`. Existing
-legacy SSE clients can continue using `http://localhost:8000/legacy/sse`; the
-server sends the per-session message endpoint as the initial `endpoint` SSE
-event. `/mcp` remains the primary transport. All HTTP routes enforce exact Host
-validation. Browser requests with an `Origin` header also require an exact
-allowed origin. Optional bearer authentication applies to every route,
-including health, except the OAuth Protected Resource Metadata discovery
-route:
+Streamable HTTP clients connect to `http://localhost:8000/mcp`. All HTTP routes
+enforce exact Host validation. Browser requests with an `Origin` header also
+require an exact allowed origin. Optional bearer authentication applies to
+every route, including health, except the OAuth Protected Resource Metadata
+discovery route:
 
 ```bash
 MCP_HTTP_BEARER_TOKEN='replace-me' \
@@ -356,10 +348,8 @@ responsible for provisioning an audience-bound token for the configured MCP
 resource. When bearer authentication is enabled, the public base URL and at
 least one HTTPS authorization-server URL are required; the public base may use
 HTTP only for loopback development. Do not place bearer tokens in repository
-files or generated context memory. When set, `MCP_HTTP_PUBLIC_BASE_URL` is also authoritative for the
-legacy SSE message URI, so HTTPS reverse-proxy deployments never infer a public
-scheme from forwarding headers. Without it, legacy SSE preserves the validated
-request `Host` with a local `http` scheme.
+files or generated context memory. When set, `MCP_HTTP_PUBLIC_BASE_URL` is
+authoritative for metadata identifiers.
 
 HTTP routes:
 
@@ -369,8 +359,6 @@ HTTP routes:
 | `GET /mcp/healthz` | Health under the MCP base path. |
 | `GET /.well-known/oauth-protected-resource[/mcp]` | Unauthenticated RFC 9728 Protected Resource Metadata discovery; Host and Origin validation still apply. |
 | `POST /mcp` | Stateful Streamable HTTP MCP endpoint. Sessions expire after 30 idle minutes. |
-| `GET /legacy/sse` | Backward-compatible SSE MCP endpoint; sends the per-session `POST` endpoint. |
-| `POST /legacy/messages?session_id=...` | Legacy SSE client message endpoint, issued by `/legacy/sse`. |
 | `GET /v1/mcp/tools` | Diagnostic list of public context tool names. |
 | `POST /v1/context/pack` | Direct `context_pack.v2`; accepts `prompt` or the REST-only alias `task`. |
 | `GET /v1/context/references/{reference_id}` | Direct reference resolution. |
@@ -397,7 +385,7 @@ Stdio remains the default transport when `MCP_TRANSPORT` is omitted.
 | `MCP_TRANSPORT` | `stdio` or `streamable-http`. |
 | `HOST`, `PORT` | HTTP bind address and port. |
 | `MCP_HTTP_BEARER_TOKEN` | Optional pre-provisioned bearer token for HTTP routes other than Protected Resource Metadata discovery. |
-| `MCP_HTTP_PUBLIC_BASE_URL` | Optional canonical public HTTP origin; required with bearer auth. Controls metadata identifiers and legacy SSE message URIs when set; otherwise legacy SSE uses the validated request Host. |
+| `MCP_HTTP_PUBLIC_BASE_URL` | Optional canonical public HTTP origin; required with bearer auth. Controls metadata identifiers. |
 | `MCP_HTTP_AUTHORIZATION_SERVERS` | Comma-separated authorization-server URLs advertised by Protected Resource Metadata. Required with bearer auth. |
 | `MCP_HTTP_ALLOWED_HOSTS` | Comma-separated exact Host values. |
 | `MCP_HTTP_ALLOWED_ORIGINS` | Comma-separated exact browser origins. |
@@ -447,7 +435,7 @@ The Cargo workspace is split by responsibility:
 | `contextd` | RMCP stdio/HTTP transport, Axum REST routes, lifecycle, project registry, and HTTP security. |
 | `context-core` | Contracts, routing, ranking, deterministic selection, compression, caches, deltas, and encoding. |
 | `context-index` | Repository scanning, generic and Tree-sitter chunking, Tantivy search, and freshness watching. |
-| `context-store` | Versioned Postcard/LMDB records, memory, references, import manifests, frontiers, and telemetry. |
+| `context-store` | Versioned Postcard/LMDB records, memory, references, frontiers, and telemetry. |
 | `context-testkit` | Native benchmark and synthetic test support. |
 | `xtask` | Release versioning, license policy, and CycloneDX SBOM generation. |
 
@@ -492,18 +480,15 @@ old or new complete generation.
 Refresh runs once per project in a background worker and survives request
 cancellation. `MCP_CONTEXT_REFRESH_CONCURRENCY` bounds concurrent refreshes
 across projects (default 2, maximum 32), independently of request permits.
-`fast` and `stable` packs use the available snapshot, revalidate candidate
-files, and overlay current contents of explicitly named files. Changed or
-deleted stale candidates are omitted, including from deferred evidence.
-`changed_files` queues work without waiting; `cache_strategy="fresh"` waits
-for shared verification within the caller deadline without cancelling it.
+Requests read one immutable published index generation. Watcher events queue
+background file-cache and index updates; `changed_files` can queue that work
+without waiting for publication.
 
 The compact `freshness` response field is diagnostic: `current` means no
 known pending source changes, `refreshing` means retrieval may be incomplete,
 and `unverified` means the watcher cannot certify completeness. Watcher failure
-queues authoritative verification and prevents ordinary cache reuse. Use
-`fresh` when completeness is required. These states do not promise a filesystem
-transaction across concurrent editor writes.
+queues authoritative verification and prevents ordinary cache reuse. These
+states do not promise a filesystem transaction across concurrent editor writes.
 
 Administrative metrics expose the bounded watcher diagnostic under
 `index_freshness.watcher`: `backend` is `native`, `metadata_snapshot`, or
@@ -581,10 +566,12 @@ creates checksums, signs them, and publishes the versioned artifacts.
 
 ## Cutover evidence
 
-Frozen Python v1 contracts and baselines remain under `tests/golden/python-v1`
-and `benchmarks/baselines`. Native contract, differential, latency, token,
-quality, freshness, state-import, cutover, and rollback evidence is under
-`tests/golden/rust-v2` and `benchmarks/results`.
+Frozen Python v1 contracts and baselines under `tests/golden/python-v1` and
+`benchmarks/baselines` are archived cutover evidence only; the repository has no
+runnable Python v1 compatibility source. Native contract, differential,
+latency, token, quality, freshness, state-import, cutover, and rollback
+evidence is retained under `tests/golden/rust-v2` and `benchmarks/results` as
+historical artifacts.
 
 The pre-migration dirty worktree patch is retained as
 `benchmarks/baselines/python-v1-pre-rust-dirty-worktree.patch`; it is not part

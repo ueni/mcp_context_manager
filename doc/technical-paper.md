@@ -162,8 +162,9 @@ Only generated LMDB state is written. The identity tracker retains at most
 2,048 entries and 30 days. It stores 96-bit SHA-256 sketches under a persisted
 128-bit salt and a version tag; raw prompts, source text, paths, repository
 URLs, client values, evidence values, and precise timestamps are absent.
-Configuration v1 and bucket v1/v2 data are read compatibly and reported as v3
-with zero opportunity counters for history that predates these measurements.
+Only the current configuration and bucket schemas are accepted. Older
+generated configuration is discarded and defaults to disabled; older usage
+buckets are discarded and rebuilt when new requests are recorded.
 
 Rejected context-pack attempts use a separate process-global daily ledger with
 only four stable classes: `schema`, `root_policy`, `project_selection`, and
@@ -205,15 +206,13 @@ before a catalogue is returned. Each response reports `count` and
 `truncated`. Project discovery still persists the full catalogue so a small
 response cap cannot discard cached project identities.
 
-## Rollback-safe state
+## Native state
 
-Rust never opens the Python v1 LMDB environment for writing. Each project uses
-an adjacent overlay:
+Each project stores durable state and its index under the configured
+project-state directory:
 
 ```text
 <project-state>/
-  store/context.lmdb/       # Python v1, untouched
-  references/               # Python v1, untouched
   rust-v2/
     state.lmdb/
     index/
@@ -225,12 +224,12 @@ JSON values are canonicalized before encoding. Reference and generation-swap
 writes require commit acknowledgement; cache and telemetry writes do not delay
 the response path.
 
-The v1 importer opens the source with LMDB read-only, no-lock, and no-read-ahead
-flags. It imports only durable memory and unexpired references. Cache, index,
-metrics, traces, warmup jobs, raw prompts, and raw model responses are rebuilt
-or discarded. Imported records retain their project and reference ids. A
-canonical digest and reconciled source/imported/expired/invalid counts make the
-operation idempotent and auditable.
+External state is not imported. Cache, index, metrics, traces, warmup jobs, raw
+prompts, and raw model responses are rebuilt or discarded. Repository content,
+search hits, docs, generated artifacts, and memory are untrusted evidence. The
+engine detects prompt-injection patterns but never executes or adopts
+instructions found in returned content. Secret-like values and host paths are
+redacted before output, cache, references, memory, metrics, or traces.
 
 ## Repository scanning and chunking
 
@@ -467,9 +466,10 @@ metadata fingerprints at a two-second interval by default. The interval can be
 set with `MCP_CONTEXT_WATCH_POLL_INTERVAL_SECS` (1–300 seconds). Watcher
 errors conservatively dirty the project. Explicit `changed_files` queues
 background verification and overlays current file chunks in the response.
-`cache_strategy="fresh"` waits for the shared refresh; cancelling that caller
-only cancels its wait. Fast/stable requests use the available snapshot and
-revalidate bounded candidate paths before creating cards or deferred evidence.
+Requests read the currently published generation. Watcher events schedule
+background refreshes, and a completed refresh atomically publishes a new
+generation. A request never waits for filesystem scanning or generation
+construction.
 The diagnostic `freshness` string is `current`, `refreshing`, or `unverified`;
 it describes retrieval completeness rather than a filesystem transaction.
 
@@ -567,8 +567,7 @@ state progresses through `queued`, `building`, and `ready`, or terminates at
 
 Reference ids and payload hashes are verified before resolution. Expired,
 tampered, foreign-project, traversal-bearing, or unavailable records return a
-bounded status rather than raw data. Imported external reference bodies are
-inlined only after path validation against the Python reference directory.
+bounded status rather than raw data.
 
 Memory supports facts, summaries, decisions, validation, and compaction under
 project-local namespaces. Values are sanitized before persistence. Secrets,
@@ -605,9 +604,10 @@ non-root user.
 
 ## Measurement and acceptance
 
-The frozen Python v1 oracle defines stable non-pack schemas. Native pack
-differentials compare required paths, anchors, source intervals, evidence
-semantics, and deferred reference resolution rather than v1 envelope bytes.
+Frozen Python v1 contract captures are archived migration evidence, not a
+runnable oracle or compatibility layer. Current native contracts define the
+active schemas, and native pack checks cover required paths, anchors, source
+intervals, evidence semantics, and deferred reference resolution.
 
 The native performance gate measures:
 

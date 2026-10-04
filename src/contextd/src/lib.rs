@@ -6,12 +6,10 @@ mod registry;
 pub use registry::ProjectRegistry;
 
 use std::{
-    collections::HashMap,
-    convert::Infallible,
     env,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -22,10 +20,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, Request, StatusCode, header},
     middleware::{self, Next},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
-    },
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use context_core::{
@@ -33,7 +28,7 @@ use context_core::{
     ContextPackRequest, ResultReferenceRequest, classify_context_pack_rejection,
     static_resource_text, unloaded_admin_response,
 };
-use http_body_util::{BodyExt, Limited};
+use http_body_util::BodyExt;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -57,17 +52,11 @@ use rmcp::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as TowerServiceExt;
-use uuid::Uuid;
 
 pub const SERVER_NAME: &str = "mcp-context-manager";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-const LEGACY_SSE_MAX_SESSIONS: usize = 64;
-const LEGACY_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const LEGACY_SSE_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
 const MCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 type NativeMcpService = StreamableHttpService<ContextServer, LocalSessionManager>;
@@ -91,20 +80,7 @@ impl ContextServer {
 struct HttpState {
     registry: Arc<ProjectRegistry>,
     security: Arc<HttpSecurity>,
-    legacy_sse: Arc<LegacySseBridge>,
     mcp_sessions: Arc<LocalSessionManager>,
-}
-
-struct LegacySseBridge {
-    mcp: NativeMcpService,
-    sessions: Mutex<HashMap<String, LegacySseSession>>,
-}
-
-struct LegacySseSession {
-    sender: mpsc::Sender<String>,
-    mcp_session_id: Option<String>,
-    protocol_version: Option<String>,
-    expires_at: Instant,
 }
 
 #[derive(Debug)]
@@ -127,11 +103,6 @@ struct ProtectedResourceConfig {
 struct ReferenceQuery {
     project_id: Option<String>,
     root_uri: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacySseQuery {
-    session_id: String,
 }
 
 #[tool_router]
@@ -475,7 +446,6 @@ async fn run_http(registry: Arc<ProjectRegistry>) -> Result<()> {
     let state = HttpState {
         registry: Arc::clone(&registry),
         security: Arc::clone(&security),
-        legacy_sse: Arc::new(LegacySseBridge::new(mcp.clone())),
         mcp_sessions: Arc::clone(&session_manager),
     };
     let app = Router::new()
@@ -490,8 +460,6 @@ async fn run_http(registry: Arc<ProjectRegistry>) -> Result<()> {
             "/.well-known/oauth-protected-resource/mcp",
             get(protected_resource_metadata),
         )
-        .route("/legacy/sse", get(legacy_sse_http))
-        .route("/legacy/messages", post(legacy_sse_message_http))
         .route("/v1/mcp/tools", get(mcp_tools_http))
         .route("/v1/context/pack", post(context_pack_http))
         .route("/v1/context/references/{reference_id}", get(reference_http))
@@ -533,7 +501,6 @@ async fn mcp_tools_http() -> Json<Value> {
     Json(json!({
         "schema": "context_http.mcp_tools.v1",
         "mcp_endpoint": "/mcp",
-        "legacy_sse_endpoint": "/legacy/sse",
         "tool_count": tools.len(),
         "tools": tools,
         "descriptions": {
@@ -557,271 +524,6 @@ async fn protected_resource_metadata(State(state): State<HttpState>) -> Response
         "bearer_methods_supported": ["header"],
     }))
     .into_response()
-}
-
-impl LegacySseBridge {
-    fn new(mcp: NativeMcpService) -> Self {
-        Self {
-            mcp,
-            sessions: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn open_session(&self) -> Result<(String, mpsc::Receiver<String>), &'static str> {
-        let mut sessions = self.lock_sessions();
-        let now = Instant::now();
-        sessions.retain(|_, session| session.expires_at > now);
-        if sessions.len() >= LEGACY_SSE_MAX_SESSIONS {
-            return Err("legacy SSE session capacity has been reached");
-        }
-        let session_id = Uuid::new_v4().to_string();
-        let (sender, receiver) = mpsc::channel(32);
-        sessions.insert(
-            session_id.clone(),
-            LegacySseSession {
-                sender,
-                mcp_session_id: None,
-                protocol_version: None,
-                expires_at: now + LEGACY_SSE_IDLE_TIMEOUT,
-            },
-        );
-        Ok((session_id, receiver))
-    }
-
-    fn session_for_message(&self, session_id: &str) -> Option<(Option<String>, Option<String>)> {
-        let mut sessions = self.lock_sessions();
-        let now = Instant::now();
-        let session = sessions.get_mut(session_id)?;
-        if session.expires_at <= now {
-            sessions.remove(session_id);
-            return None;
-        }
-        session.expires_at = now + LEGACY_SSE_IDLE_TIMEOUT;
-        Some((
-            session.mcp_session_id.clone(),
-            session.protocol_version.clone(),
-        ))
-    }
-
-    fn set_mcp_session(
-        &self,
-        session_id: &str,
-        mcp_session_id: Option<String>,
-        protocol_version: Option<String>,
-    ) {
-        let mut sessions = self.lock_sessions();
-        let Some(session) = sessions.get_mut(session_id) else {
-            return;
-        };
-        if let Some(mcp_session_id) = mcp_session_id {
-            session.mcp_session_id = Some(mcp_session_id);
-        }
-        if let Some(protocol_version) = protocol_version {
-            session.protocol_version = Some(protocol_version);
-        }
-        session.expires_at = Instant::now() + LEGACY_SSE_IDLE_TIMEOUT;
-    }
-
-    fn send_messages(&self, session_id: &str, messages: Vec<String>) -> Result<(), &'static str> {
-        let sender = {
-            let mut sessions = self.lock_sessions();
-            let now = Instant::now();
-            let session = sessions
-                .get_mut(session_id)
-                .ok_or("legacy SSE session was not found")?;
-            if session.expires_at <= now {
-                sessions.remove(session_id);
-                return Err("legacy SSE session has expired");
-            }
-            session.expires_at = now + LEGACY_SSE_IDLE_TIMEOUT;
-            session.sender.clone()
-        };
-        for message in messages {
-            sender
-                .try_send(message)
-                .map_err(|_| "legacy SSE client is not accepting messages")?;
-        }
-        Ok(())
-    }
-
-    fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, LegacySseSession>> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-async fn legacy_sse_http(State(state): State<HttpState>, headers: HeaderMap) -> Response {
-    let (session_id, receiver) = match state.legacy_sse.open_session() {
-        Ok(session) => session,
-        Err(message) => return rest_error(StatusCode::SERVICE_UNAVAILABLE, message),
-    };
-    let public_base_url = match state.security.public_base_url.as_deref() {
-        Some(public_base_url) => public_base_url.to_owned(),
-        None => {
-            let Some(host) = headers
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-            else {
-                return rest_error(StatusCode::BAD_REQUEST, "Host is required");
-            };
-            format!("http://{host}")
-        }
-    };
-    let endpoint = format!("{public_base_url}/legacy/messages?session_id={session_id}");
-    let events =
-        tokio_stream::iter([Ok::<Event, Infallible>(
-            Event::default().event("endpoint").data(endpoint),
-        )])
-        .chain(ReceiverStream::new(receiver).map(|message| {
-            Ok::<Event, Infallible>(Event::default().event("message").data(message))
-        }));
-    Sse::new(events)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keepalive"),
-        )
-        .into_response()
-}
-
-async fn legacy_sse_message_http(
-    State(state): State<HttpState>,
-    Query(query): Query<LegacySseQuery>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let (mcp_session_id, saved_protocol_version) =
-        match state.legacy_sse.session_for_message(&query.session_id) {
-            Some(session) => session,
-            None => return rest_error(StatusCode::NOT_FOUND, "legacy SSE session was not found"),
-        };
-    let request_protocol_version =
-        serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|message| {
-                message
-                    .pointer("/params/protocolVersion")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-
-    let mut request = Request::builder()
-        .method("POST")
-        .uri("/")
-        .header(header::ACCEPT, "application/json, text/event-stream")
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(host) = headers.get(header::HOST) {
-        request = request.header(header::HOST, host);
-    }
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        request = request.header(header::ORIGIN, origin);
-    }
-    if let Some(mcp_session_id) = mcp_session_id.as_deref() {
-        request = request.header("mcp-session-id", mcp_session_id);
-    }
-    if let Some(protocol_version) = saved_protocol_version
-        .as_deref()
-        .or(request_protocol_version.as_deref())
-        .or_else(|| {
-            headers
-                .get("mcp-protocol-version")
-                .and_then(|value| value.to_str().ok())
-        })
-    {
-        request = request.header("mcp-protocol-version", protocol_version);
-    }
-    let request = request
-        .body(Body::from(body))
-        .expect("legacy SSE proxy request is valid");
-    let response = state
-        .legacy_sse
-        .mcp
-        .clone()
-        .oneshot(request)
-        .await
-        .expect("streamable MCP service is infallible");
-    let status = response.status();
-    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
-    let mcp_response_session = response
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let bytes = match Limited::new(response.into_body(), LEGACY_SSE_RESPONSE_LIMIT)
-        .collect()
-        .await
-    {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
-            return rest_error(
-                StatusCode::BAD_GATEWAY,
-                "legacy SSE proxy response exceeded its size limit",
-            );
-        }
-    };
-    if !status.is_success() {
-        let mut response = Response::builder().status(status);
-        if let Some(content_type) = content_type {
-            response = response.header(header::CONTENT_TYPE, content_type);
-        }
-        return response
-            .body(Body::from(bytes))
-            .expect("legacy SSE proxy error response is valid");
-    }
-
-    let messages = match legacy_sse_messages(&bytes, content_type.as_ref()) {
-        Ok(messages) => messages,
-        Err(message) => return rest_error(StatusCode::BAD_GATEWAY, message),
-    };
-    state.legacy_sse.set_mcp_session(
-        &query.session_id,
-        mcp_response_session,
-        request_protocol_version,
-    );
-    if let Err(message) = state.legacy_sse.send_messages(&query.session_id, messages) {
-        return rest_error(StatusCode::SERVICE_UNAVAILABLE, message);
-    }
-    StatusCode::ACCEPTED.into_response()
-}
-
-fn legacy_sse_messages(
-    bytes: &[u8],
-    content_type: Option<&axum::http::HeaderValue>,
-) -> Result<Vec<String>, &'static str> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "MCP response was not valid UTF-8")?;
-    if content_type.is_some_and(|value| {
-        value
-            .to_str()
-            .is_ok_and(|value| value.starts_with("application/json"))
-    }) {
-        return Ok((!text.is_empty())
-            .then(|| text.to_owned())
-            .into_iter()
-            .collect());
-    }
-
-    let normalized = text.replace("\r\n", "\n");
-    let mut messages = Vec::new();
-    for event in normalized.split("\n\n") {
-        let mut name = None;
-        let mut data = Vec::new();
-        for line in event.lines() {
-            if let Some(value) = line.strip_prefix("event:") {
-                name = Some(value.trim());
-            } else if let Some(value) = line.strip_prefix("data:") {
-                data.push(value.strip_prefix(' ').unwrap_or(value));
-            }
-        }
-        if matches!(name, None | Some("message")) && !data.is_empty() {
-            messages.push(data.join("\n"));
-        }
-    }
-    if normalized.trim().is_empty() || !messages.is_empty() {
-        Ok(messages)
-    } else {
-        Err("MCP response did not contain a JSON-RPC SSE message")
-    }
 }
 
 async fn context_pack_http(State(state): State<HttpState>, Json(payload): Json<Value>) -> Response {
@@ -2308,30 +2010,6 @@ mod tests {
         assert!(!encoded.contains("private-project-identifier"));
     }
 
-    #[tokio::test]
-    async fn mcp_tools_contract_advertises_legacy_sse_compatibility_endpoint() {
-        let Json(payload) = mcp_tools_http().await;
-
-        assert_eq!(payload["mcp_endpoint"], "/mcp");
-        assert_eq!(payload["tool_count"], 6);
-        assert_eq!(
-            payload["tools"],
-            json!([
-                "context_pack",
-                "context_lookup",
-                "context_memory",
-                "context_admin",
-                "health",
-                "result_reference_resolve",
-            ])
-        );
-        assert_eq!(payload["legacy_sse_endpoint"], "/legacy/sse");
-        assert_eq!(
-            payload["descriptions"].as_object().map(|rows| rows.len()),
-            Some(6)
-        );
-    }
-
     #[test]
     fn every_mcp_tool_has_an_agent_usable_description() {
         let root = tempfile::tempdir().expect("repository root");
@@ -2433,22 +2111,6 @@ mod tests {
             assert!(!text.is_empty(), "empty advertised resource: {uri}");
             serde_json::from_str::<Value>(&text).expect("advertised JSON resource");
         }
-    }
-
-    #[test]
-    fn legacy_sse_parser_ignores_priming_events_and_preserves_json_rpc() {
-        let messages = legacy_sse_messages(
-            b"retry: 3000\n\n\
-              event: message\n\
-              data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
-            None,
-        )
-        .expect("valid RMCP SSE response");
-
-        assert_eq!(
-            messages,
-            vec!["{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}"]
-        );
     }
 
     #[test]

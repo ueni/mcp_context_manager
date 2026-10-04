@@ -62,8 +62,7 @@ async fn main() -> Result<()> {
         "prompt": "Profile native context pack retrieval latency and identify the measured hot path",
         "focus_paths": ["src/context-core/src/lib.rs", "src/context-index/src/lib.rs"],
         "client_profile": "codex",
-        "evidence_policy": "balanced",
-        "cache_strategy": "fast"
+        "evidence_policy": "balanced"
     }))?;
     let full_bytes = engine.context_pack_cached(&base_request).await?;
     let full: ContextPackV2 = serde_json::from_slice(&full_bytes)?;
@@ -115,8 +114,7 @@ async fn main() -> Result<()> {
                 "prompt": case["prompt"],
                 "focus_paths": case["focus_paths"],
                 "client_profile": "codex",
-                "evidence_policy": "balanced",
-                "cache_strategy": "fast"
+                "evidence_policy": "balanced"
             }))?;
             let started = Instant::now();
             let bytes = miss_engine.context_pack_cached(&pack_request).await?;
@@ -166,37 +164,6 @@ async fn main() -> Result<()> {
         1.0 - delta_evidence_tokens as f64 / full_evidence_tokens as f64
     };
 
-    let mutation_root = tempfile::tempdir()?;
-    let mutation_state = tempfile::tempdir()?;
-    let mutation_path = mutation_root.path().join("fresh.py");
-    fs::write(&mutation_path, "def fresh_anchor():\n    return 1\n")?;
-    let mutation_engine =
-        ProjectEngine::build_with_state(mutation_root.path(), mutation_state.path(), "mutation")?;
-    let mutation_request = request(json!({
-        "prompt": "fresh_anchor",
-        "focus_paths": ["fresh.py"]
-    }))?;
-    let before: ContextPackV2 = serde_json::from_slice(
-        &mutation_engine
-            .context_pack_cached(&mutation_request)
-            .await?,
-    )?;
-    fs::write(
-        &mutation_path,
-        "def fresh_anchor():\n    if True:\n        return 2\n",
-    )?;
-    let mut fresh_request = mutation_request;
-    fresh_request.changed_files = vec!["fresh.py".to_owned()];
-    fresh_request.cache_strategy = context_core::CacheStrategy::Fresh;
-    let refresh_started = Instant::now();
-    let after: ContextPackV2 =
-        serde_json::from_slice(&mutation_engine.context_pack_cached(&fresh_request).await?)?;
-    let freshness_ms = refresh_started.elapsed().as_secs_f64() * 1_000.0;
-    ensure!(
-        before.id != after.id,
-        "fresh request returned stale evidence"
-    );
-
     let manual_state = tempfile::tempdir()?;
     let continuation_state = tempfile::tempdir()?;
     let manual_engine = ProjectEngine::build_with_state(&root, manual_state.path(), "manual-full")?;
@@ -245,7 +212,6 @@ async fn main() -> Result<()> {
         "delta_reduction": delta_reduction,
         "required_anchor_recall": recall,
         "noise_ratio": noise,
-        "freshness_ms": freshness_ms,
         "general_warmup_ms": general_warmup_ms,
         "general_warmup_retrieval_ms": general_warmup_retrieval_ms,
         "prompt_warmup_ms": prompt_warmup_ms,
@@ -263,7 +229,6 @@ async fn main() -> Result<()> {
         "delta_reduction_gte_80pct": delta_reduction >= 0.80,
         "required_anchor_recall_100pct": recall == 1.0,
         "noise_ratio_lte_30pct": noise <= 0.30,
-        "freshness_lte_2s": freshness_ms <= 2_000.0,
         "general_warmup_lte_50ms": general_warmup_ms <= 50.0,
         "post_prompt_warmup_l0_lte_2ms": post_prompt_warmup_l0_ms <= 2.0,
         "iterative_continuation_reduces_tokens": continuation_token_reduction > 0.0,

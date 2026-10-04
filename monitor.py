@@ -962,10 +962,7 @@ def render_project_detail(
         ).columns
     )
     metrics = snapshot.metrics or {}
-    if _is_native_metrics(metrics):
-        details = _native_project_details(metrics, snapshot, url, state)
-    else:
-        details = _legacy_project_details(metrics, snapshot, url, state)
+    details = _native_project_details(metrics, snapshot, url, state)
     lines = [
         _style("mcp-context-manager project details", color, Ansi.BOLD + Ansi.CYAN),
         "",
@@ -1000,63 +997,13 @@ def render_project_detail(
     return "\n".join(lines)
 
 
-def _legacy_project_details(
-    metrics: dict[str, Any],
-    snapshot: ProjectSnapshot,
-    url: str,
-    state: MonitorState,
-) -> list[tuple[str, str]]:
-    """Keep the historical Python monitor details readable during rollout."""
-
-    fragment_hits = _int_at(metrics, ("cache", "context_pack_fragment_hits"))
-    fragment_misses = _int_at(metrics, ("cache", "context_pack_fragment_misses"))
-    fragment_ratio = _fragment_cache_ratio(metrics)
-    return [
-        ("project", _project_name(snapshot.target)),
-        ("project id", _project_identifier(snapshot.target)),
-        ("endpoint", url),
-        ("updated", state.last_updated or "-"),
-        ("requests", fmt_int(_int_at(metrics, ("requests", "total")))),
-        (
-            "context_pack",
-            fmt_int(
-                _int_at(
-                    metrics,
-                    ("requests", "by_operation", "context_pack", "count"),
-                )
-            ),
-        ),
-        (
-            "avg ms",
-            fmt_ms(
-                _float_at(
-                    metrics,
-                    ("requests", "by_operation", "context_pack", "avg_elapsed_ms"),
-                )
-            ),
-        ),
-        (
-            "fragment cache",
-            f"{fragment_hits}/{fragment_misses} h/m  {fragment_ratio * 100:5.1f}%",
-        ),
-        (
-            "candidate compact.",
-            fmt_int(_tokens_spared_by_mcp(metrics)),
-        ),
-        (
-            "refs deferred",
-            fmt_bytes(_int_at(metrics, ("references", "bytes_deferred_est"))),
-        ),
-    ]
-
-
 def _native_project_details(
     metrics: dict[str, Any],
     snapshot: ProjectSnapshot,
     url: str,
     state: MonitorState,
 ) -> list[tuple[str, str]]:
-    """Render native v2 counters rather than obsolete fragment-cache fields."""
+    """Render counters from the native context metrics contract."""
 
     l0 = _cache_l0(metrics)
     l1 = _cache_l1(metrics)
@@ -1065,6 +1012,9 @@ def _native_project_details(
     references = _mapping_at(metrics, ("references",))
     pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
     continuation = _mapping_at(metrics, ("cache", "continuation"))
+    file_cache = _mapping_at(metrics, ("cache", "file"))
+    diff_cache = _mapping_at(metrics, ("cache", "git_diff"))
+    symbol_cache = _mapping_at(metrics, ("cache", "symbols"))
     return [
         ("project", _project_name(snapshot.target)),
         ("project id", _project_identifier(snapshot.target)),
@@ -1086,6 +1036,9 @@ def _native_project_details(
             f"{fmt_int(l1.get('approximate_hits', 0))} approximate hits",
         ),
         ("retrieval misses", fmt_int(_native_retrieval_misses(metrics))),
+        ("file cache", _index_file_cache_summary(file_cache)),
+        ("Git diff cache", _git_diff_cache_summary(diff_cache)),
+        ("symbol postings", _symbol_cache_summary(symbol_cache)),
         (
             "index",
             f"{retrieval.get('backend', '-')}, {fmt_int(retrieval.get('doc_count', 0))} chunks",
@@ -1142,28 +1095,19 @@ def render_performance_view(
     freshness = freshness if isinstance(freshness, dict) else {}
     background = metrics.get("background", {})
     background = background if isinstance(background, dict) else {}
-    native_metrics = _is_native_metrics(metrics)
-    stage_column_overhead = (6 if native_metrics else 4) * 10 + (7 if native_metrics else 5) * 3 + 1
+    stage_column_overhead = 6 * 10 + 7 * 3 + 1
     stage_column_width = max(
         24,
         min(48, width - stage_column_overhead),
     )
     stage_rows = _performance_stage_rows(metrics)
     cache_rows = _performance_cache_rows(metrics, background, freshness)
-    if native_metrics:
-        stage_table = _render_table(
-            ("operation", "avg ms", "p50 ms", "p95 ms", "min ms", "max ms", "last ms"),
-            stage_rows,
-            widths=(stage_column_width, 9, 9, 9, 9, 9, 9),
-            aligns=("left", "right", "right", "right", "right", "right", "right"),
-        )
-    else:
-        stage_table = _render_table(
-            ("stage", "avg ms", "min ms", "max ms", "last ms"),
-            stage_rows,
-            widths=(stage_column_width, 10, 10, 10, 10),
-            aligns=("left", "right", "right", "right", "right"),
-        )
+    stage_table = _render_table(
+        ("operation", "avg ms", "p50 ms", "p95 ms", "min ms", "max ms", "last ms"),
+        stage_rows,
+        widths=(stage_column_width, 9, 9, 9, 9, 9, 9),
+        aligns=("left", "right", "right", "right", "right", "right", "right"),
+    )
     lines = [
         _style("mcp-context-manager performance", color, Ansi.BOLD + Ansi.CYAN),
         f"endpoint: {url}",
@@ -1557,13 +1501,12 @@ def render_state_entry_view(
     width = width or terminal_size.columns
     height = height or terminal_size.lines
     payload = state.state_entry or {}
-    wrapped_entry = payload.get("entry") if isinstance(payload, dict) else None
-    entry = wrapped_entry
-    # state_browser entry responses expose the entry fields at the top level;
-    # keep accepting the older wrapped shape for compatibility.
-    if not isinstance(entry, dict):
-        entry = payload if isinstance(payload, dict) else {}
+    entry = payload if isinstance(payload, dict) else {}
     value = entry.get("value")
+    browser_envelope = (
+        entry.get("schema") == "context_state_browser.v1"
+        and entry.get("mode") == "entry"
+    )
     if state.state_entry_preview_source_id != id(payload):
         preview, truncated = _serialize_state_entry_preview(entry)
         state.state_entry_preview_source_id = id(payload)
@@ -1572,11 +1515,6 @@ def render_state_entry_view(
         state.state_entry_preview_width = 0
         state.state_entry_preview_lines = []
     preview = state.state_entry_preview
-    browser_envelope = (
-        wrapped_entry is None
-        and entry.get("schema") == "context_state_browser.v1"
-        and entry.get("mode") == "entry"
-    )
 
     def metadata_value(name: str) -> Any:
         sources = (value, entry) if browser_envelope else (entry, value)
@@ -1702,16 +1640,10 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
         "source_tokens_est": 0,
         "wire_tokens_est": 0,
         "saved_tokens_est": 0,
-        "fragment_hits": 0,
-        "fragment_misses": 0,
-        "tokens_spared_by_mcp": 0,
         "bytes_deferred": 0,
-        "native_rows": 0,
     }
     for row in rows:
         metrics = row.metrics or {}
-        if _is_native_metrics(metrics):
-            totals["native_rows"] += 1
         totals["requests"] += _int_at(metrics, ("requests", "total"))
         totals["packs"] += _int_at(
             metrics, ("requests", "by_operation", "context_pack", "count")
@@ -1734,13 +1666,6 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
         )
         totals["wire_tokens_est"] += _int_at(pack_tokens, ("wire_tokens_est",))
         totals["saved_tokens_est"] += _int_at(pack_tokens, ("saved_tokens_est",))
-        totals["fragment_hits"] += _int_at(
-            metrics, ("cache", "context_pack_fragment_hits")
-        )
-        totals["fragment_misses"] += _int_at(
-            metrics, ("cache", "context_pack_fragment_misses")
-        )
-        totals["tokens_spared_by_mcp"] += _tokens_spared_by_mcp(metrics)
         totals["bytes_deferred"] += _int_at(
             metrics, ("references", "bytes_deferred_est")
         )
@@ -1753,8 +1678,6 @@ def _summary_table(
     ok_rows: list[ProjectSnapshot],
     color: bool,
 ) -> list[str]:
-    if not totals["native_rows"]:
-        return _legacy_summary_table(totals, snapshots, ok_rows, color)
     cache_total = int(totals["cache_hits"]) + int(totals["cache_misses"])
     cache_ratio = (
         int(totals["cache_hits"]) / cache_total if cache_total else 0.0
@@ -1792,30 +1715,6 @@ def _summary_table(
     return _render_table(("metric", "value"), rows, aligns=("left", "right"))
 
 
-def _legacy_summary_table(
-    totals: dict[str, Any],
-    snapshots: list[ProjectSnapshot],
-    ok_rows: list[ProjectSnapshot],
-    color: bool,
-) -> list[str]:
-    fragment_total = int(totals["fragment_hits"]) + int(totals["fragment_misses"])
-    fragment_ratio = (
-        int(totals["fragment_hits"]) / fragment_total if fragment_total else 0.0
-    )
-    rows = [
-        ("projects", f"{len(snapshots)} total / {len(ok_rows)} ok"),
-        ("requests", fmt_int(totals["requests"])),
-        ("context_pack", fmt_int(totals["packs"])),
-        (
-            "fragment cache",
-            f"{_bar(fragment_ratio, 18, color)} {fragment_ratio * 100:5.1f}%",
-        ),
-        ("candidate compact.", fmt_int(totals["tokens_spared_by_mcp"])),
-        ("refs deferred", fmt_bytes(totals["bytes_deferred"])),
-    ]
-    return _render_table(("metric", "value"), rows, aligns=("left", "right"))
-
-
 def _project_table(
     snapshots: list[ProjectSnapshot],
     color: bool,
@@ -1823,7 +1722,6 @@ def _project_table(
     selected_index: int | None = None,
 ) -> list[str]:
     widths = _project_column_widths(width)
-    native = any(_is_native_metrics(snapshot.metrics or {}) for snapshot in snapshots)
     rows = [
         _project_cells(snapshot, color, widths, selected=index == selected_index)
         for index, snapshot in enumerate(snapshots)
@@ -1836,8 +1734,8 @@ def _project_table(
             "req",
             "pack",
             "avg ms",
-            "L0 cache" if native else "cache",
-            "L1 reuse" if native else "cand tok",
+            "L0 cache",
+            "L1 reuse",
             "checks",
         ),
         rows,
@@ -1931,13 +1829,9 @@ def _project_cells(
     )
     checks = _matrix_status(snapshot.matrix or {}, color)
     cache_bar_width = max(6, widths["cache"] - 9)
-    if _is_native_metrics(metrics):
-        cache_ratio = _cache_hit_ratio(metrics)
-        l1 = _cache_l1(metrics)
-        l1_reuse = f"{fmt_int(l1.get('exact_hits', 0))}/{fmt_int(l1.get('approximate_hits', 0))}"
-    else:
-        cache_ratio = _fragment_cache_ratio(metrics)
-        l1_reuse = fmt_int(_tokens_spared_by_mcp(metrics))
+    cache_ratio = _cache_hit_ratio(metrics)
+    l1 = _cache_l1(metrics)
+    l1_reuse = f"{fmt_int(l1.get('exact_hits', 0))}/{fmt_int(l1.get('approximate_hits', 0))}"
     return (
         selector,
         project,
@@ -2024,10 +1918,6 @@ def _measurement_check_rows(
         "candidates_per_selected": "Candidates per selected",
         "retrieval.context_pack.candidates_per_selected": "Ranked candidates per selected item",
         "cache_hit_ratio": "Cache hit ratio",
-        "cache.context_pack_fragment_hit_ratio": "Context-pack fragment cache hit ratio",
-        "cache.retrieval.search_term.hit_ratio": "Search-term fragment cache hit ratio",
-        "cache.retrieval.file_summary.hit_ratio": "File-summary fragment cache hit ratio",
-        "cache.retrieval.test_owner_paths.hit_ratio": "Test-owner fragment cache hit ratio",
         "cache.hit_ratio": "Overall cache hit ratio",
         "external_calls_saved": "External calls saved",
         "tooling.external_calls_saved_per_pack": "Estimated external tool calls avoided per pack",
@@ -2100,115 +1990,28 @@ def _measurement_check_rows(
     return rows
 
 
-RETRIEVAL_BREAKDOWN_STAGES = (
-    "search_fragment_ms",
-    "search_merge_ms",
-    "search_summary_ms",
-    "symbol_lookup_ms",
-    "test_owner_summary_ms",
-)
-
-
-def _recent_context_pack_stage_ms(metrics: dict[str, Any], name: str) -> float | None:
-    recent_rows = metrics.get("recent")
-    if not isinstance(recent_rows, list):
-        return None
-    for row in reversed(recent_rows):
-        if not isinstance(row, dict):
-            continue
-        operation = row.get("operation")
-        if operation is None:
-            operation = row.get("operation_name")
-        if operation != "context_pack":
-            continue
-        stage_timings = row.get("stage_timings_ms")
-        if not isinstance(stage_timings, dict):
-            continue
-        last_elapsed_ms = stage_timings.get(name)
-        if isinstance(last_elapsed_ms, (int, float)):
-            return float(last_elapsed_ms)
-    return None
-
-
-def _context_pack_stage_stats(metrics: dict[str, Any], name: str) -> dict[str, Any]:
-    stages = metrics.get("benchmarks", {}).get("stage_latency_ms_by_operation", {})
-    pack_stages = stages.get("context_pack", {}) if isinstance(stages, dict) else {}
-    stats = pack_stages.get(name, {}) if isinstance(pack_stages, dict) else {}
-    if isinstance(stats, dict) and "last_elapsed_ms" not in stats:
-        recent_last_ms = _recent_context_pack_stage_ms(
-            metrics.get("benchmarks", {}), name
-        )
-        if recent_last_ms is not None:
-            stats = dict(stats)
-            stats["last_elapsed_ms"] = recent_last_ms
-    return stats if isinstance(stats, dict) else {}
-
-
-def _performance_retrieval_bottleneck(metrics: dict[str, Any]) -> str:
-    top_name = ""
-    top_ms = -1.0
-    for name in RETRIEVAL_BREAKDOWN_STAGES:
-        stats = _context_pack_stage_stats(metrics, name)
-        avg_ms = stats.get("avg_elapsed_ms")
-        if not isinstance(avg_ms, (float, int)):
-            continue
-        if avg_ms > top_ms:
-            top_ms = avg_ms
-            top_name = name
-    if top_name and top_ms > 0:
-        return f"{top_name} ({fmt_ms(top_ms)} ms)"
-    return "-"
-
-
 def _performance_stage_rows(
     metrics: dict[str, Any],
 ) -> list[tuple[str, ...]]:
-    if _is_native_metrics(metrics):
-        operations = _mapping_at(metrics, ("requests", "by_operation"))
-        rows = []
-        for operation, stats in sorted(
-            operations.items(), key=lambda row: (row[0] != "context_pack", row[0])
-        ):
-            if not isinstance(stats, dict):
-                continue
-            rows.append(
-                (
-                    operation,
-                    fmt_ms(stats.get("avg_elapsed_ms", 0.0)),
-                    fmt_ms(stats.get("p50_recent_ms", 0.0)),
-                    fmt_ms(stats.get("p95_recent_ms", 0.0)),
-                    fmt_ms(stats.get("min_elapsed_ms", 0.0)),
-                    fmt_ms(stats.get("max_elapsed_ms", 0.0)),
-                    fmt_ms(stats.get("last_elapsed_ms", 0.0)),
-                )
-            )
-        return rows or [("context_pack", "-", "-", "-", "-", "-", "-")]
-    rows: list[tuple[str, str, str, str, str]] = []
-    for name in (
-        "total_ms",
-        "index_refresh_ms",
-        "explicit_path_refresh_ms",
-        "candidate_retrieval_ms",
-        *RETRIEVAL_BREAKDOWN_STAGES,
-        "snippet_batch_ms",
-        "skill_guidance_ms",
-        "cache_lookup_ms",
-        "reference_write_ms",
-        "response_assembly_ms",
+    operations = _mapping_at(metrics, ("requests", "by_operation"))
+    rows = []
+    for operation, stats in sorted(
+        operations.items(), key=lambda row: (row[0] != "context_pack", row[0])
     ):
-        stats = _context_pack_stage_stats(metrics, name)
         if not isinstance(stats, dict):
-            stats = {}
+            continue
         rows.append(
             (
-                name,
+                operation,
                 fmt_ms(stats.get("avg_elapsed_ms", 0.0)),
+                fmt_ms(stats.get("p50_recent_ms", 0.0)),
+                fmt_ms(stats.get("p95_recent_ms", 0.0)),
                 fmt_ms(stats.get("min_elapsed_ms", 0.0)),
                 fmt_ms(stats.get("max_elapsed_ms", 0.0)),
                 fmt_ms(stats.get("last_elapsed_ms", 0.0)),
             )
         )
-    return rows
+    return rows or [("context_pack", "-", "-", "-", "-", "-", "-")]
 
 
 def _performance_cache_rows(
@@ -2216,200 +2019,73 @@ def _performance_cache_rows(
     background: dict[str, Any],
     freshness: dict[str, Any],
 ) -> list[tuple[str, str]]:
-    if _is_native_metrics(metrics):
-        l0 = _cache_l0(metrics)
-        l1 = _cache_l1(metrics)
-        retrieval = _mapping_at(metrics, ("retrieval",))
-        references = _mapping_at(metrics, ("references",))
-        pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
-        continuation = _mapping_at(metrics, ("cache", "continuation"))
-        freshness_state = "dirty" if freshness.get("dirty") else "clean"
-        return [
-            ("engine", _native_engine_status(metrics)),
-            (
-                "L0 pack cache",
-                _cache_hit_summary(l0),
-            ),
-            ("L0 miss causes", _l0_miss_reason_summary(l0)),
-            (
-                "L0 storage",
-                f"{fmt_int(l0.get('entries', 0))} entries / "
-                f"{fmt_bytes(l0.get('weighted_bytes', 0))}",
-            ),
-            (
-                "L1 frontier",
-                f"{fmt_int(l1.get('exact_hits', 0))} exact, "
-                f"{fmt_int(l1.get('approximate_hits', 0))} approximate hits",
-            ),
-            ("retrieval misses", fmt_int(_native_retrieval_misses(metrics))),
-            (
-                "index",
-                f"{retrieval.get('backend', '-')}, "
-                f"{fmt_int(retrieval.get('doc_count', 0))} chunks",
-            ),
-            (
-                "freshness",
-                f"{freshness_state}, gen {fmt_int(freshness.get('generation', 0))}, "
-                f"{fmt_int(freshness.get('refreshes', 0))} refreshes",
-            ),
-            (
-                "references",
-                f"{fmt_int(references.get('active_count', 0))} active / "
-                f"{fmt_int(references.get('total_count', 0))} total",
-            ),
-            (
-                "compression",
-                _compression_factor_summary(pack_tokens),
-            ),
-            (
-                "tokens saved est.",
-                f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire, "
-                f"{fmt_int(pack_tokens.get('delta_tokens_saved_est', 0))} delta",
-            ),
-            (
-                "continuation reuse",
-                f"{fmt_int(continuation.get('reuses', 0))}/{fmt_int(continuation.get('requests', 0))} reused, "
-                f"{fmt_int(continuation.get('fallbacks', 0))} fallbacks, "
-                f"{fmt_int(pack_tokens.get('continuation_wire_tokens_avoided_est', 0))} wire tokens avoided",
-            ),
-            (
-                "token estimates",
-                f"{fmt_int(pack_tokens.get('selected_source_tokens_est', 0))} source / "
-                f"{fmt_int(pack_tokens.get('evidence_card_tokens_est', 0))} cards / "
-                f"{fmt_int(pack_tokens.get('wire_tokens_est', 0))} wire "
-                f"({fmt_bytes(pack_tokens.get('wire_bytes', 0))})",
-            ),
-            ("background", str(background.get("status") or "-")),
-        ]
-    index_job = (
-        background.get("index_refresh", {})
-        if isinstance(background.get("index_refresh"), dict)
-        else {}
-    )
-    cache_job = (
-        background.get("cache_prune", {})
-        if isinstance(background.get("cache_prune"), dict)
-        else {}
-    )
-    auto_warmup_job = (
-        background.get("cache_auto_warmup", {})
-        if isinstance(background.get("cache_auto_warmup"), dict)
-        else {}
-    )
+    l0 = _cache_l0(metrics)
+    l1 = _cache_l1(metrics)
+    retrieval = _mapping_at(metrics, ("retrieval",))
+    references = _mapping_at(metrics, ("references",))
+    pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
+    continuation = _mapping_at(metrics, ("cache", "continuation"))
+    file_cache = _mapping_at(metrics, ("cache", "file"))
+    diff_cache = _mapping_at(metrics, ("cache", "git_diff"))
+    symbol_cache = _mapping_at(metrics, ("cache", "symbols"))
+    freshness_state = "dirty" if freshness.get("dirty") else "clean"
     return [
-        ("freshness", str(freshness.get("state") or "-")),
-        ("refresh reason", str(freshness.get("refresh_reason") or "-")),
+        ("engine", _native_engine_status(metrics)),
         (
-            "background refresh",
-            _background_job_summary(index_job),
+            "L0 pack cache",
+            _cache_hit_summary(l0),
         ),
-        ("cache maintenance", _background_job_summary(cache_job)),
-        ("background queue", fmt_int(background.get("queue_depth", 0))),
+        ("L0 miss causes", _l0_miss_reason_summary(l0)),
         (
-            "fragment hit ratio",
-            f"{_fragment_cache_ratio(metrics) * 100:5.1f}%",
-        ),
-        (
-            "search-term cache",
-            _namespace_cache_summary(metrics, "retrieval.search_term"),
+            "L0 storage",
+            f"{fmt_int(l0.get('entries', 0))} entries / "
+            f"{fmt_bytes(l0.get('weighted_bytes', 0))}",
         ),
         (
-            "file-summary cache",
-            _namespace_cache_summary(metrics, "retrieval.file_summary"),
+            "L1 frontier",
+            f"{fmt_int(l1.get('exact_hits', 0))} exact, "
+            f"{fmt_int(l1.get('approximate_hits', 0))} approximate hits",
+        ),
+        ("retrieval misses", fmt_int(_native_retrieval_misses(metrics))),
+        ("file cache", _index_file_cache_summary(file_cache)),
+        ("Git diff cache", _git_diff_cache_summary(diff_cache)),
+        ("symbol postings", _symbol_cache_summary(symbol_cache)),
+        (
+            "index",
+            f"{retrieval.get('backend', '-')}, "
+            f"{fmt_int(retrieval.get('doc_count', 0))} chunks",
         ),
         (
-            "test-owner cache",
-            _namespace_cache_summary(metrics, "retrieval.test_owner_paths"),
+            "freshness",
+            f"{freshness_state}, gen {fmt_int(freshness.get('generation', 0))}, "
+            f"{fmt_int(freshness.get('refreshes', 0))} refreshes",
         ),
-        ("retrieval bottleneck", _performance_retrieval_bottleneck(metrics)),
         (
-            "skill card cache",
-            _namespace_cache_summary(metrics, "skill.compiled"),
+            "references",
+            f"{fmt_int(references.get('active_count', 0))} active / "
+            f"{fmt_int(references.get('total_count', 0))} total",
         ),
-        ("warmup", _warmup_summary(metrics)),
-        ("auto warmup", _auto_warmup_summary(metrics, auto_warmup_job)),
+        ("compression", _compression_factor_summary(pack_tokens)),
+        (
+            "tokens saved est.",
+            f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire, "
+            f"{fmt_int(pack_tokens.get('delta_tokens_saved_est', 0))} delta",
+        ),
+        (
+            "continuation reuse",
+            f"{fmt_int(continuation.get('reuses', 0))}/{fmt_int(continuation.get('requests', 0))} reused, "
+            f"{fmt_int(continuation.get('fallbacks', 0))} fallbacks, "
+            f"{fmt_int(pack_tokens.get('continuation_wire_tokens_avoided_est', 0))} wire tokens avoided",
+        ),
+        (
+            "token estimates",
+            f"{fmt_int(pack_tokens.get('selected_source_tokens_est', 0))} source / "
+            f"{fmt_int(pack_tokens.get('evidence_card_tokens_est', 0))} cards / "
+            f"{fmt_int(pack_tokens.get('wire_tokens_est', 0))} wire "
+            f"({fmt_bytes(pack_tokens.get('wire_bytes', 0))})",
+        ),
+        ("background", str(background.get("status") or "-")),
     ]
-
-
-def _background_job_summary(job: dict[str, Any]) -> str:
-    status = str(job.get("status") or "idle")
-    pending = "pending" if job.get("pending") else "idle"
-    last_error = str(job.get("last_error") or "")
-    if last_error:
-        return f"{status} ({last_error})"
-    completed = str(job.get("last_completed_at") or "")
-    suffix = f", completed {completed[:19]}" if completed else ""
-    return f"{status}/{pending}{suffix}"
-
-
-def _namespace_cache_summary(metrics: dict[str, Any], namespace: str) -> str:
-    cache = metrics.get("cache", {})
-    cache = cache if isinstance(cache, dict) else {}
-    by_namespace = cache.get("by_namespace", {})
-    by_namespace = by_namespace if isinstance(by_namespace, dict) else {}
-    row = by_namespace.get(namespace, {})
-    if not isinstance(row, dict):
-        return "-"
-    return (
-        f"{fmt_int(row.get('hits', 0))}/"
-        f"{fmt_int(row.get('misses', 0))} h/m  "
-        f"{float(row.get('hit_ratio', 0.0) or 0.0) * 100:5.1f}%"
-    )
-
-
-def _warmup_summary(metrics: dict[str, Any]) -> str:
-    warmup = metrics.get("warmup", {})
-    if not isinstance(warmup, dict):
-        return "-"
-    count = int(warmup.get("count", 0) or 0)
-    if not count:
-        return "not run"
-    last_at = str(warmup.get("last_recorded_at") or "")
-    last_suffix = f", last {last_at[:19]}" if last_at else ""
-    return (
-        f"{fmt_int(count)} runs, avg {fmt_ms(warmup.get('avg_elapsed_ms', 0.0))}, "
-        f"last {fmt_ms(warmup.get('last_elapsed_ms', 0.0))}, "
-        f"{fmt_int(warmup.get('last_query_count', 0))} queries"
-        f"{last_suffix}"
-    )
-
-
-def _auto_warmup_summary(metrics: dict[str, Any], job: dict[str, Any]) -> str:
-    warmup = metrics.get("warmup", {})
-    if not isinstance(warmup, dict):
-        warmup = {}
-    auto_learn = warmup.get("auto_learn", {})
-    auto_learn = auto_learn if isinstance(auto_learn, dict) else {}
-    auto_count = int(warmup.get("auto_count", 0) or 0)
-    status = str(
-        auto_learn.get("last_auto_status")
-        or warmup.get("last_auto_status")
-        or job.get("status")
-        or ""
-    )
-    reason = str(auto_learn.get("last_reason_code") or "")
-    if not auto_count and not reason and not status:
-        return "not run"
-    pending = "pending" if job.get("pending") else "idle"
-    parts = [f"{fmt_int(auto_count)} auto runs"]
-    if status:
-        parts.append(status)
-    if pending:
-        parts.append(pending)
-    if reason:
-        parts.append(f"reason {reason}")
-    coverage = auto_learn.get("last_coverage", {})
-    if isinstance(coverage, dict) and int(coverage.get("planned", 0) or 0):
-        parts.append(
-            f"coverage {fmt_int(coverage.get('completed', 0))}/{fmt_int(coverage.get('planned', 0))}"
-        )
-    deduplicated = int(auto_learn.get("deduplicated_count", 0) or 0)
-    failures = int(auto_learn.get("failure_count", 0) or 0)
-    if deduplicated:
-        parts.append(f"{fmt_int(deduplicated)} dedup")
-    if failures:
-        parts.append(f"{fmt_int(failures)} failed")
-    return ", ".join(parts)
 
 
 def _state_rows(state: MonitorState) -> list[dict[str, Any]]:
@@ -2739,13 +2415,6 @@ def _int_at(payload: dict[str, Any], path: tuple[str, ...]) -> int:
     return int(value or 0) if isinstance(value, (int, float)) else 0
 
 
-def _tokens_spared_by_mcp(metrics: dict[str, Any]) -> int:
-    tokens = metrics.get("tokens", {})
-    if isinstance(tokens, dict) and "tokens_spared_by_mcp_est" in tokens:
-        return _int_at(metrics, ("tokens", "tokens_spared_by_mcp_est"))
-    return _int_at(metrics, ("tokens", "estimated_input_tokens_saved"))
-
-
 def _mapping_at(payload: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]:
     value: Any = payload
     for key in path:
@@ -2755,20 +2424,8 @@ def _mapping_at(payload: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any
     return value if isinstance(value, dict) else {}
 
 
-def _is_native_metrics(metrics: dict[str, Any]) -> bool:
-    """Recognize the native server without relying on its version string."""
-
-    return bool(_mapping_at(metrics, ("cache", "l0"))) or (
-        _mapping_at(metrics, ("retrieval",)).get("backend") == "tantivy"
-    )
-
-
 def _cache_l0(metrics: dict[str, Any]) -> dict[str, Any]:
-    l0 = _mapping_at(metrics, ("cache", "l0"))
-    if l0:
-        return l0
-    cache = _mapping_at(metrics, ("cache",))
-    return {"hits": cache.get("hits", 0), "misses": cache.get("misses", 0)}
+    return _mapping_at(metrics, ("cache", "l0"))
 
 
 def _cache_l1(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -2780,13 +2437,11 @@ def _cache_hit_ratio(metrics: dict[str, Any]) -> float:
     ratio = cache.get("hit_ratio")
     if isinstance(ratio, (int, float)):
         return max(0.0, min(1.0, float(ratio)))
-    if _is_native_metrics(metrics):
-        l0 = _cache_l0(metrics)
-        hits = _int_at(l0, ("hits",))
-        misses = _int_at(l0, ("misses",))
-        total = hits + misses
-        return hits / total if total else 0.0
-    return _fragment_cache_ratio(metrics)
+    l0 = _cache_l0(metrics)
+    hits = _int_at(l0, ("hits",))
+    misses = _int_at(l0, ("misses",))
+    total = hits + misses
+    return hits / total if total else 0.0
 
 
 def _cache_hit_summary(cache: dict[str, Any]) -> str:
@@ -2795,6 +2450,50 @@ def _cache_hit_summary(cache: dict[str, Any]) -> str:
     total = hits + misses
     ratio = hits / total if total else 0.0
     return f"{fmt_int(hits)}/{fmt_int(misses)} h/m  {ratio * 100:5.1f}%"
+
+
+def _index_file_cache_summary(cache: dict[str, Any]) -> str:
+    hits = _int_at(cache, ("hits",))
+    misses = _int_at(cache, ("misses",))
+    total = hits + misses
+    ratio = _float_at(cache, ("hit_ratio",))
+    elapsed_us = _int_at(cache, ("latency_total_micros",))
+    average_ms = elapsed_us / total / 1000 if total else 0.0
+    return (
+        f"{hits}/{total} hits ({ratio * 100:.1f}%), "
+        f"{fmt_int(_int_at(cache, ('entries',)))} files / "
+        f"{fmt_bytes(_int_at(cache, ('bytes',)))}, avg {fmt_ms(average_ms)} ms"
+    )
+
+
+def _git_diff_cache_summary(cache: dict[str, Any]) -> str:
+    hits = _int_at(cache, ("hits",))
+    misses = _int_at(cache, ("misses",))
+    total = hits + misses
+    ratio = _float_at(cache, ("hit_ratio",))
+    elapsed_us = _int_at(cache, ("latency_total_micros",))
+    average_ms = elapsed_us / total / 1000 if total else 0.0
+    return (
+        f"{hits}/{total} hits ({ratio * 100:.1f}%), "
+        f"{fmt_int(_int_at(cache, ('regenerations',)))} regenerated, "
+        f"{fmt_int(_int_at(cache, ('invalidations',)))} invalidated, "
+        f"{fmt_int(_int_at(cache, ('patch_eligible',)))} patch eligible / "
+        f"{fmt_int(_int_at(cache, ('reload_fallbacks',)))} reload, "
+        f"avg {fmt_ms(average_ms)} ms"
+    )
+
+
+def _symbol_cache_summary(cache: dict[str, Any]) -> str:
+    queries = _int_at(cache, ("queries",))
+    hits = _int_at(cache, ("posting_hits",))
+    misses = _int_at(cache, ("posting_misses",))
+    elapsed_us = _int_at(cache, ("latency_total_micros",))
+    average_ms = elapsed_us / queries / 1000 if queries else 0.0
+    return (
+        f"{hits}/{hits + misses} posting hits, "
+        f"{fmt_int(_int_at(cache, ('candidate_count',)))} candidates, "
+        f"avg {fmt_ms(average_ms)} ms"
+    )
 
 
 def _l0_miss_reason_summary(cache: dict[str, Any]) -> str:
@@ -2840,16 +2539,6 @@ def _native_retrieval_misses(metrics: dict[str, Any]) -> int:
 def _native_engine_status(metrics: dict[str, Any]) -> str:
     background = _mapping_at(metrics, ("background",))
     return str(background.get("status") or "active")
-
-
-def _fragment_cache_ratio(metrics: dict[str, Any]) -> float:
-    explicit = _float_at(metrics, ("cache", "context_pack_fragment_hit_ratio"))
-    if explicit:
-        return explicit
-    hits = _int_at(metrics, ("cache", "context_pack_fragment_hits"))
-    misses = _int_at(metrics, ("cache", "context_pack_fragment_misses"))
-    total = hits + misses
-    return (hits / total) if total else 0.0
 
 
 def _float_at(payload: dict[str, Any], path: tuple[str, ...]) -> float:

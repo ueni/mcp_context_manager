@@ -546,6 +546,31 @@ def native_metrics(*, status: str = "idle") -> dict[str, object]:
                 "approximate_hits": 3,
                 "retrieval_misses": 2,
             },
+            "file": {
+                "hits": 8,
+                "misses": 2,
+                "hit_ratio": 0.8,
+                "entries": 10,
+                "bytes": 4096,
+                "latency_total_micros": 250,
+            },
+            "git_diff": {
+                "hits": 3,
+                "misses": 2,
+                "hit_ratio": 0.6,
+                "regenerations": 2,
+                "invalidations": 1,
+                "patch_eligible": 1,
+                "reload_fallbacks": 1,
+                "latency_total_micros": 5000,
+            },
+            "symbols": {
+                "queries": 5,
+                "posting_hits": 4,
+                "posting_misses": 1,
+                "candidate_count": 12,
+                "latency_total_micros": 1000,
+            },
             "continuation": {"requests": 4, "reuses": 3, "fallbacks": 1},
         },
         "retrieval": {"backend": "tantivy", "doc_count": 99, "misses": 2},
@@ -594,6 +619,11 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("75.0%", rendered)
         self.assertIn("8 exact / 3 approximate", rendered)
         self.assertIn("L1 reuse", rendered)
+        self.assertIn("file cache", rendered)
+        self.assertIn("Git diff cache", rendered)
+        self.assertIn("symbol postings", rendered)
+        self.assertIn("80.0%", rendered)
+        self.assertIn("60.0%", rendered)
         self.assertIn("2 pass", rendered)
         self.assertNotIn("candidate compact.", rendered)
 
@@ -697,6 +727,8 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("8 exact, 3 approximate hits", performance)
         self.assertIn("context_lookup.search", performance)
         self.assertIn("p95 ms", performance)
+        self.assertIn("Git diff cache", performance)
+        self.assertIn("symbol postings", performance)
         self.assertIn("5.00x source-to-wire", performance)
         self.assertIn("720 source-to-wire, 120 delta", performance)
         self.assertIn(
@@ -806,30 +838,6 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         matrix = quality_matrix(status="insufficient", current=None)
 
         self.assertEqual(monitor_metrics._matrix_status(matrix, color=False), "2 pending")
-
-
-class MonitorLegacyMetricsRenderingTests(unittest.TestCase):
-    def test_legacy_payload_keeps_its_fragment_cache_labels(self) -> None:
-        snapshot = monitor_metrics.ProjectSnapshot(
-            target=monitor_metrics.ProjectTarget(project_id="legacy"),
-            metrics={
-                "requests": {"total": 1, "by_operation": {"context_pack": {"count": 1}}},
-                "cache": {
-                    "context_pack_fragment_hits": 2,
-                    "context_pack_fragment_misses": 2,
-                },
-                "tokens": {"estimated_input_tokens_saved": 20},
-            },
-            matrix={"checks": []},
-        )
-
-        rendered = monitor_metrics.render_dashboard(
-            [snapshot], "http://localhost:8000/mcp", color=False, width=160
-        )
-
-        self.assertIn("fragment cache", rendered)
-        self.assertIn("cand tok", rendered)
-        self.assertNotIn("L0 pack cache", rendered)
 
 
 if __name__ == "__main__":

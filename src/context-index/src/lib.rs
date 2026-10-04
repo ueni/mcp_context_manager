@@ -195,6 +195,7 @@ pub struct IndexSnapshot {
     generation: String,
     refresh_signature: String,
     chunks: Vec<Chunk>,
+    files: BTreeMap<String, String>,
     fingerprints: BTreeMap<String, FileFingerprint>,
     corpus_digest: String,
     stats: SnapshotStats,
@@ -260,6 +261,9 @@ pub struct ProjectIndex {
     chunks_by_path: Arc<HashMap<String, Vec<usize>>>,
     chunks_by_id: Arc<HashMap<String, usize>>,
     chunks_by_address: Arc<HashMap<String, usize>>,
+    symbols_by_gram: Arc<HashMap<String, Vec<usize>>>,
+    files: Arc<BTreeMap<String, String>>,
+    cache_diagnostics: Arc<IndexCacheDiagnostics>,
     fingerprints: Arc<BTreeMap<String, FileFingerprint>>,
     corpus_digest: String,
     stats: IndexStats,
@@ -267,6 +271,17 @@ pub struct ProjectIndex {
     writer_lock: Arc<Mutex<()>>,
     writer_generation: Arc<AtomicU64>,
     committed_generation: u64,
+}
+
+#[derive(Default)]
+struct IndexCacheDiagnostics {
+    file_hits: AtomicU64,
+    file_misses: AtomicU64,
+    file_elapsed_micros: AtomicU64,
+    symbol_queries: AtomicU64,
+    symbol_candidate_hits: AtomicU64,
+    symbol_candidate_count: AtomicU64,
+    symbol_elapsed_micros: AtomicU64,
 }
 
 impl ProjectIndex {
@@ -298,6 +313,7 @@ impl ProjectIndex {
         Self::from_parts(
             root,
             scanned.chunks,
+            scanned.files,
             scanned.fingerprints,
             scanned.corpus_digest,
             scanned.stats,
@@ -308,6 +324,7 @@ impl ProjectIndex {
     fn from_parts(
         root: PathBuf,
         chunks: Vec<Chunk>,
+        files: BTreeMap<String, String>,
         fingerprints: BTreeMap<String, FileFingerprint>,
         corpus_digest: String,
         stats: IndexStats,
@@ -341,6 +358,7 @@ impl ProjectIndex {
         let mut chunks_by_path: HashMap<String, Vec<usize>> = HashMap::new();
         let mut chunks_by_id = HashMap::new();
         let mut chunks_by_address = HashMap::new();
+        let mut symbols_by_gram: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, chunk) in chunks.iter().enumerate() {
             check_control(control)?;
             chunks_by_path
@@ -349,6 +367,11 @@ impl ProjectIndex {
                 .push(index);
             chunks_by_id.insert(chunk.id.clone(), index);
             chunks_by_address.insert(immutable_candidate_address(&chunk.id), index);
+            if !chunk.symbol.is_empty() {
+                for gram in symbol_grams(&chunk.symbol.to_ascii_lowercase()) {
+                    symbols_by_gram.entry(gram).or_default().push(index);
+                }
+            }
         }
 
         check_control(control)?;
@@ -361,6 +384,9 @@ impl ProjectIndex {
             chunks_by_path: Arc::new(chunks_by_path),
             chunks_by_id: Arc::new(chunks_by_id),
             chunks_by_address: Arc::new(chunks_by_address),
+            symbols_by_gram: Arc::new(symbols_by_gram),
+            files: Arc::new(files),
+            cache_diagnostics: Arc::new(IndexCacheDiagnostics::default()),
             fingerprints: Arc::new(fingerprints),
             corpus_digest,
             stats,
@@ -373,10 +399,11 @@ impl ProjectIndex {
 
     pub fn snapshot(&self) -> IndexSnapshot {
         IndexSnapshot {
-            schema: "context_index.snapshot.v1".to_owned(),
+            schema: "context_index.snapshot.v2".to_owned(),
             generation: self.stats.refresh_signature.clone(),
             refresh_signature: self.stats.refresh_signature.clone(),
             chunks: self.chunks.as_ref().clone(),
+            files: self.files.as_ref().clone(),
             fingerprints: self.fingerprints.as_ref().clone(),
             corpus_digest: self.corpus_digest.clone(),
             stats: SnapshotStats {
@@ -396,7 +423,7 @@ impl ProjectIndex {
         project_scope: Option<&str>,
         control: Option<&WorkControl>,
     ) -> Result<Self> {
-        if snapshot.schema != "context_index.snapshot.v1"
+        if snapshot.schema != "context_index.snapshot.v2"
             || snapshot.generation != snapshot.refresh_signature
         {
             bail!("unsupported persisted index snapshot")
@@ -405,6 +432,10 @@ impl ProjectIndex {
         let current = repository_signature_for_project_controlled(&root, project_scope, control)?;
         if current != snapshot.refresh_signature
             || fingerprint_signature(&snapshot.fingerprints, &snapshot.corpus_digest) != current
+            || snapshot.files.len() != snapshot.fingerprints.len()
+            || snapshot.files.iter().any(|(path, text)| {
+                snapshot.fingerprints.get(path) != Some(&fingerprint(text))
+            })
         {
             bail!("persisted index snapshot is stale or corrupt")
         }
@@ -417,6 +448,7 @@ impl ProjectIndex {
         Self::from_parts(
             root,
             snapshot.chunks,
+            snapshot.files,
             snapshot.fingerprints,
             snapshot.corpus_digest,
             stats,
@@ -451,9 +483,11 @@ impl ProjectIndex {
             .cloned()
             .collect::<Vec<_>>();
         let mut fingerprints = self.fingerprints.as_ref().clone();
+        let mut files = self.files.as_ref().clone();
         for path in &normalized {
             check_control(control)?;
             fingerprints.remove(path);
+            files.remove(path);
             let absolute = self.root.join(path);
             match fs::symlink_metadata(&absolute) {
                 Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
@@ -461,6 +495,7 @@ impl ProjectIndex {
                 }
                 Ok(_) => {
                     if let Some(text) = read_text(&absolute)? {
+                        files.insert(path.clone(), text.clone());
                         fingerprints.insert(path.clone(), fingerprint(&text));
                         chunks.extend(chunks_for_file(path, &absolute, &text)?);
                     }
@@ -521,6 +556,7 @@ impl ProjectIndex {
         let mut chunks_by_path: HashMap<String, Vec<usize>> = HashMap::new();
         let mut chunks_by_id = HashMap::new();
         let mut chunks_by_address = HashMap::new();
+        let mut symbols_by_gram: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, chunk) in chunks.iter().enumerate() {
             chunks_by_path
                 .entry(chunk.path.clone())
@@ -528,6 +564,11 @@ impl ProjectIndex {
                 .push(index);
             chunks_by_id.insert(chunk.id.clone(), index);
             chunks_by_address.insert(immutable_candidate_address(&chunk.id), index);
+            if !chunk.symbol.is_empty() {
+                for gram in symbol_grams(&chunk.symbol.to_ascii_lowercase()) {
+                    symbols_by_gram.entry(gram).or_default().push(index);
+                }
+            }
         }
 
         let incremental_document_count = chunks
@@ -544,6 +585,9 @@ impl ProjectIndex {
             chunks_by_path: Arc::new(chunks_by_path),
             chunks_by_id: Arc::new(chunks_by_id),
             chunks_by_address: Arc::new(chunks_by_address),
+            symbols_by_gram: Arc::new(symbols_by_gram),
+            files: Arc::new(files),
+            cache_diagnostics: Arc::clone(&self.cache_diagnostics),
             fingerprints: Arc::new(fingerprints),
             corpus_digest: self.corpus_digest.clone(),
             stats,
@@ -568,30 +612,6 @@ impl ProjectIndex {
         &self.stats
     }
 
-    /// Returns whether the on-disk text for a path still matches this
-    /// published snapshot. Errors and deleted or unsafe paths are treated as
-    /// mismatches so callers never reuse known-stale evidence.
-    pub fn path_matches_snapshot(&self, path: &str) -> bool {
-        let Ok(path) = validate_relative_path(path) else {
-            return false;
-        };
-        let Some(absolute) = self.regular_source_path(&path) else {
-            return false;
-        };
-        let Ok(metadata) = fs::symlink_metadata(&absolute) else {
-            return false;
-        };
-        if metadata.file_type().is_symlink() || metadata.is_dir() {
-            return false;
-        }
-        let Ok(Some(text)) = read_text(&absolute) else {
-            return false;
-        };
-        self.fingerprints
-            .get(&path)
-            .is_some_and(|expected| *expected == fingerprint(&text))
-    }
-
     /// Returns an opaque, repository-relative fingerprint from this published
     /// snapshot. Callers can persist it as provenance without depending on
     /// the private fingerprint representation.
@@ -600,48 +620,6 @@ impl ProjectIndex {
         self.fingerprints
             .get(&path)
             .map(|fingerprint| format!("{}:{}", fingerprint.len, fingerprint.sha256))
-    }
-
-    /// Reads and chunks a current regular text file for a request-side
-    /// overlay while the published Tantivy snapshot is being refreshed.
-    pub fn current_chunks_for_path(&self, path: &str) -> Vec<Chunk> {
-        let Ok(path) = validate_relative_path(path) else {
-            return Vec::new();
-        };
-        if path == "."
-            || path.starts_with("reference-corpus/")
-            || is_ignored_repository_path(Path::new(&path))
-        {
-            return Vec::new();
-        }
-        let Some(absolute) = self.regular_source_path(&path) else {
-            return Vec::new();
-        };
-        let Ok(metadata) = fs::symlink_metadata(&absolute) else {
-            return Vec::new();
-        };
-        if metadata.file_type().is_symlink() || metadata.is_dir() {
-            return Vec::new();
-        }
-        let Ok(Some(text)) = read_text(&absolute) else {
-            return Vec::new();
-        };
-        chunks_for_file(&path, &absolute, &text).unwrap_or_default()
-    }
-
-    fn regular_source_path(&self, path: &str) -> Option<PathBuf> {
-        let mut absolute = self.root.clone();
-        for component in Path::new(path).components() {
-            absolute.push(component);
-            if fs::symlink_metadata(&absolute)
-                .ok()?
-                .file_type()
-                .is_symlink()
-            {
-                return None;
-            }
-        }
-        fs::metadata(&absolute).ok()?.is_file().then_some(absolute)
     }
 
     pub fn all_paths(&self) -> Vec<String> {
@@ -706,10 +684,24 @@ impl ProjectIndex {
     }
 
     pub fn symbols(&self, query: &str, limit: usize) -> Vec<SymbolRecord> {
+        let started = std::time::Instant::now();
         let query = query.to_ascii_lowercase();
-        let mut symbols = self
-            .chunks
-            .iter()
+        let candidates = self.symbol_candidates(&query);
+        self.cache_diagnostics
+            .symbol_queries
+            .fetch_add(1, Ordering::Relaxed);
+        self.cache_diagnostics.symbol_candidate_count.fetch_add(
+            u64::try_from(candidates.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if !candidates.is_empty() {
+            self.cache_diagnostics
+                .symbol_candidate_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let mut symbols = candidates
+            .into_iter()
+            .filter_map(|index| self.chunks.get(index))
             .filter(|chunk| {
                 !chunk.symbol.is_empty()
                     && (query.is_empty()
@@ -736,7 +728,55 @@ impl ProjectIndex {
                 && left.name == right.name
         });
         symbols.truncate(limit);
+        self.cache_diagnostics.symbol_elapsed_micros.fetch_add(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         symbols
+    }
+
+    pub fn cache_diagnostics(&self) -> (u64, u64, u64, u64, u64, u64, u64, usize, u64) {
+        (
+            self.cache_diagnostics.file_hits.load(Ordering::Relaxed),
+            self.cache_diagnostics.file_misses.load(Ordering::Relaxed),
+            self.cache_diagnostics.file_elapsed_micros.load(Ordering::Relaxed),
+            self.cache_diagnostics.symbol_queries.load(Ordering::Relaxed),
+            self.cache_diagnostics.symbol_candidate_hits.load(Ordering::Relaxed),
+            self.cache_diagnostics.symbol_candidate_count.load(Ordering::Relaxed),
+            self.cache_diagnostics.symbol_elapsed_micros.load(Ordering::Relaxed),
+            self.files.len(),
+            self.files.values().map(String::len).sum::<usize>() as u64,
+        )
+    }
+
+    fn symbol_candidates(&self, query: &str) -> Vec<usize> {
+        if query.is_empty() {
+            return self
+                .chunks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, chunk)| (!chunk.symbol.is_empty()).then_some(index))
+                .collect();
+        }
+        let grams = symbol_grams(query);
+        let Some(first) = grams.first() else {
+            return Vec::new();
+        };
+        let Some(first_candidates) = self.symbols_by_gram.get(first) else {
+            return Vec::new();
+        };
+        let mut candidates = first_candidates.clone();
+        for gram in grams.iter().skip(1) {
+            let Some(matches) = self.symbols_by_gram.get(gram) else {
+                return Vec::new();
+            };
+            let matches = matches.iter().copied().collect::<HashSet<_>>();
+            candidates.retain(|candidate| matches.contains(candidate));
+            if candidates.is_empty() {
+                return candidates;
+            }
+        }
+        candidates
     }
 
     pub fn chunks_for_path(&self, raw_path: &str) -> Result<Vec<Chunk>> {
@@ -751,31 +791,39 @@ impl ProjectIndex {
     }
 
     pub fn file_line_count(&self, raw_path: &str) -> Result<usize> {
+        let started = Instant::now();
         let path = validate_relative_path(raw_path)?;
-        let absolute = self.root.join(&path);
-        let metadata = fs::symlink_metadata(&absolute)
-            .with_context(|| format!("path does not exist: {path}"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!("path is not a regular repository file: {path}");
-        }
-        let text = read_text(&absolute)?
-            .ok_or_else(|| anyhow::anyhow!("file is not UTF-8 text: {path}"))?;
-        Ok(text.lines().count())
+        let Some(text) = self.files.get(&path) else {
+            self.cache_diagnostics.file_misses.fetch_add(1, Ordering::Relaxed);
+            self.record_file_latency(started);
+            bail!("path is not a cached text file: {path}");
+        };
+        self.cache_diagnostics.file_hits.fetch_add(1, Ordering::Relaxed);
+        let count = text.lines().count();
+        self.record_file_latency(started);
+        Ok(count)
     }
 
     pub fn file_content(&self, raw_path: &str, max_bytes: usize) -> Result<(String, bool)> {
+        let started = Instant::now();
         let path = validate_relative_path(raw_path)?;
-        let absolute = self.root.join(&path);
-        let metadata = fs::symlink_metadata(&absolute)
-            .with_context(|| format!("path does not exist: {path}"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!("path is not a regular repository file: {path}");
-        }
-        let mut text = read_text(&absolute)?
-            .ok_or_else(|| anyhow::anyhow!("file is not UTF-8 text: {path}"))?;
+        let Some(mut text) = self.files.get(&path).cloned() else {
+            self.cache_diagnostics.file_misses.fetch_add(1, Ordering::Relaxed);
+            self.record_file_latency(started);
+            bail!("path is not a cached text file: {path}");
+        };
+        self.cache_diagnostics.file_hits.fetch_add(1, Ordering::Relaxed);
         let truncated = text.len() > max_bytes;
         truncate_utf8(&mut text, max_bytes);
+        self.record_file_latency(started);
         Ok((text, truncated))
+    }
+
+    fn record_file_latency(&self, started: Instant) {
+        self.cache_diagnostics.file_elapsed_micros.fetch_add(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn search(
@@ -945,18 +993,14 @@ impl ProjectIndex {
     }
 
     pub fn snippet(&self, raw_path: &str, start_line: u32, end_line: Option<u32>) -> Result<Chunk> {
+        let started = Instant::now();
         let path = validate_relative_path(raw_path)?;
-        let absolute = self.root.join(&path);
-        let metadata = fs::symlink_metadata(&absolute)
-            .with_context(|| format!("path does not exist: {path}"))?;
-        if metadata.file_type().is_symlink() {
-            bail!("symlink paths are not allowed: {path}");
-        }
-        if !metadata.is_file() {
-            bail!("path is not a file: {path}");
-        }
-        let text = read_text(&absolute)?
-            .ok_or_else(|| anyhow::anyhow!("file is not UTF-8 text: {path}"))?;
+        let Some(text) = self.files.get(&path) else {
+            self.cache_diagnostics.file_misses.fetch_add(1, Ordering::Relaxed);
+            self.record_file_latency(started);
+            bail!("path is not a cached text file: {path}");
+        };
+        self.cache_diagnostics.file_hits.fetch_add(1, Ordering::Relaxed);
         let lines: Vec<&str> = text.lines().collect();
         if lines.is_empty() {
             bail!("cannot select a line range from an empty file: {path}");
@@ -973,6 +1017,7 @@ impl ProjectIndex {
             .max(start as u32) as usize;
         let bounded_end = end.min(lines.len());
         let content = lines[start - 1..bounded_end].join("\n");
+        self.record_file_latency(started);
         Ok(Chunk {
             id: chunk_id(&path, start as u32, bounded_end as u32, ""),
             path,
@@ -1121,6 +1166,7 @@ pub fn validate_relative_path(raw: &str) -> Result<String> {
 
 struct ScannedRepository {
     chunks: Vec<Chunk>,
+    files: BTreeMap<String, String>,
     fingerprints: BTreeMap<String, FileFingerprint>,
     corpus_digest: String,
     stats: IndexStats,
@@ -1133,6 +1179,7 @@ fn scan_repository(
 ) -> Result<ScannedRepository> {
     let mut chunks = Vec::new();
     let mut source_digest = Sha256::new();
+    let mut files = BTreeMap::new();
     let mut fingerprints = BTreeMap::new();
     let mut file_count = 0;
     let mut python_symbol_chunks = 0;
@@ -1167,6 +1214,7 @@ fn scan_repository(
             .to_string_lossy()
             .replace('\\', "/");
         update_source_signature(&mut source_digest, &path, &text);
+        files.insert(path.clone(), text.clone());
         fingerprints.insert(path.clone(), fingerprint(&text));
         file_count += 1;
         let mut file_chunks = chunks_for_file(&path, entry.path(), &text)?;
@@ -1196,6 +1244,7 @@ fn scan_repository(
     chunks.sort_by(chunk_order);
     Ok(ScannedRepository {
         chunks,
+        files,
         fingerprints,
         corpus_digest: corpus.digest,
         stats: IndexStats {
@@ -1214,6 +1263,20 @@ fn scan_repository(
             refresh_signature: format!("files:{}", digest_hex(source_digest)),
         },
     })
+}
+
+fn symbol_grams(symbol: &str) -> Vec<String> {
+    let characters = symbol.chars().collect::<Vec<_>>();
+    let width = characters.len().min(3);
+    if width == 0 {
+        return Vec::new();
+    }
+    characters
+        .windows(width)
+        .map(|gram| gram.iter().collect())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn chunks_for_file(path: &str, absolute: &Path, text: &str) -> Result<Vec<Chunk>> {
@@ -1855,6 +1918,54 @@ mod tests {
             .snippet("empty.txt", 1, Some(1))
             .expect_err("reject a range from an empty file");
         assert!(empty.to_string().contains("empty file"));
+    }
+
+    #[test]
+    fn full_file_snapshot_v2_serves_cached_content_without_rereading_source() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        let path = root.path().join("notes.txt");
+        fs::write(&path, "before\nsecond line\n").expect("write fixture");
+        let index = ProjectIndex::build(root.path()).expect("build index");
+        let snapshot = index.snapshot();
+        assert_eq!(snapshot.schema, "context_index.snapshot.v2");
+
+        let restored = ProjectIndex::from_snapshot_controlled(root.path(), snapshot, None, None)
+            .expect("restore v2 snapshot");
+        fs::write(&path, "after\n").expect("mutate worktree after publication");
+        assert_eq!(
+            restored.file_content("notes.txt", 100).expect("cached file").0,
+            "before\nsecond line\n"
+        );
+        assert_eq!(
+            restored
+                .snippet("notes.txt", 2, Some(2))
+                .expect("cached snippet")
+                .content,
+            "second line"
+        );
+
+    }
+
+    #[test]
+    fn symbol_postings_preserve_case_insensitive_substring_results() {
+        let root = tempfile::tempdir().expect("temporary repository");
+        fs::write(
+            root.path().join("users.rs"),
+            "fn create_user() {}\nfn delete_user() {}\nfn create_token() {}\n",
+        )
+        .expect("write symbols");
+        let index = ProjectIndex::build(root.path()).expect("build index");
+        let symbols = index.symbols("USER", 8);
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["create_user", "delete_user"]
+        );
+        let diagnostics = index.cache_diagnostics();
+        assert_eq!(diagnostics.3, 1);
+        assert_eq!(diagnostics.4, 2);
     }
 
     #[test]

@@ -661,7 +661,6 @@ impl ProjectRegistry {
                 max_items: 1,
                 max_source_tokens: 0,
                 evidence_policy: Default::default(),
-                cache_strategy: Default::default(),
                 base_pack: None,
                 known_evidence: Vec::new(),
             };

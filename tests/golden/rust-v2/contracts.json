@@ -139,7 +139,6 @@
             ],
             "parameters": {
               "base_pack": "Previous pack id for delta generation.",
-              "cache_strategy": "fast, stable, fresh.",
               "changed_files": "Changed repository paths.",
               "client_profile": "codex, claude, copilot, generic.",
               "evidence_policy": "reference, balanced, source.",
@@ -454,7 +453,6 @@
           ],
           "parameters": {
             "base_pack": "Previous pack id for delta generation.",
-            "cache_strategy": "fast, stable, fresh.",
             "changed_files": "Changed repository paths.",
             "client_profile": "codex, claude, copilot, generic.",
             "evidence_policy": "reference, balanced, source.",
@@ -841,7 +839,6 @@
     },
     "context_admin.profile_calibrate": {
       "defaults": {
-        "cache_strategy": "fast",
         "client_profile": "generic",
         "evidence_policy": "balanced",
         "model_profile": "unknown"

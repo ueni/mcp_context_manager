@@ -28,8 +28,7 @@ fn request(prompt: &str) -> ContextPackRequest {
         "prompt": prompt,
         "client_profile": "codex",
         "max_items": 4,
-        "evidence_policy": "balanced",
-        "cache_strategy": "fast"
+        "evidence_policy": "balanced"
     }))
     .expect("static benchmark request")
 }

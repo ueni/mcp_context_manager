@@ -77,7 +77,6 @@ def main() -> int:
                     "focus_paths": ["src/contextd/src/lib.rs"],
                     "root_uri": args.root_uri,
                     "project_id": args.project_id,
-                    "cache_strategy": "fresh",
                 },
             },
         ),

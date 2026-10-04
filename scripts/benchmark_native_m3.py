@@ -38,7 +38,6 @@ def pack_call(request_id: int) -> dict[str, Any]:
                 ],
                 "client_profile": "codex",
                 "evidence_policy": "balanced",
-                "cache_strategy": "fast",
             },
         },
     )

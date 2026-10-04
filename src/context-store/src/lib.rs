@@ -2,12 +2,12 @@
 
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Result, anyhow, bail};
 use heed::{
-    Database, EnvFlags, EnvOpenOptions,
+    Database, EnvOpenOptions,
     types::{Bytes, Str},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -47,32 +47,6 @@ pub struct ReferenceValidation {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct StoredJson {
     canonical_json: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ImportManifest {
-    pub schema: String,
-    pub source_count: u64,
-    pub imported_count: u64,
-    pub skipped_expired_count: u64,
-    pub skipped_invalid_count: u64,
-    pub memory_source_count: u64,
-    pub memory_imported_count: u64,
-    pub reference_source_count: u64,
-    pub reference_imported_count: u64,
-    pub digest: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct V1Inspection {
-    pub schema: &'static str,
-    pub total_records: u64,
-    pub memory_records: u64,
-    pub reference_records: u64,
-    pub digest: String,
-    pub memory_digest: String,
-    pub reference_digest: String,
-    pub read_only: bool,
 }
 
 #[derive(Debug)]
@@ -227,98 +201,6 @@ impl StateStore {
             }
         }
         Ok(rows)
-    }
-
-    /// Import only durable memory and unexpired references from a Python v1
-    /// environment. The read-only source is never locked or modified.
-    pub fn import_v1(
-        &self,
-        python_lmdb: &Path,
-        python_references: Option<&Path>,
-    ) -> Result<ImportManifest> {
-        let source = unsafe {
-            EnvOpenOptions::new()
-                .max_dbs(1)
-                .flags(EnvFlags::READ_ONLY | EnvFlags::NO_LOCK | EnvFlags::NO_READ_AHEAD)
-                .open(python_lmdb)?
-        };
-        let source_txn = source.read_txn()?;
-        let source_db: Database<Bytes, Bytes> = source
-            .open_database(&source_txn, None)?
-            .ok_or_else(|| anyhow!("Python v1 unnamed LMDB database is missing"))?;
-        let now = OffsetDateTime::now_utc();
-        let mut imported = Vec::new();
-        let mut manifest = ImportManifest {
-            schema: "context_store.v1_import_manifest.v1".to_owned(),
-            source_count: 0,
-            imported_count: 0,
-            skipped_expired_count: 0,
-            skipped_invalid_count: 0,
-            memory_source_count: 0,
-            memory_imported_count: 0,
-            reference_source_count: 0,
-            reference_imported_count: 0,
-            digest: String::new(),
-        };
-
-        for row in source_db.iter(&source_txn)? {
-            let (raw_key, raw_value) = row?;
-            if raw_key == b"memory:store" {
-                let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw_value) else {
-                    manifest.skipped_invalid_count += 1;
-                    continue;
-                };
-                let count = count_memory_records(raw_value);
-                manifest.memory_source_count += count;
-                manifest.memory_imported_count += count;
-                imported.push(("memory:store".to_owned(), value));
-            } else if raw_key.starts_with(b"memory:") {
-                manifest.memory_source_count += 1;
-                match serde_json::from_slice::<serde_json::Value>(raw_value) {
-                    Ok(value) => {
-                        manifest.memory_imported_count += 1;
-                        imported.push((String::from_utf8_lossy(raw_key).into_owned(), value));
-                    }
-                    Err(_) => manifest.skipped_invalid_count += 1,
-                }
-            } else if raw_key.starts_with(b"reference:") {
-                manifest.reference_source_count += 1;
-                let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(raw_value) else {
-                    manifest.skipped_invalid_count += 1;
-                    continue;
-                };
-                if reference_is_expired(&value, now) {
-                    manifest.skipped_expired_count += 1;
-                    continue;
-                }
-                if inline_external_reference(&mut value, python_references).is_err() {
-                    manifest.skipped_invalid_count += 1;
-                    continue;
-                }
-                manifest.reference_imported_count += 1;
-                imported.push((String::from_utf8_lossy(raw_key).into_owned(), value));
-            }
-        }
-        drop(source_txn);
-        drop(source);
-
-        imported.sort_by(|left, right| left.0.cmp(&right.0));
-        manifest.source_count = manifest.memory_source_count + manifest.reference_source_count;
-        manifest.imported_count =
-            manifest.memory_imported_count + manifest.reference_imported_count;
-        manifest.digest = canonical_record_digest(&imported)?;
-
-        let mut write_txn = self.environment.write_txn()?;
-        for (key, value) in &imported {
-            let encoded = encode_json_record(value)?;
-            self.records.put(&mut write_txn, key, &encoded)?;
-        }
-        let manifest_value = serde_json::to_value(&manifest)?;
-        let encoded_manifest = encode_json_record(&manifest_value)?;
-        self.records
-            .put(&mut write_txn, "import:v1", &encoded_manifest)?;
-        write_txn.commit()?;
-        Ok(manifest)
     }
 
     pub fn create_reference(
@@ -707,116 +589,6 @@ fn reference_is_expired(value: &serde_json::Value, now: OffsetDateTime) -> bool 
         .is_some_and(|expires_at| expires_at < now)
 }
 
-fn inline_external_reference(
-    value: &mut serde_json::Value,
-    references_dir: Option<&Path>,
-) -> Result<()> {
-    if value.get("storage").and_then(serde_json::Value::as_str) != Some("file") {
-        return Ok(());
-    }
-    let relative = value
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("file reference is missing its relative path"))?;
-    let mut components = Path::new(relative).components();
-    let safe_name = match (components.next(), components.next()) {
-        (Some(Component::Normal(name)), None) => name,
-        _ => bail!("reference path is not a safe basename"),
-    };
-    let references_dir =
-        references_dir.ok_or_else(|| anyhow!("reference directory is required"))?;
-    let body = fs::read_to_string(references_dir.join(safe_name))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("reference record must be an object"))?;
-    object.insert(
-        "storage".to_owned(),
-        serde_json::Value::String("inline".to_owned()),
-    );
-    object.insert("body".to_owned(), serde_json::Value::String(body));
-    object.remove("path");
-    Ok(())
-}
-
-fn canonical_record_digest(records: &[(String, serde_json::Value)]) -> Result<String> {
-    let mut digest = Sha256::new();
-    for (key, value) in records {
-        let encoded = serde_json::to_vec(value)?;
-        update_record_digest(&mut digest, key.as_bytes(), &encoded);
-    }
-    Ok(digest_hex(digest))
-}
-
-/// Inspect the Python v1 unnamed LMDB database without creating files, taking
-/// locks, or opening any write transaction.
-pub fn inspect_v1(path: &Path) -> heed::Result<V1Inspection> {
-    let env = unsafe {
-        EnvOpenOptions::new()
-            .max_dbs(1)
-            .flags(EnvFlags::READ_ONLY | EnvFlags::NO_LOCK | EnvFlags::NO_READ_AHEAD)
-            .open(path)?
-    };
-    let read_txn = env.read_txn()?;
-    let database: Database<Bytes, Bytes> = env
-        .open_database(&read_txn, None)?
-        .expect("the unnamed LMDB database always exists");
-
-    let mut total_records = 0_u64;
-    let mut memory_records = 0_u64;
-    let mut reference_records = 0_u64;
-    let mut all = Sha256::new();
-    let mut memory = Sha256::new();
-    let mut references = Sha256::new();
-
-    for row in database.iter(&read_txn)? {
-        let (key, value) = row?;
-        total_records += 1;
-        update_record_digest(&mut all, key, value);
-
-        if key == b"memory:store" {
-            memory_records = count_memory_records(value);
-            update_record_digest(&mut memory, key, value);
-        } else if key.starts_with(b"memory:") {
-            memory_records += 1;
-            update_record_digest(&mut memory, key, value);
-        }
-
-        if key.starts_with(b"reference:") {
-            reference_records += 1;
-            update_record_digest(&mut references, key, value);
-        }
-    }
-
-    Ok(V1Inspection {
-        schema: "context_store.v1_inspection.v1",
-        total_records,
-        memory_records,
-        reference_records,
-        digest: digest_hex(all),
-        memory_digest: digest_hex(memory),
-        reference_digest: digest_hex(references),
-        read_only: true,
-    })
-}
-
-fn count_memory_records(value: &[u8]) -> u64 {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(value) else {
-        return 1;
-    };
-    ["entries", "summaries", "decisions"]
-        .into_iter()
-        .filter_map(|field| value.get(field)?.as_array())
-        .map(|rows| rows.len() as u64)
-        .sum()
-}
-
-fn update_record_digest(digest: &mut Sha256, key: &[u8], value: &[u8]) {
-    digest.update((key.len() as u64).to_be_bytes());
-    digest.update(key);
-    digest.update((value.len() as u64).to_be_bytes());
-    digest.update(value);
-}
-
 fn digest_hex(digest: Sha256) -> String {
     digest
         .finalize()
@@ -875,85 +647,6 @@ mod tests {
             .expect("write batch");
 
         assert_eq!(store.iter_json("frontier:").expect("rows").len(), 2);
-    }
-
-    #[test]
-    fn v1_import_is_read_only_isolated_and_idempotent() {
-        let root = tempfile::tempdir().expect("temporary state root");
-        let python_lmdb = root.path().join("python-v1/context.lmdb");
-        fs::create_dir_all(&python_lmdb).expect("Python LMDB directory");
-        {
-            let mut options = EnvOpenOptions::new();
-            options.max_dbs(1).map_size(8 * 1024 * 1024);
-            let environment = unsafe { options.open(&python_lmdb).expect("open Python fixture") };
-            let mut write_txn = environment.write_txn().expect("Python fixture transaction");
-            let database = environment
-                .create_database::<Bytes, Bytes>(&mut write_txn, None)
-                .expect("unnamed Python database");
-            let memory = serde_json::to_vec(&json!({
-                "schema": "context_memory_store.v1",
-                "entries": [{"namespace": "repo", "key": "choice", "value": "native"}],
-                "summaries": [],
-                "decisions": []
-            }))
-            .expect("memory JSON");
-            database
-                .put(&mut write_txn, b"memory:store", &memory)
-                .expect("memory row");
-            let active = serde_json::to_vec(&json!({
-                "schema": "mcp_result_reference.store.v1",
-                "reference_id": "ctxref-active",
-                "expires_at": "2099-01-01T00:00:00Z",
-                "storage": "inline",
-                "sha256": "active-hash",
-                "body": "{}"
-            }))
-            .expect("active reference JSON");
-            database
-                .put(&mut write_txn, b"reference:ctxref-active", &active)
-                .expect("active reference");
-            let expired = serde_json::to_vec(&json!({
-                "schema": "mcp_result_reference.store.v1",
-                "reference_id": "ctxref-expired",
-                "expires_at": "2000-01-01T00:00:00Z",
-                "storage": "inline",
-                "sha256": "expired-hash",
-                "body": "{}"
-            }))
-            .expect("expired reference JSON");
-            database
-                .put(&mut write_txn, b"reference:ctxref-expired", &expired)
-                .expect("expired reference");
-            write_txn.commit().expect("commit Python fixture");
-        }
-        let source_before = fs::read(python_lmdb.join("data.mdb")).expect("source data");
-        let store = StateStore::open(root.path()).expect("open isolated v2 overlay");
-        let first = store
-            .import_v1(&python_lmdb, None)
-            .expect("first durable import");
-        let second = store
-            .import_v1(&python_lmdb, None)
-            .expect("idempotent durable import");
-
-        assert_eq!(first, second);
-        assert_eq!(first.source_count, 3);
-        assert_eq!(first.imported_count, 2);
-        assert_eq!(first.memory_imported_count, 1);
-        assert_eq!(first.reference_imported_count, 1);
-        assert_eq!(first.skipped_expired_count, 1);
-        assert_eq!(store.iter_json("reference:").expect("references").len(), 1);
-        assert!(store.get_json("memory:store").expect("memory").is_some());
-        assert!(store.paths().lmdb.starts_with(root.path().join("rust-v2")));
-        assert_eq!(
-            source_before,
-            fs::read(python_lmdb.join("data.mdb")).expect("source data after import")
-        );
-    }
-
-    #[test]
-    fn external_reference_import_rejects_path_traversal() {
-        let mut record = json!({"storage": "file", "path": "../escape.json"});
-        assert!(inline_external_reference(&mut record, Some(Path::new("references"))).is_err());
     }
 
     #[test]

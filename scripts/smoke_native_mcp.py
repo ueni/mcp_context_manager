@@ -10,7 +10,6 @@ import os
 import socket
 import subprocess
 import time
-from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
@@ -316,93 +315,6 @@ def rest_json(
     return response.status, response_body
 
 
-def read_sse_event(response: http.client.HTTPResponse) -> tuple[str, str]:
-    event = "message"
-    data: list[str] = []
-    while True:
-        line = response.readline()
-        if not line:
-            raise RuntimeError("legacy SSE stream closed before an event arrived")
-        text = line.decode("utf-8").rstrip("\r\n")
-        if not text:
-            if data:
-                return event, "\n".join(data)
-            event = "message"
-            continue
-        if text.startswith(":"):
-            continue
-        field, separator, value = text.partition(":")
-        if not separator:
-            continue
-        value = value.removeprefix(" ")
-        if field == "event":
-            event = value
-        elif field == "data":
-            data.append(value)
-
-
-def legacy_sse_post(port: int, path: str, message: dict[str, Any]) -> int:
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    connection.request(
-        "POST",
-        path,
-        body=json.dumps(message, separators=(",", ":")),
-        headers={"Content-Type": "application/json"},
-    )
-    response = connection.getresponse()
-    response.read()
-    connection.close()
-    return response.status
-
-
-def smoke_legacy_sse(
-    port: int,
-    expected_public_base: str,
-    *,
-    host_header: str | None = None,
-) -> None:
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    try:
-        headers = {"Accept": "text/event-stream"}
-        if host_header is not None:
-            headers["Host"] = host_header
-        connection.request("GET", "/legacy/sse", headers=headers)
-        response = connection.getresponse()
-        assert response.status == 200
-        assert "text/event-stream" in response.getheader("Content-Type", "")
-        event, endpoint = read_sse_event(response)
-        assert event == "endpoint"
-        parsed_endpoint = urlsplit(endpoint)
-        assert f"{parsed_endpoint.scheme}://{parsed_endpoint.netloc}" == expected_public_base
-        assert parsed_endpoint.path == "/legacy/messages"
-        assert parsed_endpoint.query.startswith("session_id=")
-        message_path = parsed_endpoint.path
-        if parsed_endpoint.query:
-            message_path = f"{message_path}?{parsed_endpoint.query}"
-
-        assert legacy_sse_post(port, message_path, initialize_message()) == 202
-        event, initialized = read_sse_event(response)
-        assert event == "message"
-        initialized_message = json.loads(initialized)
-        assert initialized_message["id"] == 1
-        assert initialized_message["result"]["serverInfo"]["name"] == "mcp-context-manager"
-
-        assert (
-            legacy_sse_post(
-                port,
-                message_path,
-                {"jsonrpc": "2.0", "method": "notifications/initialized"},
-            )
-            == 202
-        )
-        assert legacy_sse_post(port, message_path, request(2, "tools/list")) == 202
-        event, tools = read_sse_event(response)
-        assert event == "message"
-        assert_native_tools(json.loads(tools))
-    finally:
-        connection.close()
-
-
 def wait_for_health(
     port: int,
     *,
@@ -501,8 +413,6 @@ def smoke_http(binary: Path) -> None:
         assert tools_payload["schema"] == "context_http.mcp_tools.v1"
         assert tools_payload["tool_count"] == 6
         assert "health" in tools_payload["tools"]
-        assert tools_payload["legacy_sse_endpoint"] == "/legacy/sse"
-        smoke_legacy_sse(port, "https://context.example")
         rest_arguments = pack_message(7)["params"]["arguments"]
         status, rest_pack = rest_json(
             port,
@@ -565,41 +475,6 @@ def smoke_http(binary: Path) -> None:
         assert mcp_delete(port, session_id) == 404
         status, _, _ = raw_rest(port, "GET", "/mcp/unexpected")
         assert status == 404
-    finally:
-        process.terminate()
-        process.wait(timeout=5)
-
-
-def smoke_legacy_sse_default_host(binary: Path) -> None:
-    port = unused_port()
-    environment = os.environ.copy()
-    environment.pop("MCP_HTTP_BEARER_TOKEN", None)
-    environment.pop("MCP_HTTP_PUBLIC_BASE_URL", None)
-    environment.pop("MCP_HTTP_AUTHORIZATION_SERVERS", None)
-    environment.update(
-        {
-            "HOST": "127.0.0.1",
-            "PORT": str(port),
-            "MCP_CONTEXT_STATE_DIR": "/tmp/mcp-context-native-smoke-legacy-host",
-            "MCP_HTTP_ALLOWED_HOSTS": (
-                f"127.0.0.1,127.0.0.1:{port},mcp-context-manager:8000"
-            ),
-        }
-    )
-    process = subprocess.Popen(
-        [str(binary), "--transport", "streamable-http"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=environment,
-        text=True,
-    )
-    try:
-        wait_for_health(port)
-        smoke_legacy_sse(
-            port,
-            "http://mcp-context-manager:8000",
-            host_header="mcp-context-manager:8000",
-        )
     finally:
         process.terminate()
         process.wait(timeout=5)
@@ -717,7 +592,6 @@ def main() -> int:
 
     smoke_stdio(binary)
     smoke_http(binary)
-    smoke_legacy_sse_default_host(binary)
     smoke_http_security(binary)
     smoke_http_auth_configuration(binary)
     print(
@@ -726,7 +600,6 @@ def main() -> int:
                 "binary": str(binary),
                 "stdio": "ok",
                 "http": "ok",
-                "legacy_sse": "ok",
                 "security": "ok",
             }
         )
