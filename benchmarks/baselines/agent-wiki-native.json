@@ -1,0 +1,45 @@
+{
+  "measurements": [
+    {
+      "build_ms": 80.8074,
+      "chunks": 10000,
+      "during_publication_ms": {
+        "p50": 0.0153,
+        "p95": 0.45188999999999996,
+        "p99": 0.46592999999999996
+      },
+      "first_query_ms": 0.33471,
+      "identifier_recall": 1,
+      "projects": 4,
+      "queries": 200,
+      "warm_ms": {
+        "p50": 0.01521,
+        "p95": 0.37089,
+        "p99": 0.46538999999999997
+      }
+    },
+    {
+      "build_ms": 723.26493,
+      "chunks": 100000,
+      "during_publication_ms": {
+        "p50": 0.025740000000000002,
+        "p95": 3.08574,
+        "p99": 4.08645
+      },
+      "first_query_ms": 2.65266,
+      "identifier_recall": 1,
+      "projects": 4,
+      "queries": 200,
+      "warm_ms": {
+        "p50": 0.03159,
+        "p95": 3.7611,
+        "p99": 3.83562
+      }
+    }
+  ],
+  "profile": "release",
+  "schema": "agent_wiki.benchmark.v1",
+  "date": "2026-10-15",
+  "implementation_base": "1dc471ea71ac3f5c7d4f43aba7c9afd245f30ce8",
+  "measurement": "in-process lexical top-10 search; synthetic four-project corpus; not transport latency"
+}

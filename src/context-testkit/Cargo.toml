@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 context-core = { path = "../context-core" }
+context-index = { path = "../context-index" }
 context-store = { path = "../context-store" }
 contextd = { path = "../contextd" }
 serde_json.workspace = true

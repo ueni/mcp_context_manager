@@ -41,6 +41,18 @@ debug, test, docs, security, and general repository tasks.
     source/version/licence/freshness provenance and prompt-injection signal,
     then use the pack's `more` id with `result_reference_resolve` when the
     bounded deferred excerpt is required.
+12. For reusable project knowledge, inspect `context_pack.wiki` and use
+    `context_lookup(mode="wiki_search")` before repeating investigation. Wiki
+    search shares admitted projects by default; retain owner and applicability.
+    Resolve immutable `wiki` or `wiki_source` references for supporting detail.
+13. Publish cited findings with `context_memory(mode="wiki_upsert", wiki=...)`
+    during work. Consolidate superseded pages before compaction using expected
+    revisions, then retain `compact`'s durable `wiki_references`. Keep unsupported
+    claims unverified and Git-derived claims historical unless current evidence
+    supports them. No client-native compaction hook is implied.
+14. Request supplied-URL datasheet jobs through `context_admin(mode="wiki")`.
+    Run the optional companion outside the server with explicit publisher hosts
+    and rights evidence. The MCP server does not fetch or extract documents.
 
 Repository instructions alone cannot force a model to call a tool on every
 turn. The expected setup is to combine this file with the server instructions

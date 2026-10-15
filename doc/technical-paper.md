@@ -582,6 +582,52 @@ as `unverified` and excluded from packs. Source validity is reported as
 current, stale, or unverified by memory reads/validation, while cache and
 freshness indicators remain diagnostic fields.
 
+## Agent knowledge projection
+
+The additive stable `context_pack.v2.wiki` field holds bounded source-linked
+knowledge with owner project, applicability, freshness, and immutable reference
+objects. Wiki and repository cards share the request item/source-token budgets.
+`wiki_search` and `wiki_get`, typed `wiki_upsert`/`wiki_consolidate`, and the
+administrative `wiki` actions extend existing tools without adding tool names.
+`wiki_scope=all_authorized` is the search default; `selected_project` restricts
+the active selector. Responses use `agent_wiki.*.v1` schemas. Page/source
+identifiers, revision hashes, content, source status, and citations are stable;
+generation counters, timings, and indexing counts are diagnostic.
+
+LMDB stores immutable wiki revisions and compare-and-swap current pointers.
+Consolidation checks and publishes every affected pointer in one transaction.
+Old revisions remain addressable without TTL. Source snapshots use immutable
+normalized-text hashes, UTF-8 byte ranges, and line ranges, including PDF page
+provenance. Long single-line sources remain searchable without truncating
+subsequent text. Queue
+claim/completion and imported source records use transactional state transitions;
+claims carry an attempt number and a ten-minute lease. Unknown rights metadata,
+hash mismatch, malformed page locations, and sensitive text prevent import.
+
+A registry-authorized `WikiHub` publishes one deterministic Tantivy snapshot,
+with keyed document metadata and per-project source views. Query work consists
+of lexical retrieval, bounded point lookups, and indexed fingerprint checks;
+it performs no repository scan, Git command, network access, or model call.
+Publication is serialized and occurs on write/background paths. The projection
+is rebuildable from canonical state after restart. Source watchers remain alive
+with registered views, and source/Git changes coalesce into background refresh.
+The current implementation rebuilds the shared search snapshot on publication;
+this affects ingestion cost rather than query complexity.
+
+Shared epochs participate in pack identity and validity. Watcher events invalidate
+remote cached packs before source refresh. Dirty-source knowledge is withheld,
+and a publication racing pack construction is retried against the new epoch.
+Cross-project retrieval retains applicability instead of turning another
+project's decision or an old commit into a universal current fact. Compaction
+retains durable references alongside its bounded structured-memory summary;
+it does not consume or persist raw conversation transcripts.
+
+The optional Python/Poppler companion is outside the native runtime. It claims
+supplied publisher URLs, validates/pins public HTTPS addresses, revalidates
+redirects, bounds extraction, and submits text through the same public MCP
+contract. Raw PDFs remain in temporary worker staging. No downloader, extractor,
+OCR engine, human UI, embedding dependency, or synthesis model runs in contextd.
+
 ## Redaction and untrusted repository content
 
 Repository text, docs, generated artifacts, memory, and search hits are

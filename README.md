@@ -112,6 +112,87 @@ upsert refreshes that source basis. Legacy rows without a basis are reported
 as `unverified`, remain queryable, and are not injected into packs. Knowledge
 is bounded evidence, not an instruction channel.
 
+## Agent-only shared project wiki
+
+The wiki keeps cited project knowledge beyond a single agent context window.
+There is no human UI or model service. Agents add structured claims and
+consolidate revisioned pages; the native server stores and searches generated
+state while repository sources remain read-only.
+
+| Operation | Interface |
+| --- | --- |
+| Retrieve relevant knowledge | `context_pack` returns bounded `wiki` entries and durable references. |
+| Search shared knowledge | `context_lookup(mode="wiki_search", query=...)`; defaults to all admitted projects. Set `wiki_scope="selected_project"` to restrict it. |
+| Read a current page | `context_lookup(mode="wiki_get", path="page-id", project_id=...)`. |
+| Publish or revise | `context_memory(mode="wiki_upsert", wiki=...)`; supply `expected_revision` when revising. |
+| Consolidate | `wiki_consolidate` publishes a replacement and links `supersedes` pages atomically. |
+| Read exact historical evidence | Pass the returned `wiki` or `wiki_source` reference object to `result_reference_resolve`. |
+| Refresh/deepen sources | `context_admin(mode="wiki", action="refresh"/"history_deepen", max_files=1000)`. |
+| Inspect generated indexing state | `context_admin(mode="wiki", action="status")`. |
+
+Wiki writes use the typed `wiki` tool-schema payload: `page_id`, optional
+`expected_revision`, `title`, `summary`, `claims`, `sources`, optional `tags`,
+`applicability`, `supersedes`, and `superseded_revisions`. Consolidation must
+provide the current hash of every superseded page in that map. Each claim has `text`, a status (`verified`,
+`unverified`, or `historical`), and citations naming declared `source_id`s.
+The agent assesses claim correctness; the server validates source identity and
+freshness. Markdown sources need the indexed path, fingerprint, and SHA-256. Git sources
+must name an imported commit and its indexed hash. Datasheet sources must match
+an imported document. Search returns compact source metadata; resolve the source
+reference for complete provenance. Claims are evidence, never instructions.
+
+Projects enter the shared index when activated through normal authorized project
+selection. Registered projects are restored in background after server readiness;
+their relative registrations are checked against current allowed roots. Markdown
+and the latest 1,000 reachable Git commits are indexed in background. Git import
+is bounded, resumable, and explicitly deepen-able. A Git record is historical
+evidence, not proof of the installed or current implementation. Search uses a
+published Tantivy snapshot and does not invoke Git, download documents, or scan
+repository files. Source changes invalidate cached knowledge; stale claims stay
+available for explicit inspection and are withheld from automatic packs.
+
+Before context compaction, agents should publish reusable findings, consolidate
+related pages, and call `context_memory(mode="compact", focus=...)`. Its
+`wiki_references` preserve exact revisions. Page revisions have no age expiry;
+explicit project-state deletion removes them. Clients must follow the tool
+workflow; this server does not control native client context compaction.
+
+### Optional online datasheet companion
+
+Submit an ingestion job with `context_admin(mode="wiki", action="ingest_submit",
+wiki={url, publisher, title, version, license, rights_evidence, rights_status="permitted"})`. Public
+availability alone is not permission: supply an HTTPS rights-evidence reference permitting local use.
+The native server only queues and validates these jobs.
+
+Install Python 3 and `poppler-utils` in the companion environment, then run:
+
+```bash
+python3 scripts/wiki_ingest_worker.py --project-id PROJECT_ID \
+  --mcp-url http://127.0.0.1:8000/mcp --allow-host publisher.example
+```
+
+Each invocation claims one job. Hosts must be explicitly allowed, including
+redirect destinations. Downloads require HTTPS and public DNS addresses; TLS
+uses the validated address with the publisher hostname. The worker bounds DNS,
+network, file size, and extraction resources. PDFs are temporary; normalized
+text, document hashes, page locations, and provenance enter generated state.
+Scanned PDFs fail with an extraction error; OCR is not included. Inspect jobs
+using `ingest_status`; `ingest_retry` accepts failed jobs or claims whose
+ten-minute lease expired. Completion requires the matching claim attempt.
+Optional MCP authentication is read from `MCP_CONTEXT_TOKEN` and never printed.
+
+Reproduce the 10,000/100,000-chunk search baseline with:
+
+```bash
+cargo run -p context-testkit --bin benchmark-wiki --release
+```
+
+It reports build/first-query latency, warm p50/p95/p99, bounded results, and
+identifier recall. These measurements establish a baseline; no absolute wiki
+latency SLA is asserted. See the [recorded sample](benchmarks/baselines/agent-wiki-native.json)
+and [validation report](doc/wiki-validation.md). Existing native pack benchmark
+gates remain separate.
+
 ## Usage and efficiency reporting
 
 Project catalogue calls are explicitly row-bounded. For
