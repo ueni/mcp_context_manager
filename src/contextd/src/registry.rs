@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use context_core::{
     ContextAdminRequest, ContextPackRejectionClass, ContextPackRequest, GovernedFrontierLineage,
-    ProjectEngine, ResultReferenceRequest, SharedFrontierCache, UsageMonitor,
+    ProjectEngine, ResultReferenceRequest, SharedFrontierCache, UsageMonitor, WikiHub,
 };
 use context_index::{WorkControl, is_ignored_repository_path};
 use serde::Deserialize;
@@ -49,6 +49,8 @@ pub struct ProjectRegistry {
     default_project_id: String,
     usage_monitor: Arc<UsageMonitor>,
     shared_frontiers: Option<Arc<SharedFrontierCache>>,
+    shared_wiki: Arc<WikiHub>,
+    wiki_catalog_lock: Arc<Mutex<()>>,
     governed_lineages: HashMap<PathBuf, GovernedFrontierLineage>,
     blocking: Arc<BlockingCoordinator>,
     #[cfg(test)]
@@ -240,6 +242,7 @@ impl ProjectRegistry {
             .then(|| SharedFrontierCache::open(state_root.join("global-frontiers")))
             .transpose()?
             .map(Arc::new);
+        let shared_wiki = Arc::new(WikiHub::new()?);
         let blocking_limit = blocking_limit_from_env();
         let request_timeout = duration_from_env(
             "MCP_CONTEXT_REQUEST_TIMEOUT_SECS",
@@ -262,6 +265,8 @@ impl ProjectRegistry {
             default_project_id: project_id,
             usage_monitor,
             shared_frontiers,
+            shared_wiki,
+            wiki_catalog_lock: Arc::new(Mutex::new(())),
             governed_lineages,
             blocking: Arc::new(BlockingCoordinator {
                 limit: blocking_limit,
@@ -677,6 +682,14 @@ impl ProjectRegistry {
                 .blocking
                 .warmup_state
                 .store(state, Ordering::Release);
+            let restore = Arc::clone(&registry);
+            let _ = registry
+                .run_repository_work_bounded("wiki restore", false, move |control| {
+                    control.check()?;
+                    restore.restore_wiki_projects()?;
+                    Ok(Vec::new())
+                })
+                .await;
         });
     }
 
@@ -772,6 +785,37 @@ impl ProjectRegistry {
     }
 
     pub fn result_reference_resolve(&self, request: &ResultReferenceRequest) -> Result<Vec<u8>> {
+        if request
+            .reference
+            .as_ref()
+            .and_then(|reference| reference.get("kind"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "wiki" | "wiki_source"))
+        {
+            let owner = request
+                .reference
+                .as_ref()
+                .and_then(|reference| reference.get("project_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("wiki reference requires owner project_id"))?;
+            if request
+                .project_id
+                .as_deref()
+                .is_some_and(|selected| selected != owner)
+            {
+                bail!("wiki reference owner does not match the selected project");
+            }
+            if let Some(root) = request.root_uri.as_deref()
+                && self.select_project(None, Some(root))? != owner
+            {
+                bail!("wiki reference owner does not match selected root");
+            }
+            let mut scoped = request.clone();
+            scoped.project_id = Some(owner.to_owned());
+            scoped.root_uri = None;
+            let engine = self.engine_for(Some(owner), None)?;
+            return engine.result_reference_resolve(&scoped);
+        }
         let engine = self.engine_for(request.project_id.as_deref(), request.root_uri.as_deref())?;
         let mut scoped = request.clone();
         scoped.project_id = Some(engine.project_id().to_owned());
@@ -783,6 +827,102 @@ impl ProjectRegistry {
             return Ok(encoded);
         }
         engine.result_reference_resolve(&scoped)
+    }
+
+    fn persist_wiki_registration(&self, spec: &ProjectSpec) -> Result<()> {
+        if spec.local_root == self.base_root {
+            return Ok(());
+        }
+        let _guard = self
+            .wiki_catalog_lock
+            .lock()
+            .map_err(|_| anyhow!("wiki catalogue lock poisoned"))?;
+        let mut entry = None;
+        for allowed in &self.allowed_roots {
+            let (mapped, _) = self.map_host_path(allowed);
+            let Ok(mapped) = mapped.canonicalize() else {
+                continue;
+            };
+            if let Ok(relative) = spec.local_root.strip_prefix(mapped) {
+                let relative = relative.to_string_lossy();
+                entry = Some(
+                    json!({"boundary":sha256_hex(allowed.to_string_lossy().as_bytes()),"relative":if relative.is_empty(){"."}else{relative.as_ref()}}),
+                );
+                break;
+            }
+        }
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        let target = self.state_root.join("wiki-projects.v1.json");
+        let mut entries = std::fs::read(&target)
+            .ok()
+            .filter(|bytes| bytes.len() <= 256 * 1024)
+            .and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
+            .unwrap_or_default();
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+        if entries.len() > 1000 {
+            bail!("wiki project catalogue exceeds 1000 projects");
+        }
+        let temporary = self.state_root.join(".wiki-projects.v1.tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&entries)?)?;
+        std::fs::rename(temporary, target)?;
+        Ok(())
+    }
+
+    fn restore_wiki_projects(&self) -> Result<()> {
+        let target = self.state_root.join("wiki-projects.v1.json");
+        let bytes = match std::fs::read(target) {
+            Ok(bytes) if bytes.len() <= 256 * 1024 => bytes,
+            _ => return Ok(()),
+        };
+        let entries: Vec<Value> = serde_json::from_slice(&bytes)?;
+        for entry in entries.into_iter().take(1000) {
+            let Some(relative) = entry["relative"]
+                .as_str()
+                .and_then(|path| context_index::validate_relative_path(path).ok())
+            else {
+                continue;
+            };
+            let Some(allowed) = self.allowed_roots.iter().find(|allowed| {
+                sha256_hex(allowed.to_string_lossy().as_bytes())
+                    == entry["boundary"].as_str().unwrap_or_default()
+            }) else {
+                continue;
+            };
+            let root = allowed.join(relative);
+            let Ok(spec) = self.project_from_uri(&canonical_file_uri(&root)?, "wiki_restore")
+            else {
+                continue;
+            };
+            let id = spec.project_id.clone();
+            self.state
+                .lock()
+                .map_err(|_| anyhow!("registry lock poisoned"))?
+                .specs
+                .insert(id.clone(), spec);
+            // Sequential and outside search; every root is re-authorized before state is loaded.
+            let _ = self.engine_for(Some(&id), None);
+        }
+        Ok(())
+    }
+
+    pub fn shared_wiki_search(
+        &self,
+        request: &context_core::ContextLookupRequest,
+    ) -> Result<Value> {
+        let active = self.engine_for(request.project_id.as_deref(), request.root_uri.as_deref())?;
+        let selected = if request.wiki_scope == context_core::WikiSearchScope::SelectedProject {
+            Some(active.project_id().to_owned())
+        } else {
+            None
+        };
+        Ok(
+            json!({"schema":"agent_wiki.search.v1", "generation":self.shared_wiki.generation(),
+            "results":self.shared_wiki.search(&request.query,selected.as_deref(),usize::from(request.max_results),false)?}),
+        )
     }
 
     pub fn record_context_pack_rejection(&self, class: ContextPackRejectionClass) {
@@ -868,6 +1008,8 @@ impl ProjectRegistry {
             return Ok(engine);
         }
         let engine = Arc::new(builder(&spec)?);
+        engine.attach_wiki_hub(Arc::clone(&self.shared_wiki))?;
+        self.persist_wiki_registration(&spec)?;
         let mut state = self
             .state
             .lock()
@@ -1611,6 +1753,88 @@ fn project_markers_from_env() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_wiki_rechecks_project_boundaries_and_restores_registered_projects() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let a = workspace.join("alpha");
+        let b = workspace.join("beta");
+        let outside = fixture.path().join("outside");
+        for root in [&a, &b, &outside] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        std::fs::write(a.join("policy.md"), "auroracontract timeout is 400ms\n").unwrap();
+        let state = fixture.path().join("state");
+        let registry =
+            super::ProjectRegistry::new(a.clone(), state.clone(), vec![workspace.clone()], vec![])
+                .unwrap();
+        let alpha = registry.engine_for(None, None).unwrap();
+        let beta = registry
+            .engine_for(None, Some(b.to_str().unwrap()))
+            .unwrap();
+        let index = alpha.index();
+        let (content, _) = index.file_content("policy.md", 4096).unwrap();
+        let hash = super::sha256_hex(content.as_bytes());
+        let write=serde_json::from_value(serde_json::json!({"mode":"wiki_upsert","wiki":{
+            "page_id":"aurora","title":"auroracontract","summary":"auroracontract timeout is 400ms",
+            "claims":[{"text":"auroracontract timeout is 400ms","status":"verified","citations":[{"source_id":"policy"}]}],
+            "sources":[{"id":"policy","kind":"markdown","path":"policy.md","sha256":hash,"fingerprint":index.snapshot_fingerprint("policy.md")}]
+        }})).unwrap();
+        let published: serde_json::Value =
+            serde_json::from_slice(&alpha.context_memory(&write).unwrap()).unwrap();
+        let request=serde_json::from_value(serde_json::json!({"mode":"wiki_search","query":"auroracontract","project_id":beta.project_id()})).unwrap();
+        let search = registry.shared_wiki_search(&request).unwrap();
+        assert!(
+            search["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["project_id"] == alpha.project_id())
+        );
+        assert!(
+            registry
+                .engine_for(None, Some(outside.to_str().unwrap()))
+                .is_err()
+        );
+        let reference =
+            serde_json::from_value(serde_json::json!({"reference":published["reference"]}))
+                .unwrap();
+        assert!(registry.result_reference_resolve(&reference).is_ok());
+        let mismatch = serde_json::from_value(
+            serde_json::json!({"reference":published["reference"],"root_uri":b}),
+        )
+        .unwrap();
+        assert!(registry.result_reference_resolve(&mismatch).is_err());
+        drop(index);
+        drop(alpha);
+        drop(beta);
+        drop(registry);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let restarted = loop {
+            match super::ProjectRegistry::new(
+                a.clone(),
+                state.clone(),
+                vec![workspace.clone()],
+                vec![],
+            ) {
+                Ok(registry) => break registry,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(error) => panic!("wiki handles did not close: {error}"),
+            }
+        };
+        restarted.engine_for(None, None).unwrap();
+        restarted.restore_wiki_projects().unwrap();
+        let restored = restarted.shared_wiki_search(&request).unwrap();
+        assert!(
+            restored["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["page_id"] == "aurora")
+        );
+    }
     use super::*;
     use std::sync::{
         Barrier,
@@ -1751,6 +1975,12 @@ mod tests {
         drop(held);
         drop(registry.default_engine().expect("prune trigger"));
         assert!(registry.cached_project_ids().expect("pruned ids").len() <= ENGINE_CAPACITY);
+        let evicted_uri = canonical_file_uri(&repositories[2]).expect("evicted URI");
+        drop(
+            registry
+                .engine_for(None, Some(&evicted_uri))
+                .expect("wiki views must permit reloading an evicted engine"),
+        );
 
         let outside = tempfile::tempdir().expect("outside root");
         std::fs::write(outside.path().join("Cargo.toml"), "[workspace]\n").expect("outside marker");

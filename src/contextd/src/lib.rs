@@ -126,12 +126,21 @@ impl ContextServer {
     }
 
     #[tool(
-        description = "Perform bounded targeted follow-up after context_pack. Choose `mode` for search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, or explain_cache; provide repository-relative paths and selectors only. Use this to resolve specific files, symbols, callers, tests, or omitted evidence without broad repository reads."
+        description = "Perform bounded targeted follow-up after context_pack. Choose `mode` for search, snippet, tree, symbols, references, impact, related_symbols, test_owners, chunk, explain_cache, wiki_search, or wiki_get; provide repository-relative paths and selectors only. Use this to resolve specific files, symbols, callers, tests, or omitted evidence without broad repository reads."
     )]
     fn context_lookup(
         &self,
         Parameters(mut request): Parameters<ContextLookupRequest>,
     ) -> Result<String, String> {
+        if request.mode == "wiki_search" {
+            return serde_json::to_string(
+                &self
+                    .registry
+                    .shared_wiki_search(&request)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string());
+        }
         let engine = self
             .registry
             .engine_for(request.project_id.as_deref(), request.root_uri.as_deref())
@@ -145,7 +154,7 @@ impl ContextServer {
     }
 
     #[tool(
-        description = "Read or update structured, non-secret repository memory. Use the explicit memory modes for durable facts, summaries, decisions, validation results, or compaction; never store raw prompts, model responses, credentials, private conversation text, or host-absolute paths. Select the intended project explicitly when multiple projects are configured."
+        description = "Read or update structured, non-secret repository memory. Use wiki_upsert/wiki_consolidate with the typed wiki payload for cited revisioned agent knowledge. Use the explicit memory modes for durable facts, summaries, decisions, validation results, or compaction; never store raw prompts, model responses, credentials, private conversation text, or host-absolute paths. Select the intended project explicitly when multiple projects are configured."
     )]
     fn context_memory(
         &self,
@@ -164,7 +173,7 @@ impl ContextServer {
     }
 
     #[tool(
-        description = "Resolve a `ctxref-*` deferred result returned by context_pack or another tool. Supply the reference id (and expected hash when provided); resolution enforces project boundary, expiry, and content-integrity checks. Use before relying on omitted raw evidence for destructive edits, security conclusions, release claims, or other high-confidence decisions."
+        description = "Resolve a durable wiki/wiki_source reference object or a `ctxref-*` deferred result returned by context_pack or another tool. Supply the reference id (and expected hash when provided); resolution enforces project boundary, expiry, and content-integrity checks. Use before relying on omitted raw evidence for destructive edits, security conclusions, release claims, or other high-confidence decisions."
     )]
     fn result_reference_resolve(
         &self,
@@ -178,7 +187,7 @@ impl ContextServer {
     }
 
     #[tool(
-        description = "Operate and inspect bounded generated server state. Select `mode` for projects, health, index refresh/status, cache stats/prune/warmup, global monitor_usage, budgets/contracts, metrics and measurement matrices, benchmarks, state browser, quality evaluation, cache planning, instructions, resource proxy, or schema minification. Read-only global/project-list and monitor actions avoid loading a project where possible; mutation modes affect generated MCP state only, never repository source files."
+        description = "Operate and inspect bounded generated server state. Use mode=wiki for status, refresh, history_deepen and ingest_submit/ingest_claim/ingest_status/ingest_retry/ingest_import/ingest_fail; the optional companion performs network/PDF work. Select `mode` for projects, health, index refresh/status, cache stats/prune/warmup, global monitor_usage, budgets/contracts, metrics and measurement matrices, benchmarks, state browser, quality evaluation, cache planning, instructions, resource proxy, or schema minification. Read-only global/project-list and monitor actions avoid loading a project where possible; mutation modes affect generated MCP state only, never repository source files."
     )]
     async fn context_admin(
         &self,

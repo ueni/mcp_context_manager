@@ -20,7 +20,7 @@ use tantivy::{
     Index, IndexReader, ReloadPolicy, TantivyDocument, Term,
     collector::TopDocs,
     doc,
-    query::{AllQuery, Query, QueryParser},
+    query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, TermQuery},
     schema::{Field, STORED, STRING, Schema, TEXT, Value},
 };
 use tree_sitter::{Node, Parser};
@@ -273,6 +273,260 @@ pub struct ProjectIndex {
     committed_generation: u64,
 }
 
+/// Background ingestion reuses the governed manifest's rights/path/hash validation.
+pub fn governed_reference_sources(
+    root: &Path,
+    project_scope: &str,
+) -> Result<(String, Vec<serde_json::Value>)> {
+    let corpus = corpus::load(root, Some(project_scope))?;
+    Ok((corpus.digest, corpus.normalized_sources))
+}
+
+/// Compact Tantivy snapshot for durable agent wiki pages. Rebuilding the
+/// snapshot is intended for startup and writes; searches stay bounded and do
+/// not scan the page collection.
+pub struct WikiSearchIndex {
+    index: Index,
+    reader: IndexReader,
+    title: Field,
+    body: Field,
+    tags: Field,
+    project: Field,
+    page_id: Field,
+    revision: Field,
+    current: Field,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WikiSearchHit {
+    pub page_id: String,
+    pub revision: String,
+    pub project_id: String,
+    pub title: String,
+    pub summary: String,
+    pub score: f32,
+}
+
+impl WikiSearchIndex {
+    pub fn build(pages: &[serde_json::Value]) -> Result<Self> {
+        let mut builder = Schema::builder();
+        let title = builder.add_text_field("title", TEXT | STORED);
+        let body = builder.add_text_field("body", TEXT | STORED);
+        let tags = builder.add_text_field("tags", TEXT);
+        let project = builder.add_text_field("project", STRING | STORED);
+        let page_id = builder.add_text_field("page_id", STRING | STORED);
+        let revision = builder.add_text_field("revision", STRING | STORED);
+        let current = builder.add_text_field("current", STRING | STORED);
+        let index = Index::create_in_ram(builder.build());
+        let mut writer = index.writer_with_num_threads(1, 20_000_000)?;
+        let mut pages = pages.iter().collect::<Vec<_>>();
+        pages.sort_by_key(|page| {
+            (
+                page["project_id"].as_str().unwrap_or_default(),
+                page["page_id"].as_str().unwrap_or_default(),
+                page["revision"].as_str().unwrap_or_default(),
+            )
+        });
+        for page in pages {
+            add_wiki_document(
+                &mut writer,
+                [title, body, tags, project, page_id, revision, current],
+                page,
+            )?;
+        }
+        writer.commit()?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        reader.reload()?;
+        Ok(Self {
+            index,
+            reader,
+            title,
+            body,
+            tags,
+            project,
+            page_id,
+            revision,
+            current,
+        })
+    }
+
+    pub fn search(
+        &self,
+        query: &str,
+        project_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WikiSearchHit>> {
+        self.search_allowed(query, project_filter, None, limit)
+    }
+
+    pub fn search_allowed(
+        &self,
+        query: &str,
+        project_filter: Option<&str>,
+        allowed_projects: Option<&HashSet<String>>,
+        limit: usize,
+    ) -> Result<Vec<WikiSearchHit>> {
+        let terms = normalize_terms(query, 12);
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let searcher = self.reader.searcher();
+        let mut parser =
+            QueryParser::for_index(&self.index, vec![self.title, self.body, self.tags]);
+        parser.set_field_boost(self.title, 2.5);
+        let text_query = parser.parse_query(&terms.join(" OR "))?;
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![
+            (Occur::Must, text_query),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.current, "true"),
+                    tantivy::schema::IndexRecordOption::Basic,
+                )),
+            ),
+        ];
+        if let Some(project_id) = project_filter {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.project, project_id),
+                    tantivy::schema::IndexRecordOption::Basic,
+                )),
+            ));
+        } else if let Some(allowed_projects) = allowed_projects {
+            if allowed_projects.is_empty() {
+                return Ok(Vec::new());
+            }
+            clauses.push((
+                Occur::Must,
+                Box::new(BooleanQuery::new(
+                    allowed_projects
+                        .iter()
+                        .map(|project_id| {
+                            (
+                                Occur::Should,
+                                Box::new(TermQuery::new(
+                                    Term::from_field_text(self.project, project_id),
+                                    tantivy::schema::IndexRecordOption::Basic,
+                                )) as Box<dyn Query>,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            ));
+        }
+        let query = BooleanQuery::new(clauses);
+        let mut hits = Vec::new();
+        for (score, address) in searcher.search(
+            &query,
+            &TopDocs::with_limit(limit.saturating_mul(4).min(256)).order_by_score(),
+        )? {
+            let document: TantivyDocument = searcher.doc(address)?;
+            let text = |field: Field| {
+                document
+                    .get_first(field)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let project_id = text(self.project);
+            hits.push(WikiSearchHit {
+                page_id: text(self.page_id),
+                revision: text(self.revision),
+                project_id,
+                title: text(self.title),
+                summary: text(self.body),
+                score,
+            });
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.project_id.cmp(&right.project_id))
+                .then_with(|| left.page_id.cmp(&right.page_id))
+                .then_with(|| left.revision.cmp(&right.revision))
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+}
+
+fn add_wiki_document(
+    writer: &mut tantivy::IndexWriter,
+    fields: [Field; 7],
+    page: &serde_json::Value,
+) -> Result<()> {
+    let [title, body, tags, project, page_id, revision, current] = fields;
+    let get = |name: &str| {
+        page.get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let claims = page
+        .get("claims")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let claims_text = claims
+        .into_iter()
+        .map(|claim| {
+            claim.as_str().map(str::to_owned).unwrap_or_else(|| {
+                claim
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let applicability_text = page
+        .get("applicability")
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default();
+    let body_text = format!(
+        "{}\n{}\n{}",
+        get("summary"),
+        claims_text,
+        applicability_text
+    );
+    let tag_text = page
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let mut document = TantivyDocument::default();
+    document.add_text(title, get("title"));
+    document.add_text(body, body_text);
+    document.add_text(tags, tag_text);
+    document.add_text(project, get("project_id"));
+    document.add_text(page_id, get("page_id"));
+    document.add_text(revision, get("revision"));
+    document.add_text(
+        current,
+        if page
+            .get("current")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+        {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    writer.add_document(document)?;
+    Ok(())
+}
+
 #[derive(Default)]
 struct IndexCacheDiagnostics {
     file_hits: AtomicU64,
@@ -285,6 +539,16 @@ struct IndexCacheDiagnostics {
 }
 
 impl ProjectIndex {
+    pub fn reference_signature(&self) -> &str {
+        &self.corpus_digest
+    }
+    /// Cached Markdown only; used by background wiki ingestion without filesystem reads.
+    pub fn markdown_documents(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.files.iter().filter(|(path, _)| {
+            let path = path.to_ascii_lowercase();
+            path.ends_with(".md") || path.ends_with(".markdown")
+        })
+    }
     pub fn build(root: impl AsRef<Path>) -> Result<Self> {
         Self::build_for_project(root, None)
     }
@@ -433,9 +697,10 @@ impl ProjectIndex {
         if current != snapshot.refresh_signature
             || fingerprint_signature(&snapshot.fingerprints, &snapshot.corpus_digest) != current
             || snapshot.files.len() != snapshot.fingerprints.len()
-            || snapshot.files.iter().any(|(path, text)| {
-                snapshot.fingerprints.get(path) != Some(&fingerprint(text))
-            })
+            || snapshot
+                .files
+                .iter()
+                .any(|(path, text)| snapshot.fingerprints.get(path) != Some(&fingerprint(text)))
         {
             bail!("persisted index snapshot is stale or corrupt")
         }
@@ -739,11 +1004,21 @@ impl ProjectIndex {
         (
             self.cache_diagnostics.file_hits.load(Ordering::Relaxed),
             self.cache_diagnostics.file_misses.load(Ordering::Relaxed),
-            self.cache_diagnostics.file_elapsed_micros.load(Ordering::Relaxed),
-            self.cache_diagnostics.symbol_queries.load(Ordering::Relaxed),
-            self.cache_diagnostics.symbol_candidate_hits.load(Ordering::Relaxed),
-            self.cache_diagnostics.symbol_candidate_count.load(Ordering::Relaxed),
-            self.cache_diagnostics.symbol_elapsed_micros.load(Ordering::Relaxed),
+            self.cache_diagnostics
+                .file_elapsed_micros
+                .load(Ordering::Relaxed),
+            self.cache_diagnostics
+                .symbol_queries
+                .load(Ordering::Relaxed),
+            self.cache_diagnostics
+                .symbol_candidate_hits
+                .load(Ordering::Relaxed),
+            self.cache_diagnostics
+                .symbol_candidate_count
+                .load(Ordering::Relaxed),
+            self.cache_diagnostics
+                .symbol_elapsed_micros
+                .load(Ordering::Relaxed),
             self.files.len(),
             self.files.values().map(String::len).sum::<usize>() as u64,
         )
@@ -794,11 +1069,15 @@ impl ProjectIndex {
         let started = Instant::now();
         let path = validate_relative_path(raw_path)?;
         let Some(text) = self.files.get(&path) else {
-            self.cache_diagnostics.file_misses.fetch_add(1, Ordering::Relaxed);
+            self.cache_diagnostics
+                .file_misses
+                .fetch_add(1, Ordering::Relaxed);
             self.record_file_latency(started);
             bail!("path is not a cached text file: {path}");
         };
-        self.cache_diagnostics.file_hits.fetch_add(1, Ordering::Relaxed);
+        self.cache_diagnostics
+            .file_hits
+            .fetch_add(1, Ordering::Relaxed);
         let count = text.lines().count();
         self.record_file_latency(started);
         Ok(count)
@@ -808,11 +1087,15 @@ impl ProjectIndex {
         let started = Instant::now();
         let path = validate_relative_path(raw_path)?;
         let Some(mut text) = self.files.get(&path).cloned() else {
-            self.cache_diagnostics.file_misses.fetch_add(1, Ordering::Relaxed);
+            self.cache_diagnostics
+                .file_misses
+                .fetch_add(1, Ordering::Relaxed);
             self.record_file_latency(started);
             bail!("path is not a cached text file: {path}");
         };
-        self.cache_diagnostics.file_hits.fetch_add(1, Ordering::Relaxed);
+        self.cache_diagnostics
+            .file_hits
+            .fetch_add(1, Ordering::Relaxed);
         let truncated = text.len() > max_bytes;
         truncate_utf8(&mut text, max_bytes);
         self.record_file_latency(started);
@@ -996,11 +1279,15 @@ impl ProjectIndex {
         let started = Instant::now();
         let path = validate_relative_path(raw_path)?;
         let Some(text) = self.files.get(&path) else {
-            self.cache_diagnostics.file_misses.fetch_add(1, Ordering::Relaxed);
+            self.cache_diagnostics
+                .file_misses
+                .fetch_add(1, Ordering::Relaxed);
             self.record_file_latency(started);
             bail!("path is not a cached text file: {path}");
         };
-        self.cache_diagnostics.file_hits.fetch_add(1, Ordering::Relaxed);
+        self.cache_diagnostics
+            .file_hits
+            .fetch_add(1, Ordering::Relaxed);
         let lines: Vec<&str> = text.lines().collect();
         if lines.is_empty() {
             bail!("cannot select a line range from an empty file: {path}");
@@ -1933,7 +2220,10 @@ mod tests {
             .expect("restore v2 snapshot");
         fs::write(&path, "after\n").expect("mutate worktree after publication");
         assert_eq!(
-            restored.file_content("notes.txt", 100).expect("cached file").0,
+            restored
+                .file_content("notes.txt", 100)
+                .expect("cached file")
+                .0,
             "before\nsecond line\n"
         );
         assert_eq!(
@@ -1943,7 +2233,6 @@ mod tests {
                 .content,
             "second line"
         );
-
     }
 
     #[test]
@@ -2271,5 +2560,69 @@ mod tests {
         let mut corrupt = snapshot;
         corrupt.refresh_signature = "files:corrupt".to_owned();
         assert!(ProjectIndex::from_snapshot_controlled(root.path(), corrupt, None, None).is_err());
+    }
+
+    #[test]
+    fn wiki_search_filters_owner_and_stale_pages_before_top_docs() {
+        let mut pages = (0..40)
+            .map(|index| {
+                serde_json::json!({
+                    "page_id": format!("stale-{index:03}"),
+                    "revision": format!("{:064x}", index + 1),
+                    "project_id": "other-project",
+                    "title": "Quasar transport",
+                    "summary": "quasar timeout",
+                    "claims": [],
+                    "current": false,
+                })
+            })
+            .collect::<Vec<_>>();
+        pages.push(serde_json::json!({
+            "page_id": "valid-target",
+            "revision": format!("{:064x}", 100),
+            "project_id": "target-project",
+            "title": "Quasar transport",
+            "summary": "quasar timeout",
+            "claims": [],
+            "current": true,
+        }));
+        let index = WikiSearchIndex::build(&pages).expect("wiki index");
+
+        let hits = index
+            .search("quasar timeout", Some("target-project"), 1)
+            .expect("scoped wiki search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].page_id, "valid-target");
+    }
+
+    #[test]
+    fn wiki_search_order_is_stable_and_titles_rank_above_body_matches() {
+        let pages = vec![
+            serde_json::json!({"page_id":"z-page", "revision":format!("{:064x}", 1), "project_id":"p", "title":"Other", "summary":"quasar transport", "current":true}),
+            serde_json::json!({"page_id":"b-page", "revision":format!("{:064x}", 2), "project_id":"p", "title":"Quasar transport", "summary":"same", "current":true}),
+            serde_json::json!({"page_id":"a-page", "revision":format!("{:064x}", 3), "project_id":"p", "title":"Quasar transport", "summary":"same", "current":true}),
+        ];
+        let first = WikiSearchIndex::build(&pages).expect("first index");
+        let rebuilt = WikiSearchIndex::build(&pages).expect("rebuilt index");
+        let first_hits = first.search("quasar", None, 3).expect("first search");
+        let rebuilt_hits = rebuilt.search("quasar", None, 3).expect("rebuilt search");
+        assert_eq!(
+            first_hits
+                .iter()
+                .map(|hit| &hit.page_id)
+                .collect::<Vec<_>>(),
+            ["a-page", "b-page", "z-page"]
+        );
+        assert_eq!(
+            first_hits
+                .iter()
+                .map(|hit| &hit.page_id)
+                .collect::<Vec<_>>(),
+            rebuilt_hits
+                .iter()
+                .map(|hit| &hit.page_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(first_hits[0].score > first_hits[2].score);
     }
 }

@@ -14,6 +14,7 @@ const MAX_CORPUS_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CorpusLoad {
+    pub normalized_sources: Vec<serde_json::Value>,
     pub chunks: Vec<Chunk>,
     pub source_count: usize,
     pub metadata_only_count: usize,
@@ -125,6 +126,7 @@ pub(crate) fn load(root: &Path, expected_project_scope: Option<&str>) -> Result<
     let mut seen_ids = HashSet::new();
     let mut seen_hashes = HashSet::new();
     let mut chunks = Vec::new();
+    let mut normalized_sources = Vec::new();
     let mut metadata_only_count = 0;
     let mut deduplicated_count = 0;
     let mut corpus_bytes = 0usize;
@@ -222,6 +224,10 @@ pub(crate) fn load(root: &Path, expected_project_scope: Option<&str>) -> Result<
             FreshnessStatus::Stale => "stale",
             FreshnessStatus::Superseded => "superseded",
         };
+        normalized_sources.push(serde_json::json!({"source_id":source.source_id,"kind":"datasheet","title":source.title,
+            "text":text,"sha256":expected_hash,"document_sha256":expected_hash,"url":source.canonical_url,
+            "publisher":source.publisher,"version":source.version,"retrieved_at":source.retrieved_at,
+            "rights":"permitted","license":source.rights.license,"rights_evidence":source.rights.evidence,"freshness":freshness}));
         let provenance = format!(
             "corpus|source={}|version={}|license={}|freshness={}|injection={}",
             source.source_id,
@@ -237,6 +243,7 @@ pub(crate) fn load(root: &Path, expected_project_scope: Option<&str>) -> Result<
     }
 
     Ok(CorpusLoad {
+        normalized_sources,
         chunks,
         source_count: manifest.sources.len(),
         metadata_only_count,
