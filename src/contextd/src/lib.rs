@@ -10,13 +10,13 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, Request, StatusCode, header},
     middleware::{self, Next},
@@ -28,7 +28,6 @@ use context_core::{
     ContextPackRequest, ResultReferenceRequest, classify_context_pack_rejection,
     static_resource_text, unloaded_admin_response,
 };
-use http_body_util::BodyExt;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -53,7 +52,6 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-use tower::ServiceExt as TowerServiceExt;
 
 pub const SERVER_NAME: &str = "mcp-context-manager";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -88,7 +86,6 @@ struct HttpSecurity {
     bearer_token: Option<String>,
     allowed_hosts: Vec<String>,
     allowed_origins: Vec<String>,
-    public_base_url: Option<String>,
     protected_resource: Option<ProtectedResourceConfig>,
 }
 
@@ -943,7 +940,6 @@ impl HttpSecurity {
             bearer_token,
             allowed_hosts,
             allowed_origins,
-            public_base_url,
             protected_resource,
         })
     }
@@ -1026,6 +1022,8 @@ fn project_id_from_resource(uri: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use std::time::Instant;
 
     #[test]
     fn freshness_unavailable_is_a_retryable_http_error() {

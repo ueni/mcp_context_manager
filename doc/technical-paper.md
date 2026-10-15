@@ -22,11 +22,8 @@ RMCP stdio / Streamable HTTP / Axum REST
               ProjectRegistry
                     |
           Arc<ProjectEngine>
-      +-------------+----------------+
-      |             |                |
-  L0 wire cache  L1 frontier   change journal
-      |             |                |
-      +--------> ContextEngine <------+
+                    |
+     change journal + freshness gate
                     |
         native Tantivy + chunk store
                     |
@@ -44,7 +41,7 @@ RMCP stdio / Streamable HTTP / Axum REST
 - `context-index` owns safe repository traversal, chunking, Tree-sitter
   extractors, Tantivy generations, and watchers.
 - `context-store` owns the isolated versioned LMDB overlay, durable imports,
-  references, frontiers, snapshots, and telemetry.
+  references, wiki revisions, snapshots, and telemetry.
 - `context-testkit` owns synthetic repositories and native acceptance
   benchmarks.
 - `xtask` owns release versioning, dependency-license policy, and SBOM output.
@@ -62,8 +59,9 @@ Five context tools are public:
 - `context_admin`
 - `result_reference_resolve`
 
-The non-pack tools preserve their stable v1 schemas. `context_pack` is the only
-intentional breaking contract and returns one compact v2 object:
+Each mode declares its response schema. Cache statistics, pruning, and runtime
+metrics use v2 diagnostic schemas; index warmup uses `context_index.warmup.v1`.
+`context_pack` returns one compact v2 object:
 
 ```json
 {
@@ -96,26 +94,22 @@ and unsupported values are rejected before contract generation. The MCP input
 schema exposes the two accepted values as an enum, and the response's top-level
 `profile` always names the accepted profile used to produce it.
 
-`context_admin(mode="warmup")` performs one normal freshness refresh and
-optionally admits the supplied prompt through the shared L0 path without
-recording a user `context_pack` operation. It does not issue generic retrieval
-seeds.
-`context_admin(mode="cache_prune")` invalidates L0 and deletes persistent L1
-rows in one bounded transaction, classifying each row once in expired-negative,
-stale-signature, then age order. The response reports bounded counts and timing,
-never the raw warmup prompt.
+`context_admin(mode="warmup")` initializes the selected engine and waits for
+known dirty or unverified index state to refresh. It returns
+`context_index.warmup.v1` and does not construct a pack or seed retrieval.
+`context_admin(mode="cache_stats")` returns `context_cache.stats.v2` for the
+retained lookup cache. `cache_prune` returns `context_cache.prune.v2` after
+pruning lookup entries, inactive deferred-reference mappings, and expired
+references. These are diagnostic schemas; pack evidence tuples are unchanged.
 
 `context_admin(mode="monitor_usage")` controls a process-global, default-off
-30-day aggregate ledger. Version 3 buckets preserve deterministic day ordering
+30-day aggregate ledger. Version 4 buckets preserve deterministic day ordering
 and the fixed-order client-profile dimension: `codex`, `claude`, `copilot`,
 `generic`, `missing`, and `other`. Unknown non-empty values are coalesced into
 `other`; raw profile values are not retained. Each profile bucket contains
-request counts and bounded latency, input-to-wire, token-saving, cache,
-frontier, route, and delta-reuse totals plus integer-derived ratios. They also
-contain fixed-name opportunity, effectiveness, miss-cause, and repeat-distance
-counters. Route
-shares use the fixed `debug`, `review`, `implementation`, and `explore`
-categories.
+request counts and bounded latency, input-to-wire, token-saving, explicit-delta,
+and continuation totals. Route shares use the fixed `debug`, `review`,
+`implementation`, and `explore` categories.
 
 The public report envelope is `context_monitor_usage.report.v4`. It keeps the
 newest rows while preserving chronological order, applies `max_entries`
@@ -129,42 +123,10 @@ complete `context_monitor_usage.report.v3` payload in generated global-monitor
 state behind a project-bound, hash-checked, 24-hour result reference. Report
 generation and resolution never write repository source.
 
-The denominators are explicit:
-
-- raw L0 hit rate is `L0 hits including singleflight / (L0 hits + L0 misses)`;
-- exact effectiveness is `exact L0 hits / requests with an earlier retained
-  semantic L0 identity in the same project` (an actual hit remains eligible if
-  the bounded tracker has evicted its older sketch);
-- frontier effectiveness is `frontier exact-or-negative hits / L0 misses or
-  uncached packs with an earlier retained canonical term/scope identity`;
-- delta adoption is `requests using base-pack or known-evidence input / requests
-  with an earlier related exact or frontier identity`; and
-- lineage opportunity is a count, not a hit rate: a matching exact or frontier
-  sketch was observed under another project id with the same Git common-dir
-  lineage sketch.
-
-Lineage detection does not reuse cache entries, evidence, source state, or
-project identifiers. It derives a versioned salted sketch from the local Git
-common directory, so unrelated repositories are not joined. Non-Git roots use
-their own canonical root only as ephemeral hash input. The host value is never
-stored.
-
-Each L0 miss receives exactly one cause in this precedence order: an earlier
-exact identity outside the 30-minute idle window is `expired`; a changed source
-signature is `invalidated_generation_or_signature`; an earlier exact identity
-with the same signature is `cold_or_restart`; otherwise evidence-state,
-scope/options, and canonical request variants are distinguished before the
-remaining cold case. Repeat distances are stored only as 15-minute slots and
-reported as same-slot, within the 30-minute idle window, 30 minutes to two
-hours, two hours to one day, or one to 30 days.
-
-Only generated LMDB state is written. The identity tracker retains at most
-2,048 entries and 30 days. It stores 96-bit SHA-256 sketches under a persisted
-128-bit salt and a version tag; raw prompts, source text, paths, repository
-URLs, client values, evidence values, and precise timestamps are absent.
-Only the current configuration and bucket schemas are accepted. Older
-generated configuration is discarded and defaults to disabled; older usage
-buckets are discarded and rebuilt when new requests are recorded.
+Only generated LMDB state is written. Only current configuration and bucket
+schemas are accepted. Older generated configuration defaults to disabled;
+older usage buckets are ignored and replaced as new requests are recorded.
+No cache-hit counters or request-identity tracker are retained.
 
 Rejected context-pack attempts use a separate process-global daily ledger with
 only four stable classes: `schema`, `root_policy`, `project_selection`, and
@@ -173,13 +135,7 @@ credentials, and agent identifiers are never stored. `usage_share_millis`
 uses only requests represented in the fixed client-profile buckets as its
 denominator; it describes observed client-profile usage share, not
 organization-wide adoption. Disabled request handling is an atomic flag check
-and does not change cache behavior.
-
-The replayable `benchmark-reuse-opportunity` testkit binary covers exact
-repeats, unique requests, idle expiry, source invalidation, engine restart, and
-linked-worktree variants. Its synthetic repeat hit rate validates cache
-mechanics only; production adoption decisions must use opportunity-normalized
-monitor data.
+and does not change pack behavior.
 
 ## Project routing and boundaries
 
@@ -283,14 +239,13 @@ evidence distinguishable while allowing one deterministic Tantivy ranking.
 Equal content hashes are indexed once; metadata, freshness, path, version, and
 content hashes feed the project refresh signature, while chunk ids include the
 content digest. A changed or superseded manifest therefore invalidates affected
-frontiers and packs deterministically without cross-project reuse.
+pack identities deterministically.
 
 Only search-optimized chunks exist in the live index. Generated durable state
-contains compact pack/frontier provenance and bounded deferred excerpts, never
-the staged raw source or a raw full-text copy. Corpus-derived index/frontier
-state has no age-based expiry (`expires_at_ms=0` for positive frontiers); it is
-removed only by deterministic source invalidation, explicit project removal,
-or administrative pruning. Ordinary bounded result references may expire under
+contains compact pack provenance and bounded deferred excerpts, never
+the staged raw source or a raw full-text copy. Corpus index state has no
+age-based expiry; it is invalidated when the governed source changes or the
+project is removed. Ordinary bounded result references may expire under
 their existing integrity policy without expiring the corpus index itself.
 
 Corpus provenance is carried compactly in the evidence symbol: source id,
@@ -306,7 +261,7 @@ source is absent.
 The labelled RFC/W3C spike fixture and benchmark compare repository-only and
 corpus-enabled fixed-query top-k hit rate. The recorded report includes cold and
 warm p50/p95, aggregate selected-source and wire tokens, estimated savings,
-repeat-request L0 hit rate, stale signalling, and the latency/chunk-count effect
+stale signalling and the latency/chunk-count effect
 at corpus sizes zero and two. These diagnostics do not change the stable compact
 pack tuple; the `reference_corpus` block in index status is diagnostic.
 
@@ -364,9 +319,8 @@ consulted.
 Fallback is deterministic and visible in the response-level `reuse` object:
 `missing`, `expired`, `stale_generation`, `stale_dependencies`, and
 `missing_pack` all produce a full pack and advance the continuation only after
-that pack succeeds. A prior pack may survive an unrelated generation change
-when its recorded source paths still match; changed dependencies and journal
-overflow produce `stale_dependencies`. `reused` reports valid derived delta
+that pack succeeds. A generation change or pending source events invalidate
+the derived delta state. `reused` reports valid derived delta
 state. `delta_applied` and
 `wire_tokens_avoided_est` are emitted once at the response level, not copied
 into evidence cards.
@@ -374,10 +328,8 @@ into evidence cards.
 Continuation requests are serialized by a per-project continuation gate across
 state resolution, pack construction, and state advancement. This prevents two
 concurrent turns from reading and then overwriting the same predecessor.
-Continuation responses are not admitted to L0 because their meaning advances
-per successful turn; ordinary and explicit-delta requests retain Moka
-singleflight. Replay therefore advances from the latest successful snapshot,
-while failed builds leave the record unchanged.
+Every request retrieves and builds a pack. Replay advances from the latest
+successful snapshot, while failed builds leave the record unchanged.
 
 The direct native benchmark includes a three-turn implementation/test/review
 sequence. It compares manual full-pack wire-token estimates with automatic
@@ -386,75 +338,17 @@ ids and paths, establishing no retrieval-quality regression for the paired
 turns. The retained issue run is
 `benchmarks/results/issue-12-continuation-reuse.json`.
 
-## Cache hierarchy
+## Direct pack generation and retained caches
 
-### L0 wire cache
+Each pack performs a new project-local indexed search followed by deterministic
+selection and encoding. No encoded-response or retrieval-frontier cache is
+consulted. Immutable pack snapshots support deltas and continuation only.
+Deferred result references remain integrity-checked before reuse.
 
-L0 is a 64 MiB weighted Moka future cache of immutable encoded response bytes,
-reference ids, and a validity certificate. It uses 30-minute time-to-idle
-expiry and `try_get_with` singleflight, so concurrent identical misses perform
-one build. Explicitly focused packs retain source dependencies and may be
-reused across unrelated published generations after those paths are
-revalidated. Broad or unscoped packs remain bound to the cached generation
-and refresh signature because new files can change retrieval ranking. Every
-apparent hit also revalidates referenced bodies (existence, expiry, and content
-hash) before serving cached bytes.
-
-The short-lived `context_lookup` cache is separate from L0 and is bounded to
-256 entries or 16 MiB with a 30-second idle TTL. Its generation/signature-keyed
-`cache` response object and metrics are diagnostic, not repository evidence.
-
-### L1 frontier cache
-
-L1 stores ranked frontiers rather than final responses. The in-memory budget is
-128 MiB and the persistent LMDB budget is 256 MiB. A frontier records ordered
-chunk ids, scores, cumulative token costs, dependencies, canonical terms and
-scope, source generation, candidate capacity, and the cutoff.
-
-Positive frontiers are admitted only after two identical observations within
-30 minutes. Serving is exact-only and requires matching canonical terms, scope,
-generation, and sufficient candidate capacity; route is diagnostic only.
-Missing source candidates fall back to a new search. Negative entries expire
-after 30 seconds and are also exact-only.
-
-### Governed cross-worktree frontier pool
-
-Cross-worktree reuse is opt-in through an operator-owned lineage manifest; no
-request field, repository name, directory name, remote URL, or repository file
-can create membership. The governance digest is combined with the canonical
-Git common-directory digest, so assigning the same manifest id to unrelated
-repositories cannot join them. Eligibility is re-proved for every lookup and
-publication: the worktree must be clean, its top level must equal the selected
-project root, and its commit, source signature, and deterministic index
-signature must match exactly. Governed reference corpora are always excluded.
-
-The shared 256 MiB persistent pool stores immutable positive frontier records
-under content-addressed keys. Candidate and dependency identities are SHA-256
-digests of project-local chunk ids. Shared records contain no prompts, raw
-terms, paths, project ids, generations, pack snapshots, references,
-continuations, memory, metrics, redaction state, or source text. Negative
-frontiers are never shared.
-
-On an apparent hit, the requester verifies capacity, record shape, every
-candidate and dependency address, its own source/index signatures, and a
-stable local generation and Git proof. It reranks the candidates using its own
-index. Any missing/deleted candidate, dirty worktree, divergent head, changed
-file, stale index, governed corpus, or concurrent generation change causes a
-deterministic project-local search. Project-local L1 remains authoritative and
-is checked first.
-
-`context_admin(mode="metrics")` reports eligible lineage opportunities, safe
-hits, fallbacks, estimated search latency saved, aggregate isolation
-rejections, and fixed rejection-reason counters. The latency estimate is
-project-local: it subtracts the requesting lookup time from the accepted 50 ms
-warm-miss envelope; producer timing is never stored in a shared record.
-`cache_stats` reports the
-shared budget without keys or paths. `cache_prune` applies the requested age to
-shared generated records as well as local cache state; reopening the global
-state reloads records within the same fixed budget.
-The opt-in usage monitor from the reuse-opportunity work records the same five
-bounded lineage totals under `lineage_frontier`, globally and per normalized
-client profile, without prompts, paths, ids, or source values.
+The short-lived `context_lookup` cache is bounded to 256 entries or 16 MiB with
+a 30-second TTL. Its generation/signature-keyed `cache` response object and
+metrics are diagnostic, not repository evidence. File snapshots, symbol
+postings, Git-diff snapshots, and the shared wiki search index remain in use.
 
 ## Freshness
 
@@ -465,11 +359,10 @@ non-ignored regular files, does not follow symlinks, and compares bounded file
 metadata fingerprints at a two-second interval by default. The interval can be
 set with `MCP_CONTEXT_WATCH_POLL_INTERVAL_SECS` (1–300 seconds). Watcher
 errors conservatively dirty the project. Explicit `changed_files` queues
-background verification and overlays current file chunks in the response.
-Requests read the currently published generation. Watcher events schedule
-background refreshes, and a completed refresh atomically publishes a new
-generation. A request never waits for filesystem scanning or generation
-construction.
+verification. Pack requests wait for known pending changes or watcher-failure
+verification before retrieval, using their cancellation control while waiting.
+Watcher events schedule background refreshes, and a completed refresh atomically
+publishes a new generation. Requests then read one complete published snapshot.
 The diagnostic `freshness` string is `current`, `refreshing`, or `unverified`;
 it describes retrieval completeness rather than a filesystem transaction.
 
@@ -487,9 +380,9 @@ and event-channel disconnection mark the project for background full
 verification. A later successful metadata snapshot may recover the fallback
 backend, while the dirty/overflow journal remains fail-closed until that full
 verification completes. Administrative metrics expose only bounded backend and
-failure categories, without raw errors or paths. Ordinary cache reuse is
-disabled while verification is pending, and available-snapshot responses
-report `unverified`. A failed strict fresh verification returns the retryable
+failure categories, without raw errors or paths. Available-snapshot lookup
+responses report `unverified` while verification is pending. A failed strict
+pack verification returns the retryable
 `context_pack freshness unavailable` error.
 
 Each project coalesces requests into one detached refresh worker. A separate
@@ -501,13 +394,11 @@ an abandoned candidate, allowing a clean rebuild. Metadata copying, snapshot
 persistence, and signature scans remain proportional to repository size.
 
 One shared generated-tree policy is consumed by project discovery, watcher
-filtering, signature traversal, index traversal, and governed Git pathspecs.
-This prevents churn under `.workingdir/` and equivalent agent/build/cache trees
-from triggering refresh or lineage discovery.
+filtering, signature traversal, and index traversal. This prevents churn under
+`.workingdir/` and equivalent agent/build/cache trees from triggering refresh.
 
-Generation, source signature, and explicit-path signatures participate in
-cache validity. A cached response is served only when its certificate still
-matches the active index.
+Lookup cache keys include the published generation and source signature.
+Pack generation always performs indexed retrieval against a published snapshot.
 
 ## Blocking work, deadlines, and cancellation
 
@@ -524,20 +415,18 @@ A request dropped while queued drops its semaphore future and never starts.
 After a running request expires, its cancellation control is checked between
 files and chunks and before initial index publication. Background refreshes
 have independent lifetimes and may publish after a waiting request expires.
-Governed-lineage Git execution is additionally limited to five seconds and 4
-MiB of output; cancellation kills the child and bounded reaping never extends
-the request indefinitely. Cooperative repository phases terminate within
+Cooperative repository phases terminate within
 cancellation grace. If an unexpected operating-system or library phase
 outlives that grace, the async request remains attached to the blocking join
 until its permit and active-job drop guards have run; aborting a live
 `spawn_blocking` closure cannot stop it and would abandon executor capacity.
-The cancellation flag remains latched, so the closure cannot publish cache,
-frontier, manifest, or index state. Permits and active/queued counters use drop
+The cancellation flag remains latched, so the closure cannot publish pack
+snapshots, references, or initial index state. Permits and active/queued counters use drop
 guards. Queue
 exhaustion and deadline expiry return stable retryable diagnostics before the
 usual 60-second MCP client budget. Phase measurements remain bounded and
-content-free: the existing request ledger records cache outcome, refresh
-checks/updates, retrieval, pack-build and total latency. Public runtime
+content-free: the request ledger records refresh checks/updates, retrieval,
+pack-build and total latency. Public runtime
 measurements add queue wait, engine load, queue/active/singleflight depth,
 cancellations, timeouts, deadline remaining, and post-timeout work; freshness
 measurements add signature scan, full/incremental refresh, index-state I/O,
@@ -657,19 +546,16 @@ intervals, evidence semantics, and deferred reference resolution.
 
 The native performance gate measures:
 
-- L0 server p95 at most 2 ms;
+- repeated direct pack p95, reported without a cache-hit gate;
 - general admin warmup at most 50 ms;
-- a prompt admitted by admin warmup returns through L0 at most 2 ms;
-- local MCP L0 p95 at most 10 ms;
-- L1 p95 at most 15 ms;
-- current-repository warm miss p95 at most 50 ms;
+- current-repository direct pack p95 at most 50 ms;
 - balanced pack median at most 400 tokens;
 - delta median reduction at least 80%;
 - required-anchor recall 100%;
 - noise ratio at most 30%;
 - relevant-evidence freshness at most two seconds.
 
-The issue-29 load gate additionally exercises cold start, warm cache, one-file
+The issue-29 load gate additionally exercises cold start, repeated packs, one-file
 refresh, edit burst, deterministic large-file disk pressure, concurrent
 same-project calls, and multiple projects on a current-thread Tokio runtime.
 Every normal request must remain below the SDK's 60-second default and maximum
@@ -688,9 +574,9 @@ and `git diff --check`.
 Rust 1.97.1 and `Cargo.lock` are pinned. CMake invokes locked Cargo builds in
 Debian and Alpine builders, validates executable target and linkage, and emits
 dynamic glibc plus static PIE musl artifacts. The final Alpine image contains
-the musl server, runtime certificates, curl, Git, and zlib. Git is used only for
-shell-free, read-only governed-worktree lineage proofs with
-`GIT_OPTIONAL_LOCKS=0`; it does not authorize source-repository mutation. No
+the musl server, runtime certificates, curl, Git, and zlib. Git supports
+read-only history ingestion and Git-diff snapshots; the server does not mutate
+source repositories. No
 Python interpreter or production Python dependency is present.
 
 `cargo xtask release-version` updates the workspace, lockfile, and standalone

@@ -208,8 +208,7 @@ before bounding the response.
 30-day usage ledger. Successful `context_pack` requests are grouped into the
 bounded client profiles `codex`, `claude`, `copilot`, `generic`, `missing`, and
 `other`. Reports include request counts and bounded latency, input-to-wire,
-token-saving, raw cache outcomes, opportunity-normalized reuse, miss causes,
-coarse repeat distance, frontier, route, and delta-adoption summaries. Rejected
+token-saving, route, and explicit-delta and continuation summaries. Rejected
 attempts are counted only as `schema`, `root_policy`, `project_selection`, or
 `internal`.
 
@@ -230,22 +229,8 @@ any rows are omitted, `truncation.retrieval.reference` identifies a complete
 v3 report retained in generated state for 24 hours; pass that object to
 `result_reference_resolve`. Source repositories remain read-only.
 
-Raw L0 hit rate uses all L0 hits and misses. Exact effectiveness uses only
-requests whose semantic L0 identity was observed earlier in the same project;
-frontier effectiveness uses L0 misses with an earlier canonical term/scope
-identity; delta adoption uses related earlier exact/frontier packs as its
-denominator. Lineage opportunity counts matching salted identities in another
-worktree derived from the same Git common directory, but never shares cache or
-source state across projects. Synthetic repeated-request hit rate is a cache
-mechanics benchmark, not evidence of production reuse adoption.
-
-Replay exact, unique, expiry, invalidation, restart, and linked-worktree
-telemetry scenarios with:
-
-```bash
-cargo run -p context-testkit --bin benchmark-reuse-opportunity --quiet
-cargo run -p context-testkit --bin benchmark-worktree-frontier --quiet
-```
+Only current usage-bucket schemas are reported. Older generated buckets are
+ignored; no cache-outcome or request-identity tracker is maintained.
 
 ## MCP-first workflow
 
@@ -456,9 +441,8 @@ Stdio remains the default transport when `MCP_TRANSPORT` is omitted.
 | `MCP_CONTEXT_BLOCKING_CONCURRENCY` | Global cap for repository-heavy blocking jobs. Defaults to `max(1, min(2, available_parallelism / 2))`. |
 | `MCP_CONTEXT_REQUEST_TIMEOUT_SECS` | End-to-end `context_pack` server budget, default `48`, kept below the common 60-second client timeout. |
 | `MCP_CONTEXT_CANCELLATION_GRACE_SECS` | Portion of the server budget reserved for cooperative blocking-job cancellation, default `2`. |
-| `MCP_CONTEXT_FRONTIER_LINEAGES_FILE` | Absolute path to an operator-owned `context_frontier_lineages.v1` JSON manifest that explicitly groups 2–64 allowed Git worktree roots. Omit to disable cross-worktree frontier reuse. |
 | `MCP_CONTEXT_ALLOWED_ROOTS` | Host roots allowed for `root_uri` project selection. |
-| `MCP_CONTEXT_ROOT_MAPPINGS` | Comma-separated host-to-container mappings such as `/home/user/source=/workspace-roots`. A mapped URI resolving to the configured default repository with compatible lineage reuses its engine and state. |
+| `MCP_CONTEXT_ROOT_MAPPINGS` | Comma-separated host-to-container mappings such as `/home/user/source=/workspace-roots`. A mapped URI resolving to the configured default repository reuses its engine and state. |
 | `MCP_CONTEXT_WATCH_POLL_INTERVAL_SECS` | Metadata-snapshot fallback interval when the native watcher cannot register, bounded to 1–300 seconds and defaulting to 2. |
 | `MCP_CONTEXT_HOST_ROOT` | Compose helper for the host directory mounted at `/workspace-roots`. |
 | `MCP_CONTEXT_REPO_PATH` | Compose helper for a narrow default path below `/workspace-roots`. |
@@ -482,19 +466,18 @@ the global blocking-job cap rather than on a Tokio async worker. Background
 refresh scans and Tantivy updates use the independent refresh cap described
 below. Requests that expire while queued never start. Running
 requests receive cooperative cancellation between files and chunks and before
-an index commit or generation swap. Governed-lineage Git commands have a fixed
-five-second execution cap, bounded output, and are killed when request
-cancellation wins. Cooperative phases stop within cancellation grace. If a
+an index commit or generation swap. Cooperative phases stop within cancellation grace. If a
 blocking phase unexpectedly outlives that grace, the response stays attached
 until the job releases its global permit and active-job counter; Tokio cannot
 abort a live `spawn_blocking` closure safely. Cancellation remains latched so
-the request job cannot commit cache, frontier, manifest, or initial index state.
+the request job cannot commit pack snapshots, references, or initial index state.
 An already scheduled refresh may still publish after its caller leaves. REST reports
 queue/deadline or fail-closed freshness exhaustion as HTTP 503; MCP returns a
 stable retryable `context_pack busy`, `context_pack timed out`, or
 `context_pack freshness unavailable` diagnostic with warmup/retry guidance.
 
-Use `context_admin(mode="warmup")` before a latency-sensitive normal request.
+Use `context_admin(mode="warmup")` to initialize the engine and wait for known
+index changes before a latency-sensitive request. Warmup does not generate packs.
 The server also schedules the default project only after stdio/HTTP transport
 readiness. `context_admin(mode="warmup")`, `health`, `metrics`, and
 `measurement_report` expose its `queued`, `building`, `ready`, or `failed`
@@ -505,7 +488,7 @@ Increasing a client timeout can be a bounded fallback, but it does not replace
 the server concurrency cap or cancellation budget. Generated agent/build/cache
 trees such as `.workingdir/`, `.worktrees/`, `.openclaw/`, `target/`, and
 `node_modules/` are excluded consistently from discovery, watching,
-signatures, indexing, and governed Git lineage checks at any directory depth.
+signatures, indexing, and Git diff collection at any directory depth.
 
 ## Native architecture
 
@@ -516,7 +499,7 @@ The Cargo workspace is split by responsibility:
 | `contextd` | RMCP stdio/HTTP transport, Axum REST routes, lifecycle, project registry, and HTTP security. |
 | `context-core` | Contracts, routing, ranking, deterministic selection, compression, caches, deltas, and encoding. |
 | `context-index` | Repository scanning, generic and Tree-sitter chunking, Tantivy search, and freshness watching. |
-| `context-store` | Versioned Postcard/LMDB records, memory, references, frontiers, and telemetry. |
+| `context-store` | Versioned Postcard/LMDB records, memory, references, wiki revisions, and telemetry. |
 | `context-testkit` | Native benchmark and synthetic test support. |
 | `xtask` | Release versioning, license policy, and CycloneDX SBOM generation. |
 
@@ -526,12 +509,9 @@ use Tree-sitter symbol chunks; all other text uses deterministic 80-line
 windows with eight-line overlap. Tantivy readers persist across requests and
 reload only after committed generations.
 
-The fast path uses:
+Each pack performs indexed retrieval, deterministic selection, and encoding.
+The request path uses:
 
-- a 64 MiB Moka L0 cache of immutable encoded response bytes;
-- a 128 MiB in-memory and 256 MiB LMDB frontier cache;
-- deterministic reranking after approximate frontier reuse;
-- an optional 256 MiB persistent pool of path-free immutable frontier records for explicitly governed, clean worktrees that share one Git common directory, HEAD, source signature, and index signature;
 - a 50 ms coalescing filesystem watcher plus a metadata-snapshot fallback that prunes generated directories before traversal;
 - a bounded changed-path journal and per-file fingerprints for atomic
   incremental changed/deleted/renamed/untracked refresh;
@@ -541,12 +521,10 @@ The fast path uses:
 
 Lookup cache diagnostics are exposed in the per-result `cache` object and in
 metrics; they are diagnostic fields rather than retrieved project evidence.
-Lookup caching is bounded to 256 entries or 16 MiB with a 30-second idle TTL,
+Lookup caching is bounded to 256 entries or 16 MiB with a 30-second TTL,
 and keys include the normalized request plus published generation/signature.
-L0 entries for explicitly focused requests retain source dependencies and may
-survive unrelated generation changes when those files remain current. Broad
-or unscoped packs remain generation/signature-bound because new files can
-change retrieval ranking even when prior selected paths are unchanged.
+Pack snapshots retain the evidence identities needed for explicit deltas and
+continuation memory. They do not serve cached pack responses or retrieval results.
 
 Watcher registration is established before the baseline index scan. Every
 incremental result is checked against a second independently computed source
@@ -562,13 +540,13 @@ Refresh runs once per project in a background worker and survives request
 cancellation. `MCP_CONTEXT_REFRESH_CONCURRENCY` bounds concurrent refreshes
 across projects (default 2, maximum 32), independently of request permits.
 Requests read one immutable published index generation. Watcher events queue
-background file-cache and index updates; `changed_files` can queue that work
-without waiting for publication.
+background file-cache and index updates. Pack requests wait for known pending
+changes, including explicit `changed_files`, to publish before retrieval.
 
 The compact `freshness` response field is diagnostic: `current` means no
 known pending source changes, `refreshing` means retrieval may be incomplete,
 and `unverified` means the watcher cannot certify completeness. Watcher failure
-queues authoritative verification and prevents ordinary cache reuse. These
+requires authoritative verification before pack generation. These
 states do not promise a filesystem transaction across concurrent editor writes.
 
 Administrative metrics expose the bounded watcher diagnostic under
@@ -581,28 +559,6 @@ Incremental refresh replaces only changed paths' Tantivy documents and pins
 old readers until publication. Metadata copying and full signature scans still
 scale with repository size. A discarded candidate forces a clean rebase before
 another update can reuse its underlying writer.
-
-Cross-worktree reuse is disabled by default. A deployment may opt in with an
-operator-owned manifest such as:
-
-```json
-{
-  "schema": "context_frontier_lineages.v1",
-  "lineages": [
-    {
-      "id": "mcp-context-manager-v2",
-      "roots": ["/workspace-roots/builder", "/workspace-roots/verifier", "/workspace-roots/gatekeeper"]
-    }
-  ]
-}
-```
-
-Every root must also be inside `MCP_CONTEXT_ALLOWED_ROOTS`. The id and root
-list provide governance only; they never prove equivalence by themselves. The
-server invokes Git read-only (`GIT_OPTIONAL_LOCKS=0`) to require a clean linked
-worktree, a shared Git common directory, and an identical commit. It then
-requires exact source and index signatures. If Git is unavailable or any proof
-fails, retrieval remains project-local.
 
 ## Build, test, and release
 
@@ -629,7 +585,7 @@ cmake --build --preset docker-image-archive
 python3 scripts/smoke_native_image.py mcp-context-manager:local
 ```
 
-The load benchmark gates cold start, warm L0, one-file refresh, an edit burst,
+The load benchmark gates cold start, repeated packs, one-file refresh, an edit burst,
 a deterministic large-file disk-pressure case, concurrent same-project calls,
 multiple projects, and current-thread event-loop lag against the common
 60-second MCP SDK budget. A bounded reference run is recorded in
