@@ -19,7 +19,9 @@ COLD_MCP_RESPONSE_TIMEOUT_SECONDS = float(
 )
 
 
-def request(request_id: int, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def request(
+    request_id: int, method: str, params: dict[str, Any] | None = None
+) -> dict[str, Any]:
     message: dict[str, Any] = {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -83,7 +85,7 @@ def lookup_message(request_id: int) -> dict[str, Any]:
             "name": "context_lookup",
             "arguments": {
                 "mode": "search",
-                "query": "ProjectEngine context_pack_cached retrieval",
+                "query": "ProjectEngine context_pack_generate retrieval",
                 "path": "src/context-core/src/lib.rs",
                 "max_results": 4,
             },
@@ -117,8 +119,7 @@ def assert_lookup(response: dict[str, Any]) -> None:
     assert lookup["schema"] == "context_search.v1"
     assert lookup["count"] > 0
     assert any(
-        result["path"] == "src/context-core/src/lib.rs"
-        for result in lookup["results"]
+        result["path"] == "src/context-core/src/lib.rs" for result in lookup["results"]
     )
 
 
@@ -540,9 +541,7 @@ def smoke_http_security(binary: Path) -> None:
             headers={"Origin": "https://attacker.example"},
         )
         assert status == 403
-        status, health = rest_json(
-            port, "GET", "/healthz", headers=authorization
-        )
+        status, health = rest_json(port, "GET", "/healthz", headers=authorization)
         assert status == 200 and health["native"] is True
         status, _ = rest_json(
             port,

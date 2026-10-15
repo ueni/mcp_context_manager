@@ -10,7 +10,6 @@ repository.workspace = true
 anyhow.workspace = true
 context-index = { path = "../context-index" }
 context-store = { path = "../context-store" }
-moka.workspace = true
 notify.workspace = true
 regex.workspace = true
 schemars.workspace = true

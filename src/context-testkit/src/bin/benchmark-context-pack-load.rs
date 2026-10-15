@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
 
     let cold_start_ms =
         timed_pack(&registry, request("cold load anchor", None, Vec::new())?).await?;
-    let warm_cache_ms =
+    let repeated_pack_ms =
         timed_pack(&registry, request("cold load anchor", None, Vec::new())?).await?;
 
     fs::write(
@@ -191,7 +191,7 @@ async fn main() -> Result<()> {
     let event_loop_max_lag_ms = max_lag_micros.load(Ordering::Relaxed) as f64 / 1_000.0;
     let normal_request_gates = [
         cold_start_ms,
-        warm_cache_ms,
+        repeated_pack_ms,
         one_file_refresh_ms,
         edit_burst_ms,
         slow_disk_pressure_ms,
@@ -222,7 +222,7 @@ async fn main() -> Result<()> {
             },
             "milliseconds": {
                 "cold_start": cold_start_ms,
-                "warm_cache_hit": warm_cache_ms,
+                "repeated_pack": repeated_pack_ms,
                 "one_file_refresh": one_file_refresh_ms,
                 "edit_burst": edit_burst_ms,
                 "slow_disk_pressure": slow_disk_pressure_ms,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one complete native Milestone 3 cache, quality, and freshness gate."""
+"""Run one complete native Milestone 3 direct retrieval, quality, and freshness gate."""
 
 from __future__ import annotations
 
@@ -14,7 +14,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from smoke_native_mcp import initialize_message, read_stdio, request, tool_json, write_stdio
+from smoke_native_mcp import (
+    initialize_message,
+    read_stdio,
+    request,
+    tool_json,
+    write_stdio,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -155,10 +161,8 @@ def main() -> int:
         process.terminate()
         process.wait(timeout=5)
 
-    local_mcp_p95 = percentile_95(timings)
+    repeated_pack_p95 = percentile_95(timings)
     gates = dict(direct["gates"])
-    gates["local_mcp_l0_p95_lte_10ms"] = local_mcp_p95 <= 10.0
-    gates["runtime_l0_hits_recorded"] = metrics["cache"]["l0"]["hits"] >= 100
     if usage_report is not None:
         profiled_requests = sum(
             int(bucket.get("profiled_request_count") or 0)
@@ -170,8 +174,7 @@ def main() -> int:
             for bucket in usage_report.get("buckets", [])
             if isinstance(bucket, dict)
             for profile in bucket.get("client_profiles", [])
-            if isinstance(profile, dict)
-            and profile.get("client_profile") == "codex"
+            if isinstance(profile, dict) and profile.get("client_profile") == "codex"
         )
         gates["monitor_usage_profiled_requests_recorded"] = profiled_requests >= 101
         gates["monitor_usage_codex_bucket_recorded"] = codex_requests >= 101
@@ -181,14 +184,14 @@ def main() -> int:
         "method": {
             "environment": "devcontainer",
             "transport": "persistent MCP stdio",
-            "l0_samples": len(timings),
+            "repeated_pack_samples": len(timings),
             "state": "isolated rust-v2 overlay per run",
             "monitor_usage": "enabled" if args.monitor_usage else "disabled",
         },
         "summary": {
             **direct["summary"],
-            "local_mcp_l0_p95_ms": local_mcp_p95,
-            "local_mcp_l0_median_ms": statistics.median(timings),
+            "local_mcp_repeated_pack_p95_ms": repeated_pack_p95,
+            "local_mcp_repeated_pack_median_ms": statistics.median(timings),
         },
         "runtime_metrics": metrics,
         "gates": gates,

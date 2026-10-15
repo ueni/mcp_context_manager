@@ -1428,7 +1428,6 @@ mod tests {
             "refresh",
             "index_state_io",
             "retrieval",
-            "cache_state_io",
             "serialization",
         ] {
             assert!(
@@ -1524,7 +1523,7 @@ mod tests {
         release.store(true, Ordering::Release);
         let response = warmup.await.expect("warmup task").expect("warmup response");
         let response: Value = serde_json::from_str(&response).expect("warmup JSON");
-        assert_eq!(response["schema"], "context_cache.warmup.v1");
+        assert_eq!(response["schema"], "context_index.warmup.v1");
         assert_eq!(registry.runtime_status()["blocking"]["engine_builds"], 1);
         assert_eq!(registry.blocking_snapshot().0, 1);
         assert_eq!(registry.blocking_snapshot().1, 0);
@@ -1614,12 +1613,6 @@ mod tests {
         let engine = registry.default_engine().expect("constructed engine");
         let generation = engine.index().stats().refresh_signature.clone();
         let pack_rows = engine.store().iter_json("pack:").expect("pack rows").len();
-        let frontier_rows = engine
-            .store()
-            .iter_json("frontier:")
-            .expect("frontier rows")
-            .len();
-
         let error = pack
             .await
             .expect("pack task")
@@ -1633,14 +1626,6 @@ mod tests {
         assert_eq!(
             engine.store().iter_json("pack:").expect("pack rows").len(),
             pack_rows
-        );
-        assert_eq!(
-            engine
-                .store()
-                .iter_json("frontier:")
-                .expect("frontier rows")
-                .len(),
-            frontier_rows
         );
     }
 
@@ -1679,12 +1664,6 @@ mod tests {
         let cancellation_started = Instant::now();
         let generation = engine.index().stats().refresh_signature.clone();
         let pack_rows = engine.store().iter_json("pack:").expect("pack rows").len();
-        let frontier_rows = engine
-            .store()
-            .iter_json("frontier:")
-            .expect("frontier rows")
-            .len();
-
         tokio::time::sleep(Duration::from_millis(220)).await;
         assert!(
             !pack.is_finished(),
@@ -1695,14 +1674,6 @@ mod tests {
         assert_eq!(
             engine.store().iter_json("pack:").expect("pack rows").len(),
             pack_rows
-        );
-        assert_eq!(
-            engine
-                .store()
-                .iter_json("frontier:")
-                .expect("frontier rows")
-                .len(),
-            frontier_rows
         );
 
         release.store(true, Ordering::Release);
@@ -1721,14 +1692,6 @@ mod tests {
         assert_eq!(
             engine.store().iter_json("pack:").expect("pack rows").len(),
             pack_rows
-        );
-        assert_eq!(
-            engine
-                .store()
-                .iter_json("frontier:")
-                .expect("frontier rows")
-                .len(),
-            frontier_rows
         );
     }
 
@@ -1919,7 +1882,7 @@ mod tests {
             .expect("enable monitor");
         let engine = registry.engine_for(None, None).expect("default engine");
         engine
-            .context_pack_cached(
+            .context_pack_generate(
                 &serde_json::from_value(json!({
                     "prompt": "bounded monitor fixture",
                     "focus_paths": ["lib.rs"],

@@ -92,7 +92,7 @@ impl WorkControl {
 }
 
 /// Returns whether a repository-relative path belongs to generated state.
-/// Watchers, scanners, project discovery, and Git lineage use this policy.
+/// Watchers, scanners, project discovery, and Git diff collection use this policy.
 pub fn is_ignored_repository_path(path: &Path) -> bool {
     path.components().any(|component| {
         component.as_os_str().to_str().is_some_and(|name| {
@@ -260,7 +260,6 @@ pub struct ProjectIndex {
     chunks: Arc<Vec<Chunk>>,
     chunks_by_path: Arc<HashMap<String, Vec<usize>>>,
     chunks_by_id: Arc<HashMap<String, usize>>,
-    chunks_by_address: Arc<HashMap<String, usize>>,
     symbols_by_gram: Arc<HashMap<String, Vec<usize>>>,
     files: Arc<BTreeMap<String, String>>,
     cache_diagnostics: Arc<IndexCacheDiagnostics>,
@@ -621,7 +620,6 @@ impl ProjectIndex {
 
         let mut chunks_by_path: HashMap<String, Vec<usize>> = HashMap::new();
         let mut chunks_by_id = HashMap::new();
-        let mut chunks_by_address = HashMap::new();
         let mut symbols_by_gram: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, chunk) in chunks.iter().enumerate() {
             check_control(control)?;
@@ -630,7 +628,6 @@ impl ProjectIndex {
                 .or_default()
                 .push(index);
             chunks_by_id.insert(chunk.id.clone(), index);
-            chunks_by_address.insert(immutable_candidate_address(&chunk.id), index);
             if !chunk.symbol.is_empty() {
                 for gram in symbol_grams(&chunk.symbol.to_ascii_lowercase()) {
                     symbols_by_gram.entry(gram).or_default().push(index);
@@ -647,7 +644,6 @@ impl ProjectIndex {
             chunks: Arc::new(chunks),
             chunks_by_path: Arc::new(chunks_by_path),
             chunks_by_id: Arc::new(chunks_by_id),
-            chunks_by_address: Arc::new(chunks_by_address),
             symbols_by_gram: Arc::new(symbols_by_gram),
             files: Arc::new(files),
             cache_diagnostics: Arc::new(IndexCacheDiagnostics::default()),
@@ -820,7 +816,6 @@ impl ProjectIndex {
 
         let mut chunks_by_path: HashMap<String, Vec<usize>> = HashMap::new();
         let mut chunks_by_id = HashMap::new();
-        let mut chunks_by_address = HashMap::new();
         let mut symbols_by_gram: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, chunk) in chunks.iter().enumerate() {
             chunks_by_path
@@ -828,7 +823,6 @@ impl ProjectIndex {
                 .or_default()
                 .push(index);
             chunks_by_id.insert(chunk.id.clone(), index);
-            chunks_by_address.insert(immutable_candidate_address(&chunk.id), index);
             if !chunk.symbol.is_empty() {
                 for gram in symbol_grams(&chunk.symbol.to_ascii_lowercase()) {
                     symbols_by_gram.entry(gram).or_default().push(index);
@@ -849,7 +843,6 @@ impl ProjectIndex {
             chunks: Arc::new(chunks),
             chunks_by_path: Arc::new(chunks_by_path),
             chunks_by_id: Arc::new(chunks_by_id),
-            chunks_by_address: Arc::new(chunks_by_address),
             symbols_by_gram: Arc::new(symbols_by_gram),
             files: Arc::new(files),
             cache_diagnostics: Arc::clone(&self.cache_diagnostics),
@@ -1250,31 +1243,6 @@ impl ProjectIndex {
         Ok((hits, terms))
     }
 
-    /// Rerank opaque, content-addressed candidate identities against this
-    /// project's current index. `None` is a fail-closed signal that at least
-    /// one shared candidate no longer exists locally.
-    pub fn rerank_immutable_candidates(
-        &self,
-        prompt: &str,
-        explicit_paths: &[String],
-        candidate_addresses: &[String],
-        max_items: usize,
-    ) -> Result<Option<(Vec<SearchHit>, Vec<String>)>> {
-        if candidate_addresses
-            .iter()
-            .any(|address| !self.chunks_by_address.contains_key(address))
-        {
-            return Ok(None);
-        }
-        let candidate_ids = candidate_addresses
-            .iter()
-            .filter_map(|address| self.chunks_by_address.get(address))
-            .map(|index| self.chunks[*index].id.clone())
-            .collect::<Vec<_>>();
-        self.rerank(prompt, explicit_paths, &candidate_ids, max_items)
-            .map(Some)
-    }
-
     pub fn snippet(&self, raw_path: &str, start_line: u32, end_line: Option<u32>) -> Result<Chunk> {
         let started = Instant::now();
         let path = validate_relative_path(raw_path)?;
@@ -1667,15 +1635,6 @@ fn digest_hex(digest: Sha256) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-/// Stable opaque identity for an immutable retrieval candidate. Project-local
-/// chunk ids contain paths, so only this digest may enter a shared frontier.
-pub fn immutable_candidate_address(candidate_id: &str) -> String {
-    format!(
-        "ca:{}",
-        digest_hex(Sha256::new_with_prefix(candidate_id.as_bytes()))
-    )
 }
 
 fn should_visit(entry: &DirEntry) -> bool {

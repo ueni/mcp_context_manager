@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use context_core::{ContextAdminRequest, ContextPackRequest, ContextPackV2, ProjectEngine};
 use serde_json::{Value, json};
 
@@ -83,49 +83,43 @@ async fn main() -> Result<()> {
         let cold = ProjectEngine::build_with_state(&fixture, state.path(), PROJECT_SCOPE)?;
         let started = Instant::now();
         let pack: ContextPackV2 =
-            serde_json::from_slice(&cold.context_pack_cached(&request(prompt)).await?)?;
+            serde_json::from_slice(&cold.context_pack_generate(&request(prompt)).await?)?;
         cold_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
         corpus_hits += usize::from(pack_hit(&pack, expected));
 
         let repository_pack: ContextPackV2 =
-            serde_json::from_slice(&repository.context_pack_cached(&request(prompt)).await?)?;
+            serde_json::from_slice(&repository.context_pack_generate(&request(prompt)).await?)?;
         repository_hits += usize::from(pack_hit(&repository_pack, expected));
     }
 
     let mut warm_ms = Vec::new();
     let mut repository_warm_ms = Vec::new();
     for (prompt, _) in QUERIES {
-        corpus.context_pack_cached(&request(prompt)).await?;
+        corpus.context_pack_generate(&request(prompt)).await?;
         for _ in 0..20 {
             let started = Instant::now();
-            corpus.context_pack_cached(&request(prompt)).await?;
+            corpus.context_pack_generate(&request(prompt)).await?;
             warm_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
 
             let started = Instant::now();
-            repository.context_pack_cached(&request(prompt)).await?;
+            repository.context_pack_generate(&request(prompt)).await?;
             repository_warm_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
         }
     }
 
     let stale_pack: ContextPackV2 = serde_json::from_slice(
         &corpus
-            .context_pack_cached(&request("traceparent HTTP header vendor tracestate"))
+            .context_pack_generate(&request("traceparent HTTP header vendor tracestate"))
             .await?,
     )?;
     let stale_source_signalled = stale_pack.evidence.iter().any(|card| {
         card.4.contains("source=w3c-trace-context") && card.4.contains("freshness=stale")
     });
 
-    let metrics = admin(&corpus, "metrics").await?;
     let repository_index = admin(&repository, "index_status").await?;
     let corpus_index = admin(&corpus, "index_status").await?;
-    let token_metrics = metrics
-        .pointer("/tokens/context_pack")
-        .context("context-pack token metrics")?;
-    let repeat_request_cache_hit_rate = metrics
-        .pointer("/cache/hit_ratio")
-        .and_then(Value::as_f64)
-        .context("cache hit ratio")?;
+    let metrics = admin(&corpus, "metrics").await?;
+    let token_metrics = &metrics["tokens"]["context_pack"];
     let fixed_query_count = QUERIES.len();
     let corpus_hit_rate = corpus_hits as f64 / fixed_query_count as f64;
     let repository_only_hit_rate = repository_hits as f64 / fixed_query_count as f64;
@@ -151,9 +145,9 @@ async fn main() -> Result<()> {
         "tokens": {
             "selected_source_est": token_metrics["selected_source_tokens_est"],
             "wire_est": token_metrics["wire_tokens_est"],
-            "estimated_savings": token_metrics["saved_tokens_est"]
+            "estimated_savings": token_metrics["saved_tokens_est"],
         },
-        "repeat_request_cache_hit_rate": repeat_request_cache_hit_rate,
+        "repeat_request_latency_p95_ms": percentile(&warm_ms, 95),
         "corpus_size_effects": [
             {
                 "source_count": repository_index["reference_corpus"]["source_count"],
@@ -169,7 +163,6 @@ async fn main() -> Result<()> {
         "gates": {
             "corpus_top_k_hit_rate_100pct": corpus_hit_rate == 1.0,
             "repository_and_corpus_distinguishable": repository_only_hit_rate == 0.0,
-            "repeat_cache_hit_rate_gte_90pct": repeat_request_cache_hit_rate >= 0.90,
             "stale_source_signalled": stale_source_signalled
         }
     });

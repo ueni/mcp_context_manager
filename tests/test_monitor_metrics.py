@@ -67,7 +67,9 @@ class MonitorMcpTimeoutTests(unittest.TestCase):
         )
 
     def test_warmup_preserves_larger_configured_deadline(self) -> None:
-        client = monitor_metrics.McpHttpClient("http://localhost:8000/mcp", timeout=90.0)
+        client = monitor_metrics.McpHttpClient(
+            "http://localhost:8000/mcp", timeout=90.0
+        )
 
         self.assertEqual(
             client._timeout_for_tool("context_admin", {"mode": "warmup"}),
@@ -87,7 +89,9 @@ class MonitorUsageControlTests(unittest.TestCase):
         self.assertTrue(
             monitor_metrics._needs_initial_usage_status(state, snapshots, None)
         )
-        self.assertIn("detailed=unknown", monitor_metrics._mcp_status_line(state, False))
+        self.assertIn(
+            "detailed=unknown", monitor_metrics._mcp_status_line(state, False)
+        )
         state.usage_status_requested = True
         state.usage_enabled = False
         self.assertFalse(
@@ -114,7 +118,12 @@ class MonitorUsageControlTests(unittest.TestCase):
 
         self.assertEqual(
             client.calls,
-            [("context_admin", {"mode": "monitor_usage", "action": "report", "project_id": "one"})],
+            [
+                (
+                    "context_admin",
+                    {"mode": "monitor_usage", "action": "report", "project_id": "one"},
+                )
+            ],
         )
 
 
@@ -133,7 +142,14 @@ class McpInspectionViewTests(unittest.TestCase):
                 self.read_uris: list[str] = []
 
             def list_tools(self) -> dict[str, object]:
-                return {"tools": [{"name": "context_pack", "description": "Build compact context."}]}
+                return {
+                    "tools": [
+                        {
+                            "name": "context_pack",
+                            "description": "Build compact context.",
+                        }
+                    ]
+                }
 
             def list_resources(self) -> dict[str, object]:
                 return {
@@ -158,7 +174,9 @@ class McpInspectionViewTests(unittest.TestCase):
         client = InspectionClient()
         payload = monitor_metrics.inspect_mcp_surface(client)
         self.assertEqual(client.read_uris, [])
-        state = monitor_metrics.MonitorState(view="inspection", inspection_payload=payload)
+        state = monitor_metrics.MonitorState(
+            view="inspection", inspection_payload=payload
+        )
         rendered = monitor_metrics.render_mcp_inspection(
             "http://localhost:8000/mcp", False, 120, state
         )
@@ -201,7 +219,9 @@ class McpInspectionViewTests(unittest.TestCase):
             monitor_metrics.render_mcp_inspection("url", False, 120, state),
         )
 
-    def test_inspection_renders_resource_read_failures_and_is_discoverable(self) -> None:
+    def test_inspection_renders_resource_read_failures_and_is_discoverable(
+        self,
+    ) -> None:
         class FailingResourceClient:
             def list_tools(self) -> dict[str, object]:
                 return {"tools": []}
@@ -214,7 +234,9 @@ class McpInspectionViewTests(unittest.TestCase):
 
         client = FailingResourceClient()
         payload = monitor_metrics.inspect_mcp_surface(client)
-        state = monitor_metrics.MonitorState(view="inspection", inspection_payload=payload)
+        state = monitor_metrics.MonitorState(
+            view="inspection", inspection_payload=payload
+        )
         self.assertEqual(
             monitor_metrics.handle_key("enter", state, 0), "inspection_resource"
         )
@@ -231,7 +253,9 @@ class McpInspectionViewTests(unittest.TestCase):
         self.assertIn("i inspect", monitor_metrics._controls(60, False))
         self.assertIn("Enter open", monitor_metrics._controls(60, False))
 
-    def test_resource_viewer_prettifies_json_scrolls_and_returns_to_catalogue(self) -> None:
+    def test_resource_viewer_prettifies_json_scrolls_and_returns_to_catalogue(
+        self,
+    ) -> None:
         class JsonResourceClient:
             def read_resource(self, uri: str) -> dict[str, object]:
                 return {
@@ -309,7 +333,9 @@ class MonitorProjectSelectionTests(unittest.TestCase):
             client, project_ids=[], root_uri="", include_matrix=True
         )
 
-        self.assertEqual([snapshot.target.project_id for snapshot in snapshots], ["one", "two"])
+        self.assertEqual(
+            [snapshot.target.project_id for snapshot in snapshots], ["one", "two"]
+        )
         self.assertEqual(
             client.calls,
             [
@@ -318,6 +344,7 @@ class MonitorProjectSelectionTests(unittest.TestCase):
                 ("context_admin", {"mode": "measurement_report", "project_id": "two"}),
             ],
         )
+
     def test_explicit_projects_do_not_trigger_workspace_discovery(self) -> None:
         client = FakeClient()
 
@@ -328,7 +355,9 @@ class MonitorProjectSelectionTests(unittest.TestCase):
             include_matrix=True,
         )
 
-        self.assertEqual([snapshot.target.project_id for snapshot in snapshots], ["one", "two"])
+        self.assertEqual(
+            [snapshot.target.project_id for snapshot in snapshots], ["one", "two"]
+        )
         self.assertEqual(
             client.calls,
             [
@@ -426,7 +455,7 @@ class MonitorStateEntryViewTests(unittest.TestCase):
         state.state_entry = {
             "schema": "context_state_browser.v1",
             "mode": "entry",
-            "key": "frontier:fr_demo",
+            "key": "memory:demo",
             "found": True,
             "value": {"records": [1, 2]},
         }
@@ -456,10 +485,10 @@ class MonitorStateEntryViewTests(unittest.TestCase):
         state.state_entry = {
             "schema": "context_state_browser.v1",
             "mode": "entry",
-            "key": "frontier:fr_demo",
+            "key": "memory:demo",
             "found": True,
             "value": {
-                "schema": "retrieval_frontier.v1",
+                "schema": "context_memory.entry.v1",
                 "status": "ready",
                 "expires_at": "2099-01-01T00:00:00Z",
                 "records": ["x" * 1024] * 100,
@@ -470,7 +499,7 @@ class MonitorStateEntryViewTests(unittest.TestCase):
             "http://localhost:8000/mcp", False, 80, state, height=24
         )
 
-        self.assertIn("retrieval_frontier.v1", rendered)
+        self.assertIn("context_memory.entry.v1", rendered)
         self.assertIn("ready", rendered)
         self.assertIn("2099-01-01T00:00:00Z", rendered)
         self.assertIn("(truncated)", rendered)
@@ -487,7 +516,7 @@ class MonitorStateEntryViewTests(unittest.TestCase):
 
 def native_metrics(*, status: str = "idle") -> dict[str, object]:
     return {
-        "schema": "context_metrics.v1",
+        "schema": "context_metrics.v2",
         "requests": {
             "total": 24,
             "by_operation": {
@@ -519,33 +548,13 @@ def native_metrics(*, status: str = "idle") -> dict[str, object]:
                 "wire_tokens_est": 180,
                 "wire_bytes": 720,
                 "saved_tokens_est": 720,
-                "delta_tokens_saved_est": 120,
                 "continuation_wire_tokens_avoided_est": 80,
                 "compression_factor_est": 5.0,
-                "compression_ratio_est": 0.2,
             }
         },
+        "context_pack": {"candidate_count": 12, "retrieval_micros": 4000},
         "cache": {
-            "hits": 12,
-            "misses": 4,
-            "hit_ratio": 0.75,
-            "l0": {
-                "hits": 12,
-                "misses": 4,
-                "singleflight_hits": 2,
-                "entries": 7,
-                "weighted_bytes": 65_536,
-                "miss_reasons": {
-                    "cold_or_invalidated": 1,
-                    "request_variant": 3,
-                },
-                "invalidations": 4,
-            },
-            "l1": {
-                "exact_hits": 8,
-                "approximate_hits": 3,
-                "retrieval_misses": 2,
-            },
+            "lookup": {"hits": 12, "misses": 4, "entries": 7, "bytes": 65536},
             "file": {
                 "hits": 8,
                 "misses": 2,
@@ -571,9 +580,8 @@ def native_metrics(*, status: str = "idle") -> dict[str, object]:
                 "candidate_count": 12,
                 "latency_total_micros": 1000,
             },
-            "continuation": {"requests": 4, "reuses": 3, "fallbacks": 1},
         },
-        "retrieval": {"backend": "tantivy", "doc_count": 99, "misses": 2},
+        "continuation": {"requests": 4, "reuses": 3, "fallbacks": 1},
         "references": {"active_count": 4, "total_count": 6},
         "index_freshness": {"generation": 3, "dirty": False, "refreshes": 2},
         "background": {"status": status},
@@ -610,20 +618,15 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
             matrix=quality_matrix(),
         )
 
-    def test_dashboard_uses_native_l0_l1_counters(self) -> None:
+    def test_dashboard_uses_native_lookup_and_index_counters(self) -> None:
         rendered = monitor_metrics.render_dashboard(
             [self.snapshot], "http://localhost:8000/mcp", color=False, width=160
         )
 
-        self.assertIn("L0 pack cache", rendered)
+        self.assertIn("lookup cache", rendered)
         self.assertIn("75.0%", rendered)
-        self.assertIn("8 exact / 3 approximate", rendered)
-        self.assertIn("L1 reuse", rendered)
-        self.assertIn("file cache", rendered)
-        self.assertIn("Git diff cache", rendered)
-        self.assertIn("symbol postings", rendered)
-        self.assertIn("80.0%", rendered)
-        self.assertIn("60.0%", rendered)
+        self.assertNotIn("L0", rendered)
+        self.assertNotIn("L1", rendered)
         self.assertIn("2 pass", rendered)
         self.assertNotIn("candidate compact.", rendered)
 
@@ -638,16 +641,6 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                         "elapsed_micros_total": 5000,
                         "input_tokens_est": 100,
                         "wire_tokens_est": 20,
-                        "cache_outcomes": {
-                            "l0_hit": 3,
-                            "l0_singleflight": 2,
-                            "l0_miss": 1,
-                        },
-                        "frontier_outcomes": {
-                            "exact_hit": 2,
-                            "admitted": 1,
-                            "capacity_fallback": 1,
-                        },
                         "delta": {
                             "base_pack_requests": 2,
                             "continuation_requests": 4,
@@ -655,11 +648,7 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                             "continuation_fallbacks": 1,
                             "continuation_wire_tokens_avoided_est": 80,
                         },
-                        "delta_tokens_saved_est": 40,
-                        "reuse_opportunities": {"exact": 3, "frontier": 2, "delta": 2, "lineage": 1},
-                        "reuse_effectiveness": {"exact_hits": 3, "frontier_hits": 2, "delta_adoptions": 1},
-                        "miss_causes": {"cold_or_restart": 1, "expired": 0, "invalidated_generation_or_signature": 0, "request_variant": 0, "scope_or_options_variant": 0, "evidence_state_variant": 0},
-                        "repeat_distance_buckets": {"same_15m_slot": 2, "within_30m_idle_window": 1, "30m_to_2h": 0, "2h_to_1d": 0, "1d_to_30d": 0},
+                        "tokens_saved_est": 40,
                         "index": {"refresh_updated": 1},
                         "client_profiles": [
                             {
@@ -669,12 +658,8 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                                 "input_tokens_est": 60,
                                 "wire_tokens_est": 10,
                                 "tokens_saved_est": 50,
-                                "cache_outcomes": {"l0_hit": 1},
-                                "frontier_outcomes": {"exact_hit": 1},
                                 "routes": {"explore": 1},
                                 "delta": {"base_pack_requests": 1},
-                                "reuse_opportunities": {"exact": 1, "frontier": 1, "delta": 1},
-                                "reuse_effectiveness": {"exact_hits": 1, "frontier_hits": 1, "delta_adoptions": 1},
                             },
                             {
                                 "client_profile": "other",
@@ -683,12 +668,8 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
                                 "input_tokens_est": 40,
                                 "wire_tokens_est": 10,
                                 "tokens_saved_est": 30,
-                                "cache_outcomes": {"l0_miss": 1},
-                                "frontier_outcomes": {"admitted": 1},
                                 "routes": {"explore": 1},
                                 "delta": {"base_pack_requests": 1},
-                                "reuse_opportunities": {"exact": 2, "frontier": 1, "delta": 1},
-                                "reuse_effectiveness": {"exact_hits": 2, "frontier_hits": 1, "delta_adoptions": 0},
                             },
                         ],
                     }
@@ -722,28 +703,23 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
 
         self.assertIn("context_pack", performance)
         self.assertIn("21.5", performance)
-        self.assertIn("L0 storage", performance)
-        self.assertIn("cold 1, variant 3, invalidations 4, coalesced 2", performance)
-        self.assertIn("8 exact, 3 approximate hits", performance)
+        self.assertIn("direct retrieval", performance)
+        self.assertIn("lookup cache", performance)
+        self.assertNotIn("L0", performance)
+        self.assertNotIn("L1", performance)
         self.assertIn("context_lookup.search", performance)
         self.assertIn("p95 ms", performance)
         self.assertIn("Git diff cache", performance)
         self.assertIn("symbol postings", performance)
         self.assertIn("5.00x source-to-wire", performance)
-        self.assertIn("720 source-to-wire, 120 delta", performance)
+        self.assertIn("720 source-to-wire", performance)
         self.assertIn(
-            "3/4 reused (75.0%); 1 fallbacks / 80 wire tokens avoided",
+            "3/4 reused, 1 fallbacks, 80 wire tokens avoided",
             performance,
         )
         self.assertIn("monitor-only detailed usage", performance)
         self.assertIn("2 requests / 2.50 avg ms", performance)
-        self.assertIn("5 hits / 1 misses = 83.3%", performance)
-        self.assertIn("exact 3 / frontier 2 / delta 2 / lineage 1", performance)
-        self.assertIn("exact 3/3 (100.0%)", performance)
-        self.assertIn("1/2 eligible (50.0%)", performance)
-        self.assertIn("3 within 30m idle / 0 beyond", performance)
-        self.assertIn("2 hits / 1 admitted / 1 fallbacks", performance)
-        self.assertIn("delta adoption", performance)
+        self.assertIn("delta requests", performance)
         self.assertIn(
             "schema 1 / root policy 2 / project selection 3 / internal 4",
             performance,
@@ -753,7 +729,7 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("other", performance)
         self.assertIn("1 / 50.0%", performance)
         self.assertNotIn("search_fragment_ms", performance)
-        self.assertIn("7 entries, 64.0KiB", detail)
+        self.assertIn("7 entries", detail)
         self.assertIn("4 active / 6 total", detail)
         self.assertIn("900 source / 240 cards / 120 returned / 180 wire (720B)", detail)
         self.assertIn("quality.required_anchor_recall", detail)
@@ -837,7 +813,9 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
     def test_unloaded_quality_checks_are_pending_not_false_passes(self) -> None:
         matrix = quality_matrix(status="insufficient", current=None)
 
-        self.assertEqual(monitor_metrics._matrix_status(matrix, color=False), "2 pending")
+        self.assertEqual(
+            monitor_metrics._matrix_status(matrix, color=False), "2 pending"
+        )
 
 
 if __name__ == "__main__":

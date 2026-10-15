@@ -21,8 +21,7 @@ pub type V2Environment = heed::Env;
 pub const CODEC_VERSION: u8 = 1;
 const V2_MAP_SIZE: usize = 1024 * 1024 * 1024;
 // The LMDB map itself bounds the number of possible records. This conservative
-// minimum encoded-record footprint keeps a single prune transaction bounded
-// without rejecting any realistically representable frontier set.
+// minimum encoded-record footprint keeps a single prune transaction bounded.
 const MAX_DELETE_BATCH: usize = V2_MAP_SIZE / 16;
 
 #[derive(Clone, Debug)]
@@ -847,21 +846,21 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary state root");
         let store = StateStore::open(root.path()).expect("state store");
         store
-            .put_json("frontier:one", &json!({"value": 1}))
+            .put_json("entry:one", &json!({"value": 1}))
             .expect("row one");
         store
-            .put_json("frontier:two", &json!({"value": 2}))
+            .put_json("entry:two", &json!({"value": 2}))
             .expect("row two");
 
         assert_eq!(
             store
-                .delete_batch(&["frontier:one".to_owned(), "frontier:two".to_owned()])
+                .delete_batch(&["entry:one".to_owned(), "entry:two".to_owned()])
                 .expect("delete batch"),
             2
         );
         assert!(
             store
-                .iter_json("frontier:")
+                .iter_json("entry:")
                 .expect("remaining rows")
                 .is_empty()
         );
@@ -873,12 +872,12 @@ mod tests {
         let store = StateStore::open(root.path()).expect("state store");
         store
             .put_json_batch(&[
-                ("frontier:one".to_owned(), json!({"value": 1})),
-                ("frontier:two".to_owned(), json!({"value": 2})),
+                ("entry:one".to_owned(), json!({"value": 1})),
+                ("entry:two".to_owned(), json!({"value": 2})),
             ])
             .expect("write batch");
 
-        assert_eq!(store.iter_json("frontier:").expect("rows").len(), 2);
+        assert_eq!(store.iter_json("entry:").expect("rows").len(), 2);
     }
 
     #[test]

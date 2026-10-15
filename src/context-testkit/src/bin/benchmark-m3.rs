@@ -32,39 +32,19 @@ async fn main() -> Result<()> {
     let general_warmup_response: Value =
         serde_json::from_slice(&engine.context_admin(&general_warmup).await?)?;
     let general_warmup_ms = general_warmup_started.elapsed().as_secs_f64() * 1_000.0;
-    let general_warmup_retrieval_ms = general_warmup_response["stage_timings_ms"]["retrieval"]
-        .as_f64()
-        .context("general warmup retrieval timing")?;
     ensure!(
-        general_warmup_response["search_cache"]["query_count"]
-            .as_u64()
-            .is_some_and(|count| count == 0),
-        "general warmup unexpectedly executed generic retrieval seeds"
+        general_warmup_response["schema"] == "context_index.warmup.v1"
+            && general_warmup_response.get("search_cache").is_none(),
+        "general warmup must initialize only the index"
     );
 
-    let prompt_warmup_text = "benchmark prompt warmup exact cache admission";
-    let prompt_warmup: ContextAdminRequest = serde_json::from_value(json!({
-        "mode": "warmup",
-        "prompt": prompt_warmup_text,
-        "path": "src/context-core/src/lib.rs"
-    }))?;
-    let prompt_warmup_started = Instant::now();
-    engine.context_admin(&prompt_warmup).await?;
-    let prompt_warmup_ms = prompt_warmup_started.elapsed().as_secs_f64() * 1_000.0;
-    let prompt_request = request(json!({
-        "prompt": prompt_warmup_text,
-        "focus_paths": ["src/context-core/src/lib.rs"]
-    }))?;
-    let prompt_l0_started = Instant::now();
-    engine.context_pack_cached(&prompt_request).await?;
-    let post_prompt_warmup_l0_ms = prompt_l0_started.elapsed().as_secs_f64() * 1_000.0;
     let base_request = request(json!({
         "prompt": "Profile native context pack retrieval latency and identify the measured hot path",
         "focus_paths": ["src/context-core/src/lib.rs", "src/context-index/src/lib.rs"],
         "client_profile": "codex",
         "evidence_policy": "balanced"
     }))?;
-    let full_bytes = engine.context_pack_cached(&base_request).await?;
+    let full_bytes = engine.context_pack_generate(&base_request).await?;
     let full: ContextPackV2 = serde_json::from_slice(&full_bytes)?;
     let more = full
         .more
@@ -72,24 +52,17 @@ async fn main() -> Result<()> {
         .context("benchmark pack must carry an active more reference")?;
     ensure!(
         engine.store().reference_is_active(more)?,
-        "benchmark more reference must be active before L0 samples"
+        "benchmark reference must be active before repeated samples"
     );
-
-    let mut l0 = Vec::new();
+    let mut repeated = Vec::new();
     for _ in 0..100 {
         let started = Instant::now();
-        let bytes = engine.context_pack_cached(&base_request).await?;
-        ensure!(bytes == full_bytes, "L0 changed deterministic wire bytes");
-        l0.push(started.elapsed().as_secs_f64() * 1_000.0);
-    }
-
-    let mut l1 = Vec::new();
-    for iteration in 0..40 {
-        let mut related = base_request.clone();
-        related.known_evidence = vec![format!("client-held-{iteration}")];
-        let started = Instant::now();
-        engine.context_pack_cached(&related).await?;
-        l1.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let bytes = engine.context_pack_generate(&base_request).await?;
+        ensure!(
+            bytes == full_bytes,
+            "direct retrieval changed deterministic wire bytes"
+        );
+        repeated.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
 
     let baseline: Value = serde_json::from_slice(&fs::read(
@@ -98,7 +71,7 @@ async fn main() -> Result<()> {
     let cases = baseline["cases"]
         .as_array()
         .context("baseline cases must be an array")?;
-    let mut warm_misses = Vec::new();
+    let mut direct_samples = Vec::new();
     let mut tokens = Vec::new();
     let mut recall = 1.0_f64;
     let mut noise = 0.0_f64;
@@ -117,8 +90,8 @@ async fn main() -> Result<()> {
                 "evidence_policy": "balanced"
             }))?;
             let started = Instant::now();
-            let bytes = miss_engine.context_pack_cached(&pack_request).await?;
-            warm_misses.push(started.elapsed().as_secs_f64() * 1_000.0);
+            let bytes = miss_engine.context_pack_generate(&pack_request).await?;
+            direct_samples.push(started.elapsed().as_secs_f64() * 1_000.0);
             tokens.push(token_estimate(&bytes));
             let pack: ContextPackV2 = serde_json::from_slice(&bytes)?;
             let required = case["required_paths"]
@@ -142,11 +115,11 @@ async fn main() -> Result<()> {
             noise += noisy as f64 / pack.paths.len().max(1) as f64;
         }
     }
-    noise /= warm_misses.len() as f64;
+    noise /= direct_samples.len() as f64;
 
     let mut delta_request = base_request.clone();
     delta_request.base_pack = Some(full.id.clone());
-    let delta_bytes = engine.context_pack_cached(&delta_request).await?;
+    let delta_bytes = engine.context_pack_generate(&delta_request).await?;
     let delta: ContextPackV2 = serde_json::from_slice(&delta_bytes)?;
     let full_evidence_tokens = full
         .evidence
@@ -180,7 +153,7 @@ async fn main() -> Result<()> {
     for prompt in iterative_prompts {
         let mut manual_request = base_request.clone();
         manual_request.prompt = prompt.to_owned();
-        let manual_bytes = manual_engine.context_pack_cached(&manual_request).await?;
+        let manual_bytes = manual_engine.context_pack_generate(&manual_request).await?;
         let manual_pack: ContextPackV2 = serde_json::from_slice(&manual_bytes)?;
         manual_full_wire_tokens =
             manual_full_wire_tokens.saturating_add(token_estimate(&manual_bytes));
@@ -188,7 +161,7 @@ async fn main() -> Result<()> {
         let mut continuation_request = manual_request;
         continuation_request.memory_session = Some("benchmark-iterative-reuse".to_owned());
         let continuation_bytes = continuation_engine
-            .context_pack_cached(&continuation_request)
+            .context_pack_generate(&continuation_request)
             .await?;
         let continuation_pack: ContextPackV2 = serde_json::from_slice(&continuation_bytes)?;
         continuation_wire_tokens =
@@ -204,33 +177,30 @@ async fn main() -> Result<()> {
 
     tokens.sort_unstable();
     let balanced_tokens_median = tokens[tokens.len() / 2];
+    let mut repeated_ordered = repeated.clone();
+    repeated_ordered.sort_by(f64::total_cmp);
+    let repeated_pack_p50_ms = repeated_ordered[repeated_ordered.len() / 2];
     let summary = json!({
-        "l0_server_p95_ms": percentile_95(&l0),
-        "l1_p95_ms": percentile_95(&l1),
-        "warm_miss_p95_ms": percentile_95(&warm_misses),
+        "repeated_pack_p50_ms": repeated_pack_p50_ms,
+        "repeated_pack_p95_ms": percentile_95(&repeated),
+        "direct_pack_p95_ms": percentile_95(&direct_samples),
         "balanced_pack_tokens_median": balanced_tokens_median,
         "delta_reduction": delta_reduction,
         "required_anchor_recall": recall,
         "noise_ratio": noise,
         "general_warmup_ms": general_warmup_ms,
-        "general_warmup_retrieval_ms": general_warmup_retrieval_ms,
-        "prompt_warmup_ms": prompt_warmup_ms,
-        "post_prompt_warmup_l0_ms": post_prompt_warmup_l0_ms,
         "iterative_manual_full_wire_tokens_est": manual_full_wire_tokens,
         "iterative_continuation_wire_tokens_est": continuation_wire_tokens,
         "iterative_continuation_token_reduction": continuation_token_reduction,
         "iterative_continuation_quality_equal": continuation_quality_equal,
     });
     let gates = json!({
-        "l0_server_p95_lte_2ms": summary["l0_server_p95_ms"].as_f64().unwrap() <= 2.0,
-        "l1_p95_lte_15ms": summary["l1_p95_ms"].as_f64().unwrap() <= 15.0,
-        "warm_miss_p95_lte_50ms": summary["warm_miss_p95_ms"].as_f64().unwrap() <= 50.0,
+        "direct_pack_p95_lte_50ms": summary["direct_pack_p95_ms"].as_f64().unwrap() <= 50.0,
         "balanced_pack_median_lte_400_tokens": balanced_tokens_median <= 400,
         "delta_reduction_gte_80pct": delta_reduction >= 0.80,
         "required_anchor_recall_100pct": recall == 1.0,
         "noise_ratio_lte_30pct": noise <= 0.30,
         "general_warmup_lte_50ms": general_warmup_ms <= 50.0,
-        "post_prompt_warmup_l0_lte_2ms": post_prompt_warmup_l0_ms <= 2.0,
         "iterative_continuation_reduces_tokens": continuation_token_reduction > 0.0,
         "iterative_continuation_no_quality_regression": continuation_quality_equal,
     });

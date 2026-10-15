@@ -1090,7 +1090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_wiki_invalidates_remote_cached_packs_and_preserves_compaction_references() {
+    async fn shared_wiki_updates_remote_packs_and_preserves_compaction_references() {
         let fixture = tempdir().unwrap();
         let hub = Arc::new(WikiHub::new().unwrap());
         let aroot = fixture.path().join("a");
@@ -1111,7 +1111,7 @@ mod tests {
         )
         .unwrap();
         let before: ContextPackV2 =
-            serde_json::from_slice(&b.context_pack_cached(&request).await.unwrap()).unwrap();
+            serde_json::from_slice(&b.context_pack_generate(&request).await.unwrap()).unwrap();
         assert_eq!(before.wiki.len(), 1);
         assert!(before.evidence.is_empty());
         assert_eq!(before.wiki[0]["project_id"], "alpha");
@@ -1121,7 +1121,7 @@ mod tests {
             "quasarwiki timeout remains 400ms with bounded retry",
         );
         let after: ContextPackV2 =
-            serde_json::from_slice(&b.context_pack_cached(&request).await.unwrap()).unwrap();
+            serde_json::from_slice(&b.context_pack_generate(&request).await.unwrap()).unwrap();
         assert_ne!(before.id, after.id);
         assert_eq!(after.wiki[0]["revision"], second["revision"]);
         assert!(after.wiki[0]["summary"].as_str().unwrap().len() <= 256);

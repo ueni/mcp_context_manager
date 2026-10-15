@@ -19,11 +19,10 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use context_index::{
     Chunk, IndexSnapshot, IndexStats, ProjectIndex, SearchHit, SymbolRecord, WikiSearchIndex,
-    WorkControl, git_exclude_pathspecs, immutable_candidate_address, is_ignored_repository_path,
-    normalize_terms, repository_signature_for_project_controlled, validate_relative_path,
+    WorkControl, git_exclude_pathspecs, is_ignored_repository_path, normalize_terms,
+    repository_signature_for_project_controlled, validate_relative_path,
 };
 use context_store::{ReferenceValidation, StateStore};
-use moka::future::Cache;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
@@ -69,8 +68,6 @@ fn current_work_checkpoint() -> Result<()> {
 pub const CONTEXT_PACK_VERSION: u8 = 2;
 pub const DEFAULT_MAX_ITEMS: u8 = 8;
 pub const DEFAULT_MAX_SOURCE_TOKENS: u16 = 512;
-
-pub type WireCache<K, V> = moka::future::Cache<K, V>;
 
 /// Encodes the read-only administrative response for a project whose retrieval
 /// engine has not been opened yet.  This deliberately avoids opening LMDB,
@@ -303,12 +300,8 @@ pub struct ContextAdminRequest {
     #[serde(default = "default_lookup_path")]
     pub path: String,
     #[serde(default)]
-    pub prompt: String,
-    #[serde(default)]
     pub action: String,
     pub max_files: Option<u32>,
-    #[serde(default = "default_max_age_minutes")]
-    pub max_age_minutes: u32,
     #[serde(default = "default_admin_max_entries")]
     pub max_entries: u16,
     pub max_output_chars: Option<u32>,
@@ -464,45 +457,17 @@ pub struct ContextPackReuseV1 {
     pub wire_tokens_avoided_est: u32,
 }
 
-const L0_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const L1_MEMORY_MAX_BYTES: usize = 128 * 1024 * 1024;
 const INDEX_SNAPSHOT_MAX_BYTES: usize = 128 * 1024 * 1024;
-const L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
-const SHARED_L1_PERSISTENT_MAX_BYTES: usize = 256 * 1024 * 1024;
-const WARM_MISS_TARGET_MICROS: u64 = 50_000;
 const WATCH_COALESCE_MS: u64 = 50;
+const FAST_POLL_INTERVAL_MS: u64 = 0;
 const CHANGE_JOURNAL_MAX_PATHS: usize = 1_024;
 const MAX_REFRESH_CONCURRENCY: usize = 32;
-// Watcher-driven freshness avoids repository-wide request-path polling. Zero
-// is exposed in diagnostics to make the disabled fixed poll explicit.
-const FAST_POLL_INTERVAL_MS: u64 = 0;
-const NEGATIVE_FRONTIER_TTL_MS: u64 = 30_000;
-const POSITIVE_FRONTIER_ADMISSION_WINDOW_MS: u64 = 30 * 60 * 1_000;
-const FRONTIER_ADMISSION_TRACKER_MAX_ENTRIES: usize = 2_048;
 const OPERATION_SAMPLE_LIMIT: usize = 128;
-const REUSE_IDENTITY_VERSION: &str = "v1";
 const USAGE_CONFIG_SCHEMA: &str = "context_monitor_usage.config.v2";
-const USAGE_BUCKET_SCHEMA: &str = "context_monitor_usage.bucket.v3";
-const REUSE_TRACKER_MAX_ENTRIES: usize = 2_048;
-const REUSE_SLOT_MINUTES: i64 = 15;
-const REUSE_IDLE_SLOTS: u64 = 2;
-const REUSE_RETENTION_SLOTS: u64 = 30 * 24 * 4;
+const USAGE_BUCKET_SCHEMA: &str = "context_monitor_usage.bucket.v4";
 const CONTINUATION_TTL_SECONDS: i64 = 24 * 60 * 60;
 const CONTINUATION_MAX_ENTRIES: usize = 256;
 const CONTINUATION_MAX_SESSION_BYTES: usize = 128;
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct PackCacheKey(String);
-
-#[derive(Clone)]
-struct CachedPack {
-    bytes: Arc<Vec<u8>>,
-    reference_validations: Arc<Vec<ReferenceValidation>>,
-    validity: ValidityCertificate,
-    telemetry: PackTelemetry,
-    dependencies: Arc<Vec<String>>,
-    scoped: bool,
-}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LookupCacheKey(String);
@@ -549,268 +514,6 @@ fn lookup_cache_key(
     )))
 }
 
-struct CachedAdmission {
-    cached: Arc<CachedPack>,
-    outcome: PackCacheOutcome,
-}
-
-#[derive(Clone)]
-struct ValidityCertificate {
-    wiki_generation: u64,
-    generation: u64,
-    refresh_signature: String,
-    current: bool,
-}
-
-#[derive(Clone, Copy, Default)]
-struct L0StorageStats {
-    entries: u64,
-    weighted_bytes: u64,
-}
-
-fn l0_entry_weight(key: &PackCacheKey, value: &CachedPack) -> u32 {
-    let bytes = key.0.len()
-        + value.bytes.len()
-        + value.validity.refresh_signature.len()
-        + value
-            .reference_validations
-            .iter()
-            .map(|validation| validation.reference_id.len())
-            .sum::<usize>();
-    u32::try_from(bytes).unwrap_or(u32::MAX)
-}
-
-fn l0_cache_key(request: &ContextPackRequest, explicit_paths: &[String]) -> Result<PackCacheKey> {
-    let mut known_evidence = request.known_evidence.clone();
-    known_evidence.sort();
-    known_evidence.dedup();
-    Ok(PackCacheKey(digest_id(
-        "l0_",
-        &serde_json::to_vec(&json!({
-            "prompt": &request.prompt,
-            "explicit_paths": explicit_paths,
-            "max_items": request.max_items,
-            "max_source_tokens": request.max_source_tokens,
-            "evidence_policy": request.evidence_policy,
-            "base_pack": &request.base_pack,
-            "known_evidence": known_evidence,
-        }))?,
-    )))
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct FrontierRecord {
-    schema: String,
-    key: String,
-    route: String,
-    scope: Vec<String>,
-    terms: Vec<String>,
-    generation: u64,
-    candidate_capacity: u8,
-    candidate_ids: Vec<String>,
-    scores: Vec<f32>,
-    cumulative_token_costs: Vec<u32>,
-    dependencies: Vec<String>,
-    score_cutoff: f32,
-    refresh_signature: String,
-    negative: bool,
-    expires_at_ms: u64,
-    updated_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct SharedFrontierRecord {
-    schema: String,
-    key: String,
-    governance_identity: String,
-    git_common_dir_hash: String,
-    lineage_identity: String,
-    head_oid: String,
-    source_signature: String,
-    index_signature: String,
-    scope_signature: String,
-    terms: Vec<String>,
-    candidate_capacity: u8,
-    candidate_addresses: Vec<String>,
-    dependency_addresses: Vec<String>,
-    scores: Vec<f32>,
-    cumulative_token_costs: Vec<u32>,
-    score_cutoff: f32,
-    admitted_at_ms: u64,
-}
-
-impl SharedFrontierRecord {
-    fn estimated_bytes(&self) -> usize {
-        serde_json::to_vec(self).map_or(0, |encoded| encoded.len())
-    }
-
-    fn content_key(&self) -> Result<String> {
-        let content = serde_json::to_string(&json!({
-            "governance": &self.governance_identity,
-            "common_git": &self.git_common_dir_hash,
-            "lineage": &self.lineage_identity,
-            "head": &self.head_oid,
-            "source": &self.source_signature,
-            "index": &self.index_signature,
-            "scope": &self.scope_signature,
-            "terms": &self.terms,
-            "capacity": self.candidate_capacity,
-            "candidates": &self.candidate_addresses,
-            "dependencies": &self.dependency_addresses,
-            "scores": &self.scores,
-            "cumulative_token_costs": &self.cumulative_token_costs,
-            "score_cutoff": self.score_cutoff,
-        }))?;
-        Ok(format!("sfr:{}", sha256_text(&content)))
-    }
-}
-
-#[derive(Default)]
-struct SharedFrontierState {
-    records: VecDeque<Arc<SharedFrontierRecord>>,
-    bytes: usize,
-}
-
-/// Process-global, generated-state-only pool for immutable frontier records.
-/// Project stores never point into this pool and shared records intentionally
-/// have no project ids, paths, prompts, references, or continuation state.
-pub struct SharedFrontierCache {
-    store: StateStore,
-    state: Mutex<SharedFrontierState>,
-}
-
-impl SharedFrontierCache {
-    pub fn open(global_state: impl AsRef<std::path::Path>) -> Result<Self> {
-        let store = StateStore::open(global_state)?;
-        let state = load_shared_frontiers(&store)?;
-        Ok(Self {
-            store,
-            state: Mutex::new(state),
-        })
-    }
-
-    fn admit(&self, record: Arc<SharedFrontierRecord>) -> Result<bool> {
-        if record.schema != "context_shared_frontier.v1" || record.content_key()? != record.key {
-            return Ok(false);
-        }
-        let key = format!("shared-frontier:{}", record.key);
-        let bytes = record.estimated_bytes();
-        if bytes > SHARED_L1_PERSISTENT_MAX_BYTES {
-            return Ok(false);
-        }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("shared frontier cache lock poisoned"))?;
-        if self.store.get_json(&key)?.is_some() {
-            return Ok(false);
-        }
-        self.store
-            .put_json(&key, &serde_json::to_value(&*record)?)?;
-        while state.bytes.saturating_add(bytes) > SHARED_L1_PERSISTENT_MAX_BYTES {
-            if let Some(removed) = state.records.pop_front() {
-                state.bytes = state.bytes.saturating_sub(removed.estimated_bytes());
-                let _ = self
-                    .store
-                    .delete(&format!("shared-frontier:{}", removed.key));
-            } else {
-                break;
-            }
-        }
-        state.bytes = state.bytes.saturating_add(bytes);
-        state.records.push_back(record);
-        Ok(true)
-    }
-
-    fn records(&self) -> Result<Vec<Arc<SharedFrontierRecord>>> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("shared frontier cache lock poisoned"))?
-            .records
-            .iter()
-            .cloned()
-            .collect())
-    }
-
-    fn stats(&self) -> Result<(usize, usize)> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("shared frontier cache lock poisoned"))?;
-        Ok((state.records.len(), state.bytes))
-    }
-
-    fn prune(&self, max_age_ms: u64) -> Result<u64> {
-        let cutoff = now_millis().saturating_sub(max_age_ms);
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("shared frontier cache lock poisoned"))?;
-        let removed = state
-            .records
-            .iter()
-            .filter(|record| record.admitted_at_ms <= cutoff)
-            .map(|record| format!("shared-frontier:{}", record.key))
-            .collect::<Vec<_>>();
-        let count = self.store.delete_batch(&removed)? as u64;
-        state
-            .records
-            .retain(|record| record.admitted_at_ms > cutoff);
-        state.bytes = state
-            .records
-            .iter()
-            .map(|record| record.estimated_bytes())
-            .sum();
-        Ok(count)
-    }
-}
-
-#[derive(Clone)]
-pub struct GovernedFrontierLineage {
-    governance_identity: String,
-}
-
-impl GovernedFrontierLineage {
-    pub fn new(governance_identity: impl Into<String>) -> Result<Self> {
-        let governance_identity = governance_identity.into();
-        if governance_identity.len() < 16
-            || !governance_identity
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            bail!("governed frontier lineage identity must be a hexadecimal digest");
-        }
-        Ok(Self {
-            governance_identity,
-        })
-    }
-
-    pub fn identity(&self) -> &str {
-        &self.governance_identity
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GitWorktreeProof {
-    common_dir_hash: String,
-    head_oid: String,
-}
-
-struct SharedEligibility {
-    governance_identity: String,
-    git: GitWorktreeProof,
-    lineage_identity: String,
-    source_signature: String,
-    index_signature: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GitProofRejection {
-    Dirty,
-    Unavailable,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PackSnapshot {
     schema: String,
@@ -853,88 +556,6 @@ struct PreparedContinuation {
     reuse: ContextPackReuseV1,
 }
 
-impl FrontierRecord {
-    fn estimated_bytes(&self) -> usize {
-        serde_json::to_vec(self).map_or(0, |encoded| encoded.len())
-    }
-}
-
-#[derive(Default)]
-struct FrontierState {
-    records: VecDeque<Arc<FrontierRecord>>,
-    bytes: usize,
-}
-
-#[derive(Default)]
-struct FrontierAdmissionTracker {
-    observations: HashMap<String, (u8, u64)>,
-}
-
-impl FrontierAdmissionTracker {
-    fn observe(&mut self, key: String, now: u64) -> bool {
-        self.observations.retain(|_, (_, seen)| {
-            now.saturating_sub(*seen) <= POSITIVE_FRONTIER_ADMISSION_WINDOW_MS
-        });
-        if let Some((count, seen)) = self.observations.get_mut(&key) {
-            *count = count.saturating_add(1);
-            *seen = now;
-            if *count >= 2 {
-                self.observations.remove(&key);
-                return true;
-            }
-            return false;
-        }
-        if self.observations.len() >= FRONTIER_ADMISSION_TRACKER_MAX_ENTRIES
-            && let Some(oldest) = self
-                .observations
-                .iter()
-                .min_by_key(|(_, (_, seen))| *seen)
-                .map(|(key, _)| key.clone())
-        {
-            self.observations.remove(&oldest);
-        }
-        self.observations.insert(key, (1, now));
-        false
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-enum FrontierOutcome {
-    #[default]
-    Search,
-    ExactHit,
-    NegativeHit,
-    Admitted,
-    CapacityFallback,
-    SourceFallback,
-    LineageHit,
-}
-
-struct DeferredRetrieval {
-    hits: Vec<SearchHit>,
-    terms: Vec<String>,
-    pending: Option<Arc<FrontierRecord>>,
-    outcome: FrontierOutcome,
-    lineage: LineageRequestTelemetry,
-}
-
-#[derive(Clone, Copy, Default)]
-struct LineageRequestTelemetry {
-    eligible: bool,
-    safe_hit: bool,
-    fallback: bool,
-    latency_saved_micros_est: u64,
-    isolation_rejection: bool,
-}
-
-#[derive(Clone, Copy)]
-enum PackCacheOutcome {
-    Uncached,
-    L0Hit,
-    L0Miss,
-    L0Singleflight,
-}
-
 #[derive(Clone, Copy, Default)]
 struct PackTelemetry {
     input_tokens_est: u32,
@@ -948,76 +569,30 @@ struct PackTelemetry {
     candidate_count: u32,
     selected_count: u32,
     retrieval_micros: u64,
-    cache_state_io_micros: u64,
     serialization_micros: u64,
     pack_build_micros: u64,
-    frontier_outcome: FrontierOutcome,
     base_pack_used: bool,
     known_evidence_used: bool,
     continuation_requested: bool,
     continuation_reused: bool,
     continuation_fallback: bool,
     explicit_delta_override: bool,
-    lineage: LineageRequestTelemetry,
+}
+
+struct BuiltPack {
+    bytes: Vec<u8>,
+    telemetry: PackTelemetry,
 }
 
 struct UsageSample {
     elapsed: StdDuration,
     telemetry: PackTelemetry,
-    cache_outcome: PackCacheOutcome,
     refresh_checked: bool,
     refresh_updated: bool,
     route: &'static str,
     term_count: usize,
     scope_count: usize,
     client_profile: &'static str,
-    reuse: ReuseIdentityInput,
-}
-
-#[derive(Clone, Default)]
-struct ReuseIdentityInput {
-    prompt: String,
-    terms: Vec<String>,
-    scope: Vec<String>,
-    options: Value,
-    evidence: Value,
-    refresh_signature: String,
-    lineage_seed: String,
-}
-
-#[derive(Clone, Copy, Default)]
-struct ReuseOutcome {
-    exact_eligible: bool,
-    frontier_eligible: bool,
-    delta_eligible: bool,
-    lineage_eligible: bool,
-    exact_hit: bool,
-    frontier_hit: bool,
-    delta_adopted: bool,
-    miss_cause: Option<&'static str>,
-    repeat_distance: Option<&'static str>,
-}
-
-const REUSE_MISS_CAUSES: [&str; 6] = [
-    "cold_or_restart",
-    "expired",
-    "invalidated_generation_or_signature",
-    "request_variant",
-    "scope_or_options_variant",
-    "evidence_state_variant",
-];
-const REPEAT_DISTANCE_BUCKETS: [&str; 5] = [
-    "same_15m_slot",
-    "within_30m_idle_window",
-    "30m_to_2h",
-    "2h_to_1d",
-    "1d_to_30d",
-];
-
-struct BuiltPack {
-    bytes: Vec<u8>,
-    telemetry: PackTelemetry,
-    validity: ValidityCertificate,
 }
 
 const CLIENT_PROFILE_BUCKETS: [&str; 6] =
@@ -1121,34 +696,13 @@ struct EngineMetrics {
     operations: Mutex<BTreeMap<&'static str, OperationMetric>>,
     active_references: AtomicU64,
     total_references: AtomicU64,
-    l0_hits: AtomicU64,
-    l0_misses: AtomicU64,
-    l0_singleflight_hits: AtomicU64,
-    l0_cold_or_invalidated_misses: AtomicU64,
-    l0_request_variant_misses: AtomicU64,
-    l0_invalidations: AtomicU64,
-    l0_invalidated_entries: AtomicU64,
     lookup_cache_hits: AtomicU64,
     lookup_cache_misses: AtomicU64,
-    l1_exact_hits: AtomicU64,
-    l1_approximate_hits: AtomicU64,
-    lineage_eligible_opportunities: AtomicU64,
-    lineage_safe_hits: AtomicU64,
-    lineage_fallbacks: AtomicU64,
-    lineage_latency_saved_micros: AtomicU64,
-    lineage_isolation_rejections: AtomicU64,
-    lineage_dirty_rejections: AtomicU64,
-    lineage_divergent_rejections: AtomicU64,
-    lineage_stale_index_rejections: AtomicU64,
-    lineage_governed_corpus_rejections: AtomicU64,
-    lineage_missing_candidate_rejections: AtomicU64,
-    lineage_capacity_rejections: AtomicU64,
-    retrieval_misses: AtomicU64,
+    retrieval_requests: AtomicU64,
     refreshes: AtomicU64,
     full_refreshes: AtomicU64,
     incremental_refreshes: AtomicU64,
     incremental_fallbacks: AtomicU64,
-    lineage_git_checks: AtomicU64,
     signature_scan_micros: AtomicU64,
     git_diff_hits: AtomicU64,
     git_diff_misses: AtomicU64,
@@ -1161,7 +715,6 @@ struct EngineMetrics {
     refresh_micros: AtomicU64,
     index_state_io_micros: AtomicU64,
     retrieval_micros: AtomicU64,
-    cache_state_io_micros: AtomicU64,
     serialization_micros: AtomicU64,
     pack_input_tokens_est: AtomicU64,
     pack_selected_source_tokens_est: AtomicU64,
@@ -1265,8 +818,6 @@ impl EngineMetrics {
     fn record_pack_phase_telemetry(&self, telemetry: PackTelemetry) {
         self.retrieval_micros
             .fetch_add(telemetry.retrieval_micros, Ordering::Relaxed);
-        self.cache_state_io_micros
-            .fetch_add(telemetry.cache_state_io_micros, Ordering::Relaxed);
         self.serialization_micros
             .fetch_add(telemetry.serialization_micros, Ordering::Relaxed);
     }
@@ -1312,7 +863,6 @@ struct RefreshShared {
     freshness: Arc<FreshnessState>,
     project_id: String,
     metrics: Arc<EngineMetrics>,
-    frontiers: Arc<Mutex<FrontierState>>,
     index_snapshot_path: std::path::PathBuf,
     git_diff_cache: Arc<Mutex<GitDiffCache>>,
     #[cfg(test)]
@@ -1734,7 +1284,6 @@ type RefreshHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 pub struct UsageMonitor {
     store: StateStore,
     enabled: AtomicBool,
-    identity_salt: String,
     update_lock: Mutex<()>,
 }
 
@@ -1748,40 +1297,20 @@ impl UsageMonitor {
         let current_config = store.get_json("monitor:config")?.filter(|config| {
             config.get("schema").and_then(Value::as_str) == Some(USAGE_CONFIG_SCHEMA)
                 && config.get("enabled").and_then(Value::as_bool).is_some()
-                && config.get("identity_salt_version").and_then(Value::as_str)
-                    == Some(REUSE_IDENTITY_VERSION)
-                && config
-                    .get("identity_salt")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| {
-                        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    })
         });
         let enabled = current_config
             .as_ref()
             .and_then(|config| config.get("enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let identity_salt = current_config
-            .as_ref()
-            .and_then(|config| config.get("identity_salt"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
         let config = json!({
             "schema": USAGE_CONFIG_SCHEMA,
             "enabled": enabled,
-            "identity_salt_version": REUSE_IDENTITY_VERSION,
-            "identity_salt": identity_salt,
         });
         store.put_json("monitor:config", &config)?;
         Ok(Self {
             store,
             enabled: AtomicBool::new(enabled),
-            identity_salt: config["identity_salt"]
-                .as_str()
-                .expect("stored monitor salt is a string")
-                .to_owned(),
             update_lock: Mutex::new(()),
         })
     }
@@ -1804,8 +1333,6 @@ impl UsageMonitor {
                     &json!({
                         "schema":USAGE_CONFIG_SCHEMA,
                         "enabled":enabled,
-                        "identity_salt_version": REUSE_IDENTITY_VERSION,
-                        "identity_salt": self.identity_salt,
                     }),
                 )?;
                 self.status()
@@ -1891,39 +1418,19 @@ impl UsageMonitor {
             .map_err(|_| anyhow!("usage monitor lock poisoned"))?;
         let day = observed_at.date().to_string();
         let key = format!("monitor:usage:{day}:{project_id}");
-        let reuse = self.classify_and_record_reuse(project_id, &sample, observed_at)?;
         let mut value = self
             .store
             .get_json(&key)?
             .filter(|bucket| is_current_usage_bucket(bucket))
             .unwrap_or_else(|| {
                 json!({
-                    "schema": USAGE_BUCKET_SCHEMA,
-                    "day": day,
-                    "project_id": project_id,
-                    "request_count": 0,
-                    "elapsed_micros_total": 0,
-                    "elapsed_micros_max": 0,
-                    "input_tokens_est": 0,
-                    "wire_tokens_est": 0,
-                    "candidate_count": 0,
-                    "selected_count": 0,
-                    "tokens_saved_est": 0,
-                    "delta_tokens_saved_est": 0,
-                    "cache_outcomes": {},
-                    "frontier_outcomes": {},
-                    "lineage_frontier": {},
-                    "index": {},
-                    "delta": {},
-                    "routes": {},
-                    "term_count_buckets": {},
-                    "scope_count_buckets": {},
-                    "stages_micros": {},
+                    "schema": USAGE_BUCKET_SCHEMA, "day": day, "project_id": project_id,
+                    "request_count": 0, "elapsed_micros_total": 0, "elapsed_micros_max": 0,
+                    "input_tokens_est": 0, "wire_tokens_est": 0, "candidate_count": 0,
+                    "selected_count": 0, "tokens_saved_est": 0, "delta_tokens_saved_est": 0,
+                    "index": {}, "delta": {}, "routes": {}, "term_count_buckets": {},
+                    "scope_count_buckets": {}, "stages_micros": {},
                     "client_profiles": empty_client_profile_buckets(),
-                    "reuse_opportunities": {},
-                    "reuse_effectiveness": {},
-                    "miss_causes": empty_named_counters(&REUSE_MISS_CAUSES),
-                    "repeat_distance_buckets": empty_named_counters(&REPEAT_DISTANCE_BUCKETS),
                 })
             });
         let telemetry = sample.telemetry;
@@ -1935,115 +1442,35 @@ impl UsageMonitor {
             .and_then(Value::as_u64)
             .unwrap_or_default();
         value["elapsed_micros_max"] = Value::from(previous_max.max(elapsed_micros));
-        increment_json_u64(
-            &mut value,
-            "input_tokens_est",
-            u64::from(telemetry.input_tokens_est),
-        );
-        increment_json_u64(
-            &mut value,
-            "wire_tokens_est",
-            u64::from(telemetry.wire_tokens_est),
-        );
-        increment_json_u64(
-            &mut value,
-            "candidate_count",
-            u64::from(telemetry.candidate_count),
-        );
-        increment_json_u64(
-            &mut value,
-            "selected_count",
-            u64::from(telemetry.selected_count),
-        );
-        increment_json_u64(
-            &mut value,
-            "tokens_saved_est",
-            u64::from(telemetry.tokens_saved_est),
-        );
-        increment_json_u64(
-            &mut value,
-            "delta_tokens_saved_est",
-            u64::from(telemetry.delta_tokens_saved_est),
-        );
-        increment_json_nested(
-            &mut value,
-            "cache_outcomes",
-            match sample.cache_outcome {
-                PackCacheOutcome::Uncached => "uncached",
-                PackCacheOutcome::L0Hit => "l0_hit",
-                PackCacheOutcome::L0Miss => "l0_miss",
-                PackCacheOutcome::L0Singleflight => "l0_singleflight",
-            },
-            1,
-        );
-        if matches!(
-            sample.cache_outcome,
-            PackCacheOutcome::Uncached | PackCacheOutcome::L0Miss
-        ) {
-            increment_json_nested(
-                &mut value,
-                "frontier_outcomes",
-                match telemetry.frontier_outcome {
-                    FrontierOutcome::Search => "search",
-                    FrontierOutcome::ExactHit => "exact_hit",
-                    FrontierOutcome::NegativeHit => "negative_hit",
-                    FrontierOutcome::Admitted => "admitted",
-                    FrontierOutcome::CapacityFallback => "capacity_fallback",
-                    FrontierOutcome::SourceFallback => "source_fallback",
-                    FrontierOutcome::LineageHit => "lineage_hit",
-                },
-                1,
-            );
-            record_lineage_telemetry(&mut value, telemetry.lineage);
+        for (field, count) in [
+            ("input_tokens_est", telemetry.input_tokens_est),
+            ("wire_tokens_est", telemetry.wire_tokens_est),
+            ("candidate_count", telemetry.candidate_count),
+            ("selected_count", telemetry.selected_count),
+            ("tokens_saved_est", telemetry.tokens_saved_est),
+            ("delta_tokens_saved_est", telemetry.delta_tokens_saved_est),
+        ] {
+            increment_json_u64(&mut value, field, u64::from(count));
         }
-        increment_json_nested(
-            &mut value,
-            "index",
-            "refresh_checked",
-            u64::from(sample.refresh_checked),
-        );
-        increment_json_nested(
-            &mut value,
-            "index",
-            "refresh_updated",
-            u64::from(sample.refresh_updated),
-        );
-        increment_json_nested(
-            &mut value,
-            "delta",
-            "base_pack_requests",
-            u64::from(telemetry.base_pack_used),
-        );
-        increment_json_nested(
-            &mut value,
-            "delta",
-            "known_evidence_requests",
-            u64::from(telemetry.known_evidence_used),
-        );
-        increment_json_nested(
-            &mut value,
-            "delta",
-            "continuation_requests",
-            u64::from(telemetry.continuation_requested),
-        );
-        increment_json_nested(
-            &mut value,
-            "delta",
-            "continuation_reuses",
-            u64::from(telemetry.continuation_reused),
-        );
-        increment_json_nested(
-            &mut value,
-            "delta",
-            "continuation_fallbacks",
-            u64::from(telemetry.continuation_fallback),
-        );
-        increment_json_nested(
-            &mut value,
-            "delta",
-            "continuation_explicit_overrides",
-            u64::from(telemetry.explicit_delta_override),
-        );
+        for (field, count) in [
+            ("refresh_checked", sample.refresh_checked),
+            ("refresh_updated", sample.refresh_updated),
+        ] {
+            increment_json_nested(&mut value, "index", field, u64::from(count));
+        }
+        for (field, count) in [
+            ("base_pack_requests", telemetry.base_pack_used),
+            ("known_evidence_requests", telemetry.known_evidence_used),
+            ("continuation_requests", telemetry.continuation_requested),
+            ("continuation_reuses", telemetry.continuation_reused),
+            ("continuation_fallbacks", telemetry.continuation_fallback),
+            (
+                "continuation_explicit_overrides",
+                telemetry.explicit_delta_override,
+            ),
+        ] {
+            increment_json_nested(&mut value, "delta", field, u64::from(count));
+        }
         increment_json_nested(
             &mut value,
             "delta",
@@ -2067,217 +1494,22 @@ impl UsageMonitor {
             coarse_count_bucket(sample.scope_count),
             1,
         );
-        record_reuse_outcome(&mut value, reuse);
-        match sample.cache_outcome {
-            PackCacheOutcome::L0Hit | PackCacheOutcome::L0Singleflight => {
-                increment_json_nested(&mut value, "stages_micros", "cache", elapsed_micros);
-            }
-            PackCacheOutcome::Uncached | PackCacheOutcome::L0Miss => {
-                increment_json_nested(
-                    &mut value,
-                    "stages_micros",
-                    "retrieval",
-                    telemetry.retrieval_micros,
-                );
-                increment_json_nested(
-                    &mut value,
-                    "stages_micros",
-                    "pack_build",
-                    telemetry.pack_build_micros,
-                );
-            }
-        }
-        record_client_profile_sample(
+        increment_json_nested(
             &mut value,
-            sample.client_profile,
-            &sample,
-            reuse,
-            elapsed_micros,
+            "stages_micros",
+            "retrieval",
+            telemetry.retrieval_micros,
         );
+        increment_json_nested(
+            &mut value,
+            "stages_micros",
+            "pack_build",
+            telemetry.pack_build_micros,
+        );
+        record_client_profile_sample(&mut value, sample.client_profile, &sample, elapsed_micros);
         self.store.put_json(&key, &value)?;
         self.prune()?;
         Ok(())
-    }
-
-    fn classify_and_record_reuse(
-        &self,
-        project_id: &str,
-        sample: &UsageSample,
-        observed_at: OffsetDateTime,
-    ) -> Result<ReuseOutcome> {
-        let slot = reuse_time_slot(observed_at);
-        let prompt = self.reuse_sketch("prompt", &json!(sample.reuse.prompt))?;
-        let terms = self.reuse_sketch("terms", &json!(sample.reuse.terms))?;
-        let scope = self.reuse_sketch("scope", &json!(sample.reuse.scope))?;
-        let options = self.reuse_sketch("options", &sample.reuse.options)?;
-        let evidence = self.reuse_sketch("evidence", &sample.reuse.evidence)?;
-        let exact = self.reuse_sketch("exact", &json!([&prompt, &scope, &options, &evidence]))?;
-        let frontier = self.reuse_sketch("frontier", &json!([&terms, &scope]))?;
-        let scope_options = self.reuse_sketch("scope_options", &json!([&scope, &options]))?;
-        let lineage = self.reuse_sketch("lineage", &json!(sample.reuse.lineage_seed))?;
-        let signature = self.reuse_sketch(
-            "generation_signature",
-            &json!(sample.reuse.refresh_signature),
-        )?;
-
-        let mut state = self
-            .store
-            .get_json("monitor:reuse:state")?
-            .filter(|value| {
-                value.get("schema").and_then(Value::as_str)
-                    == Some("context_monitor_reuse.state.v1")
-            })
-            .unwrap_or_else(empty_reuse_state);
-        let entries = state
-            .get("entries")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| {
-                entry
-                    .get("last_slot")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|last| slot.saturating_sub(last) <= REUSE_RETENTION_SLOTS)
-            })
-            .collect::<Vec<_>>();
-        let local = entries
-            .iter()
-            .filter(|entry| entry.get("project_id").and_then(Value::as_str) == Some(project_id))
-            .collect::<Vec<_>>();
-        let prior_exact = newest_reuse_entry(&local, "exact", &exact);
-        let prior_frontier = newest_reuse_entry(&local, "frontier", &frontier);
-        let prior_prompt = newest_reuse_entry(&local, "prompt", &prompt);
-        let prior_scope_options = newest_reuse_entry(&local, "scope_options", &scope_options);
-        let prior_lineage = entries
-            .iter()
-            .filter(|entry| {
-                entry.get("project_id").and_then(Value::as_str) != Some(project_id)
-                    && entry.get("lineage").and_then(Value::as_str) == Some(lineage.as_str())
-                    && (entry.get("exact").and_then(Value::as_str) == Some(exact.as_str())
-                        || entry.get("frontier").and_then(Value::as_str) == Some(frontier.as_str()))
-            })
-            .max_by_key(|entry| {
-                entry
-                    .get("last_slot")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default()
-            });
-
-        let exact_hit = matches!(
-            sample.cache_outcome,
-            PackCacheOutcome::L0Hit | PackCacheOutcome::L0Singleflight
-        );
-        let exact_eligible = prior_exact.is_some() || exact_hit;
-        let frontier_eligible = matches!(
-            sample.cache_outcome,
-            PackCacheOutcome::Uncached | PackCacheOutcome::L0Miss
-        ) && prior_frontier.is_some();
-        let delta_eligible = prior_exact.is_some() || prior_frontier.is_some();
-        let lineage_eligible = prior_lineage.is_some();
-        let frontier_hit = frontier_eligible
-            && matches!(
-                sample.telemetry.frontier_outcome,
-                FrontierOutcome::ExactHit
-                    | FrontierOutcome::NegativeHit
-                    | FrontierOutcome::LineageHit
-            );
-        let delta_adopted = delta_eligible
-            && (sample.telemetry.base_pack_used || sample.telemetry.known_evidence_used);
-
-        let miss_cause = if !matches!(sample.cache_outcome, PackCacheOutcome::L0Miss) {
-            None
-        } else if let Some(previous) = prior_exact {
-            let distance = slot.saturating_sub(reuse_entry_slot(previous));
-            if distance > REUSE_IDLE_SLOTS {
-                Some("expired")
-            } else if previous.get("signature").and_then(Value::as_str) != Some(signature.as_str())
-            {
-                Some("invalidated_generation_or_signature")
-            } else {
-                Some("cold_or_restart")
-            }
-        } else if prior_prompt.is_some_and(|previous| {
-            previous.get("scope_options").and_then(Value::as_str) == Some(scope_options.as_str())
-                && previous.get("evidence").and_then(Value::as_str) != Some(evidence.as_str())
-        }) {
-            Some("evidence_state_variant")
-        } else if prior_prompt.is_some() {
-            Some("scope_or_options_variant")
-        } else if prior_frontier.is_some() || prior_scope_options.is_some() {
-            Some("request_variant")
-        } else {
-            Some("cold_or_restart")
-        };
-
-        let nearest_slot = [prior_exact, prior_frontier, prior_lineage]
-            .into_iter()
-            .flatten()
-            .map(reuse_entry_slot)
-            .max();
-        let repeat_distance =
-            nearest_slot.map(|last| repeat_distance_bucket(slot.saturating_sub(last)));
-
-        let mut retained = entries
-            .into_iter()
-            .filter(|entry| {
-                !(entry.get("project_id").and_then(Value::as_str) == Some(project_id)
-                    && entry.get("exact").and_then(Value::as_str) == Some(exact.as_str()))
-            })
-            .collect::<Vec<_>>();
-        retained.push(json!({
-            "schema": "context_monitor_reuse.entry.v1",
-            "project_id": project_id,
-            "identity_version": REUSE_IDENTITY_VERSION,
-            "exact": exact,
-            "prompt": prompt,
-            "frontier": frontier,
-            "scope_options": scope_options,
-            "evidence": evidence,
-            "lineage": lineage,
-            "signature": signature,
-            "last_slot": slot,
-        }));
-        retained.sort_by(|left, right| {
-            reuse_entry_slot(right)
-                .cmp(&reuse_entry_slot(left))
-                .then_with(|| {
-                    left.get("exact")
-                        .and_then(Value::as_str)
-                        .cmp(&right.get("exact").and_then(Value::as_str))
-                })
-        });
-        retained.truncate(REUSE_TRACKER_MAX_ENTRIES);
-        state = json!({
-            "schema": "context_monitor_reuse.state.v1",
-            "identity_version": REUSE_IDENTITY_VERSION,
-            "slot_minutes": REUSE_SLOT_MINUTES,
-            "max_entries": REUSE_TRACKER_MAX_ENTRIES,
-            "entries": retained,
-        });
-        self.store.put_json("monitor:reuse:state", &state)?;
-
-        Ok(ReuseOutcome {
-            exact_eligible,
-            frontier_eligible,
-            delta_eligible,
-            lineage_eligible,
-            exact_hit,
-            frontier_hit,
-            delta_adopted,
-            miss_cause,
-            repeat_distance,
-        })
-    }
-
-    fn reuse_sketch(&self, namespace: &str, value: &Value) -> Result<String> {
-        let encoded = serde_json::to_vec(&json!({
-            "version": REUSE_IDENTITY_VERSION,
-            "salt": self.identity_salt,
-            "namespace": namespace,
-            "value": value,
-        }))?;
-        Ok(digest_id("ru_", &encoded))
     }
 
     pub fn record_rejection(&self, class: ContextPackRejectionClass) -> Result<()> {
@@ -2344,27 +1576,6 @@ impl UsageMonitor {
             );
         }
         self.store.delete_batch(&remove)?;
-        if let Some(mut state) = self.store.get_json("monitor:reuse:state")? {
-            let slot = reuse_time_slot(OffsetDateTime::now_utc());
-            let mut entries = state
-                .get("entries")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|entry| {
-                    entry
-                        .get("last_slot")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|last| slot.saturating_sub(last) <= REUSE_RETENTION_SLOTS)
-                })
-                .collect::<Vec<_>>();
-            entries.sort_by_key(|entry| std::cmp::Reverse(reuse_entry_slot(entry)));
-            entries.truncate(REUSE_TRACKER_MAX_ENTRIES);
-            state = empty_reuse_state();
-            state["entries"] = Value::Array(entries);
-            self.store.put_json("monitor:reuse:state", &state)?;
-        }
         Ok(())
     }
 
@@ -2392,7 +1603,6 @@ impl UsageMonitor {
                 .cmp(&right.get("day").and_then(Value::as_str))
         });
         for bucket in &mut buckets {
-            add_reuse_report(bucket);
             add_client_profile_report(bucket);
         }
         let mut rejection_buckets = self
@@ -2601,116 +1811,8 @@ fn monitor_report_response(
     })
 }
 
-fn empty_reuse_state() -> Value {
-    json!({
-        "schema": "context_monitor_reuse.state.v1",
-        "identity_version": REUSE_IDENTITY_VERSION,
-        "slot_minutes": REUSE_SLOT_MINUTES,
-        "max_entries": REUSE_TRACKER_MAX_ENTRIES,
-        "entries": [],
-    })
-}
-
-fn reuse_time_slot(observed_at: OffsetDateTime) -> u64 {
-    let divisor = REUSE_SLOT_MINUTES.saturating_mul(60);
-    u64::try_from(observed_at.unix_timestamp().div_euclid(divisor)).unwrap_or_default()
-}
-
-fn reuse_entry_slot(entry: &Value) -> u64 {
-    entry
-        .get("last_slot")
-        .and_then(Value::as_u64)
-        .unwrap_or_default()
-}
-
-fn newest_reuse_entry<'a>(entries: &[&'a Value], field: &str, expected: &str) -> Option<&'a Value> {
-    entries
-        .iter()
-        .copied()
-        .filter(|entry| entry.get(field).and_then(Value::as_str) == Some(expected))
-        .max_by_key(|entry| reuse_entry_slot(entry))
-}
-
-fn repeat_distance_bucket(distance_slots: u64) -> &'static str {
-    match distance_slots {
-        0 => "same_15m_slot",
-        1..=REUSE_IDLE_SLOTS => "within_30m_idle_window",
-        3..=8 => "30m_to_2h",
-        9..=96 => "2h_to_1d",
-        _ => "1d_to_30d",
-    }
-}
-
-fn empty_named_counters(names: &[&str]) -> Value {
-    let mut counters = serde_json::Map::new();
-    for name in names {
-        counters.insert((*name).to_owned(), Value::from(0));
-    }
-    Value::Object(counters)
-}
-
 fn is_current_usage_bucket(bucket: &Value) -> bool {
     bucket.get("schema").and_then(Value::as_str) == Some(USAGE_BUCKET_SCHEMA)
-}
-
-fn record_reuse_outcome(bucket: &mut Value, outcome: ReuseOutcome) {
-    for (field, eligible) in [
-        ("exact", outcome.exact_eligible),
-        ("frontier", outcome.frontier_eligible),
-        ("delta", outcome.delta_eligible),
-        ("lineage", outcome.lineage_eligible),
-    ] {
-        increment_json_nested(bucket, "reuse_opportunities", field, u64::from(eligible));
-    }
-    for (field, effective) in [
-        ("exact_hits", outcome.exact_hit && outcome.exact_eligible),
-        ("frontier_hits", outcome.frontier_hit),
-        ("delta_adoptions", outcome.delta_adopted),
-    ] {
-        increment_json_nested(bucket, "reuse_effectiveness", field, u64::from(effective));
-    }
-    if let Some(cause) = outcome.miss_cause {
-        increment_json_nested(bucket, "miss_causes", cause, 1);
-    }
-    if let Some(distance) = outcome.repeat_distance {
-        increment_json_nested(bucket, "repeat_distance_buckets", distance, 1);
-    }
-}
-
-fn record_lineage_telemetry(bucket: &mut Value, telemetry: LineageRequestTelemetry) {
-    for (field, value) in [
-        ("eligible_opportunities", u64::from(telemetry.eligible)),
-        ("safe_hits", u64::from(telemetry.safe_hit)),
-        ("fallbacks", u64::from(telemetry.fallback)),
-        (
-            "isolation_rejections",
-            u64::from(telemetry.isolation_rejection),
-        ),
-        (
-            "latency_saved_micros_est",
-            telemetry.latency_saved_micros_est,
-        ),
-    ] {
-        increment_json_nested(bucket, "lineage_frontier", field, value);
-    }
-}
-
-fn add_reuse_report(bucket: &mut Value) {
-    let raw_hits = sum_nested_fields(bucket, "cache_outcomes", &["l0_hit", "l0_singleflight"]);
-    let raw_attempts =
-        raw_hits.saturating_add(sum_nested_fields(bucket, "cache_outcomes", &["l0_miss"]));
-    let exact = sum_nested_fields(bucket, "reuse_opportunities", &["exact"]);
-    let frontier = sum_nested_fields(bucket, "reuse_opportunities", &["frontier"]);
-    let delta = sum_nested_fields(bucket, "reuse_opportunities", &["delta"]);
-    let exact_hits = sum_nested_fields(bucket, "reuse_effectiveness", &["exact_hits"]);
-    let frontier_hits = sum_nested_fields(bucket, "reuse_effectiveness", &["frontier_hits"]);
-    let delta_adoptions = sum_nested_fields(bucket, "reuse_effectiveness", &["delta_adoptions"]);
-    bucket["opportunity_normalized"] = json!({
-        "raw_l0_hit_rate_millis": scaled_ratio(raw_hits, raw_attempts, 1_000),
-        "exact_effectiveness_millis": scaled_ratio(exact_hits, exact, 1_000),
-        "frontier_effectiveness_millis": scaled_ratio(frontier_hits, frontier, 1_000),
-        "delta_adoption_millis": scaled_ratio(delta_adoptions, delta, 1_000),
-    });
 }
 
 fn empty_client_profile_buckets() -> Value {
@@ -2731,15 +1833,8 @@ fn empty_client_profile_bucket(profile: &str) -> Value {
         "wire_tokens_est": 0,
         "tokens_saved_est": 0,
         "delta_tokens_saved_est": 0,
-        "cache_outcomes": {},
-        "frontier_outcomes": {},
-        "lineage_frontier": {},
         "routes": {},
         "delta": {},
-        "reuse_opportunities": {},
-        "reuse_effectiveness": {},
-        "miss_causes": empty_named_counters(&REUSE_MISS_CAUSES),
-        "repeat_distance_buckets": empty_named_counters(&REPEAT_DISTANCE_BUCKETS),
     })
 }
 
@@ -2801,7 +1896,6 @@ fn record_client_profile_sample(
     bucket: &mut Value,
     profile: &str,
     sample: &UsageSample,
-    reuse: ReuseOutcome,
     elapsed_micros: u64,
 ) {
     if !bucket.get("client_profiles").is_some_and(Value::is_object) {
@@ -2813,98 +1907,33 @@ fn record_client_profile_sample(
     {
         bucket["client_profiles"][profile] = empty_client_profile_bucket(profile);
     }
-    let profile_bucket = &mut bucket["client_profiles"][profile];
+    let target = &mut bucket["client_profiles"][profile];
     let telemetry = sample.telemetry;
-    increment_json_u64(profile_bucket, "request_count", 1);
-    increment_json_u64(profile_bucket, "elapsed_micros_total", elapsed_micros);
-    let previous_max = profile_bucket
+    increment_json_u64(target, "request_count", 1);
+    increment_json_u64(target, "elapsed_micros_total", elapsed_micros);
+    let previous_max = target
         .get("elapsed_micros_max")
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    profile_bucket["elapsed_micros_max"] = Value::from(previous_max.max(elapsed_micros));
-    increment_json_u64(
-        profile_bucket,
-        "input_tokens_est",
-        u64::from(telemetry.input_tokens_est),
-    );
-    increment_json_u64(
-        profile_bucket,
-        "wire_tokens_est",
-        u64::from(telemetry.wire_tokens_est),
-    );
-    increment_json_u64(
-        profile_bucket,
-        "tokens_saved_est",
-        u64::from(telemetry.tokens_saved_est),
-    );
-    increment_json_u64(
-        profile_bucket,
-        "delta_tokens_saved_est",
-        u64::from(telemetry.delta_tokens_saved_est),
-    );
-    increment_json_nested(
-        profile_bucket,
-        "cache_outcomes",
-        match sample.cache_outcome {
-            PackCacheOutcome::Uncached => "uncached",
-            PackCacheOutcome::L0Hit => "l0_hit",
-            PackCacheOutcome::L0Miss => "l0_miss",
-            PackCacheOutcome::L0Singleflight => "l0_singleflight",
-        },
-        1,
-    );
-    if matches!(
-        sample.cache_outcome,
-        PackCacheOutcome::Uncached | PackCacheOutcome::L0Miss
-    ) {
-        increment_json_nested(
-            profile_bucket,
-            "frontier_outcomes",
-            match telemetry.frontier_outcome {
-                FrontierOutcome::Search => "search",
-                FrontierOutcome::ExactHit => "exact_hit",
-                FrontierOutcome::NegativeHit => "negative_hit",
-                FrontierOutcome::Admitted => "admitted",
-                FrontierOutcome::CapacityFallback => "capacity_fallback",
-                FrontierOutcome::SourceFallback => "source_fallback",
-                FrontierOutcome::LineageHit => "lineage_hit",
-            },
-            1,
-        );
-        record_lineage_telemetry(profile_bucket, telemetry.lineage);
+    target["elapsed_micros_max"] = Value::from(previous_max.max(elapsed_micros));
+    for (field, count) in [
+        ("input_tokens_est", telemetry.input_tokens_est),
+        ("wire_tokens_est", telemetry.wire_tokens_est),
+        ("tokens_saved_est", telemetry.tokens_saved_est),
+        ("delta_tokens_saved_est", telemetry.delta_tokens_saved_est),
+    ] {
+        increment_json_u64(target, field, u64::from(count));
     }
-    increment_json_nested(profile_bucket, "routes", sample.route, 1);
-    increment_json_nested(
-        profile_bucket,
-        "delta",
-        "base_pack_requests",
-        u64::from(telemetry.base_pack_used),
-    );
-    increment_json_nested(
-        profile_bucket,
-        "delta",
-        "known_evidence_requests",
-        u64::from(telemetry.known_evidence_used),
-    );
-    increment_json_nested(
-        profile_bucket,
-        "delta",
-        "continuation_requests",
-        u64::from(telemetry.continuation_requested),
-    );
-    increment_json_nested(
-        profile_bucket,
-        "delta",
-        "continuation_reuses",
-        u64::from(telemetry.continuation_reused),
-    );
-    increment_json_nested(
-        profile_bucket,
-        "delta",
-        "continuation_fallbacks",
-        u64::from(telemetry.continuation_fallback),
-    );
-    record_reuse_outcome(profile_bucket, reuse);
+    increment_json_nested(target, "routes", sample.route, 1);
+    for (field, value) in [
+        ("base_pack_requests", telemetry.base_pack_used),
+        ("known_evidence_requests", telemetry.known_evidence_used),
+        ("continuation_requests", telemetry.continuation_requested),
+        ("continuation_reuses", telemetry.continuation_reused),
+        ("continuation_fallbacks", telemetry.continuation_fallback),
+    ] {
+        increment_json_nested(target, "delta", field, u64::from(value));
+    }
 }
 
 fn add_client_profile_report(bucket: &mut Value) {
@@ -2918,7 +1947,7 @@ fn add_client_profile_report(bucket: &mut Value) {
         .map(|profile| {
             stored
                 .get(*profile)
-                .and_then(|value| value.get("request_count"))
+                .and_then(|row| row.get("request_count"))
                 .and_then(Value::as_u64)
                 .unwrap_or_default()
         })
@@ -2930,7 +1959,6 @@ fn add_client_profile_report(bucket: &mut Value) {
                 .get(*profile)
                 .cloned()
                 .unwrap_or_else(|| empty_client_profile_bucket(profile));
-            add_reuse_report(&mut value);
             let requests = value
                 .get("request_count")
                 .and_then(Value::as_u64)
@@ -2951,35 +1979,19 @@ fn add_client_profile_report(bucket: &mut Value) {
                 .get("tokens_saved_est")
                 .and_then(Value::as_u64)
                 .unwrap_or_default();
-            let cache_hits =
-                sum_nested_fields(&value, "cache_outcomes", &["l0_hit", "l0_singleflight"]);
-            let frontier_hits =
-                sum_nested_fields(&value, "frontier_outcomes", &["exact_hit", "negative_hit"]);
-            let frontier_requests = value
-                .get("frontier_outcomes")
-                .and_then(Value::as_object)
-                .map(|outcomes| {
-                    outcomes
-                        .values()
-                        .filter_map(Value::as_u64)
-                        .fold(0_u64, u64::saturating_add)
-                })
-                .unwrap_or_default();
-            let delta_reuse = value
-                .pointer("/delta/base_pack_requests")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
             value["usage_share_millis"] =
                 Value::from(scaled_ratio(requests, profiled_requests, 1_000));
             value["avg_elapsed_micros"] = Value::from(divide_or_zero(elapsed, requests));
             value["input_to_wire_ratio_millis"] = Value::from(scaled_ratio(input, wire, 1_000));
             value["avg_tokens_saved_est"] = Value::from(divide_or_zero(saved, requests));
-            value["cache_hit_share_millis"] =
-                Value::from(scaled_ratio(cache_hits, requests, 1_000));
-            value["frontier_hit_share_millis"] =
-                Value::from(scaled_ratio(frontier_hits, frontier_requests, 1_000));
-            value["delta_reuse_share_millis"] =
-                Value::from(scaled_ratio(delta_reuse, requests, 1_000));
+            value["delta_reuse_share_millis"] = Value::from(scaled_ratio(
+                value
+                    .pointer("/delta/base_pack_requests")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                requests,
+                1_000,
+            ));
             let mut route_shares = serde_json::Map::new();
             for route in CONTEXT_PACK_ROUTE_BUCKETS {
                 let count = value
@@ -2999,19 +2011,6 @@ fn add_client_profile_report(bucket: &mut Value) {
         .collect::<Vec<_>>();
     bucket["profiled_request_count"] = Value::from(profiled_requests);
     bucket["client_profiles"] = Value::Array(profiles);
-}
-
-fn sum_nested_fields(value: &Value, section: &str, fields: &[&str]) -> u64 {
-    value
-        .get(section)
-        .and_then(Value::as_object)
-        .map(|values| {
-            fields
-                .iter()
-                .filter_map(|field| values.get(*field).and_then(Value::as_u64))
-                .fold(0_u64, u64::saturating_add)
-        })
-        .unwrap_or_default()
 }
 
 fn scaled_ratio(numerator: u64, denominator: u64, scale: u64) -> u64 {
@@ -3116,19 +2115,13 @@ pub struct ProjectEngine {
     store: Arc<StateStore>,
     wiki_index: RwLock<Arc<WikiSearchIndex>>,
     project_id: String,
-    l0: Cache<PackCacheKey, Arc<CachedPack>>,
     lookup_cache: Mutex<LookupCacheState>,
-    frontiers: Arc<Mutex<FrontierState>>,
-    frontier_admissions: Mutex<FrontierAdmissionTracker>,
     pack_snapshots: Mutex<HashMap<String, Arc<PackSnapshot>>>,
     continuation_lock: Mutex<()>,
     deferred_references: Mutex<HashMap<String, ReferenceValidation>>,
     freshness: Arc<FreshnessState>,
     metrics: Arc<EngineMetrics>,
     usage_monitor: Arc<UsageMonitor>,
-    lineage_seed: String,
-    governed_lineage: Option<GovernedFrontierLineage>,
-    shared_frontiers: Option<Arc<SharedFrontierCache>>,
     #[cfg(test)]
     index_snapshot_path: std::path::PathBuf,
     #[cfg(test)]
@@ -3177,67 +2170,14 @@ impl ProjectEngine {
         usage_monitor: Arc<UsageMonitor>,
         control: Option<&WorkControl>,
     ) -> Result<Self> {
-        Self::build_with_state_and_l0_idle(
-            root,
-            project_state,
-            project_id,
-            StdDuration::from_secs(30 * 60),
-            usage_monitor,
-            None,
-            None,
-            control,
-        )
+        Self::build_inner(root, project_state, project_id, usage_monitor, control)
     }
 
-    pub fn build_with_governed_frontiers(
+    fn build_inner(
         root: impl AsRef<std::path::Path>,
         project_state: impl AsRef<std::path::Path>,
         project_id: impl Into<String>,
         usage_monitor: Arc<UsageMonitor>,
-        governed_lineage: GovernedFrontierLineage,
-        shared_frontiers: Arc<SharedFrontierCache>,
-    ) -> Result<Self> {
-        Self::build_with_governed_frontiers_controlled(
-            root,
-            project_state,
-            project_id,
-            usage_monitor,
-            governed_lineage,
-            shared_frontiers,
-            None,
-        )
-    }
-
-    pub fn build_with_governed_frontiers_controlled(
-        root: impl AsRef<std::path::Path>,
-        project_state: impl AsRef<std::path::Path>,
-        project_id: impl Into<String>,
-        usage_monitor: Arc<UsageMonitor>,
-        governed_lineage: GovernedFrontierLineage,
-        shared_frontiers: Arc<SharedFrontierCache>,
-        control: Option<&WorkControl>,
-    ) -> Result<Self> {
-        Self::build_with_state_and_l0_idle(
-            root,
-            project_state,
-            project_id,
-            StdDuration::from_secs(30 * 60),
-            usage_monitor,
-            Some(governed_lineage),
-            Some(shared_frontiers),
-            control,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)] // Internal constructor keeps public build variants explicit.
-    fn build_with_state_and_l0_idle(
-        root: impl AsRef<std::path::Path>,
-        project_state: impl AsRef<std::path::Path>,
-        project_id: impl Into<String>,
-        l0_idle: StdDuration,
-        usage_monitor: Arc<UsageMonitor>,
-        governed_lineage: Option<GovernedFrontierLineage>,
-        shared_frontiers: Option<Arc<SharedFrontierCache>>,
         control: Option<&WorkControl>,
     ) -> Result<Self> {
         let project_id = project_id.into();
@@ -3263,7 +2203,6 @@ impl ProjectEngine {
         if let Some(control) = control {
             control.check()?;
         }
-        let frontiers = load_frontiers(&store, &index.stats().refresh_signature)?;
         let pack_snapshots = load_pack_snapshots(&store)?;
         let deferred_references = load_deferred_references(&store)?;
         let (active_references, total_references) = reference_counts(&store)?;
@@ -3274,14 +2213,7 @@ impl ProjectEngine {
         metrics
             .total_references
             .store(total_references, Ordering::Relaxed);
-        let lineage_seed = repository_lineage_seed(index.root());
-        let l0 = Cache::builder()
-            .max_capacity(L0_MAX_BYTES)
-            .weigher(|key: &PackCacheKey, value: &Arc<CachedPack>| l0_entry_weight(key, value))
-            .time_to_idle(l0_idle)
-            .build();
         let index = Arc::new(RwLock::new(index));
-        let frontiers = Arc::new(Mutex::new(frontiers));
         #[cfg(test)]
         let refresh_hook = Arc::new(Mutex::new(None));
         let wiki_hub = Arc::new(RwLock::new(None));
@@ -3291,7 +2223,6 @@ impl ProjectEngine {
             freshness: Arc::clone(&freshness),
             project_id: project_id.clone(),
             metrics: Arc::clone(&metrics),
-            frontiers: Arc::clone(&frontiers),
             index_snapshot_path: index_snapshot_path.clone(),
             git_diff_cache: Arc::new(Mutex::new(GitDiffCache::default())),
             #[cfg(test)]
@@ -3308,19 +2239,13 @@ impl ProjectEngine {
             store,
             wiki_index: RwLock::new(wiki_index),
             project_id,
-            l0,
             lookup_cache: Mutex::new(LookupCacheState::default()),
-            frontiers,
-            frontier_admissions: Mutex::new(FrontierAdmissionTracker::default()),
             pack_snapshots: Mutex::new(pack_snapshots),
             continuation_lock: Mutex::new(()),
             deferred_references: Mutex::new(deferred_references),
             freshness,
             metrics,
             usage_monitor,
-            lineage_seed,
-            governed_lineage,
-            shared_frontiers,
             #[cfg(test)]
             index_snapshot_path,
             #[cfg(test)]
@@ -3354,29 +2279,6 @@ impl ProjectEngine {
             Arc::clone(&index),
             self.freshness.generation.load(Ordering::Acquire),
         )
-    }
-
-    fn l0_storage_stats(&self) -> L0StorageStats {
-        self.l0
-            .iter()
-            .fold(L0StorageStats::default(), |mut stats, (key, value)| {
-                stats.entries = stats.entries.saturating_add(1);
-                stats.weighted_bytes = stats
-                    .weighted_bytes
-                    .saturating_add(u64::from(l0_entry_weight(key.as_ref(), &value)));
-                stats
-            })
-    }
-
-    fn invalidate_l0(&self) {
-        let stats = self.l0_storage_stats();
-        self.metrics
-            .l0_invalidations
-            .fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .l0_invalidated_entries
-            .fetch_add(stats.entries, Ordering::Relaxed);
-        self.l0.invalidate_all();
     }
 
     pub fn store(&self) -> &StateStore {
@@ -3452,42 +2354,19 @@ impl ProjectEngine {
         request: &ContextPackRequest,
         elapsed: StdDuration,
         telemetry: PackTelemetry,
-        cache_outcome: PackCacheOutcome,
         refresh_checked: bool,
         refresh_updated: bool,
     ) -> UsageSample {
         let scope = normalized_explicit_paths(request).unwrap_or_default();
-        let mut known_evidence = request.known_evidence.clone();
-        known_evidence.sort();
-        known_evidence.dedup();
-        let index = self.index();
         UsageSample {
             elapsed,
             telemetry,
-            cache_outcome,
             refresh_checked,
             refresh_updated,
             route: classify_route(&request.prompt),
             term_count: normalize_terms(&request.prompt, 8).len(),
             scope_count: scope.len(),
             client_profile: normalized_client_profile(request.client_profile.as_deref()),
-            reuse: ReuseIdentityInput {
-                prompt: request.prompt.clone(),
-                terms: normalize_terms(&request.prompt, 8),
-                scope: scope.clone(),
-                options: json!({
-                    "scope": scope,
-                    "max_items": request.max_items,
-                    "max_source_tokens": request.max_source_tokens,
-                    "evidence_policy": request.evidence_policy,
-                }),
-                evidence: json!({
-                    "base_pack": request.base_pack,
-                    "known_evidence": known_evidence,
-                }),
-                refresh_signature: index.stats().refresh_signature.clone(),
-                lineage_seed: self.lineage_seed.clone(),
-            },
         }
     }
 
@@ -3495,7 +2374,7 @@ impl ProjectEngine {
         let started = Instant::now();
         let result = (|| {
             request.validate_limits()?;
-            let refresh = self.ensure_fresh(request)?;
+            let refresh = self.ensure_pack_fresh(request)?;
             Ok::<_, anyhow::Error>((self.build_context_pack_entry(request)?, refresh))
         })();
         match result {
@@ -3508,7 +2387,6 @@ impl ProjectEngine {
                             request,
                             started.elapsed(),
                             pack.telemetry,
-                            PackCacheOutcome::Uncached,
                             refresh_checked,
                             refresh_updated,
                         ),
@@ -3528,11 +2406,11 @@ impl ProjectEngine {
         }
     }
 
-    pub async fn context_pack_cached(&self, request: &ContextPackRequest) -> Result<Vec<u8>> {
-        self.context_pack_cached_controlled(request, None).await
+    pub async fn context_pack_generate(&self, request: &ContextPackRequest) -> Result<Vec<u8>> {
+        self.context_pack_with_control(request, None).await
     }
 
-    pub async fn context_pack_cached_controlled(
+    pub async fn context_pack_with_control(
         &self,
         request: &ContextPackRequest,
         control: Option<&WorkControl>,
@@ -3548,39 +2426,17 @@ impl ProjectEngine {
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
-            let refresh = self.ensure_fresh_controlled(request, control)?;
-            let admission = if request.memory_session.is_some() {
-                if self.freshness.dirty.load(Ordering::Acquire) {
-                    self.refresh_index_with_paths(true, &[], control)?;
-                }
-                let pack = self.build_context_pack_entry(request)?;
-                let response: ContextPackV2 = serde_json::from_slice(&pack.bytes)?;
-                if let Some(control) = control {
-                    control.check()?;
-                }
-                CachedAdmission {
-                    cached: Arc::new(CachedPack {
-                        bytes: Arc::new(pack.bytes),
-                        reference_validations: Arc::new(Vec::new()),
-                        validity: pack.validity,
-                        telemetry: pack.telemetry,
-                        dependencies: Arc::new(response.paths),
-                        scoped: !request.focus_paths.is_empty(),
-                    }),
-                    outcome: PackCacheOutcome::Uncached,
-                }
-            } else {
-                self.admit_context_pack_cached(request).await?
-            };
+            let refresh = self.ensure_pack_fresh_controlled(request, control)?;
+            let pack = self.build_context_pack_entry(request)?;
             if let Some(control) = control {
                 control.check()?;
             }
-            Ok::<_, anyhow::Error>((admission, refresh))
+            Ok::<_, anyhow::Error>((pack, refresh))
         }
         .await;
         match result {
-            Ok((admission, (refresh_checked, refresh_updated))) => {
-                self.record_context_pack(started, &admission.cached.telemetry);
+            Ok((pack, (refresh_checked, refresh_updated))) => {
+                self.record_context_pack(started, &pack.telemetry);
                 if self.usage_monitor.enabled() {
                     current_work_checkpoint()?;
                     let _ = self.usage_monitor.record(
@@ -3588,14 +2444,13 @@ impl ProjectEngine {
                         self.usage_sample(
                             request,
                             started.elapsed(),
-                            admission.cached.telemetry,
-                            admission.outcome,
+                            pack.telemetry,
                             refresh_checked,
                             refresh_updated,
                         ),
                     );
                 }
-                Ok(admission.cached.bytes.as_ref().clone())
+                Ok(pack.bytes)
             }
             Err(error) => {
                 self.record_operation("context_pack", started, false, 0);
@@ -3607,98 +2462,6 @@ impl ProjectEngine {
                 Err(error)
             }
         }
-    }
-
-    async fn admit_context_pack_cached(
-        &self,
-        request: &ContextPackRequest,
-    ) -> Result<CachedAdmission> {
-        request.validate_limits()?;
-        self.validate_project_selector(request.project_id.as_deref(), request.root_uri.as_deref())?;
-        let (index, generation) = self.index_generation();
-        let refresh_signature = index.stats().refresh_signature.clone();
-        let explicit_paths = normalized_explicit_paths(request)?;
-        // The key is request-shaped rather than generation-shaped.  Scoped
-        // requests can validate only their source dependencies; unscoped
-        // retrieval remains generation/signature-bound below.
-        let key = l0_cache_key(request, &explicit_paths)?;
-        let mut needs_refresh = false;
-        if let Some(cached) = self.l0.get(&key).await {
-            match self.cached_pack_is_valid(&cached, generation, &refresh_signature) {
-                Ok(true) => {
-                    self.metrics.l0_hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(CachedAdmission {
-                        cached,
-                        outcome: PackCacheOutcome::L0Hit,
-                    });
-                }
-                Ok(false) => {
-                    needs_refresh = cached.validity.generation != generation
-                        || cached.validity.refresh_signature != refresh_signature
-                        || self.freshness.dirty.load(Ordering::Acquire);
-                    self.invalidate_l0_entry(&key).await;
-                }
-                Err(error) => {
-                    self.invalidate_l0_entry(&key).await;
-                    return Err(error);
-                }
-            }
-        }
-
-        // A miss while the watcher has observed a change must not build from
-        // the old published snapshot.  Existing valid entries are handled
-        // above, so this refresh is paid only by requests that need new data.
-        if needs_refresh || self.freshness.dirty.load(Ordering::Acquire) {
-            self.refresh_index_with_paths(true, &[], None)?;
-        }
-
-        self.l0.run_pending_tasks().await;
-        let cache_was_empty = self.l0.iter().next().is_none();
-        let built_by_this_request = Arc::new(AtomicBool::new(false));
-        let build_marker = Arc::clone(&built_by_this_request);
-        let cached = self
-            .l0
-            .try_get_with(key, async {
-                build_marker.store(true, Ordering::Release);
-                let pack = self.build_context_pack(request, explicit_reuse_diagnostic(request))?;
-                let response: ContextPackV2 = serde_json::from_slice(&pack.bytes)?;
-                let reference_validations = response
-                    .more
-                    .into_iter()
-                    .map(|reference_id| self.cached_reference_validation(&reference_id))
-                    .collect::<Result<Vec<_>>>()?;
-                current_work_checkpoint()?;
-                Ok::<Arc<CachedPack>, anyhow::Error>(Arc::new(CachedPack {
-                    bytes: Arc::new(pack.bytes),
-                    reference_validations: Arc::new(reference_validations),
-                    validity: pack.validity,
-                    telemetry: pack.telemetry,
-                    dependencies: Arc::new(response.paths),
-                    scoped: !request.focus_paths.is_empty(),
-                }))
-            })
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
-        let outcome = if built_by_this_request.load(Ordering::Acquire) {
-            self.metrics.l0_misses.fetch_add(1, Ordering::Relaxed);
-            if cache_was_empty {
-                self.metrics
-                    .l0_cold_or_invalidated_misses
-                    .fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.metrics
-                    .l0_request_variant_misses
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            PackCacheOutcome::L0Miss
-        } else {
-            self.metrics.l0_hits.fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .l0_singleflight_hits
-                .fetch_add(1, Ordering::Relaxed);
-            PackCacheOutcome::L0Singleflight
-        };
-        Ok(CachedAdmission { cached, outcome })
     }
 
     fn prepare_continuation(&self, request: &ContextPackRequest) -> Result<PreparedContinuation> {
@@ -3838,67 +2601,6 @@ impl ProjectEngine {
         Ok(pack)
     }
 
-    fn cached_pack_is_valid(
-        &self,
-        cached: &CachedPack,
-        generation: u64,
-        refresh_signature: &str,
-    ) -> Result<bool> {
-        let (current, current_generation) = self.index_generation();
-        if !cached.validity.current {
-            return Ok(false);
-        }
-        if cached.validity.wiki_generation != self.wiki_generation() {
-            return Ok(false);
-        }
-        let signature_matches = cached.validity.refresh_signature == refresh_signature
-            && refresh_signature == current.stats().refresh_signature;
-        let generation_matches =
-            cached.validity.generation == generation && generation == current_generation;
-        let dependencies_current = generation_matches
-            && signature_matches
-            && !self.freshness.dirty.load(Ordering::Acquire)
-            && !self.freshness.journal_overflow.load(Ordering::Acquire);
-        if !dependencies_current {
-            return Ok(false);
-        }
-        for validation in cached.reference_validations.iter() {
-            if !self.store.reference_validation_is_active(validation)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn cached_reference_validation(&self, reference_id: &str) -> Result<ReferenceValidation> {
-        let cached = {
-            self.deferred_references
-                .lock()
-                .map_err(|_| anyhow!("deferred reference lock poisoned"))?
-                .values()
-                .find(|validation| validation.reference_id == reference_id)
-                .cloned()
-        };
-        if let Some(validation) = cached
-            && self.store.reference_validation_is_active(&validation)?
-        {
-            return Ok(validation);
-        }
-        self.store
-            .reference_validation(reference_id)?
-            .ok_or_else(|| anyhow!("context pack produced an invalid reference"))
-    }
-
-    async fn invalidate_l0_entry(&self, key: &PackCacheKey) {
-        self.l0.invalidate(key).await;
-        self.metrics
-            .l0_invalidations
-            .fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .l0_invalidated_entries
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     fn build_context_pack(
         &self,
         request: &ContextPackRequest,
@@ -3933,8 +2635,7 @@ impl ProjectEngine {
         let (index, generation) = self.index_generation();
         let event_epoch = self.freshness.event_epoch.load(Ordering::Acquire);
         let retrieval_started = Instant::now();
-        let (candidates, terms, frontier_outcome, lineage) =
-            self.retrieve_candidates(&index, request, &explicit_paths)?;
+        let (candidates, terms) = self.retrieve_candidates(&index, request, &explicit_paths)?;
         let mut checked_paths = HashMap::new();
         let snapshot_current = !self.freshness.dirty.load(Ordering::Acquire)
             && !self.freshness.watcher_requires_verification();
@@ -4092,7 +2793,6 @@ impl ProjectEngine {
             evidence_card_tokens_est.saturating_sub(returned_evidence_tokens_est);
         reuse.delta_applied = reuse.wire_tokens_avoided_est > 0
             && matches!(reuse.source.as_str(), "continuation" | "explicit");
-        let state_io_started = Instant::now();
         let snapshot = Arc::new(PackSnapshot {
             schema: "context_pack.snapshot.v1".to_owned(),
             pack_id: pack_id.clone(),
@@ -4123,8 +2823,6 @@ impl ProjectEngine {
             &terms,
             usize::from(request.max_items),
         )?;
-        let cache_state_io_micros =
-            u64::try_from(state_io_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         current_work_checkpoint()?;
         let response = ContextPackV2 {
             v: CONTEXT_PACK_VERSION,
@@ -4176,12 +2874,10 @@ impl ProjectEngine {
             candidate_count: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
             selected_count: u32::try_from(selected.len()).unwrap_or(u32::MAX),
             retrieval_micros,
-            cache_state_io_micros,
             serialization_micros,
             pack_build_micros: u64::try_from(pack_started.elapsed().as_micros())
                 .unwrap_or(u64::MAX)
                 .saturating_sub(retrieval_micros),
-            frontier_outcome,
             base_pack_used: request.base_pack.is_some(),
             known_evidence_used: !request.known_evidence.is_empty(),
             continuation_requested: reuse.source == "continuation"
@@ -4197,7 +2893,6 @@ impl ProjectEngine {
                         | "missing_pack"
                 ),
             explicit_delta_override: reuse.status == "explicit_override",
-            lineage,
         };
         if wiki_generation != self.wiki_generation() {
             bail!("wiki changed while building context; retry with the current generation");
@@ -4206,12 +2901,6 @@ impl ProjectEngine {
         Ok(BuiltPack {
             telemetry,
             bytes: encoded,
-            validity: ValidityCertificate {
-                wiki_generation,
-                generation,
-                refresh_signature: index.stats().refresh_signature.clone(),
-                current: response.freshness == "current",
-            },
         })
     }
 
@@ -4227,8 +2916,10 @@ impl ProjectEngine {
         if candidates.is_empty() {
             return Ok(None);
         }
-        let mut term_fingerprints = concept_fingerprints(terms);
-        term_fingerprints.sort();
+        let term_fingerprints = terms
+            .iter()
+            .map(|term| digest_id("tm_", term.as_bytes()))
+            .collect::<Vec<_>>();
         let key = digest_id(
             "df_",
             &serde_json::to_vec(&json!({
@@ -4353,549 +3044,15 @@ impl ProjectEngine {
         index: &ProjectIndex,
         request: &ContextPackRequest,
         explicit_paths: &[String],
-    ) -> Result<(
-        Vec<SearchHit>,
-        Vec<String>,
-        FrontierOutcome,
-        LineageRequestTelemetry,
-    )> {
-        let retrieval = self.retrieve_candidates_deferred(index, request, explicit_paths)?;
-        if let Some(record) = retrieval.pending {
-            current_work_checkpoint()?;
-            self.admit_frontier_batch(&[record])?;
-        }
-        Ok((
-            retrieval.hits,
-            retrieval.terms,
-            retrieval.outcome,
-            retrieval.lineage,
-        ))
-    }
-
-    fn retrieve_candidates_deferred(
-        &self,
-        index: &ProjectIndex,
-        request: &ContextPackRequest,
-        explicit_paths: &[String],
-    ) -> Result<DeferredRetrieval> {
-        let terms = normalize_terms(&request.prompt, 8);
-        let mut term_fingerprints = concept_fingerprints(&terms);
-        term_fingerprints.sort();
-        term_fingerprints.dedup();
-        let route = classify_route(&request.prompt);
-        let mut scope = explicit_paths.to_vec();
-        scope.sort();
-        scope.dedup();
-        let signature = &index.stats().refresh_signature;
-        let generation = self.freshness.generation.load(Ordering::Acquire);
-        let now = now_millis();
-        let mut lineage = LineageRequestTelemetry::default();
-
-        let (match_record, capacity_fallback) = {
-            let mut state = self
-                .frontiers
-                .lock()
-                .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
-            state.records.retain(|record| {
-                record.refresh_signature == *signature
-                    && (!record.negative || record.expires_at_ms > now)
-            });
-            state.bytes = state
-                .records
-                .iter()
-                .map(|record| record.estimated_bytes())
-                .sum();
-            let exact = state.records.iter().position(|record| {
-                record.scope == scope
-                    && record.terms == term_fingerprints
-                    && record.generation == generation
-                    && record.candidate_capacity >= request.max_items
-            });
-            let capacity_fallback = exact.is_none()
-                && state.records.iter().any(|record| {
-                    record.scope == scope
-                        && record.terms == term_fingerprints
-                        && record.generation == generation
-                        && record.candidate_capacity < request.max_items
-                });
-            let record = exact.and_then(|position| {
-                let record = state.records.remove(position)?;
-                state.records.push_back(Arc::clone(&record));
-                Some(record)
-            });
-            (record, capacity_fallback)
-        };
-
-        let had_match = match_record.is_some();
-        if let Some(record) = match_record {
-            if record.negative {
-                self.metrics.l1_exact_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(DeferredRetrieval {
-                    hits: Vec::new(),
-                    terms,
-                    pending: None,
-                    outcome: FrontierOutcome::NegativeHit,
-                    lineage,
-                });
-            }
-            let (hits, reranked_terms) = index.rerank(
-                &request.prompt,
-                explicit_paths,
-                &record.candidate_ids,
-                usize::from(request.max_items),
-            )?;
-            if !hits.is_empty() {
-                self.metrics.l1_exact_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(DeferredRetrieval {
-                    hits,
-                    terms: reranked_terms,
-                    pending: None,
-                    outcome: FrontierOutcome::ExactHit,
-                    lineage,
-                });
-            }
-        }
-
-        if let Some((hits, reranked_terms)) = self.try_shared_frontier(
-            index,
-            request,
-            explicit_paths,
-            &scope,
-            &term_fingerprints,
-            &mut lineage,
-        )? {
-            return Ok(DeferredRetrieval {
-                hits,
-                terms: reranked_terms,
-                pending: None,
-                outcome: FrontierOutcome::LineageHit,
-                lineage,
-            });
-        }
-
+    ) -> Result<(Vec<SearchHit>, Vec<String>)> {
         self.metrics
-            .retrieval_misses
+            .retrieval_requests
             .fetch_add(1, Ordering::Relaxed);
-        let (hits, terms) = index.search(
+        index.search(
             &request.prompt,
             explicit_paths,
             usize::from(request.max_items),
-        )?;
-        let record = self.build_frontier_record(
-            index,
-            route,
-            scope,
-            term_fingerprints,
-            request.max_items,
-            &hits,
-        )?;
-        let should_admit = hits.is_empty() || {
-            let mut tracker = self
-                .frontier_admissions
-                .lock()
-                .map_err(|_| anyhow!("frontier admission tracker poisoned"))?;
-            tracker.observe(record.key.clone(), now)
-        };
-        let outcome = if should_admit && !hits.is_empty() {
-            FrontierOutcome::Admitted
-        } else if capacity_fallback {
-            FrontierOutcome::CapacityFallback
-        } else if had_match {
-            FrontierOutcome::SourceFallback
-        } else {
-            FrontierOutcome::Search
-        };
-        Ok(DeferredRetrieval {
-            hits,
-            terms,
-            pending: should_admit.then_some(record),
-            outcome,
-            lineage,
-        })
-    }
-
-    fn build_frontier_record(
-        &self,
-        index: &ProjectIndex,
-        route: &str,
-        scope: Vec<String>,
-        terms: Vec<String>,
-        candidate_capacity: u8,
-        hits: &[SearchHit],
-    ) -> Result<Arc<FrontierRecord>> {
-        let generation = self.freshness.generation.load(Ordering::Acquire);
-        let now = now_millis();
-        let key = digest_id(
-            "fr_",
-            &serde_json::to_vec(&json!({
-                "scope": &scope,
-                "terms": &terms,
-                "generation": generation,
-                "candidate_capacity": candidate_capacity,
-                "signature": &index.stats().refresh_signature,
-            }))?,
-        );
-        let mut cumulative = 0_u32;
-        let cumulative_token_costs = hits
-            .iter()
-            .map(|hit| {
-                cumulative = cumulative.saturating_add(estimate_tokens(&hit.content));
-                cumulative
-            })
-            .collect::<Vec<_>>();
-        let mut dependencies = hits.iter().map(|hit| hit.path.clone()).collect::<Vec<_>>();
-        dependencies.sort();
-        dependencies.dedup();
-        Ok(Arc::new(FrontierRecord {
-            schema: "context_frontier.v2".to_owned(),
-            key: key.clone(),
-            route: route.to_owned(),
-            scope,
-            generation,
-            candidate_capacity,
-            terms,
-            candidate_ids: hits.iter().map(|hit| hit.id.clone()).collect(),
-            scores: hits.iter().map(|hit| hit.score).collect(),
-            cumulative_token_costs,
-            dependencies,
-            score_cutoff: hits.last().map_or(0.0, |hit| hit.score),
-            refresh_signature: index.stats().refresh_signature.clone(),
-            negative: hits.is_empty(),
-            expires_at_ms: if hits.is_empty() {
-                now.saturating_add(NEGATIVE_FRONTIER_TTL_MS)
-            } else {
-                0
-            },
-            updated_at_ms: now,
-        }))
-    }
-
-    fn admit_frontier_batch(&self, records: &[Arc<FrontierRecord>]) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-        let rows = records
-            .iter()
-            .map(|record| {
-                Ok((
-                    format!("frontier:{}", record.key),
-                    serde_json::to_value(&**record)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.store.put_json_batch(&rows)?;
-        let mut state = self
-            .frontiers
-            .lock()
-            .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
-        for record in records {
-            let key = &record.key;
-            if let Some(position) = state
-                .records
-                .iter()
-                .position(|item| item.key.as_str() == key.as_str())
-                && let Some(previous) = state.records.remove(position)
-            {
-                state.bytes = state.bytes.saturating_sub(previous.estimated_bytes());
-            }
-            let bytes = record.estimated_bytes();
-            while state.bytes.saturating_add(bytes) > L1_MEMORY_MAX_BYTES {
-                if let Some(previous) = state.records.pop_front() {
-                    state.bytes = state.bytes.saturating_sub(previous.estimated_bytes());
-                } else {
-                    break;
-                }
-            }
-            if bytes <= L1_MEMORY_MAX_BYTES {
-                state.bytes = state.bytes.saturating_add(bytes);
-                state.records.push_back(Arc::clone(record));
-            }
-        }
-        drop(state);
-        prune_persistent_frontiers(&self.store)?;
-        for record in records.iter().filter(|record| !record.negative) {
-            self.publish_shared_frontier(record)?;
-        }
-        Ok(())
-    }
-
-    fn shared_eligibility(
-        &self,
-        index: &ProjectIndex,
-    ) -> std::result::Result<Option<SharedEligibility>, GitProofRejection> {
-        let Some(governed) = &self.governed_lineage else {
-            return Ok(None);
-        };
-        if self.shared_frontiers.is_none() {
-            return Ok(None);
-        }
-        if index.stats().corpus_source_count > 0 {
-            return Err(GitProofRejection::Unavailable);
-        }
-        self.metrics
-            .lineage_git_checks
-            .fetch_add(1, Ordering::Relaxed);
-        let git = git_worktree_proof(index.root())?;
-        let lineage_identity = format!(
-            "ln:{}",
-            sha256_text(&format!(
-                "{}:{}",
-                governed.governance_identity, git.common_dir_hash
-            ))
-        );
-        Ok(Some(SharedEligibility {
-            governance_identity: governed.governance_identity.clone(),
-            git,
-            lineage_identity,
-            source_signature: index.stats().refresh_signature.clone(),
-            index_signature: immutable_index_signature(index.stats()),
-        }))
-    }
-
-    fn try_shared_frontier(
-        &self,
-        index: &ProjectIndex,
-        request: &ContextPackRequest,
-        explicit_paths: &[String],
-        scope: &[String],
-        terms: &[String],
-        telemetry: &mut LineageRequestTelemetry,
-    ) -> Result<Option<(Vec<SearchHit>, Vec<String>)>> {
-        let Some(pool) = &self.shared_frontiers else {
-            return Ok(None);
-        };
-        if self.governed_lineage.is_none() {
-            return Ok(None);
-        }
-        if index.stats().corpus_source_count > 0 {
-            telemetry.fallback = true;
-            telemetry.isolation_rejection = true;
-            self.metrics
-                .lineage_governed_corpus_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .lineage_isolation_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .lineage_fallbacks
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
-        }
-        let eligibility = match self.shared_eligibility(index) {
-            Ok(Some(eligibility)) => eligibility,
-            Ok(None) => return Ok(None),
-            Err(GitProofRejection::Dirty) => {
-                telemetry.fallback = true;
-                telemetry.isolation_rejection = true;
-                self.metrics
-                    .lineage_dirty_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .lineage_isolation_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .lineage_fallbacks
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            }
-            Err(GitProofRejection::Unavailable) => {
-                telemetry.fallback = true;
-                telemetry.isolation_rejection = true;
-                self.metrics
-                    .lineage_isolation_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .lineage_fallbacks
-                    .fetch_add(1, Ordering::Relaxed);
-                return Ok(None);
-            }
-        };
-        telemetry.eligible = true;
-        self.metrics
-            .lineage_eligible_opportunities
-            .fetch_add(1, Ordering::Relaxed);
-        let lookup_started = Instant::now();
-        let scope_signature = opaque_scope_signature(scope)?;
-        let generation = self.freshness.generation.load(Ordering::Acquire);
-        let mut exact = None;
-        let mut rejected = false;
-        for record in pool.records()? {
-            if record.terms != terms || record.scope_signature != scope_signature {
-                continue;
-            }
-            if record.governance_identity == eligibility.governance_identity
-                && record.git_common_dir_hash != eligibility.git.common_dir_hash
-            {
-                rejected = true;
-                continue;
-            }
-            if record.lineage_identity != eligibility.lineage_identity {
-                continue;
-            }
-            if record.head_oid != eligibility.git.head_oid
-                || record.source_signature != eligibility.source_signature
-            {
-                self.metrics
-                    .lineage_divergent_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                rejected = true;
-                continue;
-            }
-            if record.index_signature != eligibility.index_signature {
-                self.metrics
-                    .lineage_stale_index_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                rejected = true;
-                continue;
-            }
-            if record.candidate_capacity < request.max_items {
-                self.metrics
-                    .lineage_capacity_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                rejected = true;
-                continue;
-            }
-            exact = Some(record);
-            break;
-        }
-        let Some(record) = exact else {
-            telemetry.fallback = true;
-            telemetry.isolation_rejection = rejected;
-            if rejected {
-                self.metrics
-                    .lineage_isolation_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            self.metrics
-                .lineage_fallbacks
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
-        };
-        let mut expected_dependencies = record.candidate_addresses.clone();
-        expected_dependencies.sort();
-        expected_dependencies.dedup();
-        if record.candidate_addresses.is_empty()
-            || record.candidate_addresses.len() != record.scores.len()
-            || record.candidate_addresses.len() != record.cumulative_token_costs.len()
-            || record.dependency_addresses != expected_dependencies
-            || record.candidate_addresses.iter().any(|candidate| {
-                candidate.strip_prefix("ca:").is_none_or(|digest| {
-                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-            })
-        {
-            telemetry.fallback = true;
-            telemetry.isolation_rejection = true;
-            self.metrics
-                .lineage_missing_candidate_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .lineage_isolation_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .lineage_fallbacks
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
-        }
-        let Some((hits, reranked_terms)) = index.rerank_immutable_candidates(
-            &request.prompt,
-            explicit_paths,
-            &record.candidate_addresses,
-            usize::from(request.max_items),
-        )?
-        else {
-            telemetry.fallback = true;
-            telemetry.isolation_rejection = true;
-            self.metrics
-                .lineage_missing_candidate_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .lineage_isolation_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .lineage_fallbacks
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
-        };
-        let stable = self.freshness.generation.load(Ordering::Acquire) == generation
-            && self
-                .shared_eligibility(index)
-                .ok()
-                .flatten()
-                .is_some_and(|current| {
-                    current.git == eligibility.git
-                        && current.source_signature == eligibility.source_signature
-                        && current.index_signature == eligibility.index_signature
-                });
-        if !stable {
-            telemetry.fallback = true;
-            telemetry.isolation_rejection = true;
-            self.metrics
-                .lineage_stale_index_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .lineage_isolation_rejections
-                .fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .lineage_fallbacks
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
-        }
-        let lookup_micros = u64::try_from(lookup_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        self.metrics
-            .lineage_safe_hits
-            .fetch_add(1, Ordering::Relaxed);
-        let latency_saved_micros_est = WARM_MISS_TARGET_MICROS.saturating_sub(lookup_micros);
-        self.metrics
-            .lineage_latency_saved_micros
-            .fetch_add(latency_saved_micros_est, Ordering::Relaxed);
-        telemetry.safe_hit = true;
-        telemetry.latency_saved_micros_est = latency_saved_micros_est;
-        Ok(Some((hits, reranked_terms)))
-    }
-
-    fn publish_shared_frontier(&self, record: &FrontierRecord) -> Result<()> {
-        let Some(pool) = &self.shared_frontiers else {
-            return Ok(());
-        };
-        let index = self.index();
-        let Ok(Some(eligibility)) = self.shared_eligibility(&index) else {
-            return Ok(());
-        };
-        let candidate_addresses = record
-            .candidate_ids
-            .iter()
-            .map(|candidate| immutable_candidate_address(candidate))
-            .collect::<Vec<_>>();
-        if candidate_addresses.is_empty() {
-            return Ok(());
-        }
-        let mut dependency_addresses = candidate_addresses.clone();
-        dependency_addresses.sort();
-        dependency_addresses.dedup();
-        let scope_signature = opaque_scope_signature(&record.scope)?;
-        let mut shared = SharedFrontierRecord {
-            schema: "context_shared_frontier.v1".to_owned(),
-            key: String::new(),
-            governance_identity: eligibility.governance_identity,
-            git_common_dir_hash: eligibility.git.common_dir_hash,
-            lineage_identity: eligibility.lineage_identity,
-            head_oid: eligibility.git.head_oid,
-            source_signature: eligibility.source_signature,
-            index_signature: eligibility.index_signature,
-            scope_signature,
-            terms: record.terms.clone(),
-            candidate_capacity: record.candidate_capacity,
-            candidate_addresses,
-            dependency_addresses,
-            scores: record.scores.clone(),
-            cumulative_token_costs: record.cumulative_token_costs.clone(),
-            score_cutoff: record.score_cutoff,
-            admitted_at_ms: now_millis(),
-        };
-        shared.key = shared.content_key()?;
-        let _ = pool.admit(Arc::new(shared))?;
-        Ok(())
+        )
     }
 
     fn record_operation(
@@ -4921,8 +3078,26 @@ impl ProjectEngine {
         self.metrics.record_pack_telemetry(*telemetry);
     }
 
-    fn ensure_fresh(&self, request: &ContextPackRequest) -> Result<(bool, bool)> {
-        self.ensure_fresh_controlled(request, None)
+    fn ensure_pack_fresh(&self, request: &ContextPackRequest) -> Result<(bool, bool)> {
+        self.ensure_pack_fresh_controlled(request, None)
+    }
+
+    fn ensure_pack_fresh_controlled(
+        &self,
+        request: &ContextPackRequest,
+        control: Option<&WorkControl>,
+    ) -> Result<(bool, bool)> {
+        self.ensure_fresh_controlled(request, control)?;
+        if self.freshness.watcher_requires_verification() {
+            return self.refresh_index_with_paths(true, &[], control);
+        }
+        if !request.changed_files.is_empty() {
+            return self.refresh_index_with_paths(true, &request.changed_files, control);
+        }
+        if self.freshness.dirty.load(Ordering::Acquire) {
+            return self.refresh_index_with_paths(true, &[], control);
+        }
+        Ok((false, false))
     }
 
     fn ensure_fresh_controlled(
@@ -5226,15 +3401,6 @@ impl ProjectEngine {
                 hub.schedule_refresh(&shared.project_id);
             }
 
-            // Cached packs are retained across generations.  Their source
-            // dependencies are checked against the newly published index on
-            // access, allowing unrelated edits to reuse existing responses.
-            let mut frontiers = shared
-                .frontiers
-                .lock()
-                .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
-            frontiers.records.clear();
-            frontiers.bytes = 0;
             shared.metrics.refresh_micros.fetch_add(
                 u64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
@@ -5678,7 +3844,6 @@ impl ProjectEngine {
                     | "wiki_upsert"
                     | "wiki_consolidate"
             ) {
-                self.l0.invalidate_all();
                 let mut lookup_cache = self
                     .lookup_cache
                     .lock()
@@ -6655,266 +4820,6 @@ fn source_event_path(root: &std::path::Path, path: &std::path::Path) -> bool {
     !is_ignored_repository_path(relative)
 }
 
-fn load_frontiers(store: &StateStore, refresh_signature: &str) -> Result<FrontierState> {
-    let now = now_millis();
-    let mut records = store
-        .iter_json("frontier:")?
-        .into_iter()
-        .filter_map(|(_, value)| serde_json::from_value::<FrontierRecord>(value).ok())
-        .filter(|record| {
-            record.schema == "context_frontier.v2"
-                && record.refresh_signature == refresh_signature
-                && (!record.negative || record.expires_at_ms > now)
-        })
-        .collect::<Vec<_>>();
-    records.sort_by_key(|record| record.updated_at_ms);
-    let mut state = FrontierState::default();
-    for record in records {
-        let record = Arc::new(record);
-        let bytes = record.estimated_bytes();
-        if bytes > L1_MEMORY_MAX_BYTES {
-            continue;
-        }
-        while state.bytes.saturating_add(bytes) > L1_MEMORY_MAX_BYTES {
-            if let Some(removed) = state.records.pop_front() {
-                state.bytes = state.bytes.saturating_sub(removed.estimated_bytes());
-            } else {
-                break;
-            }
-        }
-        state.bytes = state.bytes.saturating_add(bytes);
-        state.records.push_back(record);
-    }
-    Ok(state)
-}
-
-fn load_shared_frontiers(store: &StateStore) -> Result<SharedFrontierState> {
-    let mut records = store
-        .iter_json("shared-frontier:")?
-        .into_iter()
-        .filter_map(|(_, value)| serde_json::from_value::<SharedFrontierRecord>(value).ok())
-        .filter(|record| {
-            record.schema == "context_shared_frontier.v1"
-                && record.content_key().is_ok_and(|key| key == record.key)
-        })
-        .collect::<Vec<_>>();
-    records.sort_by_key(|record| record.admitted_at_ms);
-    let mut state = SharedFrontierState::default();
-    for record in records {
-        let record = Arc::new(record);
-        let bytes = record.estimated_bytes();
-        if bytes > SHARED_L1_PERSISTENT_MAX_BYTES {
-            continue;
-        }
-        while state.bytes.saturating_add(bytes) > SHARED_L1_PERSISTENT_MAX_BYTES {
-            if let Some(removed) = state.records.pop_front() {
-                state.bytes = state.bytes.saturating_sub(removed.estimated_bytes());
-                let _ = store.delete(&format!("shared-frontier:{}", removed.key));
-            } else {
-                break;
-            }
-        }
-        state.bytes = state.bytes.saturating_add(bytes);
-        state.records.push_back(record);
-    }
-    Ok(state)
-}
-
-fn immutable_index_signature(stats: &IndexStats) -> String {
-    sha256_text(
-        &serde_json::to_string(&json!({
-            "schema": stats.schema,
-            "source_signature": stats.refresh_signature,
-            "file_count": stats.file_count,
-            "chunk_count": stats.chunk_count,
-            "symbol_chunks": stats.symbol_chunks,
-            "generic_chunks": stats.generic_chunks,
-            "candidate_address_version": 1,
-            "backend": "tantivy:mcp-context-manager.native.v2:0.26.1",
-        }))
-        .unwrap_or_default(),
-    )
-}
-
-fn opaque_scope_signature(scope: &[String]) -> Result<String> {
-    Ok(format!(
-        "scp:{}",
-        sha256_text(&String::from_utf8(serde_json::to_vec(scope)?)?)
-    ))
-}
-
-const GIT_COMMAND_TIMEOUT: StdDuration = StdDuration::from_secs(5);
-const GIT_COMMAND_REAP_GRACE: StdDuration = StdDuration::from_millis(250);
-const GIT_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
-
-enum BoundedOutputCapture {
-    Complete(Vec<u8>),
-    LimitExceeded,
-    Failed,
-}
-
-fn capture_output_bounded(mut stdout: std::process::ChildStdout) -> BoundedOutputCapture {
-    use std::io::Read;
-
-    let mut bytes = Vec::with_capacity(GIT_OUTPUT_LIMIT_BYTES);
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let count = match stdout.read(&mut buffer) {
-            Ok(0) => return BoundedOutputCapture::Complete(bytes),
-            Ok(count) => count,
-            Err(_) => return BoundedOutputCapture::Failed,
-        };
-        if count > GIT_OUTPUT_LIMIT_BYTES.saturating_sub(bytes.len()) {
-            return BoundedOutputCapture::LimitExceeded;
-        }
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-}
-
-fn terminate_child_bounded(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let deadline = Instant::now() + GIT_COMMAND_REAP_GRACE;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => thread::sleep(StdDuration::from_millis(5)),
-        }
-    }
-}
-
-fn terminate_child_and_capture_bounded(
-    child: &mut std::process::Child,
-    capture_receiver: &std::sync::mpsc::Receiver<BoundedOutputCapture>,
-    capture_thread: thread::JoinHandle<()>,
-) {
-    terminate_child_bounded(child);
-    let _ = capture_receiver.recv_timeout(GIT_COMMAND_REAP_GRACE);
-    if capture_thread.is_finished() {
-        let _ = capture_thread.join();
-    }
-}
-
-fn command_output_bounded(
-    command: &mut Command,
-    timeout: StdDuration,
-) -> Option<std::process::Output> {
-    command.stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut child = command.spawn().ok()?;
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_child_bounded(&mut child);
-            return None;
-        }
-    };
-    let (capture_sender, capture_receiver) = std::sync::mpsc::sync_channel(1);
-    let capture_thread = match thread::Builder::new()
-        .name("governed-git-stdout".to_owned())
-        .spawn(move || {
-            let _ = capture_sender.send(capture_output_bounded(stdout));
-        }) {
-        Ok(thread) => thread,
-        Err(_) => {
-            terminate_child_bounded(&mut child);
-            return None;
-        }
-    };
-    let deadline = Instant::now() + timeout;
-    let mut captured = None;
-    let status = loop {
-        if captured.is_none() {
-            match capture_receiver.try_recv() {
-                Ok(BoundedOutputCapture::Complete(bytes)) => captured = Some(bytes),
-                Ok(BoundedOutputCapture::LimitExceeded | BoundedOutputCapture::Failed)
-                | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    terminate_child_and_capture_bounded(
-                        &mut child,
-                        &capture_receiver,
-                        capture_thread,
-                    );
-                    return None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(_) => {
-                terminate_child_and_capture_bounded(&mut child, &capture_receiver, capture_thread);
-                return None;
-            }
-        }
-        if current_work_checkpoint().is_err() || Instant::now() >= deadline {
-            terminate_child_and_capture_bounded(&mut child, &capture_receiver, capture_thread);
-            return None;
-        }
-        thread::sleep(StdDuration::from_millis(5));
-    };
-    let bytes = match captured {
-        Some(bytes) => bytes,
-        None => match capture_receiver.recv_timeout(GIT_COMMAND_REAP_GRACE) {
-            Ok(BoundedOutputCapture::Complete(bytes)) => bytes,
-            Ok(BoundedOutputCapture::LimitExceeded | BoundedOutputCapture::Failed) | Err(_) => {
-                return None;
-            }
-        },
-    };
-    capture_thread.join().ok()?;
-    Some(std::process::Output {
-        status,
-        stdout: bytes,
-        stderr: Vec::new(),
-    })
-}
-
-fn git_output(root: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    command_output_bounded(
-        Command::new("git")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .arg("-C")
-            .arg(root)
-            .args(args),
-        GIT_COMMAND_TIMEOUT,
-    )
-    .filter(|output| output.status.success())
-}
-
-fn git_worktree_proof(
-    root: &std::path::Path,
-) -> std::result::Result<GitWorktreeProof, GitProofRejection> {
-    let mut arguments = vec![
-        "status".to_owned(),
-        "--porcelain=v2".to_owned(),
-        "--branch".to_owned(),
-        "--untracked-files=all".to_owned(),
-        "--ignore-submodules=none".to_owned(),
-        "--".to_owned(),
-        ":(top)**".to_owned(),
-    ];
-    arguments.extend(git_exclude_pathspecs());
-    let borrowed = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-    let status = git_output(root, &borrowed).ok_or(GitProofRejection::Unavailable)?;
-    let status = String::from_utf8(status.stdout).map_err(|_| GitProofRejection::Unavailable)?;
-    if status.lines().any(|line| !line.starts_with("# ")) {
-        return Err(GitProofRejection::Dirty);
-    }
-    let common = git_common_dir(root).ok_or(GitProofRejection::Unavailable)?;
-    let head_oid = status
-        .lines()
-        .find_map(|line| line.strip_prefix("# branch.oid "))
-        .ok_or(GitProofRejection::Unavailable)?
-        .to_ascii_lowercase();
-    if !matches!(head_oid.len(), 40 | 64) || !head_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(GitProofRejection::Unavailable);
-    }
-    Ok(GitWorktreeProof {
-        common_dir_hash: sha256_text(&common.to_string_lossy()),
-        head_oid,
-    })
-}
-
 fn load_pack_snapshots(store: &StateStore) -> Result<HashMap<String, Arc<PackSnapshot>>> {
     Ok(store
         .iter_json("pack:")?
@@ -7094,42 +4999,6 @@ fn reference_counts(store: &StateStore) -> Result<(u64, u64)> {
     Ok((active, references.len() as u64))
 }
 
-fn prune_persistent_frontiers(store: &StateStore) -> Result<()> {
-    let mut rows = store
-        .iter_json("frontier:")?
-        .into_iter()
-        .map(|(key, value)| {
-            let bytes = key.len() + serde_json::to_vec(&value).map_or(0, |encoded| encoded.len());
-            let updated = value
-                .get("updated_at_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            (key, bytes, updated)
-        })
-        .collect::<Vec<_>>();
-    let mut total = rows.iter().map(|(_, bytes, _)| *bytes).sum::<usize>();
-    if total <= L1_PERSISTENT_MAX_BYTES {
-        return Ok(());
-    }
-    rows.sort_by_key(|(_, _, updated)| *updated);
-    for (key, bytes, _) in rows {
-        if total <= L1_PERSISTENT_MAX_BYTES {
-            break;
-        }
-        if store.delete(&key)? {
-            total = total.saturating_sub(bytes);
-        }
-    }
-    Ok(())
-}
-
-fn concept_fingerprints(terms: &[String]) -> Vec<String> {
-    terms
-        .iter()
-        .map(|term| digest_id("tm_", term.as_bytes()))
-        .collect()
-}
-
 async fn admin_dispatch(
     engine: &ProjectEngine,
     request: &ContextAdminRequest,
@@ -7170,143 +5039,94 @@ async fn admin_dispatch(
         }
         "index_status" => Ok(index_status(engine.index().stats())),
         "cache_stats" => {
-            let l0 = engine.l0_storage_stats();
-            let shared = engine
-                .shared_frontiers
-                .as_ref()
-                .map(|pool| pool.stats())
-                .transpose()?
-                .unwrap_or_default();
-            let frontier_rows = engine.store.iter_json("frontier:")?;
-            let frontiers = engine
-                .frontiers
+            let lookup = engine
+                .lookup_cache
                 .lock()
-                .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
+                .map_err(|_| anyhow!("lookup cache lock poisoned"))?;
+            let (
+                file_hits,
+                file_misses,
+                file_micros,
+                symbol_queries,
+                symbol_hits,
+                symbol_candidates,
+                symbol_micros,
+                file_entries,
+                file_bytes,
+            ) = engine.index().cache_diagnostics();
             Ok(json!({
-                "schema": "context_cache.stats.v1",
-                "entry_count": l0.entries + frontiers.records.len() as u64,
-                "keys": frontier_rows.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+                "schema": "context_cache.stats.v2",
                 "namespaces": {
-                    "l0.context_pack.wire": {
-                        "entries": l0.entries,
-                        "weighted_bytes": l0.weighted_bytes,
-                        "max_bytes": L0_MAX_BYTES,
-                        "idle_expiry_seconds": 1800,
+                    "lookup": {
+                        "entries": lookup.entries.len(),
+                        "bytes": lookup.bytes,
+                        "max_entries": LOOKUP_CACHE_MAX_ENTRIES,
+                        "max_bytes": LOOKUP_CACHE_MAX_BYTES,
+                        "ttl_seconds": LOOKUP_CACHE_TTL.as_secs(),
                     },
-                    "l1.frontier.memory": {
-                        "entries": frontiers.records.len(),
-                        "bytes": frontiers.bytes,
-                        "max_bytes": L1_MEMORY_MAX_BYTES,
+                    "file": {
+                        "entries": file_entries,
+                        "bytes": file_bytes,
+                        "hits": file_hits,
+                        "misses": file_misses,
+                        "latency_total_micros": file_micros,
                     },
-                    "l1.frontier.persistent": {
-                        "entries": frontier_rows.len(),
-                        "max_bytes": L1_PERSISTENT_MAX_BYTES,
+                    "symbols": {
+                        "entries": engine.index().stats().symbol_chunks,
+                        "queries": symbol_queries,
+                        "posting_hits": symbol_hits,
+                        "candidate_count": symbol_candidates,
+                        "latency_total_micros": symbol_micros,
                     },
-                    "l1.frontier.shared_immutable": {
-                        "entries": shared.0,
-                        "bytes": shared.1,
-                        "max_bytes": SHARED_L1_PERSISTENT_MAX_BYTES,
-                        "project_local_paths": true,
-                    },
-                },
-                "auto_learn": {
-                    "schema": "warmup.auto_learn.v1",
-                    "enabled": false,
-                    "project_id": engine.project_id,
-                    "background": {"status": "idle", "pending": false},
                 },
             }))
         }
         "cache_prune" => {
-            let l0_removed = engine.l0_storage_stats().entries;
-            engine.invalidate_l0();
-            let mut expired_removed = 0_u64;
-            let mut stale_removed = 0_u64;
-            let mut age_removed = 0_u64;
+            let now = OffsetDateTime::now_utc();
             let mut deferred_removed = 0_u64;
-            let mut reference_removed = 0_u64;
-            let now_ms = now_millis();
-            let max_age_ms = u64::from(request.max_age_minutes).saturating_mul(60_000);
             let mut remove_keys = Vec::new();
-            for (key, value) in engine.store.iter_json("frontier:")? {
-                let expired = value
-                    .get("negative")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                    && value
-                        .get("expires_at_ms")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|expiry| expiry <= now_ms);
-                let stale = value.get("schema").and_then(Value::as_str)
-                    != Some("context_frontier.v2")
-                    || value.get("refresh_signature").and_then(Value::as_str)
-                        != Some(stats.refresh_signature.as_str());
-                let aged = value
-                    .get("updated_at_ms")
-                    .and_then(Value::as_u64)
-                    .is_none_or(|updated| {
-                        updated <= now_ms && now_ms.saturating_sub(updated) >= max_age_ms
-                    });
-                if expired {
-                    expired_removed = expired_removed.saturating_add(1);
-                    remove_keys.push(key);
-                } else if stale {
-                    stale_removed = stale_removed.saturating_add(1);
-                    remove_keys.push(key);
-                } else if aged {
-                    age_removed = age_removed.saturating_add(1);
-                    remove_keys.push(key);
-                }
-            }
-            let now_time = OffsetDateTime::now_utc();
             for (key, value) in engine.store.iter_json("deferred:")? {
                 let inactive = match value.get("reference_id").and_then(Value::as_str) {
-                    Some(reference_id) => !engine.store.reference_is_active(reference_id)?,
+                    Some(id) => !engine.store.reference_is_active(id)?,
                     None => true,
                 };
                 let expired = value
                     .get("expires_at")
                     .and_then(Value::as_str)
                     .and_then(|expiry| OffsetDateTime::parse(expiry, &Rfc3339).ok())
-                    .is_some_and(|expiry| expiry <= now_time);
+                    .is_none_or(|expiry| expiry <= now);
                 if inactive || expired {
-                    deferred_removed = deferred_removed.saturating_add(1);
+                    deferred_removed += 1;
                     remove_keys.push(key);
                 }
             }
+            let mut reference_removed = 0_u64;
             for (key, value) in engine.store.iter_json("reference:")? {
                 let expired = value
                     .get("expires_at")
                     .and_then(Value::as_str)
                     .and_then(|expiry| OffsetDateTime::parse(expiry, &Rfc3339).ok())
-                    .is_none_or(|expiry| expiry <= now_time);
+                    .is_none_or(|expiry| expiry <= now);
                 if expired {
-                    reference_removed = reference_removed.saturating_add(1);
+                    reference_removed += 1;
                     remove_keys.push(key);
                 }
             }
-            let persistent_removed = engine.store.delete_batch(&remove_keys)? as u64;
-            let shared_removed = engine
-                .shared_frontiers
-                .as_ref()
-                .map(|pool| pool.prune(max_age_ms))
-                .transpose()?
-                .unwrap_or_default();
-            let mut frontiers = engine
-                .frontiers
+            engine.store.delete_batch(&remove_keys)?;
+            let mut lookup = engine
+                .lookup_cache
                 .lock()
-                .map_err(|_| anyhow!("frontier cache lock poisoned"))?;
-            *frontiers = load_frontiers(&engine.store, &stats.refresh_signature)?;
+                .map_err(|_| anyhow!("lookup cache lock poisoned"))?;
+            let before = lookup.entries.len();
+            lookup
+                .entries
+                .retain(|_, entry| entry.expires_at > Instant::now());
+            lookup.bytes = lookup.entries.values().map(|entry| entry.bytes.len()).sum();
             Ok(json!({
-                "schema": "context_cache.prune.v1",
-                "entry_count": frontiers.records.len(),
-                "removed_entries": l0_removed + persistent_removed + shared_removed,
-                "expired_removed": expired_removed,
-                "stale_removed": stale_removed,
-                "age_removed": age_removed,
+                "schema": "context_cache.prune.v2",
+                "lookup_removed": before.saturating_sub(lookup.entries.len()),
                 "deferred_removed": deferred_removed,
                 "reference_removed": reference_removed,
-                "shared_frontier_removed": shared_removed,
             }))
         }
         "warmup" => warmup_dispatch(engine, request, &now, control).await,
@@ -7373,142 +5193,39 @@ async fn admin_dispatch(
 
 async fn warmup_dispatch(
     engine: &ProjectEngine,
-    request: &ContextAdminRequest,
+    _request: &ContextAdminRequest,
     generated_at: &str,
     control: Option<&WorkControl>,
 ) -> Result<Value> {
     let started = Instant::now();
-    let l0_before = engine.l0_storage_stats();
-    let l1_before = engine
-        .frontiers
-        .lock()
-        .map_err(|_| anyhow!("frontier cache lock poisoned"))?
-        .records
-        .len() as u64;
-    let exact_before = engine.metrics.l1_exact_hits.load(Ordering::Relaxed);
-    let approximate_before = engine.metrics.l1_approximate_hits.load(Ordering::Relaxed);
-    let misses_before = engine.metrics.retrieval_misses.load(Ordering::Relaxed);
-
     let refresh_started = Instant::now();
-    let (refresh_checked, refresh_updated) = engine.refresh_index_controlled(false, control)?;
-    let refresh_elapsed_ms = refresh_started.elapsed().as_secs_f64() * 1_000.0;
+    let (checked, updated) = if engine.freshness.dirty.load(Ordering::Acquire)
+        || engine.freshness.watcher_requires_verification()
+    {
+        engine.refresh_index_with_paths(true, &[], control)?
+    } else {
+        (false, false)
+    };
+    let refresh_ms = refresh_started.elapsed().as_secs_f64() * 1_000.0;
     let stats = engine.index().stats().clone();
-
-    let prompt_warmed = !request.prompt.trim().is_empty();
-    let prompt_started = Instant::now();
-    if prompt_warmed {
-        if let Some(control) = control {
-            control.check()?;
-        }
-        let focus_path = (!request.path.trim().is_empty() && request.path.trim() != ".")
-            .then(|| request.path.trim());
-        let prompt_request = warmup_prompt_request(&request.prompt, focus_path);
-        engine.admit_context_pack_cached(&prompt_request).await?;
-        if let Some(control) = control {
-            control.check()?;
-        }
-    }
-    let prompt_elapsed_ms = prompt_started.elapsed().as_secs_f64() * 1_000.0;
-
-    let l0_after = engine.l0_storage_stats();
-    let l1_after = engine
-        .frontiers
-        .lock()
-        .map_err(|_| anyhow!("frontier cache lock poisoned"))?
-        .records
-        .len() as u64;
-    let exact_hits = engine
-        .metrics
-        .l1_exact_hits
-        .load(Ordering::Relaxed)
-        .saturating_sub(exact_before);
-    let approximate_hits = engine
-        .metrics
-        .l1_approximate_hits
-        .load(Ordering::Relaxed)
-        .saturating_sub(approximate_before);
-    let misses = engine
-        .metrics
-        .retrieval_misses
-        .load(Ordering::Relaxed)
-        .saturating_sub(misses_before);
-    let hits = exact_hits.saturating_add(approximate_hits);
-    let query_count = hits.saturating_add(misses);
     engine.metrics.warmup_runs.fetch_add(1, Ordering::Relaxed);
-    let total_elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-
     Ok(json!({
-        "schema": "context_cache.warmup.v1",
+        "schema": "context_index.warmup.v1",
         "generated_at": generated_at,
-        "elapsed_ms": total_elapsed_ms,
         "project_id": engine.project_id,
-        "trigger": "manual",
-        "generated_state_only": true,
-        "repo_boundary_enforced": true,
         "index": {
-            "schema": "context_index.refresh.v1",
             "file_count": stats.file_count,
-            "import_count": stats.chunk_count,
+            "chunk_count": stats.chunk_count,
             "symbol_count": stats.symbol_chunks,
             "search_mode": "tantivy",
-            "skipped": !refresh_checked,
-            "updated": refresh_updated,
-            "reason": if refresh_updated {"signature_changed"} else {"signature_unchanged"},
+            "checked": checked,
+            "updated": updated,
         },
-        "cache": {
-            "entry_count_before": l0_before.entries.saturating_add(l1_before),
-            "entry_count_after": l0_after.entries.saturating_add(l1_after),
-            "l0_before": l0_before.entries,
-            "l0_after": l0_after.entries,
-            "l1_before": l1_before,
-            "l1_after": l1_after,
-        },
-        "workspace": {"file_count": stats.file_count},
-        "symbols": {"count": stats.symbol_chunks},
-        "state": {"overlay": "rust-v2"},
-        "manifest": {
-            "schema": "warmup.manifest.v1",
-            "project_id": engine.project_id,
-            "prompt_warmed": prompt_warmed,
-        },
-        "hot_chunks": {"target_count": 0, "targets": []},
-        "route_seeds": {"routes": {}, "seed_count": 0},
-        "search_cache": {
-            "query_count": query_count,
-            "hits": hits,
-            "misses": misses,
-            "exact_hits": exact_hits,
-            "approximate_hits": approximate_hits,
-        },
-        "file_summary_cache": {"hits": 0, "misses": 0, "summary_count": 0},
-        "term_stats": {},
-        "test_owner_targets": [],
         "stage_timings_ms": {
-            "refresh": refresh_elapsed_ms,
-            "retrieval": 0.0,
-            "prompt_cache": prompt_elapsed_ms,
-            "total": total_elapsed_ms,
+            "refresh": refresh_ms,
+            "total": started.elapsed().as_secs_f64() * 1_000.0,
         },
-        "omitted": [],
     }))
-}
-
-fn warmup_prompt_request(prompt: &str, focus_path: Option<&str>) -> ContextPackRequest {
-    ContextPackRequest {
-        prompt: prompt.to_owned(),
-        changed_files: Vec::new(),
-        focus_paths: focus_path.into_iter().map(str::to_owned).collect(),
-        memory_session: None,
-        client_profile: None,
-        model_profile: None,
-        project_id: None,
-        root_uri: None,
-        max_items: default_max_items(),
-        max_source_tokens: default_max_source_tokens(),
-        evidence_policy: EvidencePolicy::Balanced,
-        base_pack: None,
-        known_evidence: Vec::new(),
-    }
 }
 
 fn watcher_backend_name(value: u8) -> &'static str {
@@ -7546,38 +5263,11 @@ fn watcher_failure_name(value: u8) -> &'static str {
 fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
     let now = now_iso()?;
     let operations = engine.metrics.operation_snapshots();
-    let total_requests = operations.values().fold(0_u64, |total, operation| {
-        total.saturating_add(operation.get("count").and_then(Value::as_u64).unwrap_or(0))
+    let total_requests = operations.values().fold(0_u64, |sum, row| {
+        sum.saturating_add(row.get("count").and_then(Value::as_u64).unwrap_or(0))
     });
-    let mut by_tool_counts = BTreeMap::<String, u64>::new();
-    for (operation, value) in &operations {
-        let tool = operation.split('.').next().unwrap_or(operation);
-        let count = value.get("count").and_then(Value::as_u64).unwrap_or(0);
-        let entry = by_tool_counts.entry(tool.to_owned()).or_default();
-        *entry = entry.saturating_add(count);
-    }
-    let by_tool = by_tool_counts
-        .into_iter()
-        .map(|(tool, count)| (tool, Value::from(count)))
-        .collect::<serde_json::Map<String, Value>>();
-    let l0_hits = engine.metrics.l0_hits.load(Ordering::Relaxed);
-    let l0_misses = engine.metrics.l0_misses.load(Ordering::Relaxed);
-    let l0_singleflight_hits = engine.metrics.l0_singleflight_hits.load(Ordering::Relaxed);
-    let l0_cold_or_invalidated_misses = engine
-        .metrics
-        .l0_cold_or_invalidated_misses
-        .load(Ordering::Relaxed);
-    let l0_request_variant_misses = engine
-        .metrics
-        .l0_request_variant_misses
-        .load(Ordering::Relaxed);
-    let l0_invalidations = engine.metrics.l0_invalidations.load(Ordering::Relaxed);
-    let l0_invalidated_entries = engine
-        .metrics
-        .l0_invalidated_entries
-        .load(Ordering::Relaxed);
-    let lookup_cache_hits = engine.metrics.lookup_cache_hits.load(Ordering::Relaxed);
-    let lookup_cache_misses = engine.metrics.lookup_cache_misses.load(Ordering::Relaxed);
+    let lookup_hits = engine.metrics.lookup_cache_hits.load(Ordering::Relaxed);
+    let lookup_misses = engine.metrics.lookup_cache_misses.load(Ordering::Relaxed);
     let (
         file_hits,
         file_misses,
@@ -7589,126 +5279,69 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
         file_entries,
         file_bytes,
     ) = engine.index().cache_diagnostics();
-    let l0_storage = engine.l0_storage_stats();
-    let git_diff_storage = engine
-        .refresh_coordinator
-        .shared
-        .git_diff_cache
+    let lookup = engine
+        .lookup_cache
         .lock()
-        .map(|cache| (cache.entries.len(), cache.bytes))
-        .unwrap_or_default();
-    let l1_exact = engine.metrics.l1_exact_hits.load(Ordering::Relaxed);
-    let l1_approximate = engine.metrics.l1_approximate_hits.load(Ordering::Relaxed);
-    let retrieval_misses = engine.metrics.retrieval_misses.load(Ordering::Relaxed);
-    let cache_total = l0_hits.saturating_add(l0_misses);
-    let hit_ratio = if cache_total == 0 {
-        0.0
-    } else {
-        l0_hits as f64 / cache_total as f64
-    };
-    let input_tokens_est = engine.metrics.pack_input_tokens_est.load(Ordering::Relaxed);
-    let selected_source_tokens_est = engine
+        .map_err(|_| anyhow!("lookup cache lock poisoned"))?;
+    let continuation_requests = engine.metrics.continuation_requests.load(Ordering::Relaxed);
+    let continuation_reuses = engine.metrics.continuation_reuses.load(Ordering::Relaxed);
+    let diff_hits = engine.metrics.git_diff_hits.load(Ordering::Relaxed);
+    let diff_misses = engine.metrics.git_diff_misses.load(Ordering::Relaxed);
+    let diff_total = diff_hits.saturating_add(diff_misses);
+    let selected_source_tokens = engine
         .metrics
         .pack_selected_source_tokens_est
         .load(Ordering::Relaxed);
-    let evidence_card_tokens_est = engine
+    let wire_tokens = engine.metrics.pack_wire_tokens_est.load(Ordering::Relaxed);
+    let compression_factor = if wire_tokens == 0 {
+        0.0
+    } else {
+        selected_source_tokens as f64 / wire_tokens as f64
+    };
+    let input_tokens = engine.metrics.pack_input_tokens_est.load(Ordering::Relaxed);
+    let evidence_card_tokens = engine
         .metrics
         .pack_evidence_card_tokens_est
         .load(Ordering::Relaxed);
-    let returned_evidence_tokens_est = engine
+    let returned_tokens = engine
         .metrics
         .pack_returned_evidence_tokens_est
         .load(Ordering::Relaxed);
-    let wire_tokens_est = engine.metrics.pack_wire_tokens_est.load(Ordering::Relaxed);
-    let wire_bytes = engine.metrics.pack_wire_bytes.load(Ordering::Relaxed);
-    let tokens_saved_est = engine.metrics.pack_tokens_saved_est.load(Ordering::Relaxed);
-    let delta_tokens_saved_est = engine
-        .metrics
-        .pack_delta_tokens_saved_est
-        .load(Ordering::Relaxed);
-    let continuation_requests = engine.metrics.continuation_requests.load(Ordering::Relaxed);
-    let continuation_reuses = engine.metrics.continuation_reuses.load(Ordering::Relaxed);
-    let continuation_fallbacks = engine
-        .metrics
-        .continuation_fallbacks
-        .load(Ordering::Relaxed);
-    let continuation_explicit_overrides = engine
-        .metrics
-        .continuation_explicit_overrides
-        .load(Ordering::Relaxed);
-    let continuation_wire_tokens_avoided_est = engine
-        .metrics
-        .continuation_wire_tokens_avoided_est
-        .load(Ordering::Relaxed);
-    let compression_factor_est = if wire_tokens_est == 0 {
-        0.0
-    } else {
-        selected_source_tokens_est as f64 / wire_tokens_est as f64
-    };
-    let compression_ratio_est = if selected_source_tokens_est == 0 {
-        0.0
-    } else {
-        wire_tokens_est as f64 / selected_source_tokens_est as f64
-    };
-    let git_diff_hits = engine.metrics.git_diff_hits.load(Ordering::Relaxed);
-    let git_diff_misses = engine.metrics.git_diff_misses.load(Ordering::Relaxed);
-    let git_diff_samples = git_diff_hits + git_diff_misses;
-    let git_diff_micros = engine.metrics.git_diff_micros.load(Ordering::Relaxed);
+    let saved_tokens = engine.metrics.pack_tokens_saved_est.load(Ordering::Relaxed);
+    let tokens = json!({
+        "context_pack": {
+            "input_tokens_est": input_tokens,
+            "selected_source_tokens_est": selected_source_tokens,
+            "evidence_card_tokens_est": evidence_card_tokens,
+            "returned_evidence_tokens_est": returned_tokens,
+            "wire_tokens_est": wire_tokens,
+            "wire_bytes": engine.metrics.pack_wire_bytes.load(Ordering::Relaxed),
+            "saved_tokens_est": saved_tokens,
+            "delta_tokens_saved_est": engine.metrics.pack_delta_tokens_saved_est.load(Ordering::Relaxed),
+            "compression_factor_est": compression_factor,
+            "compression_ratio_est": if selected_source_tokens == 0 { 0.0 } else { wire_tokens as f64 / selected_source_tokens as f64 },
+            "continuation_wire_tokens_avoided_est": engine
+                .metrics
+                .continuation_wire_tokens_avoided_est
+                .load(Ordering::Relaxed),
+        },
+    });
+    let background_status =
+        watcher_status_name(engine.freshness.watcher_status.load(Ordering::Relaxed));
+
     Ok(json!({
-        "schema": "context_metrics.v1",
+        "schema": "context_metrics.v2",
         "project_id": engine.project_id,
         "generated_at": now,
-        "updated_at": now,
-        "since": now,
-        "requests": {
-            "total": total_requests,
-            "by_tool": by_tool,
-            "by_operation": operations,
-        },
-        "tokens": {
-            "input_est": input_tokens_est,
-            "output_est": wire_tokens_est,
-            "saved_est": tokens_saved_est,
-            "tokens_spared_by_mcp_est": tokens_saved_est,
-            "estimated_input_tokens_saved": tokens_saved_est,
-            "token_count_source": "offline_characters_div_4",
-            "context_pack": {
-                "input_tokens_est": input_tokens_est,
-                "selected_source_tokens_est": selected_source_tokens_est,
-                "evidence_card_tokens_est": evidence_card_tokens_est,
-                "returned_evidence_tokens_est": returned_evidence_tokens_est,
-                "wire_tokens_est": wire_tokens_est,
-                "wire_bytes": wire_bytes,
-                "saved_tokens_est": tokens_saved_est,
-                "delta_tokens_saved_est": delta_tokens_saved_est,
-                "continuation_wire_tokens_avoided_est": continuation_wire_tokens_avoided_est,
-                "compression_factor_est": compression_factor_est,
-                "compression_ratio_est": compression_ratio_est,
-                "candidate_count": engine.metrics.pack_candidate_count.load(Ordering::Relaxed),
-                "selected_count": engine.metrics.pack_selected_count.load(Ordering::Relaxed),
-            }
-        },
+        "status": background_status,
+        "background": {"status": background_status},
+        "requests": {"total": total_requests, "by_operation": operations},
         "cache": {
-            "hits": l0_hits,
-            "misses": l0_misses,
-            "hit_ratio": hit_ratio,
-            "l0": {
-                "hits": l0_hits,
-                "misses": l0_misses,
-                "singleflight_hits": l0_singleflight_hits,
-                "entries": l0_storage.entries,
-                "weighted_bytes": l0_storage.weighted_bytes,
-                "miss_reasons": {
-                    "cold_or_invalidated": l0_cold_or_invalidated_misses,
-                    "request_variant": l0_request_variant_misses,
-                },
-                "invalidations": l0_invalidations,
-                "invalidated_entries": l0_invalidated_entries,
-            },
             "lookup": {
-                "hits": lookup_cache_hits,
-                "misses": lookup_cache_misses,
-                "hit_ratio": if lookup_cache_hits + lookup_cache_misses == 0 { 0.0 } else { lookup_cache_hits as f64 / (lookup_cache_hits + lookup_cache_misses) as f64 },
+                "hits": lookup_hits,
+                "misses": lookup_misses,
+                "entries": lookup.entries.len(),
+                "bytes": lookup.bytes,
                 "max_entries": LOOKUP_CACHE_MAX_ENTRIES,
                 "ttl_seconds": LOOKUP_CACHE_TTL.as_secs(),
             },
@@ -7719,23 +5352,6 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
                 "entries": file_entries,
                 "bytes": file_bytes,
                 "latency_total_micros": file_micros,
-                "avg_latency_micros": if file_hits + file_misses == 0 { 0.0 } else { file_micros as f64 / (file_hits + file_misses) as f64 },
-            },
-            "git_diff": {
-                "hits": git_diff_hits,
-                "misses": git_diff_misses,
-                "hit_ratio": if git_diff_samples == 0 { 0.0 } else { git_diff_hits as f64 / git_diff_samples as f64 },
-                "regenerations": engine.metrics.git_diff_regenerations.load(Ordering::Relaxed),
-                "invalidations": engine.metrics.git_diff_invalidations.load(Ordering::Relaxed),
-                "patch_eligible": engine.metrics.git_diff_patch_eligible.load(Ordering::Relaxed),
-                "reload_fallbacks": engine.metrics.git_diff_reload_fallbacks.load(Ordering::Relaxed),
-                "bytes_generated": engine.metrics.git_diff_bytes.load(Ordering::Relaxed),
-                "latency_total_micros": git_diff_micros,
-                "avg_latency_micros": if git_diff_samples == 0 { 0.0 } else { git_diff_micros as f64 / git_diff_samples as f64 },
-                "entries": git_diff_storage.0,
-                "bytes": git_diff_storage.1,
-                "max_entries": GIT_DIFF_CACHE_MAX_ENTRIES,
-                "max_bytes": GIT_DIFF_CACHE_MAX_BYTES,
             },
             "symbols": {
                 "queries": symbol_queries,
@@ -7743,210 +5359,140 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
                 "posting_misses": symbol_queries.saturating_sub(symbol_hits),
                 "candidate_count": symbol_candidates,
                 "latency_total_micros": symbol_micros,
-                "avg_latency_micros": if symbol_queries == 0 { 0.0 } else { symbol_micros as f64 / symbol_queries as f64 },
-                "entries": engine.index().stats().symbol_chunks,
             },
-            "l1": {
-                "exact_hits": l1_exact,
-                "approximate_hits": l1_approximate,
-                "retrieval_misses": retrieval_misses,
-                "lineage": {
-                    "eligible_opportunities": engine.metrics.lineage_eligible_opportunities.load(Ordering::Relaxed),
-                    "safe_hits": engine.metrics.lineage_safe_hits.load(Ordering::Relaxed),
-                    "fallbacks": engine.metrics.lineage_fallbacks.load(Ordering::Relaxed),
-                    "latency_saved_micros_est": engine.metrics.lineage_latency_saved_micros.load(Ordering::Relaxed),
-                    "isolation_rejections": engine.metrics.lineage_isolation_rejections.load(Ordering::Relaxed),
-                    "rejection_reasons": {
-                        "dirty_worktree": engine.metrics.lineage_dirty_rejections.load(Ordering::Relaxed),
-                        "divergent_head_or_source": engine.metrics.lineage_divergent_rejections.load(Ordering::Relaxed),
-                        "stale_index": engine.metrics.lineage_stale_index_rejections.load(Ordering::Relaxed),
-                        "governed_corpus": engine.metrics.lineage_governed_corpus_rejections.load(Ordering::Relaxed),
-                        "missing_candidate_or_dependency": engine.metrics.lineage_missing_candidate_rejections.load(Ordering::Relaxed),
-                        "insufficient_capacity": engine.metrics.lineage_capacity_rejections.load(Ordering::Relaxed),
-                    }
-                }
-            },
-            "continuation": {
-                "requests": continuation_requests,
-                "reuses": continuation_reuses,
-                "fallbacks": continuation_fallbacks,
-                "explicit_overrides": continuation_explicit_overrides,
-                "max_entries": CONTINUATION_MAX_ENTRIES,
-                "ttl_seconds": CONTINUATION_TTL_SECONDS,
+            "git_diff": {
+                "hits": diff_hits,
+                "misses": diff_misses,
+                "hit_ratio": if diff_total == 0 {
+                    0.0
+                } else {
+                    diff_hits as f64 / diff_total as f64
+                },
+                "regenerations": engine
+                    .metrics
+                    .git_diff_regenerations
+                    .load(Ordering::Relaxed),
+                "invalidations": engine
+                    .metrics
+                    .git_diff_invalidations
+                    .load(Ordering::Relaxed),
+                "patch_eligible": engine
+                    .metrics
+                    .git_diff_patch_eligible
+                    .load(Ordering::Relaxed),
+                "reload_fallbacks": engine
+                    .metrics
+                    .git_diff_reload_fallbacks
+                    .load(Ordering::Relaxed),
+                "latency_total_micros": engine.metrics.git_diff_micros.load(Ordering::Relaxed),
             },
         },
-        "retrieval": {"backend": "tantivy", "doc_count": engine.index().stats().chunk_count, "misses": retrieval_misses},
-        "retrieval_queue": {"pending": 0, "active": 0},
+        "tokens": tokens,
+        "context_pack": {
+            "candidate_count": engine.metrics.pack_candidate_count.load(Ordering::Relaxed),
+            "selected_count": engine.metrics.pack_selected_count.load(Ordering::Relaxed),
+            "retrieval_micros": engine.metrics.retrieval_micros.load(Ordering::Relaxed),
+            "serialization_micros": engine.metrics.serialization_micros.load(Ordering::Relaxed),
+        },
+        "continuation": {
+            "requests": continuation_requests,
+            "reuses": continuation_reuses,
+            "fallbacks": engine.metrics.continuation_fallbacks.load(Ordering::Relaxed),
+            "explicit_overrides": engine.metrics.continuation_explicit_overrides.load(Ordering::Relaxed),
+            "max_entries": CONTINUATION_MAX_ENTRIES,
+            "ttl_seconds": CONTINUATION_TTL_SECONDS,
+        },
         "references": {
             "active_count": engine.metrics.active_references.load(Ordering::Relaxed),
             "total_count": engine.metrics.total_references.load(Ordering::Relaxed),
         },
-        "tooling": {"external_calls_saved_est": 0},
-        "warmup": {"runs": engine.metrics.warmup_runs.load(Ordering::Relaxed)},
-        "benchmarks": {},
         "index_freshness": {
-            "strategy": "watcher_driven_published_generations",
             "generation": engine.freshness.generation.load(Ordering::Relaxed),
             "dirty": engine.freshness.dirty.load(Ordering::Relaxed),
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
             "watcher": {
-                "backend": watcher_backend_name(engine.freshness.watcher_backend.load(Ordering::Relaxed)),
-                "status": watcher_status_name(engine.freshness.watcher_status.load(Ordering::Relaxed)),
-                "failure": watcher_failure_name(engine.freshness.watcher_failure.load(Ordering::Relaxed)),
+                "backend": watcher_backend_name(
+                    engine.freshness.watcher_backend.load(Ordering::Relaxed),
+                ),
+                "status": background_status,
+                "failure": watcher_failure_name(
+                    engine.freshness.watcher_failure.load(Ordering::Relaxed),
+                ),
                 "poll_interval_ms": watch_poll_interval().as_millis(),
             },
             "coalesce_ms": WATCH_COALESCE_MS,
             "refreshes": engine.metrics.refreshes.load(Ordering::Relaxed),
             "full_refreshes": engine.metrics.full_refreshes.load(Ordering::Relaxed),
-            "incremental_refreshes": engine.metrics.incremental_refreshes.load(Ordering::Relaxed),
-            "incremental_fallbacks": engine.metrics.incremental_fallbacks.load(Ordering::Relaxed),
-            "changed_path_count": engine.freshness.changed_paths.lock().map(|paths| paths.len()).unwrap_or_default(),
-            "journal_overflow": engine.freshness.journal_overflow.load(Ordering::Relaxed),
-            "lineage_git_checks": engine.metrics.lineage_git_checks.load(Ordering::Relaxed),
+            "incremental_refreshes": engine
+                .metrics
+                .incremental_refreshes
+                .load(Ordering::Relaxed),
+            "incremental_fallbacks": engine
+                .metrics
+                .incremental_fallbacks
+                .load(Ordering::Relaxed),
+            "changed_path_count": engine
+                .freshness
+                .changed_paths
+                .lock()
+                .map(|paths| paths.len())
+                .unwrap_or_default(),
+            "journal_overflow": engine
+                .freshness
+                .journal_overflow
+                .load(Ordering::Relaxed),
             "phase_micros": {
                 "signature_scan": engine.metrics.signature_scan_micros.load(Ordering::Relaxed),
                 "refresh": engine.metrics.refresh_micros.load(Ordering::Relaxed),
-                "index_state_io": engine.metrics.index_state_io_micros.load(Ordering::Relaxed),
+                "index_state_io": engine
+                    .metrics
+                    .index_state_io_micros
+                    .load(Ordering::Relaxed),
                 "retrieval": engine.metrics.retrieval_micros.load(Ordering::Relaxed),
-                "cache_state_io": engine.metrics.cache_state_io_micros.load(Ordering::Relaxed),
-                "serialization": engine.metrics.serialization_micros.load(Ordering::Relaxed)
-            }
+                "serialization": engine.metrics.serialization_micros.load(Ordering::Relaxed),
+            },
         },
-        "background": {"status": if engine.freshness.dirty.load(Ordering::Relaxed) {"change_pending"} else {"idle"}},
+        "warmup": {"runs": engine.metrics.warmup_runs.load(Ordering::Relaxed)},
     }))
 }
 
 fn unloaded_metrics_snapshot(project_id: &str, now: &str, status: &str) -> Value {
     json!({
-        "schema": "context_metrics.v1",
+        "schema": "context_metrics.v2",
         "project_id": project_id,
         "generated_at": now,
-        "updated_at": now,
-        "since": now,
+        "status": status,
         "requests": {
             "total": 0,
-            "by_tool": {"context_pack": 0},
-            "by_operation": {"context_pack": {
-                "count": 0,
-                "success_count": 0,
-                "error_count": 0,
-                "avg_elapsed_ms": 0.0,
-                "min_elapsed_ms": 0.0,
-                "max_elapsed_ms": 0.0,
-                "last_elapsed_ms": 0.0,
-                "p50_recent_ms": null,
-                "p95_recent_ms": null,
-                "recent_sample_count": 0,
-                "recent_sample_limit": OPERATION_SAMPLE_LIMIT,
-                "output_bytes_total": 0,
-                "avg_output_bytes": 0.0,
-            }}
-        },
-        "tokens": {
-            "input_est": 0,
-            "output_est": 0,
-            "saved_est": 0,
-            "tokens_spared_by_mcp_est": 0,
-            "estimated_input_tokens_saved": 0,
-            "token_count_source": "offline_characters_div_4",
-            "context_pack": {
-                "input_tokens_est": 0,
-                "selected_source_tokens_est": 0,
-                "evidence_card_tokens_est": 0,
-                "returned_evidence_tokens_est": 0,
-                "wire_tokens_est": 0,
-                "wire_bytes": 0,
-                "saved_tokens_est": 0,
-                "delta_tokens_saved_est": 0,
-                "continuation_wire_tokens_avoided_est": 0,
-                "compression_factor_est": 0.0,
-                "compression_ratio_est": 0.0,
-                "candidate_count": 0,
-                "selected_count": 0,
-            }
-        },
-        "cache": {
-            "hits": 0,
-            "misses": 0,
-            "hit_ratio": 0.0,
-            "l0": {
-                "hits": 0,
-                "misses": 0,
-                "singleflight_hits": 0,
-                "entries": 0,
-                "weighted_bytes": 0,
-                "miss_reasons": {"cold_or_invalidated": 0, "request_variant": 0},
-                "invalidations": 0,
-                "invalidated_entries": 0,
-            },
-            "lookup": {
-                "hits": 0,
-                "misses": 0,
-                "hit_ratio": 0.0,
-                "max_entries": LOOKUP_CACHE_MAX_ENTRIES,
-                "ttl_seconds": LOOKUP_CACHE_TTL.as_secs(),
-            },
-            "file": {"hits": 0, "misses": 0, "hit_ratio": 0.0, "entries": 0, "bytes": 0, "latency_total_micros": 0, "avg_latency_micros": 0.0},
-            "git_diff": {
-                "hits": 0, "misses": 0, "hit_ratio": 0.0, "regenerations": 0,
-                "invalidations": 0, "patch_eligible": 0, "reload_fallbacks": 0,
-                "bytes_generated": 0, "latency_total_micros": 0, "avg_latency_micros": 0.0,
-                "entries": 0, "bytes": 0,
-                "max_entries": GIT_DIFF_CACHE_MAX_ENTRIES, "max_bytes": GIT_DIFF_CACHE_MAX_BYTES,
-            },
-            "symbols": {"queries": 0, "posting_hits": 0, "posting_misses": 0, "candidate_count": 0, "latency_total_micros": 0, "avg_latency_micros": 0.0, "entries": 0},
-            "l1": {
-                "exact_hits": 0,
-                "approximate_hits": 0,
-                "retrieval_misses": 0,
-                "lineage": {
-                    "eligible_opportunities": 0,
-                    "safe_hits": 0,
-                    "fallbacks": 0,
-                    "latency_saved_micros_est": 0,
-                    "isolation_rejections": 0,
-                    "rejection_reasons": {
-                        "dirty_worktree": 0,
-                        "divergent_head_or_source": 0,
-                        "stale_index": 0,
-                        "governed_corpus": 0,
-                        "missing_candidate_or_dependency": 0,
-                        "insufficient_capacity": 0,
-                    }
-                }
-            },
-            "continuation": {
-                "requests": 0,
-                "reuses": 0,
-                "fallbacks": 0,
-                "explicit_overrides": 0,
-                "max_entries": CONTINUATION_MAX_ENTRIES,
-                "ttl_seconds": CONTINUATION_TTL_SECONDS,
+            "by_operation": {
+                "context_pack": {"count": 0, "success_count": 0, "error_count": 0},
             },
         },
-        "retrieval": {"backend": "tantivy", "doc_count": 0, "misses": 0},
-        "retrieval_queue": {"pending": 0, "active": 0},
-        "references": {"active_count": 0, "total_count": 0},
-        "tooling": {"external_calls_saved_est": 0},
-        "warmup": {"runs": 0},
-        "benchmarks": {},
+        "cache": {"lookup": {}, "file": {}, "symbols": {}},
+        "tokens": {"context_pack": {}},
+        "context_pack": {},
+        "continuation": {},
+        "background": {"status": status},
         "index_freshness": {
-            "strategy": status,
-            "generation": 0,
-            "dirty": false,
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
-            "watcher": {"backend": "unloaded", "status": status, "failure": "none", "poll_interval_ms": watch_poll_interval().as_millis()},
+            "watcher": {
+                "backend": "unloaded",
+                "status": status,
+                "failure": "none",
+                "poll_interval_ms": watch_poll_interval().as_millis(),
+            },
             "coalesce_ms": WATCH_COALESCE_MS,
-            "refreshes": 0,
-            "full_refreshes": 0,
-            "incremental_refreshes": 0,
-            "incremental_fallbacks": 0,
             "changed_path_count": 0,
             "journal_overflow": false,
-            "lineage_git_checks": 0,
-            "phase_micros": {"signature_scan": 0, "refresh": 0, "index_state_io": 0, "retrieval": 0, "cache_state_io": 0, "serialization": 0}
+            "phase_micros": {
+                "signature_scan": 0,
+                "refresh": 0,
+                "index_state_io": 0,
+                "retrieval": 0,
+                "serialization": 0,
+            },
         },
-        "background": {"status": status},
+        "warmup": {"runs": 0},
     })
 }
 
@@ -8202,14 +5748,13 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "context_projects.cached.v1",
                 "context_index.refresh.v1",
                 "context_index.status.v1",
-                "context_cache.stats.v1",
-                "context_cache.prune.v1",
-                "context_cache.warmup.v1",
+                "context_cache.stats.v2",
+                "context_cache.prune.v2",
+                "context_index.warmup.v1",
                 "context_monitor_usage.report.v4",
-                "context_monitor_usage.report.v3",
                 "context_budget.v1",
                 "tool_output_contracts.v1",
-                "context_metrics.v1",
+                "context_metrics.v2",
                 "context_measurement_report.v1",
                 "context_measurement_matrix.v1",
                 "context_benchmark.v1",
@@ -8223,9 +5768,7 @@ fn contract_for_tool(tool_name: &str) -> Value {
                 "mode": "wiki, health, projects, active_projects, cached_projects, monitor_usage, index_refresh, index_status, cache_stats, cache_prune, warmup, budget, contracts, metrics, measurement_matrix, measurement_report, benchmark, state_browser, quality_eval, cache_plan, profile_calibrate, instructions, resource_proxy, schema_minify.",
                 "action": "For wiki: status, refresh, history_deepen, ingest_submit, ingest_claim, ingest_import, ingest_status, ingest_retry, ingest_fail. For monitor_usage: status, enable, disable, or report.",
                 "wiki": "Typed supplied-URL metadata or claim-attempt/import payload; download/extraction runs only in the optional companion.",
-                "path": "Repository-relative path or resource URI.", "max_files": "Index file cap.",
-                "prompt": "Optional prompt to warm exact context_pack cache without echoing it.",
-                "max_age_minutes": "Cache prune age.",
+                "path": "Repository-relative path or resource URI.", "max_files": "Maximum commits for wiki history deepening.",
                 "max_entries": "Maximum returned rows for projects, active_projects, cached_projects, and state_browser (default 20; project catalogue range 1..=1000).",
                 "max_output_chars": "For monitor reports, inline JSON budget (default 12000) plus at most 2048 characters of truncation and retrieval metadata; otherwise a budget override.",
                 "default_output_profile": "Budget profile.",
@@ -9796,45 +7339,6 @@ fn sha256_text(text: &str) -> String {
         .collect()
 }
 
-fn repository_lineage_seed(root: &std::path::Path) -> String {
-    let lineage_path = git_common_dir(root).or_else(|| root.canonicalize().ok());
-    sha256_text(
-        &lineage_path
-            .unwrap_or_else(|| root.to_path_buf())
-            .to_string_lossy(),
-    )
-}
-
-fn git_common_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let dot_git = root.join(".git");
-    if dot_git.is_dir() {
-        dot_git.canonicalize().ok()
-    } else if dot_git.is_file() {
-        std::fs::read_to_string(&dot_git).ok().and_then(|contents| {
-            let git_dir = contents.trim().strip_prefix("gitdir:")?.trim();
-            let git_dir = std::path::Path::new(git_dir);
-            let git_dir = if git_dir.is_absolute() {
-                git_dir.to_path_buf()
-            } else {
-                root.join(git_dir)
-            };
-            let git_dir = git_dir.canonicalize().ok()?;
-            let common_file = git_dir.join("commondir");
-            if let Ok(common) = std::fs::read_to_string(common_file) {
-                git_dir.join(common.trim()).canonicalize().ok()
-            } else {
-                git_dir
-                    .parent()
-                    .and_then(std::path::Path::parent)
-                    .and_then(|path| path.canonicalize().ok())
-                    .or(Some(git_dir))
-            }
-        })
-    } else {
-        None
-    }
-}
-
 fn truncate_string(text: &mut String, max_bytes: usize) {
     if text.len() <= max_bytes {
         return;
@@ -10096,120 +7600,11 @@ fn default_admin_mode() -> String {
     "health".to_owned()
 }
 
-const fn default_max_age_minutes() -> u32 {
-    43_200
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
-
-    fn git(root: &std::path::Path, args: &[&str]) {
-        let result = Command::new("git")
-            .env("GIT_AUTHOR_DATE", "2026-08-04T00:00:00Z")
-            .env("GIT_COMMITTER_DATE", "2026-08-04T00:00:00Z")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .expect("run git fixture command");
-        assert!(result.status.success(), "git fixture command failed");
-    }
-
-    fn init_git_repository(root: &std::path::Path) {
-        fs::create_dir_all(root).expect("repository directory");
-        fs::write(
-            root.join("src.rs"),
-            "fn governed_frontier_anchor() { assert!(true); }\n",
-        )
-        .expect("source fixture");
-        git(root, &["init", "--quiet"]);
-        git(root, &["config", "user.name", "Fixture"]);
-        git(root, &["config", "user.email", "fixture@example.test"]);
-        git(root, &["add", "src.rs"]);
-        git(root, &["commit", "--quiet", "-m", "fixture"]);
-        git(
-            root,
-            &["remote", "add", "origin", "https://example.test/shared.git"],
-        );
-    }
-
-    fn linked_worktree(repository: &std::path::Path, worktree: &std::path::Path) {
-        let worktree_arg = worktree.to_str().expect("UTF-8 fixture path");
-        git(
-            repository,
-            &["worktree", "add", "--quiet", "--detach", worktree_arg],
-        );
-    }
-
-    fn governed_engine(
-        root: &std::path::Path,
-        state: &std::path::Path,
-        project_id: &str,
-        pool: Arc<SharedFrontierCache>,
-    ) -> ProjectEngine {
-        let monitor = Arc::new(
-            UsageMonitor::open(state.join("monitor-global")).expect("usage monitor fixture"),
-        );
-        ProjectEngine::build_with_governed_frontiers(
-            root,
-            state,
-            project_id,
-            monitor,
-            GovernedFrontierLineage::new("a".repeat(64)).expect("governed lineage"),
-            pool,
-        )
-        .expect("governed project engine")
-    }
-
-    fn frontier_request(variant: &str) -> ContextPackRequest {
-        serde_json::from_value(json!({
-            "prompt": "governed frontier anchor",
-            "focus_paths": ["src.rs"],
-            "known_evidence": [variant],
-        }))
-        .expect("frontier request")
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn reuse_sample(
-        prompt: &str,
-        terms: &[&str],
-        scope: &[&str],
-        evidence: &str,
-        _generation: u64,
-        signature: &str,
-        lineage: &str,
-        cache_outcome: PackCacheOutcome,
-        frontier_outcome: FrontierOutcome,
-    ) -> UsageSample {
-        UsageSample {
-            elapsed: StdDuration::from_millis(1),
-            telemetry: PackTelemetry {
-                frontier_outcome,
-                base_pack_used: evidence != "none",
-                ..PackTelemetry::default()
-            },
-            cache_outcome,
-            refresh_checked: false,
-            refresh_updated: false,
-            route: "explore",
-            term_count: terms.len(),
-            scope_count: scope.len(),
-            client_profile: "codex",
-            reuse: ReuseIdentityInput {
-                prompt: prompt.to_owned(),
-                terms: terms.iter().map(|value| (*value).to_owned()).collect(),
-                scope: scope.iter().map(|value| (*value).to_owned()).collect(),
-                options: json!({"scope": scope, "max_items": 8, "policy": "balanced"}),
-                evidence: json!({"state": evidence}),
-                refresh_signature: signature.to_owned(),
-                lineage_seed: lineage.to_owned(),
-            },
-        }
-    }
 
     #[test]
     fn request_defaults_are_the_v2_contract_defaults() {
@@ -10813,7 +8208,7 @@ mod tests {
         )
         .expect("metrics JSON");
         assert_eq!(response["schema"], "context_measurement_report.v1");
-        assert_eq!(response["metrics"]["schema"], "context_metrics.v1");
+        assert_eq!(response["metrics"]["schema"], "context_metrics.v2");
         assert_eq!(response["metrics"]["project_id"], "unloaded-project");
         assert_eq!(response["metrics"]["background"]["status"], "unloaded");
         assert_eq!(
@@ -10926,12 +8321,12 @@ mod tests {
             ("health", "context_admin.health.v1"),
             ("index_refresh", "context_index.refresh.v1"),
             ("index_status", "context_index.status.v1"),
-            ("cache_stats", "context_cache.stats.v1"),
-            ("cache_prune", "context_cache.prune.v1"),
-            ("warmup", "context_cache.warmup.v1"),
+            ("cache_stats", "context_cache.stats.v2"),
+            ("cache_prune", "context_cache.prune.v2"),
+            ("warmup", "context_index.warmup.v1"),
             ("budget", "context_budget.v1"),
             ("contracts", "tool_output_contracts.compact.v1"),
-            ("metrics", "context_metrics.v1"),
+            ("metrics", "context_metrics.v2"),
             ("measurement_matrix", "context_measurement_matrix.v1"),
             ("measurement_report", "context_measurement_report.v1"),
             ("benchmark", "context_benchmark.v1"),
@@ -11094,8 +8489,83 @@ mod tests {
         assert!(memory["summaries"][0]["summary"].as_str().unwrap().len() <= 1200);
     }
 
+    #[test]
+    fn concurrent_direct_pack_generation_returns_complete_deterministic_packs() {
+        let root = tempdir().expect("temporary repository");
+        let source = (0..400)
+            .map(|index| format!("fn anchor_{index}() {{ assert!(true); }}\n"))
+            .collect::<String>();
+        std::fs::write(root.path().join("anchors.rs"), source).expect("fixture file");
+        let engine = Arc::new(ProjectEngine::build(root.path()).expect("engine"));
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "debug anchor_17",
+            "focus_paths": ["anchors.rs"]
+        }))
+        .expect("pack request");
+        let mut tasks = Vec::new();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        for _ in 0..8 {
+            let engine = Arc::clone(&engine);
+            let request = request.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(std::thread::spawn(move || {
+                barrier.wait();
+                engine.context_pack(&request)
+            }));
+        }
+        let mut first = None;
+        for task in tasks {
+            let response = task.join().expect("pack thread").expect("pack response");
+            if let Some(expected) = &first {
+                assert_eq!(&response, expected);
+            } else {
+                first = Some(response);
+            }
+        }
+        let decoded: ContextPackV2 =
+            serde_json::from_slice(first.as_deref().expect("at least one response"))
+                .expect("complete pack");
+        assert!(!decoded.evidence.is_empty());
+    }
+
     #[tokio::test]
-    async fn l0_cache_returns_identical_wire_bytes_and_reports_hits() {
+    async fn warmup_refreshes_dirty_index_without_generating_a_pack() {
+        let root = tempdir().expect("repository");
+        let state = tempdir().expect("state");
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn before_warmup() {}\n").expect("initial source");
+        let engine =
+            ProjectEngine::build_with_state(root.path(), state.path(), "warmup").expect("engine");
+        fs::write(&source, "fn after_warmup() {}\n").expect("changed source");
+        record_watcher_event(&engine.freshness, ["lib.rs".to_owned()], false);
+        let request: ContextAdminRequest =
+            serde_json::from_value(json!({"mode": "warmup"})).expect("warmup request");
+        let response: Value =
+            serde_json::from_slice(&engine.context_admin(&request).await.expect("warmup"))
+                .expect("warmup response");
+        assert_eq!(response["schema"], "context_index.warmup.v1");
+        let (hits, _) = engine
+            .index()
+            .search("after_warmup", &[], 8)
+            .expect("published search");
+        assert!(hits.iter().any(|hit| hit.content.contains("after_warmup")));
+        assert!(
+            engine
+                .store
+                .iter_json("pack:")
+                .expect("pack snapshots")
+                .is_empty()
+        );
+        assert!(
+            !engine
+                .metrics
+                .operation_snapshots()
+                .contains_key("context_pack")
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_pack_generation_is_deterministic() {
         let root = tempdir().expect("temporary repository");
         std::fs::write(
             root.path().join("auth.py"),
@@ -11109,19 +8579,14 @@ mod tests {
         }))
         .expect("pack request");
         let first = engine
-            .context_pack_cached(&request)
+            .context_pack_generate(&request)
             .await
-            .expect("uncached response");
+            .expect("first response");
         let second = engine
-            .context_pack_cached(&request)
+            .context_pack_generate(&request)
             .await
-            .expect("cached response");
+            .expect("repeated response");
         assert_eq!(first, second);
-        assert_eq!(engine.metrics.l0_misses.load(Ordering::Relaxed), 1);
-        assert_eq!(engine.metrics.l0_hits.load(Ordering::Relaxed), 1);
-        let l0 = engine.l0_storage_stats();
-        assert_eq!(l0.entries, 1);
-        assert!(l0.weighted_bytes >= first.len() as u64);
     }
 
     #[test]
@@ -11225,123 +8690,8 @@ mod tests {
         assert_eq!(refreshed.knowledge.len(), 1);
     }
 
-    #[test]
-    fn l0_singleflight_remains_correct_for_concurrent_non_continuation_requests() {
-        let root = tempdir().expect("temporary repository");
-        let source = (0..400)
-            .map(|index| format!("fn anchor_{index}() {{ assert!(true); }}\n"))
-            .collect::<String>();
-        std::fs::write(root.path().join("anchors.rs"), source).expect("fixture file");
-        let engine = Arc::new(ProjectEngine::build(root.path()).expect("engine"));
-        let request: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "review concurrent anchor evidence",
-            "focus_paths": ["anchors.rs"]
-        }))
-        .expect("request");
-        let barrier = Arc::new(std::sync::Barrier::new(12));
-        let responses = std::thread::scope(|scope| {
-            let handles = (0..12)
-                .map(|_| {
-                    let engine = Arc::clone(&engine);
-                    let barrier = Arc::clone(&barrier);
-                    let request = request.clone();
-                    scope.spawn(move || {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .build()
-                            .expect("runtime");
-                        barrier.wait();
-                        runtime
-                            .block_on(engine.context_pack_cached(&request))
-                            .expect("singleflight pack")
-                    })
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("thread"))
-                .collect::<Vec<_>>()
-        });
-        assert!(responses.windows(2).all(|pair| pair[0] == pair[1]));
-        assert_eq!(engine.metrics.l0_misses.load(Ordering::Relaxed), 1);
-        assert_eq!(engine.metrics.l0_hits.load(Ordering::Relaxed), 11);
-        assert!(engine.metrics.l0_singleflight_hits.load(Ordering::Relaxed) > 0);
-    }
-
     #[tokio::test]
-    async fn l0_cache_uses_semantic_request_fields_after_freshness() {
-        let root = tempdir().expect("temporary repository");
-        std::fs::write(
-            root.path().join("auth.py"),
-            "def validate_token(token):\n    return token\n",
-        )
-        .expect("fixture file");
-        let engine = ProjectEngine::build(root.path()).expect("engine");
-        let first: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "debug validate_token guard",
-            "focus_paths": ["auth.py"],
-            "client_profile": "codex",
-        }))
-        .expect("first request");
-        let second: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "debug validate_token guard",
-            "changed_files": ["auth.py"],
-            "client_profile": "generic",
-            "model_profile": "unknown",
-        }))
-        .expect("second request");
-
-        let first = engine
-            .context_pack_cached(&first)
-            .await
-            .expect("first response");
-        let second = engine
-            .context_pack_cached(&second)
-            .await
-            .expect("second response");
-
-        assert_eq!(first, second);
-        assert_eq!(engine.metrics.l0_misses.load(Ordering::Relaxed), 1);
-        assert_eq!(engine.metrics.l0_hits.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            engine
-                .metrics
-                .l0_cold_or_invalidated_misses
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            engine
-                .metrics
-                .l0_request_variant_misses
-                .load(Ordering::Relaxed),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn unscoped_l0_entry_misses_after_generation_change() {
-        let root = tempdir().expect("temporary repository");
-        fs::write(root.path().join("existing.txt"), "ranking marker\n").expect("fixture file");
-        let engine = ProjectEngine::build(root.path()).expect("engine");
-        let request: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "ranking marker",
-        }))
-        .expect("pack request");
-        engine
-            .context_pack_cached(&request)
-            .await
-            .expect("first response");
-        fs::write(root.path().join("new.txt"), "new ranking marker\n").expect("new source");
-        engine
-            .context_pack_cached(&request)
-            .await
-            .expect("second response");
-        assert_eq!(engine.metrics.l0_misses.load(Ordering::Relaxed), 2);
-        assert_eq!(engine.metrics.l0_hits.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn l0_revalidates_references_and_rebuilds_invalid_entries() {
+    async fn repeated_pack_generation_regenerates_invalid_references() {
         for mutation in ["missing", "expired", "tampered"] {
             let root = tempdir().expect("temporary repository");
             std::fs::write(
@@ -11356,7 +8706,7 @@ mod tests {
             }))
             .expect("pack request");
             let first = engine
-                .context_pack_cached(&request)
+                .context_pack_generate(&request)
                 .await
                 .expect("first response");
             let first_pack: ContextPackV2 = serde_json::from_slice(&first).expect("first pack");
@@ -11400,7 +8750,7 @@ mod tests {
             }
 
             let second = engine
-                .context_pack_cached(&request)
+                .context_pack_generate(&request)
                 .await
                 .expect("rebuilt response");
             assert_eq!(first, second, "mutation={mutation}");
@@ -11410,161 +8760,7 @@ mod tests {
                     .reference_is_active(&reference_id)
                     .expect("rebuilt reference")
             );
-            assert_eq!(engine.metrics.l0_hits.load(Ordering::Relaxed), 0);
-            assert_eq!(engine.metrics.l0_misses.load(Ordering::Relaxed), 2);
-            assert_eq!(engine.metrics.l0_invalidations.load(Ordering::Relaxed), 1);
         }
-    }
-
-    #[tokio::test]
-    async fn naturally_expired_l0_entry_is_a_second_cold_miss() {
-        let root = tempdir().expect("temporary repository");
-        let state = tempdir().expect("temporary state");
-        std::fs::write(root.path().join("cache.rs"), "fn idle_cache() {}\n").expect("fixture file");
-        let engine = ProjectEngine::build_with_state_and_l0_idle(
-            root.path(),
-            state.path(),
-            "idle-expiry",
-            StdDuration::from_millis(5),
-            Arc::new(UsageMonitor::open(state.path().join("monitor")).expect("monitor")),
-            None,
-            None,
-            None,
-        )
-        .expect("engine");
-        let request: ContextPackRequest =
-            serde_json::from_value(json!({"prompt": "idle_cache"})).expect("request");
-        engine
-            .context_pack_cached(&request)
-            .await
-            .expect("first response");
-        std::thread::sleep(StdDuration::from_millis(30));
-        engine
-            .context_pack_cached(&request)
-            .await
-            .expect("second response");
-
-        assert_eq!(engine.metrics.l0_misses.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            engine
-                .metrics
-                .l0_cold_or_invalidated_misses
-                .load(Ordering::Relaxed),
-            2
-        );
-        assert_eq!(
-            engine
-                .metrics
-                .l0_request_variant_misses
-                .load(Ordering::Relaxed),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn warmup_populates_l1_and_optional_l0_without_pack_telemetry() {
-        let root = tempdir().expect("temporary repository");
-        std::fs::write(
-            root.path().join("architecture.rs"),
-            "fn repository_architecture() {}\nfn implementation_source_code() {}\nfn review_correctness_safety() {}\n",
-        )
-        .expect("fixture file");
-        let engine = ProjectEngine::build(root.path()).expect("engine");
-        let secret_prompt = "  private prompt cache architecture  ";
-        let request: ContextAdminRequest = serde_json::from_value(json!({
-            "mode": "warmup",
-            "prompt": secret_prompt,
-            "path": "architecture.rs"
-        }))
-        .expect("warmup request");
-        let response = engine
-            .context_admin(&request)
-            .await
-            .expect("warmup response");
-        let warmup: Value = serde_json::from_slice(&response).expect("warmup JSON");
-
-        assert_eq!(warmup["schema"], "context_cache.warmup.v1");
-        assert_eq!(warmup["manifest"]["prompt_warmed"], true);
-        assert_eq!(warmup["cache"]["l1_after"], 0);
-        assert_eq!(warmup["cache"]["l0_after"], 1);
-        assert_eq!(warmup["search_cache"]["query_count"], 1);
-        assert!(!String::from_utf8_lossy(&response).contains(secret_prompt));
-        let prompt_request = warmup_prompt_request(secret_prompt, Some("architecture.rs"));
-        engine
-            .admit_context_pack_cached(&prompt_request)
-            .await
-            .expect("warm exact L0 hit");
-        assert_eq!(engine.metrics.l0_hits.load(Ordering::Relaxed), 1);
-        assert!(
-            !engine
-                .metrics
-                .operations
-                .lock()
-                .expect("operations")
-                .contains_key("context_pack")
-        );
-        assert_eq!(
-            engine.metrics.pack_wire_tokens_est.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(engine.metrics.warmup_runs.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn generic_warmup_is_empty_and_positive_frontier_requires_two_hits() {
-        let root = tempdir().expect("temporary repository");
-        std::fs::write(
-            root.path().join("warmup.rs"),
-            "fn repository_architecture() {}\nfn implementation_source_code() {}\nfn debug_failing_tests() {}\nfn review_correctness_safety() {}\nfn test_coverage_ownership() {}\n",
-        )
-        .expect("fixture file");
-        let engine = ProjectEngine::build(root.path()).expect("engine");
-        let request: ContextAdminRequest =
-            serde_json::from_value(json!({"mode": "warmup"})).expect("warmup request");
-        let response: Value = serde_json::from_slice(
-            &engine
-                .context_admin(&request)
-                .await
-                .expect("warmup response"),
-        )
-        .expect("warmup JSON");
-
-        assert_eq!(response["search_cache"]["query_count"], 0);
-        assert_eq!(
-            engine
-                .store
-                .iter_json("frontier:")
-                .expect("frontiers")
-                .len(),
-            0
-        );
-        let index = engine.index();
-        let adaptive = warmup_prompt_request("repository architecture", None);
-        engine
-            .retrieve_candidates(&index, &adaptive, &[])
-            .expect("first observation");
-        assert!(
-            engine
-                .store
-                .iter_json("frontier:")
-                .expect("frontiers")
-                .is_empty()
-        );
-        engine
-            .retrieve_candidates(&index, &adaptive, &[])
-            .expect("second observation");
-        assert_eq!(
-            engine
-                .store
-                .iter_json("frontier:")
-                .expect("frontiers")
-                .len(),
-            1
-        );
-        engine
-            .retrieve_candidates(&index, &adaptive, &[])
-            .expect("exact adaptive reuse");
-        assert_eq!(engine.metrics.l1_exact_hits.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -11592,7 +8788,7 @@ mod tests {
         .expect("request");
 
         let disabled_bytes = engine
-            .context_pack_cached(&request)
+            .context_pack_generate(&request)
             .await
             .expect("disabled pack");
         let disabled_pack: ContextPackV2 =
@@ -11607,7 +8803,7 @@ mod tests {
         admitted.client_profile = Some(" CODEX ".to_owned());
         admitted.known_evidence = vec!["client-one".to_owned()];
         engine
-            .context_pack_cached(&admitted)
+            .context_pack_generate(&admitted)
             .await
             .expect("admission pack");
         let mut delta = request.clone();
@@ -11615,11 +8811,11 @@ mod tests {
         delta.base_pack = Some(disabled_pack.id);
         delta.known_evidence = vec!["client-two".to_owned()];
         engine
-            .context_pack_cached(&delta)
+            .context_pack_generate(&delta)
             .await
             .expect("delta pack");
         engine
-            .context_pack_cached(&delta)
+            .context_pack_generate(&delta)
             .await
             .expect("cached delta pack");
         let enabled = monitor
@@ -11627,11 +8823,7 @@ mod tests {
             .expect("enabled report");
         let bucket = &enabled["buckets"][0];
         assert_eq!(bucket["request_count"], 3);
-        assert_eq!(bucket["cache_outcomes"]["l0_miss"], 2);
-        assert_eq!(bucket["cache_outcomes"]["l0_hit"], 1);
-        assert_eq!(bucket["frontier_outcomes"]["admitted"], 1);
-        assert_eq!(bucket["frontier_outcomes"]["exact_hit"], 1);
-        assert_eq!(bucket["index"]["refresh_checked"], 2);
+        assert_eq!(bucket["index"]["refresh_checked"], 0);
         assert_eq!(bucket["index"]["refresh_updated"], 0);
         assert_eq!(bucket["delta"]["base_pack_requests"], 2);
         assert_eq!(bucket["delta"]["known_evidence_requests"], 3);
@@ -11640,7 +8832,6 @@ mod tests {
         assert_eq!(bucket["scope_count_buckets"]["1_2"], 3);
         assert!(bucket["stages_micros"]["retrieval"].as_u64().is_some());
         assert!(bucket["stages_micros"]["pack_build"].as_u64().is_some());
-        assert!(bucket["stages_micros"]["cache"].as_u64().is_some());
         let profiles = bucket["client_profiles"]
             .as_array()
             .expect("client profile buckets");
@@ -11660,8 +8851,6 @@ mod tests {
             assert!(profile["avg_elapsed_micros"].as_u64().is_some());
             assert!(profile["input_to_wire_ratio_millis"].as_u64().is_some());
             assert!(profile["avg_tokens_saved_est"].as_u64().is_some());
-            assert!(profile["cache_hit_share_millis"].as_u64().is_some());
-            assert!(profile["frontier_hit_share_millis"].as_u64().is_some());
             assert!(profile["delta_reuse_share_millis"].as_u64().is_some());
             assert!(profile["route_shares_millis"].is_object());
         }
@@ -11673,7 +8862,7 @@ mod tests {
         assert!(!encoded.contains("private-agent-identifier"));
         monitor.action("disable", None).expect("disable");
         engine
-            .context_pack_cached(&request)
+            .context_pack_generate(&request)
             .await
             .expect("disabled again");
         assert_eq!(
@@ -11707,11 +8896,11 @@ mod tests {
         }))
         .expect("request");
         engine
-            .context_pack_cached(&request)
+            .context_pack_generate(&request)
             .await
             .expect("initial pack");
         engine
-            .context_pack_cached(&request)
+            .context_pack_generate(&request)
             .await
             .expect("reused pack");
         let report = monitor
@@ -11726,310 +8915,6 @@ mod tests {
                 .as_u64()
                 .is_some_and(|value| value > 0)
         );
-    }
-
-    #[test]
-    fn reuse_telemetry_classifies_opportunities_misses_and_coarse_distance() {
-        let state = tempdir().expect("temporary state");
-        let monitor = UsageMonitor::open(state.path().join("global")).expect("monitor");
-        monitor.action("enable", None).expect("enable");
-        let base = OffsetDateTime::now_utc();
-        let record = |minutes,
-                      project,
-                      prompt,
-                      terms: &[&str],
-                      scope: &[&str],
-                      evidence,
-                      generation,
-                      signature,
-                      lineage,
-                      cache,
-                      frontier| {
-            monitor
-                .record_at(
-                    project,
-                    reuse_sample(
-                        prompt, terms, scope, evidence, generation, signature, lineage, cache,
-                        frontier,
-                    ),
-                    base + Duration::minutes(minutes),
-                )
-                .expect("reuse sample");
-        };
-        let miss = PackCacheOutcome::L0Miss;
-        record(
-            0,
-            "project-a",
-            "exact prompt",
-            &["exact"],
-            &["a.rs"],
-            "none",
-            0,
-            "sig-a",
-            "repo-a",
-            miss,
-            FrontierOutcome::Admitted,
-        );
-        record(
-            15,
-            "project-a",
-            "exact prompt",
-            &["exact"],
-            &["a.rs"],
-            "none",
-            0,
-            "sig-a",
-            "repo-a",
-            PackCacheOutcome::L0Hit,
-            FrontierOutcome::Search,
-        );
-        record(
-            30,
-            "project-a",
-            "exact prompt",
-            &["exact"],
-            &["a.rs"],
-            "none",
-            0,
-            "sig-a",
-            "repo-a",
-            miss,
-            FrontierOutcome::ExactHit,
-        );
-        record(
-            45,
-            "project-a",
-            "exact prompt",
-            &["exact"],
-            &["a.rs"],
-            "none",
-            1,
-            "sig-b",
-            "repo-a",
-            miss,
-            FrontierOutcome::ExactHit,
-        );
-        record(
-            90,
-            "project-a",
-            "exact prompt",
-            &["exact"],
-            &["a.rs"],
-            "none",
-            1,
-            "sig-b",
-            "repo-a",
-            miss,
-            FrontierOutcome::ExactHit,
-        );
-        record(
-            100,
-            "project-a",
-            "evidence prompt",
-            &["evidence"],
-            &["e.rs"],
-            "none",
-            0,
-            "sig-a",
-            "repo-a",
-            miss,
-            FrontierOutcome::Admitted,
-        );
-        record(
-            105,
-            "project-a",
-            "evidence prompt",
-            &["evidence"],
-            &["e.rs"],
-            "base",
-            0,
-            "sig-a",
-            "repo-a",
-            miss,
-            FrontierOutcome::ExactHit,
-        );
-        record(
-            110,
-            "project-a",
-            "scope prompt",
-            &["scope"],
-            &["one.rs"],
-            "none",
-            0,
-            "sig-a",
-            "repo-a",
-            miss,
-            FrontierOutcome::Admitted,
-        );
-        record(
-            115,
-            "project-a",
-            "scope prompt",
-            &["scope"],
-            &["two.rs"],
-            "none",
-            0,
-            "sig-a",
-            "repo-a",
-            miss,
-            FrontierOutcome::Admitted,
-        );
-        record(
-            120,
-            "project-a",
-            "variant one",
-            &["shared"],
-            &["v.rs"],
-            "none",
-            0,
-            "sig-a",
-            "repo-a",
-            miss,
-            FrontierOutcome::Admitted,
-        );
-        record(
-            125,
-            "project-a",
-            "variant two",
-            &["shared"],
-            &["v.rs"],
-            "none",
-            0,
-            "sig-a",
-            "repo-a",
-            miss,
-            FrontierOutcome::ExactHit,
-        );
-        record(
-            130,
-            "project-b",
-            "exact prompt",
-            &["exact"],
-            &["a.rs"],
-            "none",
-            0,
-            "sig-a",
-            "repo-a",
-            miss,
-            FrontierOutcome::Admitted,
-        );
-
-        let report = monitor.report(None).expect("report");
-        let buckets = report["buckets"].as_array().expect("buckets");
-        let sum = |section: &str, field: &str| {
-            buckets
-                .iter()
-                .map(|bucket| {
-                    bucket
-                        .pointer(&format!("/{section}/{field}"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default()
-                })
-                .sum::<u64>()
-        };
-        assert_eq!(sum("reuse_opportunities", "exact"), 4);
-        assert_eq!(sum("reuse_opportunities", "lineage"), 1);
-        assert_eq!(sum("reuse_effectiveness", "exact_hits"), 1);
-        assert_eq!(sum("miss_causes", "cold_or_restart"), 6);
-        assert_eq!(sum("miss_causes", "expired"), 1);
-        assert_eq!(sum("miss_causes", "invalidated_generation_or_signature"), 1);
-        assert_eq!(sum("miss_causes", "request_variant"), 1);
-        assert_eq!(sum("miss_causes", "scope_or_options_variant"), 1);
-        assert_eq!(sum("miss_causes", "evidence_state_variant"), 1);
-        assert_eq!(
-            REUSE_MISS_CAUSES
-                .iter()
-                .map(|cause| sum("miss_causes", cause))
-                .sum::<u64>(),
-            11
-        );
-        assert!(sum("repeat_distance_buckets", "within_30m_idle_window") >= 1);
-        assert!(sum("repeat_distance_buckets", "30m_to_2h") >= 1);
-        assert_eq!(report["schema"], "context_monitor_usage.report.v3");
-    }
-
-    #[test]
-    fn reuse_state_is_restart_stable_discards_old_usage_schemas_redacted_and_bounded() {
-        let state = tempdir().expect("temporary state");
-        let store = StateStore::open(state.path().join("global")).expect("store");
-        store
-            .put_json(
-                "monitor:config",
-                &json!({"schema":"context_monitor_usage.config.v1", "enabled":true}),
-            )
-            .expect("legacy config");
-        store.put_json("monitor:usage:2099-01-01:legacy", &json!({"schema":"context_monitor_usage.bucket.v2", "day":"2099-01-01", "project_id":"legacy", "request_count":1, "cache_outcomes":{"l0_miss":1}})).expect("legacy bucket");
-        drop(store);
-        let monitor = UsageMonitor::open(state.path().join("global")).expect("monitor");
-        let config = monitor
-            .store
-            .get_json("monitor:config")
-            .expect("config read")
-            .expect("config");
-        assert_eq!(config["schema"], "context_monitor_usage.config.v2");
-        assert_eq!(config["enabled"], false);
-        let salt = config["identity_salt"].as_str().expect("salt").to_owned();
-        assert_eq!(salt.len(), 32);
-        let current_report = monitor.report(Some("legacy")).expect("current report");
-        assert!(
-            current_report["buckets"]
-                .as_array()
-                .expect("buckets")
-                .is_empty()
-        );
-        assert!(
-            monitor
-                .store
-                .get_json("monitor:usage:2099-01-01:legacy")
-                .expect("old bucket read")
-                .is_none()
-        );
-        drop(monitor);
-        let monitor = UsageMonitor::open(state.path().join("global")).expect("reopen");
-        assert_eq!(monitor.identity_salt, salt);
-
-        let slot = reuse_time_slot(OffsetDateTime::now_utc());
-        let entries = (0..=REUSE_TRACKER_MAX_ENTRIES)
-            .map(|index| json!({"project_id":"bounded", "exact":format!("ru_{index:024x}"), "prompt":"ru_000000000000000000000000", "frontier":"ru_000000000000000000000000", "scope_options":"ru_000000000000000000000000", "evidence":"ru_000000000000000000000000", "lineage":"ru_000000000000000000000000", "signature":"ru_000000000000000000000000", "last_slot":slot}))
-            .collect::<Vec<_>>();
-        monitor.store.put_json("monitor:reuse:state", &json!({"schema":"context_monitor_reuse.state.v1", "identity_version":"v1", "entries":entries})).expect("tracker fixture");
-        monitor
-            .record_at(
-                "safe-project",
-                reuse_sample(
-                    "private prompt bearer ghp_secret",
-                    &["private"],
-                    &["/absolute/host/path"],
-                    "private-evidence",
-                    0,
-                    "raw-repository-url",
-                    "/host/private/repository/.git",
-                    PackCacheOutcome::L0Miss,
-                    FrontierOutcome::Admitted,
-                ),
-                OffsetDateTime::now_utc(),
-            )
-            .expect("record");
-        let tracker = monitor
-            .store
-            .get_json("monitor:reuse:state")
-            .expect("tracker read")
-            .expect("tracker");
-        assert_eq!(
-            tracker["entries"].as_array().expect("entries").len(),
-            REUSE_TRACKER_MAX_ENTRIES
-        );
-        let encoded = tracker.to_string();
-        for forbidden in [
-            "private prompt",
-            "ghp_secret",
-            "/absolute/host/path",
-            "private-evidence",
-            "raw-repository-url",
-            "/host/private/repository",
-        ] {
-            assert!(!encoded.contains(forbidden));
-        }
     }
 
     #[test]
@@ -12087,7 +8972,7 @@ mod tests {
                 .put_json(
                     &format!("monitor:usage:2099-01-01:project-{index:03}"),
                     &json!({
-                        "schema": "context_monitor_usage.bucket.v3",
+                        "schema": "context_monitor_usage.bucket.v4",
                         "day": format!("2099-01-{:02}", (index % 28) + 1),
                         "project_id": format!("project-{index:03}"),
                         "request_count": index + 1,
@@ -12218,127 +9103,6 @@ mod tests {
         assert_eq!(
             classify_context_pack_rejection(&anyhow!("private internal detail")),
             ContextPackRejectionClass::Internal
-        );
-    }
-
-    #[tokio::test]
-    async fn cache_prune_applies_reason_precedence_and_age_to_all_frontiers() {
-        let root = tempdir().expect("temporary repository");
-        std::fs::write(root.path().join("cache.rs"), "fn prune_cache() {}\n")
-            .expect("fixture file");
-        let engine = ProjectEngine::build(root.path()).expect("engine");
-        let signature = engine.index().stats().refresh_signature.clone();
-        let now = now_millis();
-        let record =
-            |key: &str, negative: bool, expires_at_ms: u64, refresh: &str, updated: Option<u64>| {
-                let mut value = serde_json::to_value(FrontierRecord {
-                    schema: "context_frontier.v2".to_owned(),
-                    key: key.to_owned(),
-                    route: "general".to_owned(),
-                    scope: Vec::new(),
-                    generation: 0,
-                    candidate_capacity: DEFAULT_MAX_ITEMS,
-                    terms: Vec::new(),
-                    candidate_ids: Vec::new(),
-                    scores: Vec::new(),
-                    cumulative_token_costs: Vec::new(),
-                    dependencies: Vec::new(),
-                    score_cutoff: 0.0,
-                    refresh_signature: refresh.to_owned(),
-                    negative,
-                    expires_at_ms,
-                    updated_at_ms: updated.unwrap_or_default(),
-                })
-                .expect("frontier JSON");
-                if updated.is_none() {
-                    value
-                        .as_object_mut()
-                        .expect("frontier object")
-                        .remove("updated_at_ms");
-                }
-                value
-            };
-        let old = now.saturating_sub(120 * 60_000);
-        for (key, value) in [
-            (
-                "frontier:expired",
-                record("expired", true, now.saturating_sub(1), "stale", Some(old)),
-            ),
-            (
-                "frontier:stale",
-                record("stale", false, 0, "stale", Some(old)),
-            ),
-            (
-                "frontier:aged",
-                record("aged", false, 0, &signature, Some(old)),
-            ),
-            (
-                "frontier:missing",
-                record("missing", false, 0, &signature, None),
-            ),
-            (
-                "frontier:recent",
-                record("recent", false, 0, &signature, Some(now)),
-            ),
-        ] {
-            engine.store.put_json(key, &value).expect("frontier row");
-        }
-        engine
-            .store
-            .put_json(
-                "reference:ctxref-expired",
-                &json!({"expires_at":"2000-01-01T00:00:00Z"}),
-            )
-            .expect("expired reference");
-        engine
-            .store
-            .put_json(
-                "deferred:expired",
-                &json!({
-                    "reference_id":"ctxref-expired",
-                    "expires_at":"2000-01-01T00:00:00Z"
-                }),
-            )
-            .expect("expired deferred row");
-        let prune: ContextAdminRequest = serde_json::from_value(json!({
-            "mode": "cache_prune", "max_age_minutes": 60
-        }))
-        .expect("prune request");
-        let response: Value =
-            serde_json::from_slice(&engine.context_admin(&prune).await.expect("prune response"))
-                .expect("prune JSON");
-        assert_eq!(response["expired_removed"], 1);
-        assert_eq!(response["stale_removed"], 1);
-        assert_eq!(response["age_removed"], 2);
-        assert_eq!(response["deferred_removed"], 1);
-        assert_eq!(response["reference_removed"], 1);
-        assert_eq!(
-            engine
-                .store
-                .iter_json("frontier:")
-                .expect("remaining")
-                .len(),
-            1
-        );
-
-        let prune_all: ContextAdminRequest = serde_json::from_value(json!({
-            "mode": "cache_prune", "max_age_minutes": 0
-        }))
-        .expect("prune all request");
-        let response: Value = serde_json::from_slice(
-            &engine
-                .context_admin(&prune_all)
-                .await
-                .expect("prune all response"),
-        )
-        .expect("prune all JSON");
-        assert_eq!(response["age_removed"], 1);
-        assert!(
-            engine
-                .store
-                .iter_json("frontier:")
-                .expect("empty")
-                .is_empty()
         );
     }
 
@@ -12581,9 +9345,9 @@ mod tests {
         assert_eq!(replay.reuse.status, "reused");
         assert!(replay.evidence.is_empty());
         let metrics = metrics_snapshot(&engine).expect("metrics");
-        assert_eq!(metrics["cache"]["continuation"]["requests"], 3);
-        assert_eq!(metrics["cache"]["continuation"]["reuses"], 2);
-        assert_eq!(metrics["cache"]["continuation"]["fallbacks"], 1);
+        assert_eq!(metrics["continuation"]["requests"], 3);
+        assert_eq!(metrics["continuation"]["reuses"], 2);
+        assert_eq!(metrics["continuation"]["fallbacks"], 1);
         assert!(
             metrics["tokens"]["context_pack"]["continuation_wire_tokens_avoided_est"]
                 .as_u64()
@@ -12640,8 +9404,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fresh_changed_file_rebuilds_and_changes_evidence_identity() {
+    #[tokio::test]
+    async fn fresh_changed_file_rebuilds_and_changes_evidence_identity() {
         let root = tempdir().expect("temporary repository");
         let path = root.path().join("auth.py");
         std::fs::write(&path, "def validate_token(token):\n    return token\n")
@@ -12668,9 +9432,13 @@ mod tests {
             "changed_files": ["auth.py"],
         }))
         .expect("changed request");
-        let second: ContextPackV2 =
-            serde_json::from_slice(&engine.context_pack(&changed).expect("changed pack"))
-                .expect("changed response");
+        let second: ContextPackV2 = serde_json::from_slice(
+            &engine
+                .context_pack_generate(&changed)
+                .await
+                .expect("changed pack"),
+        )
+        .expect("changed response");
         assert_ne!(first.id, second.id);
         assert_ne!(first.evidence[0].0, second.evidence[0].0);
         assert_eq!(engine.freshness.generation.load(Ordering::Relaxed), 1);
@@ -12721,7 +9489,9 @@ mod tests {
         });
 
         assert_eq!(
-            engine.refresh_index(false).expect("overflow refresh"),
+            engine
+                .refresh_index_with_paths(true, &[], None)
+                .expect("overflow refresh"),
             (true, true)
         );
         stop.store(true, Ordering::Release);
@@ -12733,170 +9503,6 @@ mod tests {
             engine.metrics.incremental_fallbacks.load(Ordering::Relaxed),
             1
         );
-    }
-
-    #[test]
-    fn l1_never_serves_approximate_reordered_terms() {
-        let root = tempdir().expect("temporary repository");
-        std::fs::write(
-            root.path().join("ranking.rs"),
-            "fn deterministic_frontier_ranking() {\n    let candidate = 1;\n    assert!(candidate > 0);\n}\n",
-        )
-        .expect("fixture file");
-        let engine = ProjectEngine::build(root.path()).expect("engine");
-        let first: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "deterministic frontier ranking candidate"
-        }))
-        .expect("first request");
-        engine.context_pack(&first).expect("first pack");
-        let reordered: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "candidate ranking frontier deterministic"
-        }))
-        .expect("reordered request");
-        engine.context_pack(&reordered).expect("reranked pack");
-        assert_eq!(
-            engine.metrics.l1_approximate_hits.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(engine.metrics.retrieval_misses.load(Ordering::Relaxed), 2);
-        let state = engine
-            .store
-            .iter_json("frontier:")
-            .expect("frontier state")
-            .into_iter()
-            .map(|(_, value)| value.to_string())
-            .collect::<String>();
-        assert!(!state.contains("deterministic frontier ranking candidate"));
-        assert!(!state.contains("candidate ranking frontier deterministic"));
-    }
-
-    #[test]
-    fn l1_frontier_identity_is_route_independent_and_cold_equivalent() {
-        let root = tempdir().expect("temporary repository");
-        std::fs::write(
-            root.path().join("shared.rs"),
-            "fn shared_frontier_anchor() { assert!(true); }\n",
-        )
-        .expect("fixture file");
-        let engine = ProjectEngine::build(root.path()).expect("engine");
-        let request: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "review shared frontier anchor"
-        }))
-        .expect("request");
-        assert_eq!(classify_route(&request.prompt), "review");
-        let index = engine.index();
-        let (cold, terms) = index
-            .search(&request.prompt, &[], usize::from(request.max_items))
-            .expect("cold search");
-        let mut fingerprints = concept_fingerprints(&terms);
-        fingerprints.sort();
-        fingerprints.dedup();
-        let diagnostic_debug_record = engine
-            .build_frontier_record(
-                &index,
-                "debug",
-                Vec::new(),
-                fingerprints,
-                request.max_items,
-                &cold,
-            )
-            .expect("frontier");
-        engine
-            .admit_frontier_batch(&[diagnostic_debug_record])
-            .expect("admit frontier");
-
-        let (cached, _, outcome, _) = engine
-            .retrieve_candidates(&index, &request, &[])
-            .expect("route-independent hit");
-        assert!(matches!(outcome, FrontierOutcome::ExactHit));
-        assert_eq!(
-            cached.iter().map(|hit| &hit.id).collect::<Vec<_>>(),
-            cold.iter().map(|hit| &hit.id).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn negative_frontier_is_exact_only_and_does_not_mask_similar_search() {
-        let root = tempdir().expect("temporary repository");
-        std::fs::write(
-            root.path().join("evidence.rs"),
-            "fn alpha_beta_gamma_delta_epsilon_eta() { assert!(true); }\n",
-        )
-        .expect("fixture file");
-        let engine = ProjectEngine::build(root.path()).expect("engine");
-        let negative_prompt = "alpha beta gamma delta epsilon zeta";
-        let exact_request: ContextPackRequest =
-            serde_json::from_value(json!({"prompt": negative_prompt})).expect("exact request");
-        let terms = normalize_terms(negative_prompt, 8);
-        let index = engine.index();
-        let negative = engine
-            .build_frontier_record(
-                &index,
-                classify_route(negative_prompt),
-                Vec::new(),
-                {
-                    let mut fingerprints = concept_fingerprints(&terms);
-                    fingerprints.sort();
-                    fingerprints
-                },
-                DEFAULT_MAX_ITEMS,
-                &[],
-            )
-            .expect("negative frontier");
-        engine
-            .admit_frontier_batch(&[negative])
-            .expect("admit negative frontier");
-        let (exact_hits, _, _, _) = engine
-            .retrieve_candidates(&index, &exact_request, &[])
-            .expect("exact negative reuse");
-        assert!(exact_hits.is_empty());
-
-        let similar: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "alpha beta gamma delta epsilon eta"
-        }))
-        .expect("similar request");
-        let (similar_hits, _, _, _) = engine
-            .retrieve_candidates(&index, &similar, &[])
-            .expect("real similar search");
-        assert!(similar_hits.iter().any(|hit| hit.path == "evidence.rs"));
-        assert_eq!(engine.metrics.l1_exact_hits.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            engine.metrics.l1_approximate_hits.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(engine.metrics.retrieval_misses.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn l1_frontier_scope_is_insensitive_to_explicit_path_order() {
-        let root = tempdir().expect("temporary repository");
-        std::fs::write(
-            root.path().join("alpha.rs"),
-            "fn frontier_scope_alpha() { let candidate = 1; }\n",
-        )
-        .expect("alpha fixture");
-        std::fs::write(
-            root.path().join("beta.rs"),
-            "fn frontier_scope_beta() { let candidate = 2; }\n",
-        )
-        .expect("beta fixture");
-        let engine = ProjectEngine::build(root.path()).expect("engine");
-        let first: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "frontier scope candidate",
-            "focus_paths": ["alpha.rs", "beta.rs"]
-        }))
-        .expect("first request");
-        let reordered: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "frontier scope candidate",
-            "focus_paths": ["beta.rs", "alpha.rs"]
-        }))
-        .expect("reordered request");
-
-        engine.context_pack(&first).expect("first pack");
-        engine.context_pack(&reordered).expect("reordered pack");
-        engine.context_pack(&first).expect("third pack");
-
-        assert_eq!(engine.metrics.l1_exact_hits.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -13004,157 +9610,19 @@ mod tests {
         assert!(!persisted.contains(&normalized));
     }
 
-    #[tokio::test]
-    async fn governed_linked_worktrees_share_only_opaque_frontiers_and_rerank_locally() {
-        let fixture = tempdir().expect("fixture root");
-        let repository = fixture.path().join("repository");
-        let verifier_root = fixture.path().join("verifier");
-        init_git_repository(&repository);
-        linked_worktree(&repository, &verifier_root);
-        assert!(git_worktree_proof(&repository).is_ok());
-        assert!(git_worktree_proof(&verifier_root).is_ok());
-        let state = tempdir().expect("state root");
-        let shared_state = state.path().join("shared");
-        let pool = Arc::new(SharedFrontierCache::open(&shared_state).expect("shared pool"));
-        let builder = governed_engine(
-            &repository,
-            &state.path().join("builder"),
-            "builder",
-            Arc::clone(&pool),
-        );
-        builder
-            .context_pack_cached(&frontier_request("builder-observation-one"))
-            .await
-            .expect("first builder search");
-        let builder_bytes = builder
-            .context_pack_cached(&frontier_request("builder-observation-two"))
-            .await
-            .expect("builder admission");
-        let builder_pack: ContextPackV2 =
-            serde_json::from_slice(&builder_bytes).expect("builder pack");
-        assert_eq!(
-            builder
-                .store()
-                .iter_json("frontier:")
-                .expect("local frontier")
-                .len(),
-            1
-        );
-        assert_eq!(pool.stats().expect("shared stats").0, 1);
-
-        let verifier = governed_engine(
-            &verifier_root,
-            &state.path().join("verifier"),
-            "verifier",
-            Arc::clone(&pool),
-        );
-        verifier
-            .usage_monitor
-            .action("enable", None)
-            .expect("enable verifier telemetry");
-        let verifier_bytes = verifier
-            .context_pack_cached(&frontier_request("verifier-request"))
-            .await
-            .expect("verifier shared lookup");
-        let verifier_pack: ContextPackV2 =
-            serde_json::from_slice(&verifier_bytes).expect("verifier pack");
-        assert_eq!(builder_pack.paths, verifier_pack.paths);
-        assert_eq!(
-            verifier.metrics.lineage_safe_hits.load(Ordering::Relaxed),
-            1
-        );
-        let usage = verifier
-            .usage_monitor
-            .action("report", Some("verifier"))
-            .expect("lineage usage report");
-        assert_eq!(
-            usage["buckets"][0]["lineage_frontier"]["eligible_opportunities"],
-            1
-        );
-        assert_eq!(usage["buckets"][0]["lineage_frontier"]["safe_hits"], 1);
-
-        let shared_json = pool
-            .store
-            .iter_json("shared-frontier:")
-            .expect("shared records")
-            .into_iter()
-            .map(|(_, value)| value.to_string())
-            .collect::<String>();
-        for forbidden in [
-            "src.rs",
-            "builder",
-            "verifier",
-            "governed frontier anchor",
-            "reference:",
-            "pack:",
-        ] {
-            assert!(!shared_json.contains(forbidden), "shared path/state leak");
-        }
-        assert!(shared_json.contains("ca:"));
-        assert!(
-            verifier
-                .store()
-                .iter_json("pack:")
-                .expect("verifier snapshots")
-                .iter()
-                .all(|(_, value)| value["pack_id"] == verifier_pack.id)
-        );
-        if let Some(reference) = builder_pack.more {
-            assert!(
-                !verifier
-                    .store()
-                    .reference_is_active(&reference)
-                    .expect("local reference")
-            );
-        }
-
-        drop(verifier);
-        drop(builder);
-        drop(pool);
-        let reopened = Arc::new(SharedFrontierCache::open(&shared_state).expect("reopened pool"));
-        let gatekeeper = governed_engine(
-            &verifier_root,
-            &state.path().join("gatekeeper"),
-            "gatekeeper",
-            reopened,
-        );
-        gatekeeper
-            .context_pack_cached(&frontier_request("gatekeeper-request"))
-            .await
-            .expect("persistent shared lookup");
-        assert_eq!(
-            gatekeeper.metrics.lineage_safe_hits.load(Ordering::Relaxed),
-            1
-        );
-        let prune: ContextAdminRequest = serde_json::from_value(json!({
-            "mode": "cache_prune",
-            "max_age_minutes": 0
-        }))
-        .expect("prune request");
-        let pruned: Value = serde_json::from_slice(
-            &gatekeeper
-                .context_admin(&prune)
-                .await
-                .expect("shared prune"),
-        )
-        .expect("prune response");
-        assert_eq!(pruned["shared_frontier_removed"], 1);
-    }
-
     #[test]
-    fn generated_worktree_churn_is_ignored_by_watcher_and_git_lineage() {
+    fn generated_worktree_churn_is_ignored_by_watcher() {
         let fixture = tempdir().expect("fixture root");
         let repository = fixture.path().join("repository");
-        init_git_repository(&repository);
+        std::fs::create_dir_all(&repository).expect("repository root");
+        std::fs::write(repository.join("src.rs"), "fn source() {}\n").expect("source file");
         let generated = repository.join("nested/.workingdir/issue-29/target");
         std::fs::create_dir_all(&generated).expect("generated tree");
         let churn = generated.join("churn.rs");
         std::fs::write(&churn, "fn churn_initial() {}\n").expect("initial generated file");
         let state = tempdir().expect("state root");
-        let shared = Arc::new(
-            SharedFrontierCache::open(state.path().join("shared")).expect("shared frontier"),
-        );
-        let engine = governed_engine(&repository, &state.path().join("engine"), "churn", shared);
+        let engine = ProjectEngine::build_with_state(&repository, state.path(), "churn")
+            .expect("project engine");
         let initial_deadline = Instant::now() + StdDuration::from_secs(3);
         while !engine.freshness.dirty.load(Ordering::Relaxed) && Instant::now() < initial_deadline {
             std::thread::sleep(StdDuration::from_millis(10));
@@ -13168,15 +9636,12 @@ mod tests {
             .clear();
         let generation = engine.freshness.generation.load(Ordering::Relaxed);
         let refreshes = engine.metrics.refreshes.load(Ordering::Relaxed);
-        let git_checks = engine.metrics.lineage_git_checks.load(Ordering::Relaxed);
         for revision in 0..20 {
             std::fs::write(&churn, format!("fn churn_{revision}() {{}}\n"))
                 .expect("generated churn");
             assert!(!source_event_path(&repository, &churn));
         }
         std::thread::sleep(StdDuration::from_millis(150));
-
-        assert!(git_worktree_proof(&repository).is_ok());
         assert!(
             !engine.freshness.dirty.load(Ordering::Relaxed),
             "unexpected journal: {:?}",
@@ -13187,10 +9652,6 @@ mod tests {
             generation
         );
         assert_eq!(engine.metrics.refreshes.load(Ordering::Relaxed), refreshes);
-        assert_eq!(
-            engine.metrics.lineage_git_checks.load(Ordering::Relaxed),
-            git_checks
-        );
     }
 
     #[test]
@@ -13392,7 +9853,8 @@ mod tests {
             }));
 
             let refresh_engine = Arc::clone(&engine);
-            let refresh = thread::spawn(move || refresh_engine.refresh_index(false));
+            let refresh =
+                thread::spawn(move || refresh_engine.refresh_index_with_paths(true, &[], None));
             entered.wait();
             fs::write(&source, "fn mutation_during_refresh() {}\n").expect("mid-refresh mutation");
             record_watcher_event(&engine.freshness, ["lib.rs".to_owned()], false);
@@ -13465,19 +9927,29 @@ mod tests {
         }))
         .expect("fresh request");
         let waiter = thread::spawn(move || {
-            waiter_engine.ensure_fresh_controlled(&request, Some(&waiter_control))
+            waiter_engine.ensure_pack_fresh_controlled(&request, Some(&waiter_control))
         });
         entered.wait();
-        let fast: ContextPackRequest = serde_json::from_value(json!({
-            "prompt": "after_refresh",
-            "changed_files": ["lib.rs"], "evidence_policy": "source"
+        control.cancel();
+        assert!(waiter.join().expect("waiter").is_err());
+        resume.wait();
+
+        let deadline = Instant::now() + StdDuration::from_secs(2);
+        while engine.index().stats().refresh_signature == initial && Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert_ne!(engine.index().stats().refresh_signature, initial);
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "after_refresh", "focus_paths": ["lib.rs"],
+            "evidence_policy": "source"
         }))
-        .expect("fast request");
-        let started = Instant::now();
-        let bytes = engine.context_pack(&fast).expect("available snapshot pack");
-        assert!(started.elapsed() < StdDuration::from_secs(1));
-        let response: ContextPackV2 = serde_json::from_slice(&bytes).expect("pack");
-        assert_eq!(response.freshness, "refreshing");
+        .expect("refreshed request");
+        let response: ContextPackV2 = serde_json::from_slice(
+            &engine
+                .context_pack(&request)
+                .expect("fresh pack after cancelled waiter"),
+        )
+        .expect("fresh response");
         assert!(
             response
                 .evidence
@@ -13490,15 +9962,6 @@ mod tests {
                 .iter()
                 .any(|card| card.5.contains("before_refresh"))
         );
-        control.cancel();
-        assert!(waiter.join().expect("waiter").is_err());
-        resume.wait();
-
-        let deadline = Instant::now() + StdDuration::from_secs(2);
-        while engine.index().stats().refresh_signature == initial && Instant::now() < deadline {
-            thread::sleep(StdDuration::from_millis(10));
-        }
-        assert_ne!(engine.index().stats().refresh_signature, initial);
     }
 
     #[test]
@@ -13710,9 +10173,23 @@ mod tests {
             .expect("change journal")
             .clear();
 
-        let (checked, updated) = engine.refresh_index(false).expect("ordinary refresh");
-        assert!(checked);
-        assert!(updated);
+        let request: ContextPackRequest = serde_json::from_value(json!({
+            "prompt": "after_watcher_failure", "focus_paths": ["lib.rs"],
+            "evidence_policy": "source"
+        }))
+        .expect("ordinary pack request");
+        let response: ContextPackV2 = serde_json::from_slice(
+            &engine
+                .context_pack(&request)
+                .expect("ordinary pack verifies failed watcher"),
+        )
+        .expect("verified response");
+        assert!(
+            response
+                .evidence
+                .iter()
+                .any(|card| card.5.contains("after_watcher_failure"))
+        );
         assert_ne!(engine.index().stats().refresh_signature, initial_signature);
         assert_eq!(
             engine.freshness.watcher_status.load(Ordering::Acquire),
@@ -13730,70 +10207,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn governed_git_process_obeys_the_work_deadline() {
-        let control = WorkControl::new(Instant::now() + StdDuration::from_millis(30));
-        let _scope = WorkControlScope::install(Some(&control));
-        let started = Instant::now();
-        let output = command_output_bounded(Command::new("sleep").arg("30"), GIT_COMMAND_TIMEOUT);
-        assert!(output.is_none());
-        assert!(started.elapsed() < StdDuration::from_secs(1));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn governed_git_output_is_hard_capped_and_oversized_child_is_reaped() {
-        let exact = command_output_bounded(
-            Command::new("head")
-                .arg("-c")
-                .arg(GIT_OUTPUT_LIMIT_BYTES.to_string())
-                .arg("/dev/zero"),
-            GIT_COMMAND_TIMEOUT,
-        )
-        .expect("output at the hard limit");
-        assert!(exact.status.success());
-        assert_eq!(exact.stdout.len(), GIT_OUTPUT_LIMIT_BYTES);
-
-        let fixture = tempdir().expect("capture fixture");
-        let pid_path = fixture.path().join("oversized.pid");
-        let oversized_bytes = GIT_OUTPUT_LIMIT_BYTES.saturating_add(1);
-        let started = Instant::now();
-        let output = command_output_bounded(
-            Command::new("sh")
-                .arg("-c")
-                .arg("printf '%s' \"$$\" > \"$1\"; head -c \"$2\" /dev/zero; exec sleep 30")
-                .arg("governed-git-output")
-                .arg(&pid_path)
-                .arg(oversized_bytes.to_string()),
-            StdDuration::from_secs(3),
-        );
-        assert!(output.is_none());
-        assert!(
-            started.elapsed() < StdDuration::from_millis(1500),
-            "oversized output must terminate the child before its command deadline"
-        );
-
-        let pid = std::fs::read_to_string(&pid_path).expect("oversized child pid");
-        let child_is_alive = Command::new("sh")
-            .arg("-c")
-            .arg("kill -0 \"$1\" 2>/dev/null")
-            .arg("governed-git-reap-check")
-            .arg(pid.trim())
-            .status()
-            .expect("child reap check")
-            .success();
-        assert!(!child_is_alive, "oversized output child was not reaped");
-
-        std::fs::remove_file(pid_path).expect("remove pid marker");
-        assert_eq!(
-            std::fs::read_dir(fixture.path())
-                .expect("capture fixture contents")
-                .count(),
-            0,
-            "stdout capture left a temporary artifact"
-        );
-    }
-
     #[test]
     fn persisted_index_generation_recovers_from_crash_and_corruption() {
         let root = tempdir().expect("repository root");
@@ -13852,272 +10265,6 @@ mod tests {
         assert!(
             snapshot.exists(),
             "cancellation must preserve the old artifact"
-        );
-    }
-
-    #[tokio::test]
-    async fn unrelated_repositories_cannot_share_even_with_identical_content_remote_and_governance()
-    {
-        let fixture = tempdir().expect("fixture root");
-        let first = fixture.path().join("one/repository");
-        let second = fixture.path().join("two/repository");
-        init_git_repository(&first);
-        init_git_repository(&second);
-        assert_eq!(
-            git_worktree_proof(&first).expect("first proof").head_oid,
-            git_worktree_proof(&second).expect("second proof").head_oid
-        );
-        let state = tempdir().expect("state root");
-        let pool =
-            Arc::new(SharedFrontierCache::open(state.path().join("shared")).expect("shared pool"));
-        let producer = governed_engine(
-            &first,
-            &state.path().join("producer"),
-            "same-name",
-            Arc::clone(&pool),
-        );
-        producer
-            .context_pack_cached(&frontier_request("first"))
-            .await
-            .expect("producer first");
-        producer
-            .context_pack_cached(&frontier_request("second"))
-            .await
-            .expect("producer admission");
-        let attacker = governed_engine(&second, &state.path().join("attacker"), "same-name", pool);
-        attacker
-            .context_pack_cached(&frontier_request("attacker"))
-            .await
-            .expect("safe local fallback");
-        assert_eq!(
-            attacker.metrics.lineage_safe_hits.load(Ordering::Relaxed),
-            0
-        );
-        assert!(
-            attacker
-                .metrics
-                .lineage_isolation_rejections
-                .load(Ordering::Relaxed)
-                >= 1
-        );
-    }
-
-    #[tokio::test]
-    async fn dirty_and_missing_candidate_shared_frontiers_fall_back_deterministically() {
-        let fixture = tempdir().expect("fixture root");
-        let repository = fixture.path().join("repository");
-        let consumer_root = fixture.path().join("consumer");
-        init_git_repository(&repository);
-        linked_worktree(&repository, &consumer_root);
-        let state = tempdir().expect("state root");
-        let producer_pool = Arc::new(
-            SharedFrontierCache::open(state.path().join("producer-shared")).expect("producer pool"),
-        );
-        let producer = governed_engine(
-            &repository,
-            &state.path().join("producer"),
-            "producer",
-            Arc::clone(&producer_pool),
-        );
-        producer
-            .context_pack_cached(&frontier_request("first"))
-            .await
-            .expect("producer first");
-        producer
-            .context_pack_cached(&frontier_request("second"))
-            .await
-            .expect("producer admission");
-        let original = producer_pool
-            .records()
-            .expect("shared records")
-            .pop()
-            .expect("shared record");
-
-        fs::write(
-            consumer_root.join("src.rs"),
-            "fn governed_frontier_anchor() { assert!(false); }\n",
-        )
-        .expect("dirty source");
-        let dirty = governed_engine(
-            &consumer_root,
-            &state.path().join("dirty"),
-            "dirty",
-            Arc::clone(&producer_pool),
-        );
-        dirty
-            .context_pack_cached(&frontier_request("dirty"))
-            .await
-            .expect("dirty local fallback");
-        assert_eq!(dirty.metrics.lineage_safe_hits.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            dirty
-                .metrics
-                .lineage_dirty_rejections
-                .load(Ordering::Relaxed),
-            1
-        );
-
-        git(&consumer_root, &["checkout", "--", "src.rs"]);
-        let missing_pool = Arc::new(
-            SharedFrontierCache::open(state.path().join("missing-shared")).expect("missing pool"),
-        );
-        let mut missing = (*original).clone();
-        missing.candidate_addresses = vec![format!("ca:{}", "0".repeat(64))];
-        missing.dependency_addresses = missing.candidate_addresses.clone();
-        missing.scores = vec![1.0];
-        missing.cumulative_token_costs = vec![1];
-        missing.key = missing.content_key().expect("missing candidate key");
-        missing_pool
-            .admit(Arc::new(missing))
-            .expect("inject missing candidate");
-        let consumer = governed_engine(
-            &consumer_root,
-            &state.path().join("missing"),
-            "missing",
-            missing_pool,
-        );
-        consumer
-            .context_pack_cached(&frontier_request("missing"))
-            .await
-            .expect("missing candidate local fallback");
-        assert_eq!(
-            consumer.metrics.lineage_safe_hits.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            consumer
-                .metrics
-                .lineage_missing_candidate_rejections
-                .load(Ordering::Relaxed),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn divergent_stale_capacity_and_governed_corpus_never_use_shared_frontiers() {
-        let fixture = tempdir().expect("fixture root");
-        let repository = fixture.path().join("repository");
-        let consumer_root = fixture.path().join("consumer");
-        init_git_repository(&repository);
-        linked_worktree(&repository, &consumer_root);
-        let state = tempdir().expect("state root");
-        let producer_pool = Arc::new(
-            SharedFrontierCache::open(state.path().join("producer-shared")).expect("producer pool"),
-        );
-        let producer = governed_engine(
-            &repository,
-            &state.path().join("producer"),
-            "producer",
-            Arc::clone(&producer_pool),
-        );
-        producer
-            .context_pack_cached(&frontier_request("first"))
-            .await
-            .expect("producer first");
-        producer
-            .context_pack_cached(&frontier_request("second"))
-            .await
-            .expect("producer admission");
-        let original = producer_pool
-            .records()
-            .expect("records")
-            .pop()
-            .expect("record");
-
-        for kind in ["divergent", "stale", "capacity"] {
-            let pool = Arc::new(
-                SharedFrontierCache::open(state.path().join(format!("{kind}-shared")))
-                    .expect("variant pool"),
-            );
-            let mut record = (*original).clone();
-            match kind {
-                "divergent" => record.head_oid = "0".repeat(40),
-                "stale" => record.index_signature = "stale-index".to_owned(),
-                "capacity" => record.candidate_capacity = 1,
-                _ => unreachable!(),
-            }
-            record.key = record.content_key().expect("variant key");
-            pool.admit(Arc::new(record)).expect("variant admission");
-            let engine = governed_engine(&consumer_root, &state.path().join(kind), kind, pool);
-            engine
-                .context_pack_cached(&frontier_request(kind))
-                .await
-                .expect("local fallback");
-            assert_eq!(engine.metrics.lineage_safe_hits.load(Ordering::Relaxed), 0);
-            let rejection = match kind {
-                "divergent" => engine
-                    .metrics
-                    .lineage_divergent_rejections
-                    .load(Ordering::Relaxed),
-                "stale" => engine
-                    .metrics
-                    .lineage_stale_index_rejections
-                    .load(Ordering::Relaxed),
-                "capacity" => engine
-                    .metrics
-                    .lineage_capacity_rejections
-                    .load(Ordering::Relaxed),
-                _ => unreachable!(),
-            };
-            assert_eq!(rejection, 1);
-        }
-
-        let corpus_root = fixture.path().join("corpus");
-        init_git_repository(&corpus_root);
-        fs::create_dir_all(corpus_root.join("reference-corpus")).expect("corpus directory");
-        let corpus_text = "governed corpus text\n";
-        fs::write(corpus_root.join("reference-corpus/spec.txt"), corpus_text).expect("corpus text");
-        fs::write(
-            corpus_root.join("reference-corpus/manifest.json"),
-            serde_json::to_vec(&json!({
-                "schema": "context_reference_manifest.v1",
-                "project_scope": "corpus",
-                "sources": [{
-                    "source_id": "spec",
-                    "canonical_url": "https://example.test/spec",
-                    "publisher": "Fixture",
-                    "title": "Fixture spec",
-                    "version": "1",
-                    "retrieved_at": "2026-08-04T00:00:00Z",
-                    "media_type": "text/plain",
-                    "normalized_media_type": "text/plain; charset=utf-8",
-                    "normalized_path": "reference-corpus/spec.txt",
-                    "content_sha256": sha256_text(corpus_text),
-                    "rights": {"status": "permitted", "license": "MIT", "evidence": "https://example.test/license"},
-                    "freshness": {"status": "current", "checked_at": "2026-08-04T00:00:00Z"}
-                }]
-            }))
-            .expect("manifest"),
-        )
-        .expect("manifest file");
-        git(&corpus_root, &["add", "reference-corpus"]);
-        git(&corpus_root, &["commit", "--quiet", "-m", "corpus"]);
-        let corpus_pool = Arc::new(
-            SharedFrontierCache::open(state.path().join("corpus-shared")).expect("corpus pool"),
-        );
-        let corpus_engine = governed_engine(
-            &corpus_root,
-            &state.path().join("corpus"),
-            "corpus",
-            corpus_pool,
-        );
-        corpus_engine
-            .context_pack_cached(&frontier_request("corpus"))
-            .await
-            .expect("corpus local retrieval");
-        assert_eq!(
-            corpus_engine
-                .metrics
-                .lineage_governed_corpus_rejections
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            corpus_engine
-                .metrics
-                .lineage_safe_hits
-                .load(Ordering::Relaxed),
-            0
         );
     }
 }

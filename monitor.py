@@ -424,7 +424,9 @@ def collect_snapshots(
     # Never discover projects from the monitor. The server's cached catalogue
     # is a bounded v2-state directory list, not a recursive workspace walk.
     if project_ids:
-        targets = [ProjectTarget(project_id=pid) for pid in project_ids[:MAX_MONITOR_PROJECTS]]
+        targets = [
+            ProjectTarget(project_id=pid) for pid in project_ids[:MAX_MONITOR_PROJECTS]
+        ]
     else:
         targets = _safe_cached_projects(client)
         if not targets:
@@ -476,7 +478,9 @@ def _collect_targets(
     worker_count = min(max(1, max_workers), len(targets))
     if worker_count == 1:
         return [
-            _collect_one(client, target, root_uri=root_uri, include_matrix=include_matrix)
+            _collect_one(
+                client, target, root_uri=root_uri, include_matrix=include_matrix
+            )
             for target in targets
         ]
     with ThreadPoolExecutor(
@@ -544,7 +548,9 @@ def inspect_mcp_surface(client: Any) -> dict[str, Any]:
     tools_result = client.list_tools()
     resources_result = client.list_resources()
     tools = tools_result.get("tools") if isinstance(tools_result, dict) else []
-    resources = resources_result.get("resources") if isinstance(resources_result, dict) else []
+    resources = (
+        resources_result.get("resources") if isinstance(resources_result, dict) else []
+    )
     resource_rows = resources if isinstance(resources, list) else []
     inspected_resources: list[dict[str, Any]] = []
     for resource in resource_rows[:MCP_INSPECTION_MAX_RESOURCES]:
@@ -780,10 +786,14 @@ def render_mcp_inspection(
             state.inspection_viewer_index = None
             lines.append("The selected item is no longer available.")
         else:
-            lines.extend(_render_mcp_inspection_viewer(item, color, width, height, state))
+            lines.extend(
+                _render_mcp_inspection_viewer(item, color, width, height, state)
+            )
     else:
         selected_index = _clamped_index(state.inspection_selected_index, len(rows))
-        kind_width, name_width, uri_width, description_width = _inspection_table_widths(width)
+        kind_width, name_width, uri_width, description_width = _inspection_table_widths(
+            width
+        )
         table_rows = []
         for index, (kind, item) in enumerate(rows):
             table_rows.append(
@@ -802,7 +812,9 @@ def render_mcp_inspection(
         resource_total = _int_at(payload, ("resource_count",)) or sum(
             1 for kind, _item in rows if kind == "resource"
         )
-        resource_suffix = "; resources truncated" if payload.get("resources_truncated") else ""
+        resource_suffix = (
+            "; resources truncated" if payload.get("resources_truncated") else ""
+        )
         lines.append(
             _style(
                 f"CATALOGUE  {len(rows)} items ({resource_total} resources{resource_suffix})",
@@ -818,9 +830,13 @@ def render_mcp_inspection(
                 aligns=("left", "left", "left", "left", "left"),
             )
         )
-        lines.extend(["", "Enter opens the selected item.  Up/Down and PgUp/PgDn navigate."])
+        lines.extend(
+            ["", "Enter opens the selected item.  Up/Down and PgUp/PgDn navigate."]
+        )
     lines.append(
-        _controls(state.refresh_interval, color, status_line=_mcp_status_line(state, color))
+        _controls(
+            state.refresh_interval, color, status_line=_mcp_status_line(state, color)
+        )
     )
     return "\n".join(lines)
 
@@ -836,10 +852,14 @@ def _inspection_table_widths(width: int) -> tuple[int, int, int, int]:
 
 def _inspection_rows(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
-    resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
+    resources = (
+        payload.get("resources") if isinstance(payload.get("resources"), list) else []
+    )
     rows: list[tuple[str, dict[str, Any]]] = []
     rows.extend(("tool", tool) for tool in tools if isinstance(tool, dict))
-    rows.extend(("resource", resource) for resource in resources if isinstance(resource, dict))
+    rows.extend(
+        ("resource", resource) for resource in resources if isinstance(resource, dict)
+    )
     return rows
 
 
@@ -884,7 +904,9 @@ def _render_mcp_inspection_viewer(
             for key in ("uri", "name", "description", "mimeType")
             if value.get(key) is not None
         }
-        metadata_text = json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True)
+        metadata_text = json.dumps(
+            metadata, ensure_ascii=False, indent=2, sort_keys=True
+        )
         body = f"{metadata_text}\n\nCONTENT\n{body}"
     wrapped = _wrap_block(body, max(40, width - 2))
     visible_count = max(3, height - len(lines) - 7)
@@ -928,7 +950,9 @@ def _selected_inspection_resource(state: MonitorState) -> dict[str, Any] | None:
     return selected[1]
 
 
-def _inspection_resource_for_uri(state: MonitorState, uri: str) -> dict[str, Any] | None:
+def _inspection_resource_for_uri(
+    state: MonitorState, uri: str
+) -> dict[str, Any] | None:
     for kind, item in _inspection_rows(state.inspection_payload or {}):
         if kind == "resource" and item.get("uri") == uri:
             return item
@@ -1005,13 +1029,11 @@ def _native_project_details(
 ) -> list[tuple[str, str]]:
     """Render counters from the native context metrics contract."""
 
-    l0 = _cache_l0(metrics)
-    l1 = _cache_l1(metrics)
-    retrieval = _mapping_at(metrics, ("retrieval",))
+    retrieval = _mapping_at(metrics, ("context_pack",))
     freshness = _mapping_at(metrics, ("index_freshness",))
     references = _mapping_at(metrics, ("references",))
     pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
-    continuation = _mapping_at(metrics, ("cache", "continuation"))
+    continuation = _mapping_at(metrics, ("continuation",))
     file_cache = _mapping_at(metrics, ("cache", "file"))
     diff_cache = _mapping_at(metrics, ("cache", "git_diff"))
     symbol_cache = _mapping_at(metrics, ("cache", "symbols"))
@@ -1024,24 +1046,16 @@ def _native_project_details(
         ("requests", fmt_int(_int_at(metrics, ("requests", "total")))),
         ("context_pack", fmt_int(_context_pack_count(metrics))),
         ("avg pack ms", fmt_ms(_context_pack_avg_ms(metrics))),
-        ("L0 pack cache", _cache_hit_summary(l0)),
-        ("L0 miss causes", _l0_miss_reason_summary(l0)),
         (
-            "L0 storage",
-            f"{fmt_int(l0.get('entries', 0))} entries, {fmt_bytes(l0.get('weighted_bytes', 0))}",
+            "lookup cache",
+            _lookup_cache_summary(_mapping_at(metrics, ("cache", "lookup"))),
         ),
-        (
-            "L1 frontier",
-            f"{fmt_int(l1.get('exact_hits', 0))} exact / "
-            f"{fmt_int(l1.get('approximate_hits', 0))} approximate hits",
-        ),
-        ("retrieval misses", fmt_int(_native_retrieval_misses(metrics))),
         ("file cache", _index_file_cache_summary(file_cache)),
         ("Git diff cache", _git_diff_cache_summary(diff_cache)),
         ("symbol postings", _symbol_cache_summary(symbol_cache)),
         (
-            "index",
-            f"{retrieval.get('backend', '-')}, {fmt_int(retrieval.get('doc_count', 0))} chunks",
+            "direct retrieval",
+            f"{fmt_int(retrieval.get('candidate_count', 0))} candidates / {fmt_ms(_int_at(retrieval, ('retrieval_micros',)) / max(1, _context_pack_count(metrics)) / 1000)} avg ms",
         ),
         (
             "freshness",
@@ -1054,11 +1068,13 @@ def _native_project_details(
             f"{fmt_int(references.get('active_count', 0))} active / "
             f"{fmt_int(references.get('total_count', 0))} total",
         ),
-        ("compression", _compression_factor_summary(pack_tokens)),
+        (
+            "compression",
+            _compression_factor_summary(pack_tokens),
+        ),
         (
             "tokens saved est.",
-            f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire / "
-            f"{fmt_int(pack_tokens.get('delta_tokens_saved_est', 0))} delta",
+            f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire",
         ),
         (
             "continuation reuse",
@@ -1101,7 +1117,7 @@ def render_performance_view(
         min(48, width - stage_column_overhead),
     )
     stage_rows = _performance_stage_rows(metrics)
-    cache_rows = _performance_cache_rows(metrics, background, freshness)
+    cache_rows = _performance_index_rows(metrics, background, freshness)
     stage_table = _render_table(
         ("operation", "avg ms", "p50 ms", "p95 ms", "min ms", "max ms", "last ms"),
         stage_rows,
@@ -1124,58 +1140,53 @@ def render_performance_view(
     ]
     report = state.usage_report if isinstance(state.usage_report, dict) else {}
     buckets = report.get("buckets") if isinstance(report.get("buckets"), list) else []
-    request_count = sum(_int_at(row, ("request_count",)) for row in buckets if isinstance(row, dict))
-    elapsed_micros = sum(_int_at(row, ("elapsed_micros_total",)) for row in buckets if isinstance(row, dict))
-    input_tokens = sum(_int_at(row, ("input_tokens_est",)) for row in buckets if isinstance(row, dict))
-    wire_tokens = sum(_int_at(row, ("wire_tokens_est",)) for row in buckets if isinstance(row, dict))
-    l0_hits = sum(
-        _int_at(row, ("cache_outcomes", "l0_hit"))
-        + _int_at(row, ("cache_outcomes", "l0_singleflight"))
+    request_count = sum(
+        _int_at(row, ("request_count",)) for row in buckets if isinstance(row, dict)
+    )
+    elapsed_micros = sum(
+        _int_at(row, ("elapsed_micros_total",))
         for row in buckets
         if isinstance(row, dict)
     )
-    l0_misses = sum(_int_at(row, ("cache_outcomes", "l0_miss")) for row in buckets if isinstance(row, dict))
-    frontier_hits = sum(_int_at(row, ("frontier_outcomes", "exact_hit")) for row in buckets if isinstance(row, dict))
-    frontier_admitted = sum(_int_at(row, ("frontier_outcomes", "admitted")) for row in buckets if isinstance(row, dict))
-    capacity_fallbacks = sum(_int_at(row, ("frontier_outcomes", "capacity_fallback")) for row in buckets if isinstance(row, dict))
-    source_fallbacks = sum(_int_at(row, ("frontier_outcomes", "source_fallback")) for row in buckets if isinstance(row, dict))
-    base_pack_requests = sum(_int_at(row, ("delta", "base_pack_requests")) for row in buckets if isinstance(row, dict))
-    continuation_requests = sum(_int_at(row, ("delta", "continuation_requests")) for row in buckets if isinstance(row, dict))
-    continuation_reuses = sum(_int_at(row, ("delta", "continuation_reuses")) for row in buckets if isinstance(row, dict))
-    continuation_fallbacks = sum(_int_at(row, ("delta", "continuation_fallbacks")) for row in buckets if isinstance(row, dict))
-    continuation_avoided = sum(_int_at(row, ("delta", "continuation_wire_tokens_avoided_est")) for row in buckets if isinstance(row, dict))
-    delta_saved = sum(_int_at(row, ("delta_tokens_saved_est",)) for row in buckets if isinstance(row, dict))
-    exact_opportunities = sum(_int_at(row, ("reuse_opportunities", "exact")) for row in buckets if isinstance(row, dict))
-    frontier_opportunities = sum(_int_at(row, ("reuse_opportunities", "frontier")) for row in buckets if isinstance(row, dict))
-    delta_opportunities = sum(_int_at(row, ("reuse_opportunities", "delta")) for row in buckets if isinstance(row, dict))
-    lineage_opportunities = sum(_int_at(row, ("reuse_opportunities", "lineage")) for row in buckets if isinstance(row, dict))
-    exact_effective = sum(_int_at(row, ("reuse_effectiveness", "exact_hits")) for row in buckets if isinstance(row, dict))
-    frontier_effective = sum(_int_at(row, ("reuse_effectiveness", "frontier_hits")) for row in buckets if isinstance(row, dict))
-    delta_adoptions = sum(_int_at(row, ("reuse_effectiveness", "delta_adoptions")) for row in buckets if isinstance(row, dict))
-    miss_causes = {
-        cause: sum(_int_at(row, ("miss_causes", cause)) for row in buckets if isinstance(row, dict))
-        for cause in (
-            "cold_or_restart",
-            "expired",
-            "invalidated_generation_or_signature",
-            "request_variant",
-            "scope_or_options_variant",
-            "evidence_state_variant",
-        )
-    }
-    repeat_within_idle = sum(
-        _int_at(row, ("repeat_distance_buckets", bucket))
+    input_tokens = sum(
+        _int_at(row, ("input_tokens_est",)) for row in buckets if isinstance(row, dict)
+    )
+    wire_tokens = sum(
+        _int_at(row, ("wire_tokens_est",)) for row in buckets if isinstance(row, dict)
+    )
+    saved_tokens = sum(
+        _int_at(row, ("tokens_saved_est",)) for row in buckets if isinstance(row, dict)
+    )
+    base_pack_requests = sum(
+        _int_at(row, ("delta", "base_pack_requests"))
         for row in buckets
         if isinstance(row, dict)
-        for bucket in ("same_15m_slot", "within_30m_idle_window")
     )
-    repeat_beyond_idle = sum(
-        _int_at(row, ("repeat_distance_buckets", bucket))
+    continuation_requests = sum(
+        _int_at(row, ("delta", "continuation_requests"))
         for row in buckets
         if isinstance(row, dict)
-        for bucket in ("30m_to_2h", "2h_to_1d", "1d_to_30d")
     )
-    refresh_updates = sum(_int_at(row, ("index", "refresh_updated")) for row in buckets if isinstance(row, dict))
+    continuation_reuses = sum(
+        _int_at(row, ("delta", "continuation_reuses"))
+        for row in buckets
+        if isinstance(row, dict)
+    )
+    continuation_fallbacks = sum(
+        _int_at(row, ("delta", "continuation_fallbacks"))
+        for row in buckets
+        if isinstance(row, dict)
+    )
+    continuation_avoided = sum(
+        _int_at(row, ("delta", "continuation_wire_tokens_avoided_est"))
+        for row in buckets
+        if isinstance(row, dict)
+    )
+    refresh_updates = sum(
+        _int_at(row, ("index", "refresh_updated"))
+        for row in buckets
+        if isinstance(row, dict)
+    )
     rejection_buckets = (
         report.get("rejection_buckets")
         if isinstance(report.get("rejection_buckets"), list)
@@ -1198,17 +1209,6 @@ def render_performance_view(
         )
     )
     profile_rows = _usage_profile_rows(buckets, width)
-    percentage = lambda numerator, denominator: (
-        f"{numerator / denominator * 100.0:.1f}%" if denominator else "n/a"
-    )
-    miss_summary = (
-        f"cold/restart {fmt_int(miss_causes['cold_or_restart'])}; "
-        f"expired {fmt_int(miss_causes['expired'])}; "
-        f"invalidated {fmt_int(miss_causes['invalidated_generation_or_signature'])}; "
-        f"request {fmt_int(miss_causes['request_variant'])}; "
-        f"scope/options {fmt_int(miss_causes['scope_or_options_variant'])}; "
-        f"evidence {fmt_int(miss_causes['evidence_state_variant'])}"
-    )
     average_ms = elapsed_micros / request_count / 1000.0 if request_count else 0.0
     enabled_label = "enabled" if state.usage_enabled else "disabled"
     if state.usage_enabled is None:
@@ -1221,17 +1221,20 @@ def render_performance_view(
                 ("signal", "value"),
                 (
                     ("global collection", enabled_label),
-                    ("selected project", f"{fmt_int(request_count)} requests / {average_ms:.2f} avg ms"),
-                    ("30-day tokens", f"{fmt_int(input_tokens)} input / {fmt_int(wire_tokens)} wire"),
-                    ("raw L0 hit rate", f"{fmt_int(l0_hits)} hits / {fmt_int(l0_misses)} misses = {percentage(l0_hits, l0_hits + l0_misses)}"),
-                    ("eligible opportunity", f"exact {fmt_int(exact_opportunities)} / frontier {fmt_int(frontier_opportunities)} / delta {fmt_int(delta_opportunities)} / lineage {fmt_int(lineage_opportunities)}"),
-                    ("normalized reuse", f"exact {fmt_int(exact_effective)}/{fmt_int(exact_opportunities)} ({percentage(exact_effective, exact_opportunities)}); frontier {fmt_int(frontier_effective)}/{fmt_int(frontier_opportunities)} ({percentage(frontier_effective, frontier_opportunities)})"),
-                    ("delta adoption", f"{fmt_int(delta_adoptions)}/{fmt_int(delta_opportunities)} eligible ({percentage(delta_adoptions, delta_opportunities)}); {fmt_int(base_pack_requests)} base-pack requests / {fmt_int(delta_saved)} tokens saved"),
-                    ("continuation reuse", f"{fmt_int(continuation_reuses)}/{fmt_int(continuation_requests)} reused ({percentage(continuation_reuses, continuation_requests)}); {fmt_int(continuation_fallbacks)} fallbacks / {fmt_int(continuation_avoided)} wire tokens avoided"),
-                    ("L0 miss causes", _bounded_text(miss_summary, max(20, width - 27))),
-                    ("repeat distance", f"{fmt_int(repeat_within_idle)} within 30m idle / {fmt_int(repeat_beyond_idle)} beyond"),
-                    ("frontier raw", f"{fmt_int(frontier_hits)} hits / {fmt_int(frontier_admitted)} admitted / {fmt_int(capacity_fallbacks + source_fallbacks)} fallbacks"),
-                    ("index invalidation", f"{fmt_int(refresh_updates)} refresh updates"),
+                    (
+                        "selected project",
+                        f"{fmt_int(request_count)} requests / {average_ms:.2f} avg ms",
+                    ),
+                    (
+                        "30-day tokens",
+                        f"{fmt_int(input_tokens)} input / {fmt_int(wire_tokens)} wire / {fmt_int(saved_tokens)} saved",
+                    ),
+                    ("delta requests", fmt_int(base_pack_requests)),
+                    (
+                        "continuation reuse",
+                        f"{fmt_int(continuation_reuses)}/{fmt_int(continuation_requests)} reused / {fmt_int(continuation_fallbacks)} fallbacks / {fmt_int(continuation_avoided)} wire tokens avoided",
+                    ),
+                    ("index refreshes", f"{fmt_int(refresh_updates)} updates"),
                     (
                         "rejected attempts",
                         _bounded_text(rejection_summary, max(20, width - 27)),
@@ -1277,16 +1280,7 @@ def _usage_profile_rows(
             "input_tokens_est": 0,
             "wire_tokens_est": 0,
             "tokens_saved_est": 0,
-            "cache_hits": 0,
-            "frontier_hits": 0,
-            "frontier_requests": 0,
-            "delta_reuse": 0,
-            "exact_opportunities": 0,
-            "exact_effective": 0,
-            "frontier_opportunities": 0,
-            "frontier_effective": 0,
-            "delta_opportunities": 0,
-            "delta_adoptions": 0,
+            "delta_requests": 0,
             "routes": {},
         }
         for profile in USAGE_CLIENT_PROFILES
@@ -1304,51 +1298,23 @@ def _usage_profile_rows(
             if profile not in aggregates:
                 profile = "other"
             aggregate = aggregates[profile]
-            aggregate["request_count"] += _int_at(row, ("request_count",))
-            aggregate["elapsed_micros_total"] += _int_at(
-                row, ("elapsed_micros_total",)
-            )
-            aggregate["input_tokens_est"] += _int_at(row, ("input_tokens_est",))
-            aggregate["wire_tokens_est"] += _int_at(row, ("wire_tokens_est",))
-            aggregate["tokens_saved_est"] += _int_at(row, ("tokens_saved_est",))
-            aggregate["cache_hits"] += _int_at(
-                row, ("cache_outcomes", "l0_hit")
-            ) + _int_at(row, ("cache_outcomes", "l0_singleflight"))
-            frontier_outcomes = (
-                row.get("frontier_outcomes")
-                if isinstance(row.get("frontier_outcomes"), dict)
-                else {}
-            )
-            aggregate["frontier_hits"] += _int_at(
-                row, ("frontier_outcomes", "exact_hit")
-            ) + _int_at(row, ("frontier_outcomes", "negative_hit"))
-            aggregate["frontier_requests"] += sum(
-                max(0, int(value))
-                for value in frontier_outcomes.values()
-                if isinstance(value, int)
-            )
-            aggregate["delta_reuse"] += _int_at(
-                row, ("delta", "base_pack_requests")
-            )
-            aggregate["exact_opportunities"] += _int_at(row, ("reuse_opportunities", "exact"))
-            aggregate["exact_effective"] += _int_at(row, ("reuse_effectiveness", "exact_hits"))
-            aggregate["frontier_opportunities"] += _int_at(row, ("reuse_opportunities", "frontier"))
-            aggregate["frontier_effective"] += _int_at(row, ("reuse_effectiveness", "frontier_hits"))
-            aggregate["delta_opportunities"] += _int_at(row, ("reuse_opportunities", "delta"))
-            aggregate["delta_adoptions"] += _int_at(row, ("reuse_effectiveness", "delta_adoptions"))
+            for field in (
+                "request_count",
+                "elapsed_micros_total",
+                "input_tokens_est",
+                "wire_tokens_est",
+                "tokens_saved_est",
+            ):
+                aggregate[field] += _int_at(row, (field,))
+            aggregate["delta_requests"] += _int_at(row, ("delta", "base_pack_requests"))
             routes = row.get("routes") if isinstance(row.get("routes"), dict) else {}
             for route, count in routes.items():
-                if route not in USAGE_ROUTE_BUCKETS or not isinstance(count, int):
-                    continue
-                route_name = str(route)
-                aggregate["routes"][route_name] = (
-                    aggregate["routes"].get(route_name, 0) + max(0, count)
-                )
+                if route in USAGE_ROUTE_BUCKETS and isinstance(count, int):
+                    aggregate["routes"][route] = aggregate["routes"].get(
+                        route, 0
+                    ) + max(0, count)
 
-    total_requests = sum(
-        int(aggregate["request_count"]) for aggregate in aggregates.values()
-    )
-    efficiency_width = max(30, width - 44)
+    total_requests = sum(int(row["request_count"]) for row in aggregates.values())
     rows: list[tuple[str, str, str]] = []
     for profile in USAGE_CLIENT_PROFILES:
         aggregate = aggregates[profile]
@@ -1359,42 +1325,22 @@ def _usage_profile_rows(
         input_tokens = int(aggregate["input_tokens_est"])
         wire_tokens = int(aggregate["wire_tokens_est"])
         saved_tokens = int(aggregate["tokens_saved_est"])
-        cache_hits = int(aggregate["cache_hits"])
-        frontier_hits = int(aggregate["frontier_hits"])
-        frontier_requests = int(aggregate["frontier_requests"])
-        delta_reuse = int(aggregate["delta_reuse"])
-        exact_opportunities = int(aggregate["exact_opportunities"])
-        exact_effective = int(aggregate["exact_effective"])
-        frontier_opportunities = int(aggregate["frontier_opportunities"])
-        frontier_effective = int(aggregate["frontier_effective"])
-        delta_opportunities = int(aggregate["delta_opportunities"])
-        delta_adoptions = int(aggregate["delta_adoptions"])
         usage_share = requests / total_requests * 100.0 if total_requests else 0.0
         average_ms = elapsed / requests / 1000.0
         compression = input_tokens / wire_tokens if wire_tokens else 0.0
         average_saved = saved_tokens / requests
-        cache_share = cache_hits / requests * 100.0
-        exact_normalized = f"{exact_effective / exact_opportunities * 100.0:.1f}%" if exact_opportunities else "n/a"
-        frontier_normalized = f"{frontier_effective / frontier_opportunities * 100.0:.1f}%" if frontier_opportunities else "n/a"
-        delta_normalized = f"{delta_adoptions / delta_opportunities * 100.0:.1f}%" if delta_opportunities else "n/a"
         route_summary = ", ".join(
             f"{route}={fmt_int(count)}"
             for route, count in sorted(aggregate["routes"].items())[:4]
         )
-        efficiency = (
-            f"{average_ms:.2f} ms; {compression:.2f}x input/wire; "
-            f"{average_saved:.1f} saved/request; cache {cache_share:.1f}%; "
-            f"exact {exact_normalized}/{fmt_int(exact_opportunities)} eligible; "
-            f"frontier {frontier_normalized}/{fmt_int(frontier_opportunities)}; "
-            f"delta {delta_normalized}/{fmt_int(delta_opportunities)}"
-        )
+        efficiency = f"{average_ms:.2f} ms; {compression:.2f}x input/wire; {average_saved:.1f} saved/request; delta {fmt_int(aggregate['delta_requests'])}"
         if route_summary:
             efficiency += f"; routes {route_summary}"
         rows.append(
             (
                 profile,
                 f"{fmt_int(requests)} / {usage_share:.1f}%",
-                _bounded_text(efficiency, efficiency_width),
+                _bounded_text(efficiency, max(30, width - 44)),
             )
         )
     return rows
@@ -1526,9 +1472,9 @@ def render_state_entry_view(
     value_type = entry.get("value_type")
     if not value_type and "value" in entry:
         value_type = (
-            "dict" if isinstance(value, dict)
-            else "list" if isinstance(value, list)
-            else "scalar"
+            "dict"
+            if isinstance(value, dict)
+            else "list" if isinstance(value, list) else "scalar"
         )
     size_chars = entry.get("size_chars")
     if size_chars is None and "value" in entry:
@@ -1603,7 +1549,10 @@ def _serialize_state_entry_preview(entry: dict[str, Any]) -> tuple[str, bool]:
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
-        return preview[:STATE_ENTRY_PREVIEW_LIMIT], len(preview) > STATE_ENTRY_PREVIEW_LIMIT
+        return (
+            preview[:STATE_ENTRY_PREVIEW_LIMIT],
+            len(preview) > STATE_ENTRY_PREVIEW_LIMIT,
+        )
     if "value" not in entry:
         return "", False
 
@@ -1621,7 +1570,10 @@ def _serialize_state_entry_preview(entry: dict[str, Any]) -> tuple[str, bool]:
             size += len(chunk)
     except (TypeError, ValueError):
         preview = str(value)
-        return preview[:STATE_ENTRY_PREVIEW_LIMIT], len(preview) > STATE_ENTRY_PREVIEW_LIMIT
+        return (
+            preview[:STATE_ENTRY_PREVIEW_LIMIT],
+            len(preview) > STATE_ENTRY_PREVIEW_LIMIT,
+        )
     return "".join(chunks), False
 
 
@@ -1629,11 +1581,8 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
     totals = {
         "requests": 0,
         "packs": 0,
-        "cache_hits": 0,
-        "cache_misses": 0,
-        "l1_exact_hits": 0,
-        "l1_approximate_hits": 0,
-        "retrieval_misses": 0,
+        "lookup_hits": 0,
+        "lookup_misses": 0,
         "active_references": 0,
         "total_references": 0,
         "pack_elapsed_ms": 0.0,
@@ -1648,18 +1597,13 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
         totals["packs"] += _int_at(
             metrics, ("requests", "by_operation", "context_pack", "count")
         )
-        totals["cache_hits"] += _int_at(metrics, ("cache", "hits"))
-        totals["cache_misses"] += _int_at(metrics, ("cache", "misses"))
-        totals["l1_exact_hits"] += _int_at(
-            metrics, ("cache", "l1", "exact_hits")
-        )
-        totals["l1_approximate_hits"] += _int_at(
-            metrics, ("cache", "l1", "approximate_hits")
-        )
-        totals["retrieval_misses"] += _native_retrieval_misses(metrics)
+        totals["lookup_hits"] += _int_at(metrics, ("cache", "lookup", "hits"))
+        totals["lookup_misses"] += _int_at(metrics, ("cache", "lookup", "misses"))
         totals["active_references"] += _int_at(metrics, ("references", "active_count"))
         totals["total_references"] += _int_at(metrics, ("references", "total_count"))
-        totals["pack_elapsed_ms"] += _context_pack_count(metrics) * _context_pack_avg_ms(metrics)
+        totals["pack_elapsed_ms"] += _context_pack_count(
+            metrics
+        ) * _context_pack_avg_ms(metrics)
         pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
         totals["source_tokens_est"] += _int_at(
             pack_tokens, ("selected_source_tokens_est",)
@@ -1678,10 +1622,8 @@ def _summary_table(
     ok_rows: list[ProjectSnapshot],
     color: bool,
 ) -> list[str]:
-    cache_total = int(totals["cache_hits"]) + int(totals["cache_misses"])
-    cache_ratio = (
-        int(totals["cache_hits"]) / cache_total if cache_total else 0.0
-    )
+    lookup_total = int(totals["lookup_hits"]) + int(totals["lookup_misses"])
+    lookup_ratio = int(totals["lookup_hits"]) / lookup_total if lookup_total else 0.0
     packs = int(totals["packs"])
     average_pack_ms = float(totals["pack_elapsed_ms"]) / packs if packs else 0.0
     source_tokens = int(totals["source_tokens_est"])
@@ -1693,18 +1635,16 @@ def _summary_table(
         ("context_pack", fmt_int(totals["packs"])),
         ("avg pack ms", fmt_ms(average_pack_ms)),
         (
-            "L0 pack cache",
-            f"{_bar(cache_ratio, 18, color)} {cache_ratio * 100:5.1f}%",
+            "lookup cache",
+            f"{_bar(lookup_ratio, 18, color)} {lookup_ratio * 100:5.1f}%",
         ),
-        (
-            "L1 frontier",
-            f"{fmt_int(totals['l1_exact_hits'])} exact / "
-            f"{fmt_int(totals['l1_approximate_hits'])} approximate",
-        ),
-        ("retrieval misses", fmt_int(totals["retrieval_misses"])),
         (
             "compression",
-            f"{compression_factor:.2f}x source-to-wire" if compression_factor else "not observed",
+            (
+                f"{compression_factor:.2f}x source-to-wire"
+                if compression_factor
+                else "not observed"
+            ),
         ),
         ("tokens saved est.", fmt_int(totals["saved_tokens_est"])),
         (
@@ -1734,8 +1674,7 @@ def _project_table(
             "req",
             "pack",
             "avg ms",
-            "L0 cache",
-            "L1 reuse",
+            "lookup cache",
             "checks",
         ),
         rows,
@@ -1746,15 +1685,13 @@ def _project_table(
             widths["req"],
             widths["pack"],
             widths["avg_ms"],
-            widths["cache"],
-            widths["l1"],
+            widths["lookup"],
             widths["checks"],
         ),
         aligns=(
             "left",
             "left",
             "left",
-            "right",
             "right",
             "right",
             "right",
@@ -1780,8 +1717,7 @@ def _project_column_widths(width: int) -> dict[str, int]:
         "req": 4,
         "pack": 4,
         "avg_ms": 6,
-        "cache": 16,
-        "l1": 9,
+        "lookup": 16,
         "checks": 9,
     }
     target_width = min(DEFAULT_TERMINAL_COLUMNS, max(100, width))
@@ -1818,7 +1754,6 @@ def _project_cells(
             "-",
             "-",
             "-",
-            "-",
             _style("error", color, Ansi.RED),
         )
     metrics = snapshot.metrics or {}
@@ -1828,10 +1763,10 @@ def _project_cells(
         metrics, ("requests", "by_operation", "context_pack", "avg_elapsed_ms")
     )
     checks = _matrix_status(snapshot.matrix or {}, color)
-    cache_bar_width = max(6, widths["cache"] - 9)
-    cache_ratio = _cache_hit_ratio(metrics)
-    l1 = _cache_l1(metrics)
-    l1_reuse = f"{fmt_int(l1.get('exact_hits', 0))}/{fmt_int(l1.get('approximate_hits', 0))}"
+    lookup = _mapping_at(metrics, ("cache", "lookup"))
+    lookup_total = _int_at(lookup, ("hits",)) + _int_at(lookup, ("misses",))
+    lookup_ratio = _int_at(lookup, ("hits",)) / lookup_total if lookup_total else 0.0
+    lookup_bar_width = max(6, widths["lookup"] - 9)
     return (
         selector,
         project,
@@ -1839,8 +1774,7 @@ def _project_cells(
         fmt_int(requests),
         fmt_int(packs),
         fmt_ms(avg_ms),
-        f"{_bar(cache_ratio, cache_bar_width, color)} {cache_ratio * 100:5.1f}%",
-        l1_reuse,
+        f"{_bar(lookup_ratio, lookup_bar_width, color)} {lookup_ratio * 100:5.1f}%",
         checks,
     )
 
@@ -2014,75 +1948,48 @@ def _performance_stage_rows(
     return rows or [("context_pack", "-", "-", "-", "-", "-", "-")]
 
 
-def _performance_cache_rows(
-    metrics: dict[str, Any],
-    background: dict[str, Any],
-    freshness: dict[str, Any],
+def _performance_index_rows(
+    metrics: dict[str, Any], background: dict[str, Any], freshness: dict[str, Any]
 ) -> list[tuple[str, str]]:
-    l0 = _cache_l0(metrics)
-    l1 = _cache_l1(metrics)
-    retrieval = _mapping_at(metrics, ("retrieval",))
+    retrieval = _mapping_at(metrics, ("context_pack",))
     references = _mapping_at(metrics, ("references",))
     pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
-    continuation = _mapping_at(metrics, ("cache", "continuation"))
+    continuation = _mapping_at(metrics, ("continuation",))
+    lookup = _mapping_at(metrics, ("cache", "lookup"))
     file_cache = _mapping_at(metrics, ("cache", "file"))
     diff_cache = _mapping_at(metrics, ("cache", "git_diff"))
     symbol_cache = _mapping_at(metrics, ("cache", "symbols"))
     freshness_state = "dirty" if freshness.get("dirty") else "clean"
+    count = max(1, _context_pack_count(metrics))
     return [
         ("engine", _native_engine_status(metrics)),
         (
-            "L0 pack cache",
-            _cache_hit_summary(l0),
+            "direct retrieval",
+            f"{fmt_int(retrieval.get('candidate_count', 0))} candidates, {fmt_ms(_int_at(retrieval, ('retrieval_micros',)) / count / 1000)} average",
         ),
-        ("L0 miss causes", _l0_miss_reason_summary(l0)),
-        (
-            "L0 storage",
-            f"{fmt_int(l0.get('entries', 0))} entries / "
-            f"{fmt_bytes(l0.get('weighted_bytes', 0))}",
-        ),
-        (
-            "L1 frontier",
-            f"{fmt_int(l1.get('exact_hits', 0))} exact, "
-            f"{fmt_int(l1.get('approximate_hits', 0))} approximate hits",
-        ),
-        ("retrieval misses", fmt_int(_native_retrieval_misses(metrics))),
+        ("lookup cache", _lookup_cache_summary(lookup)),
         ("file cache", _index_file_cache_summary(file_cache)),
         ("Git diff cache", _git_diff_cache_summary(diff_cache)),
         ("symbol postings", _symbol_cache_summary(symbol_cache)),
         (
-            "index",
-            f"{retrieval.get('backend', '-')}, "
-            f"{fmt_int(retrieval.get('doc_count', 0))} chunks",
-        ),
-        (
             "freshness",
-            f"{freshness_state}, gen {fmt_int(freshness.get('generation', 0))}, "
-            f"{fmt_int(freshness.get('refreshes', 0))} refreshes",
+            f"{freshness_state}, gen {fmt_int(freshness.get('generation', 0))}, {fmt_int(freshness.get('refreshes', 0))} refreshes",
         ),
         (
             "references",
-            f"{fmt_int(references.get('active_count', 0))} active / "
-            f"{fmt_int(references.get('total_count', 0))} total",
+            f"{fmt_int(references.get('active_count', 0))} active / {fmt_int(references.get('total_count', 0))} total",
         ),
-        ("compression", _compression_factor_summary(pack_tokens)),
+        (
+            "compression",
+            _compression_factor_summary(pack_tokens),
+        ),
         (
             "tokens saved est.",
-            f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire, "
-            f"{fmt_int(pack_tokens.get('delta_tokens_saved_est', 0))} delta",
+            f"{fmt_int(pack_tokens.get('saved_tokens_est', 0))} source-to-wire",
         ),
         (
             "continuation reuse",
-            f"{fmt_int(continuation.get('reuses', 0))}/{fmt_int(continuation.get('requests', 0))} reused, "
-            f"{fmt_int(continuation.get('fallbacks', 0))} fallbacks, "
-            f"{fmt_int(pack_tokens.get('continuation_wire_tokens_avoided_est', 0))} wire tokens avoided",
-        ),
-        (
-            "token estimates",
-            f"{fmt_int(pack_tokens.get('selected_source_tokens_est', 0))} source / "
-            f"{fmt_int(pack_tokens.get('evidence_card_tokens_est', 0))} cards / "
-            f"{fmt_int(pack_tokens.get('wire_tokens_est', 0))} wire "
-            f"({fmt_bytes(pack_tokens.get('wire_bytes', 0))})",
+            f"{fmt_int(continuation.get('reuses', 0))}/{fmt_int(continuation.get('requests', 0))} reused, {fmt_int(continuation.get('fallbacks', 0))} fallbacks, {fmt_int(pack_tokens.get('continuation_wire_tokens_avoided_est', 0))} wire tokens avoided",
         ),
         ("background", str(background.get("status") or "-")),
     ]
@@ -2386,7 +2293,7 @@ def _legend(color: bool) -> str:
     return (
         f"{_style('checks', color, Ansi.BOLD)} come from "
         "context_admin(mode='measurement_report'); pending means the project "
-        "has not been opened for a quality run. Cache bars show L0 pack-cache hits."
+        "has not been opened for a quality run. Lookup-cache bars report indexed lookup reuse."
     )
 
 
@@ -2424,32 +2331,12 @@ def _mapping_at(payload: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any
     return value if isinstance(value, dict) else {}
 
 
-def _cache_l0(metrics: dict[str, Any]) -> dict[str, Any]:
-    return _mapping_at(metrics, ("cache", "l0"))
-
-
-def _cache_l1(metrics: dict[str, Any]) -> dict[str, Any]:
-    return _mapping_at(metrics, ("cache", "l1"))
-
-
-def _cache_hit_ratio(metrics: dict[str, Any]) -> float:
-    cache = _mapping_at(metrics, ("cache",))
-    ratio = cache.get("hit_ratio")
-    if isinstance(ratio, (int, float)):
-        return max(0.0, min(1.0, float(ratio)))
-    l0 = _cache_l0(metrics)
-    hits = _int_at(l0, ("hits",))
-    misses = _int_at(l0, ("misses",))
-    total = hits + misses
-    return hits / total if total else 0.0
-
-
-def _cache_hit_summary(cache: dict[str, Any]) -> str:
+def _lookup_cache_summary(cache: dict[str, Any]) -> str:
     hits = _int_at(cache, ("hits",))
     misses = _int_at(cache, ("misses",))
     total = hits + misses
     ratio = hits / total if total else 0.0
-    return f"{fmt_int(hits)}/{fmt_int(misses)} h/m  {ratio * 100:5.1f}%"
+    return f"{fmt_int(hits)}/{fmt_int(misses)} h/m  {ratio * 100:5.1f}%; {fmt_int(cache.get('entries', 0))} entries"
 
 
 def _index_file_cache_summary(cache: dict[str, Any]) -> str:
@@ -2496,18 +2383,6 @@ def _symbol_cache_summary(cache: dict[str, Any]) -> str:
     )
 
 
-def _l0_miss_reason_summary(cache: dict[str, Any]) -> str:
-    reasons = _mapping_at(cache, ("miss_reasons",))
-    cold = _int_at(reasons, ("cold_or_invalidated",))
-    variants = _int_at(reasons, ("request_variant",))
-    invalidations = _int_at(cache, ("invalidations",))
-    coalesced = _int_at(cache, ("singleflight_hits",))
-    return (
-        f"cold {fmt_int(cold)}, variant {fmt_int(variants)}, "
-        f"invalidations {fmt_int(invalidations)}, coalesced {fmt_int(coalesced)}"
-    )
-
-
 def _compression_factor_summary(pack_tokens: dict[str, Any]) -> str:
     factor = pack_tokens.get("compression_factor_est")
     ratio = pack_tokens.get("compression_ratio_est")
@@ -2529,11 +2404,6 @@ def _context_pack_avg_ms(metrics: dict[str, Any]) -> float:
     return _float_at(
         metrics, ("requests", "by_operation", "context_pack", "avg_elapsed_ms")
     )
-
-
-def _native_retrieval_misses(metrics: dict[str, Any]) -> int:
-    misses = _int_at(metrics, ("cache", "l1", "retrieval_misses"))
-    return misses if misses else _int_at(metrics, ("retrieval", "misses"))
 
 
 def _native_engine_status(metrics: dict[str, Any]) -> str:
@@ -3166,7 +3036,9 @@ def _apply_monitor_usage_result(
     state.mcp_error = ""
 
 
-def _apply_mcp_inspection_result(state: MonitorState, result: McpInspectionResult) -> None:
+def _apply_mcp_inspection_result(
+    state: MonitorState, result: McpInspectionResult
+) -> None:
     state.inspection_payload = result.payload
     state.inspection_error = result.error
     state.inspection_selected_index = 0
@@ -3494,7 +3366,11 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                 dirty = True
             if action == "inspection_resource" and pending is None:
                 resource = _selected_inspection_resource(state)
-                name = str((resource or {}).get("name") or (resource or {}).get("uri") or "resource")
+                name = str(
+                    (resource or {}).get("name")
+                    or (resource or {}).get("uri")
+                    or "resource"
+                )
                 uri = str((resource or {}).get("uri") or "")
                 _set_mcp_loading(state, f"reading {name}...")
                 pending = _submit_mcp_operation(
@@ -3559,7 +3435,11 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                     toggle = action == "monitor_usage"
                     _set_mcp_loading(
                         state,
-                        "updating detailed usage..." if toggle else "loading detailed usage...",
+                        (
+                            "updating detailed usage..."
+                            if toggle
+                            else "loading detailed usage..."
+                        ),
                     )
                     pending = _submit_mcp_operation(
                         executor,

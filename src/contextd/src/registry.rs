@@ -11,11 +11,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use context_core::{
-    ContextAdminRequest, ContextPackRejectionClass, ContextPackRequest, GovernedFrontierLineage,
-    ProjectEngine, ResultReferenceRequest, SharedFrontierCache, UsageMonitor, WikiHub,
+    ContextAdminRequest, ContextPackRejectionClass, ContextPackRequest, ProjectEngine,
+    ResultReferenceRequest, UsageMonitor, WikiHub,
 };
 use context_index::{WorkControl, is_ignored_repository_path};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -48,10 +47,8 @@ pub struct ProjectRegistry {
     project_markers: Vec<String>,
     default_project_id: String,
     usage_monitor: Arc<UsageMonitor>,
-    shared_frontiers: Option<Arc<SharedFrontierCache>>,
     shared_wiki: Arc<WikiHub>,
     wiki_catalog_lock: Arc<Mutex<()>>,
-    governed_lineages: HashMap<PathBuf, GovernedFrontierLineage>,
     blocking: Arc<BlockingCoordinator>,
     #[cfg(test)]
     blocking_hook: Arc<Mutex<Option<BlockingHook>>>,
@@ -136,21 +133,6 @@ struct ProjectSpec {
     source: String,
     mapped: bool,
     legacy: bool,
-    governed_lineage: Option<GovernedFrontierLineage>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FrontierLineageManifest {
-    schema: String,
-    lineages: Vec<FrontierLineageManifestEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FrontierLineageManifestEntry {
-    id: String,
-    roots: Vec<PathBuf>,
 }
 
 impl ProjectRegistry {
@@ -170,42 +152,14 @@ impl ProjectRegistry {
                 })
                 .map(|(host, local)| Ok((allowed_root_path(&host)?, PathBuf::from(local))))
                 .collect::<Result<Vec<_>>>()?;
-        let mut governance_boundaries = allowed_roots.clone();
-        governance_boundaries.push(base_root.clone());
-        let governed_lineages = load_frontier_lineage_manifest(
-            env::var_os("MCP_CONTEXT_FRONTIER_LINEAGES_FILE").map(PathBuf::from),
-            &governance_boundaries,
-        )?;
-        Self::new_with_lineages(
-            base_root,
-            state_root,
-            allowed_roots,
-            root_mappings,
-            governed_lineages,
-        )
+        Self::new(base_root, state_root, allowed_roots, root_mappings)
     }
 
     pub fn new(
         base_root: PathBuf,
         state_root: PathBuf,
         allowed_roots: Vec<PathBuf>,
-        root_mappings: Vec<(PathBuf, PathBuf)>,
-    ) -> Result<Self> {
-        Self::new_with_lineages(
-            base_root,
-            state_root,
-            allowed_roots,
-            root_mappings,
-            HashMap::new(),
-        )
-    }
-
-    fn new_with_lineages(
-        base_root: PathBuf,
-        state_root: PathBuf,
-        allowed_roots: Vec<PathBuf>,
         mut root_mappings: Vec<(PathBuf, PathBuf)>,
-        governed_lineages: HashMap<PathBuf, GovernedFrontierLineage>,
     ) -> Result<Self> {
         let base_root = base_root
             .canonicalize()
@@ -233,15 +187,10 @@ impl ProjectRegistry {
             source: "repo_path".to_owned(),
             mapped: false,
             legacy: true,
-            governed_lineage: governed_lineages.get(&base_root).cloned(),
         };
         let mut specs = HashMap::new();
         specs.insert(project_id.clone(), default_spec);
         let usage_monitor = Arc::new(UsageMonitor::open(state_root.join("global-monitor"))?);
-        let shared_frontiers = (!governed_lineages.is_empty())
-            .then(|| SharedFrontierCache::open(state_root.join("global-frontiers")))
-            .transpose()?
-            .map(Arc::new);
         let shared_wiki = Arc::new(WikiHub::new()?);
         let blocking_limit = blocking_limit_from_env();
         let request_timeout = duration_from_env(
@@ -264,10 +213,8 @@ impl ProjectRegistry {
             project_markers: project_markers_from_env(),
             default_project_id: project_id,
             usage_monitor,
-            shared_frontiers,
             shared_wiki,
             wiki_catalog_lock: Arc::new(Mutex::new(())),
-            governed_lineages,
             blocking: Arc::new(BlockingCoordinator {
                 limit: blocking_limit,
                 permits: Arc::new(Semaphore::new(blocking_limit)),
@@ -308,24 +255,13 @@ impl ProjectRegistry {
         root_uri: Option<&str>,
     ) -> Result<Arc<ProjectEngine>> {
         let usage_monitor = Arc::clone(&self.usage_monitor);
-        let shared_frontiers = self.shared_frontiers.clone();
         self.engine_for_with_builder(project_id, root_uri, move |spec| {
-            match (&spec.governed_lineage, &shared_frontiers) {
-                (Some(lineage), Some(shared)) => ProjectEngine::build_with_governed_frontiers(
-                    &spec.local_root,
-                    &spec.state_root,
-                    &spec.project_id,
-                    usage_monitor,
-                    lineage.clone(),
-                    Arc::clone(shared),
-                ),
-                _ => ProjectEngine::build_with_state_and_monitor(
-                    &spec.local_root,
-                    &spec.state_root,
-                    &spec.project_id,
-                    usage_monitor,
-                ),
-            }
+            ProjectEngine::build_with_state_and_monitor(
+                &spec.local_root,
+                &spec.state_root,
+                &spec.project_id,
+                usage_monitor,
+            )
         })
     }
 
@@ -336,7 +272,6 @@ impl ProjectRegistry {
         control: &WorkControl,
     ) -> Result<Arc<ProjectEngine>> {
         let usage_monitor = Arc::clone(&self.usage_monitor);
-        let shared_frontiers = self.shared_frontiers.clone();
         let blocking = Arc::clone(&self.blocking);
         let control = control.clone();
         let singleflight_waiter = blocking.singleflight_waiters.fetch_add(1, Ordering::AcqRel) + 1;
@@ -347,26 +282,13 @@ impl ProjectRegistry {
         let build_metrics = Arc::clone(&blocking);
         self.engine_for_with_builder(project_id, root_uri, move |spec| {
             control.check()?;
-            let engine = match (&spec.governed_lineage, &shared_frontiers) {
-                (Some(lineage), Some(shared)) => {
-                    ProjectEngine::build_with_governed_frontiers_controlled(
-                        &spec.local_root,
-                        &spec.state_root,
-                        &spec.project_id,
-                        usage_monitor,
-                        lineage.clone(),
-                        Arc::clone(shared),
-                        Some(&control),
-                    )
-                }
-                _ => ProjectEngine::build_with_state_and_monitor_controlled(
-                    &spec.local_root,
-                    &spec.state_root,
-                    &spec.project_id,
-                    usage_monitor,
-                    Some(&control),
-                ),
-            }?;
+            let engine = ProjectEngine::build_with_state_and_monitor_controlled(
+                &spec.local_root,
+                &spec.state_root,
+                &spec.project_id,
+                usage_monitor,
+                Some(&control),
+            )?;
             build_metrics.engine_builds.fetch_add(1, Ordering::Relaxed);
             Ok(engine)
         })
@@ -376,16 +298,15 @@ impl ProjectRegistry {
         self: &Arc<Self>,
         request: ContextPackRequest,
     ) -> Result<Vec<u8>> {
-        self.context_pack_bounded_inner(request, false).await
+        self.context_pack_bounded_inner(request).await
     }
 
     async fn context_pack_bounded_inner(
         self: &Arc<Self>,
         mut request: ContextPackRequest,
-        warmup: bool,
     ) -> Result<Vec<u8>> {
         let registry = Arc::clone(self);
-        self.run_repository_work_bounded("context_pack", warmup, move |job_control| {
+        self.run_repository_work_bounded("context_pack", false, move |job_control| {
             let engine_started = Instant::now();
             let engine = registry.engine_for_controlled(
                 request.project_id.as_deref(),
@@ -403,7 +324,7 @@ impl ProjectRegistry {
             request.root_uri = None;
             let pack_started = Instant::now();
             let result = tokio::runtime::Handle::current()
-                .block_on(engine.context_pack_cached_controlled(&request, Some(&job_control)));
+                .block_on(engine.context_pack_with_control(&request, Some(&job_control)));
             registry.blocking.pack_micros.fetch_add(
                 u64::try_from(pack_started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
@@ -415,10 +336,19 @@ impl ProjectRegistry {
 
     pub async fn context_admin_warmup_bounded(
         self: &Arc<Self>,
+        request: ContextAdminRequest,
+    ) -> Result<Vec<u8>> {
+        self.context_admin_warmup_bounded_inner(request, false)
+            .await
+    }
+
+    async fn context_admin_warmup_bounded_inner(
+        self: &Arc<Self>,
         mut request: ContextAdminRequest,
+        startup: bool,
     ) -> Result<Vec<u8>> {
         let registry = Arc::clone(self);
-        self.run_repository_work_bounded("context_admin warmup", false, move |job_control| {
+        self.run_repository_work_bounded("context_admin warmup", startup, move |job_control| {
             let engine_started = Instant::now();
             let engine = registry.engine_for_controlled(
                 request.project_id.as_deref(),
@@ -654,23 +584,10 @@ impl ProjectRegistry {
         }
         let registry = Arc::clone(self);
         tokio::spawn(async move {
-            let request = ContextPackRequest {
-                prompt: "repository warmup".to_owned(),
-                changed_files: Vec::new(),
-                focus_paths: Vec::new(),
-                memory_session: None,
-                client_profile: None,
-                model_profile: None,
-                project_id: None,
-                root_uri: None,
-                max_items: 1,
-                max_source_tokens: 0,
-                evidence_policy: Default::default(),
-                base_pack: None,
-                known_evidence: Vec::new(),
-            };
+            let request: ContextAdminRequest =
+                serde_json::from_value(json!({"mode": "warmup"})).expect("index warmup request");
             let state = if registry
-                .context_pack_bounded_inner(request, true)
+                .context_admin_warmup_bounded_inner(request, true)
                 .await
                 .is_ok()
             {
@@ -1242,7 +1159,6 @@ impl ProjectRegistry {
         {
             bail!("mapped project root escapes its configured local boundary");
         }
-        let governed_lineage = self.governed_lineage_for_host_root(&host_root);
         if local_root == self.base_root {
             let default_spec = self
                 .state
@@ -1252,14 +1168,9 @@ impl ProjectRegistry {
                 .get(&self.default_project_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("default project specification is missing"))?;
-            if compatible_lineages(
-                default_spec.governed_lineage.as_ref(),
-                governed_lineage.as_ref(),
-            ) {
-                let mut default_spec = default_spec;
-                default_spec.source = source.to_owned();
-                return Ok(default_spec);
-            }
+            let mut default_spec = default_spec;
+            default_spec.source = source.to_owned();
+            return Ok(default_spec);
         }
         let canonical_uri = canonical_file_uri(&host_root)?;
         let project_id = derived_project_id(&host_root, &canonical_uri);
@@ -1278,7 +1189,6 @@ impl ProjectRegistry {
             source: source.to_owned(),
             mapped,
             legacy: false,
-            governed_lineage,
         })
     }
 
@@ -1287,7 +1197,6 @@ impl ProjectRegistry {
         let Ok(default_uri) = canonical_file_uri(&self.base_root) else {
             return aliases;
         };
-        let default_lineage = self.governed_lineages.get(&self.base_root);
         aliases.insert(derived_project_id(&self.base_root, &default_uri));
         for (host_prefix, local_prefix) in &self.root_mappings {
             let Ok(mapped_prefix) = local_prefix.canonicalize() else {
@@ -1300,23 +1209,11 @@ impl ProjectRegistry {
             let host_root = host_root
                 .canonicalize()
                 .unwrap_or_else(|_| host_root.clone());
-            let lineage = self.governed_lineage_for_host_root(&host_root);
-            if compatible_lineages(default_lineage, lineage.as_ref())
-                && let Ok(uri) = canonical_file_uri(&host_root)
-            {
+            if let Ok(uri) = canonical_file_uri(&host_root) {
                 aliases.insert(derived_project_id(&host_root, &uri));
             }
         }
         aliases
-    }
-
-    fn governed_lineage_for_host_root(&self, host_root: &Path) -> Option<GovernedFrontierLineage> {
-        self.governed_lineages.get(host_root).cloned().or_else(|| {
-            host_root
-                .canonicalize()
-                .ok()
-                .and_then(|canonical| self.governed_lineages.get(&canonical).cloned())
-        })
     }
 
     fn ensure_allowed(&self, host_root: &Path) -> Result<()> {
@@ -1508,13 +1405,7 @@ impl ProjectSpec {
                 "store_exists": self.state_root.join("rust-v2/state.lmdb/data.mdb").exists(),
                 "index_exists": self.state_root.join("rust-v2/index").exists(),
                 "memory_exists": self.state_root.join("rust-v2/state.lmdb/data.mdb").exists(),
-                "cache_exists": self.state_root.join("rust-v2/state.lmdb/data.mdb").exists(),
                 "repo_boundary_enforced": true,
-            },
-            "frontier_lineage": {
-                "governed": self.governed_lineage.is_some(),
-                "identity": self.governed_lineage.as_ref().map(GovernedFrontierLineage::identity),
-                "request_configurable": false,
             },
             "git": {"is_repo": self.local_root.join(".git").exists(), "available": false, "head": "", "branch": "", "status_hash": "", "changes_hash": "", "dirty": false},
         })
@@ -1536,78 +1427,6 @@ fn prune_idle_engines(state: &mut RegistryState, default_project_id: &str) {
         };
         state.engines.remove(&project_id);
     }
-}
-
-fn load_frontier_lineage_manifest(
-    manifest_path: Option<PathBuf>,
-    allowed_roots: &[PathBuf],
-) -> Result<HashMap<PathBuf, GovernedFrontierLineage>> {
-    let Some(manifest_path) = manifest_path else {
-        return Ok(HashMap::new());
-    };
-    if !manifest_path.is_absolute() {
-        bail!("MCP_CONTEXT_FRONTIER_LINEAGES_FILE must be absolute");
-    }
-    let metadata = manifest_path
-        .symlink_metadata()
-        .context("stat governed frontier lineage manifest")?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 256 * 1024 {
-        bail!("governed frontier lineage manifest must be a regular file at most 256 KiB");
-    }
-    let manifest: FrontierLineageManifest = serde_json::from_slice(
-        &std::fs::read(&manifest_path).context("read governed frontier lineage manifest")?,
-    )
-    .context("parse governed frontier lineage manifest")?;
-    if manifest.schema != "context_frontier_lineages.v1" {
-        bail!("unsupported governed frontier lineage manifest schema");
-    }
-    let mut governed = HashMap::new();
-    for entry in manifest.lineages {
-        if entry.id.is_empty()
-            || entry.id.len() > 128
-            || !entry
-                .id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            bail!("governed frontier lineage id is invalid");
-        }
-        if entry.roots.len() < 2 || entry.roots.len() > 64 {
-            bail!("a governed frontier lineage must contain 2..64 explicit roots");
-        }
-        let mut roots = Vec::new();
-        for root in entry.roots {
-            if !root.is_absolute()
-                || root
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-            {
-                bail!("governed frontier lineage roots must be absolute and normalized");
-            }
-            if !allowed_roots
-                .iter()
-                .any(|allowed| root == *allowed || root.starts_with(allowed))
-            {
-                bail!("governed frontier lineage root is outside configured boundaries");
-            }
-            roots.push(root);
-        }
-        roots.sort();
-        roots.dedup();
-        if roots.len() < 2 {
-            bail!("governed frontier lineage roots must be distinct");
-        }
-        let identity = sha256_hex(&serde_json::to_vec(
-            &json!({"id": entry.id, "roots": roots}),
-        )?);
-        let lineage = GovernedFrontierLineage::new(identity)?;
-        for root in roots {
-            if governed.insert(root, lineage.clone()).is_some() {
-                bail!("a root may belong to only one governed frontier lineage");
-            }
-        }
-    }
-    Ok(governed)
 }
 
 fn split_env_list(value: &str) -> Vec<String> {
@@ -1655,17 +1474,6 @@ fn derived_project_id(root: &Path, canonical_uri: &str) -> String {
         slug(name),
         &sha256_hex(canonical_uri.as_bytes())[..12]
     )
-}
-
-fn compatible_lineages(
-    left: Option<&GovernedFrontierLineage>,
-    right: Option<&GovernedFrontierLineage>,
-) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => left.identity() == right.identity(),
-        _ => false,
-    }
 }
 
 fn slug(value: &str) -> String {
@@ -2127,24 +1935,6 @@ mod tests {
                 .expect("nested alias selection"),
             parent_registry.default_project_id
         );
-
-        let lineage_a = GovernedFrontierLineage::new("a".repeat(16)).expect("lineage a");
-        let lineage_b = GovernedFrontierLineage::new("b".repeat(16)).expect("lineage b");
-        let incompatible_registry = ProjectRegistry::new_with_lineages(
-            local_root,
-            fixture.path().join("incompatible-state"),
-            vec![host_root.clone()],
-            vec![(host_root.clone(), fixture.path().join("workspace"))],
-            HashMap::from([
-                (fixture.path().join("workspace"), lineage_a),
-                (host_root.clone(), lineage_b),
-            ]),
-        )
-        .expect("incompatible lineage registry");
-        let incompatible_id = incompatible_registry
-            .select_project(None, Some(&explicit_uri))
-            .expect("incompatible selection");
-        assert_ne!(incompatible_id, incompatible_registry.default_project_id);
     }
 
     #[test]
@@ -2358,40 +2148,5 @@ mod tests {
         assert_eq!(projects["count"], 1);
         assert_eq!(projects["projects"][0]["name"], "real-project");
         assert_eq!(projects["projects"][0]["source"], "discovered_git");
-    }
-
-    #[test]
-    fn governed_lineage_manifest_requires_explicit_distinct_bounded_roots() {
-        let root = tempfile::tempdir().expect("temporary root");
-        let first = root.path().join("builder");
-        let second = root.path().join("verifier");
-        std::fs::create_dir_all(&first).expect("first root");
-        std::fs::create_dir_all(&second).expect("second root");
-        let manifest = root.path().join("lineages.json");
-        std::fs::write(
-            &manifest,
-            serde_json::to_vec(&json!({
-                "schema": "context_frontier_lineages.v1",
-                "lineages": [{"id": "handoff", "roots": [&first, &second]}]
-            }))
-            .expect("manifest JSON"),
-        )
-        .expect("manifest file");
-        let governed =
-            load_frontier_lineage_manifest(Some(manifest.clone()), &[root.path().to_owned()])
-                .expect("valid manifest");
-        assert_eq!(governed.len(), 2);
-        assert_eq!(governed[&first].identity(), governed[&second].identity());
-
-        std::fs::write(
-            &manifest,
-            serde_json::to_vec(&json!({
-                "schema": "context_frontier_lineages.v1",
-                "lineages": [{"id": "handoff", "roots": [&first, &first]}]
-            }))
-            .expect("duplicate manifest JSON"),
-        )
-        .expect("duplicate manifest file");
-        assert!(load_frontier_lineage_manifest(Some(manifest), &[root.path().to_owned()]).is_err());
     }
 }
