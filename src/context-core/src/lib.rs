@@ -7788,6 +7788,16 @@ mod tests {
         assert_eq!(search["results"][0]["page_id"], "transport-retries");
         assert_eq!(search["results"][0]["source_status"], "current");
 
+        let browse: ContextLookupRequest =
+            serde_json::from_value(json!({"mode":"wiki_search", "query":"", "max_results":10}))
+                .expect("wiki browse request");
+        let browse: Value =
+            serde_json::from_slice(&engine.context_lookup(&browse).expect("browse wiki"))
+                .expect("browse response");
+        assert_eq!(browse["schema"], "agent_wiki.search.v1");
+        assert_eq!(browse["results"].as_array().expect("browse rows").len(), 1);
+        assert_eq!(browse["results"][0]["page_id"], "transport-retries");
+
         let pack: ContextPackRequest =
             serde_json::from_value(json!({"prompt":"quasar transport retries"}))
                 .expect("pack request");

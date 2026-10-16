@@ -130,6 +130,13 @@ state while repository sources remain read-only.
 | Refresh/deepen sources | `context_admin(mode="wiki", action="refresh"/"history_deepen", max_files=1000)`. |
 | Inspect generated indexing state | `context_admin(mode="wiki", action="status")`. |
 
+In the interactive monitor, press `v` to browse the selected project's wiki;
+the initial list is bounded to 40 current pages. Press `/` to search, Enter to
+open a page or run the search, and Esc to return to the results or dashboard.
+An empty `wiki_search` query lists current pages up to `max_results` within the
+requested scope; set `wiki_scope="selected_project"` to restrict it to one
+project.
+
 Wiki writes use the typed `wiki` tool-schema payload: `page_id`, optional
 `expected_revision`, `title`, `summary`, `claims`, `sources`, optional `tags`,
 `applicability`, `supersedes`, and `superseded_revisions`. Consolidation must

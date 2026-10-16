@@ -36,6 +36,7 @@ import select
 import shutil
 import sys
 import termios
+import textwrap
 import time
 import tty
 import urllib.error
@@ -147,6 +148,16 @@ class MonitorState:
     inspection_selected_index: int = 0
     inspection_viewer_index: int | None = None
     inspection_content_scroll_offset: int = 0
+    wiki_target: ProjectTarget | None = None
+    wiki_status: dict[str, Any] | None = None
+    wiki_results: list[dict[str, Any]] = field(default_factory=list)
+    wiki_query: str = ""
+    wiki_query_active: bool = False
+    wiki_selected_index: int = 0
+    wiki_scroll_offset: int = 0
+    wiki_page: dict[str, Any] | None = None
+    wiki_page_scroll_offset: int = 0
+    wiki_error: str = ""
 
 
 @dataclass
@@ -160,6 +171,22 @@ class StateBrowserResult:
 class StateEntryResult:
     target: ProjectTarget | None
     key: str
+    payload: dict[str, Any] | None = None
+    error: str = ""
+
+
+@dataclass
+class WikiBrowserResult:
+    target: ProjectTarget | None
+    status: dict[str, Any] | None = None
+    results: list[dict[str, Any]] = field(default_factory=list)
+    error: str = ""
+
+
+@dataclass
+class WikiPageResult:
+    target: ProjectTarget | None
+    page_id: str
     payload: dict[str, Any] | None = None
     error: str = ""
 
@@ -518,6 +545,50 @@ def fetch_state_browser(
     return client.call_tool("context_admin", args)
 
 
+def fetch_wiki_status(client: Any, target: ProjectTarget) -> dict[str, Any]:
+    root_uri = target.name if target.source == "root_uri" else ""
+    return client.call_tool(
+        "context_admin",
+        {"mode": "wiki", "action": "status", **_selector_args(target, root_uri)},
+    )
+
+
+def search_wiki(
+    client: Any,
+    target: ProjectTarget,
+    query: str,
+    max_results: int = 40,
+) -> dict[str, Any]:
+    root_uri = target.name if target.source == "root_uri" else ""
+    return client.call_tool(
+        "context_lookup",
+        {
+            "mode": "wiki_search",
+            "query": query,
+            "wiki_scope": "selected_project",
+            "max_results": max_results,
+            **_selector_args(target, root_uri),
+        },
+    )
+
+
+def fetch_wiki_page(
+    client: Any,
+    target: ProjectTarget,
+    page_id: str,
+) -> dict[str, Any]:
+    root_uri = target.name if target.source == "root_uri" else ""
+    return client.call_tool(
+        "context_lookup",
+        {
+            "mode": "wiki_get",
+            "path": page_id,
+            "wiki_scope": "selected_project",
+            **_selector_args(target, root_uri),
+        },
+    )
+
+
 def warmup_project(client: Any, target: ProjectTarget) -> dict[str, Any]:
     root_uri = target.name if target.source == "root_uri" else ""
     return client.call_tool(
@@ -727,6 +798,8 @@ def render_monitor_screen(
         return render_mcp_inspection(url=url, color=color, width=width, state=state)
     if state.view == "state":
         return render_state_browser(url=url, color=color, width=width, state=state)
+    if state.view == "wiki":
+        return render_wiki_browser(url=url, color=color, width=width, state=state)
     if state.view == "performance" and snapshots:
         selected = _clamped_index(state.selected_index, len(snapshots))
         return render_performance_view(
@@ -1034,6 +1107,7 @@ def _native_project_details(
     references = _mapping_at(metrics, ("references",))
     pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
     continuation = _mapping_at(metrics, ("continuation",))
+    lookup_cache = _mapping_at(metrics, ("cache", "lookup"))
     file_cache = _mapping_at(metrics, ("cache", "file"))
     diff_cache = _mapping_at(metrics, ("cache", "git_diff"))
     symbol_cache = _mapping_at(metrics, ("cache", "symbols"))
@@ -1047,8 +1121,12 @@ def _native_project_details(
         ("context_pack", fmt_int(_context_pack_count(metrics))),
         ("avg pack ms", fmt_ms(_context_pack_avg_ms(metrics))),
         (
-            "lookup cache",
-            _lookup_cache_summary(_mapping_at(metrics, ("cache", "lookup"))),
+            "max cache hit",
+            _combined_cache_summary(metrics),
+        ),
+        (
+            "lookup cache entries",
+            f"{fmt_int(_int_at(lookup_cache, ('entries',)))} entries",
         ),
         ("file cache", _index_file_cache_summary(file_cache)),
         ("Git diff cache", _git_diff_cache_summary(diff_cache)),
@@ -1434,6 +1512,186 @@ def render_state_browser(
     return "\n".join(lines)
 
 
+def render_wiki_browser(
+    url: str,
+    color: bool,
+    width: int | None,
+    state: MonitorState,
+    height: int | None = None,
+) -> str:
+    terminal_size = shutil.get_terminal_size(
+        (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+    )
+    width = width or terminal_size.columns
+    height = height or terminal_size.lines
+    target_name = _project_name(state.wiki_target) if state.wiki_target else "-"
+    if state.wiki_page:
+        return render_wiki_page(url, color, width, height, target_name, state)
+
+    results = state.wiki_results
+    visible_count = max(3, height - 13)
+    state.wiki_selected_index = _clamped_index(state.wiki_selected_index, len(results))
+    state.wiki_scroll_offset = _adjust_scroll_offset(
+        state.wiki_scroll_offset,
+        state.wiki_selected_index,
+        visible_count,
+        len(results),
+    )
+    visible = results[
+        state.wiki_scroll_offset : state.wiki_scroll_offset + visible_count
+    ]
+    lines = [
+        _style("agent wiki browser", color, Ansi.BOLD + Ansi.CYAN),
+        f"endpoint: {url}",
+        f"project:  {target_name}",
+    ]
+    status = state.wiki_status or {}
+    if status:
+        history = (
+            status.get("history") if isinstance(status.get("history"), dict) else {}
+        )
+        source_refresh = (
+            status.get("source_refresh")
+            if isinstance(status.get("source_refresh"), dict)
+            else {}
+        )
+        lines.append(
+            "wiki:     "
+            f"generation {status.get('generation', '-')} / "
+            f"{fmt_int(status.get('chunk_count', 0))} chunks / "
+            f"{fmt_int(status.get('project_count', 0))} wiki projects"
+        )
+        lines.append(
+            f"history:  {history.get('status', 'unknown')}   "
+            f"sources: {source_refresh.get('status', 'unknown')}"
+        )
+    lines.append(
+        f"search:   {state.wiki_query or '-'}"
+        + ("  (typing)" if state.wiki_query_active else "")
+    )
+    if state.wiki_error:
+        lines.append(_style(f"ERROR: {state.wiki_error}", color, Ansi.RED))
+    elif state.wiki_query:
+        lines.append(
+            f"pages returned: {len(results)}   selected: "
+            f"{state.wiki_selected_index + 1 if results else 0}   "
+            f"window: {state.wiki_scroll_offset + 1 if results else 0}-"
+            f"{state.wiki_scroll_offset + len(visible) if results else 0}"
+        )
+    else:
+        lines.append(
+            f"pages returned: {len(results)}   selected: "
+            f"{state.wiki_selected_index + 1 if results else 0}   "
+            f"window: {state.wiki_scroll_offset + 1 if results else 0}-"
+            f"{state.wiki_scroll_offset + len(visible) if results else 0}"
+        )
+        lines.append("Type / to search the wiki.")
+    lines.append("")
+    table_rows = [
+        (
+            (
+                ">"
+                if state.wiki_scroll_offset + index == state.wiki_selected_index
+                else " "
+            ),
+            _trim(str(row.get("title") or row.get("page_id") or "-"), 42),
+            _trim(str(row.get("page_id") or "-"), 28),
+            _trim(str(row.get("source_status") or "-"), 20),
+        )
+        for index, row in enumerate(visible)
+    ]
+    lines.extend(
+        _render_table(
+            ("", "title", "page id", "source status"),
+            table_rows,
+            widths=(2, max(18, width - 76), 28, 20),
+            aligns=("left", "left", "left", "left"),
+        )
+    )
+    if not state.wiki_error and not results:
+        lines.append(
+            "No matching wiki pages."
+            if state.wiki_query
+            else "No wiki pages stored for this project."
+        )
+    if state.mcp_status or state.mcp_error:
+        lines.append(_mcp_status_line(state, color))
+    lines.extend(["", "↑/↓ select  Enter open/search  / query  r refresh  Esc back"])
+    return "\n".join(lines)
+
+
+def render_wiki_page(
+    url: str,
+    color: bool,
+    width: int,
+    height: int,
+    target_name: str,
+    state: MonitorState,
+) -> str:
+    payload = state.wiki_page or {}
+    page = payload.get("page") if isinstance(payload.get("page"), dict) else payload
+    title = str(page.get("title") or payload.get("page_id") or "wiki page")
+    body = [
+        _style(title, color, Ansi.BOLD + Ansi.CYAN),
+        f"endpoint: {url}",
+        f"project:  {target_name}",
+        f"page:     {payload.get('page_id', page.get('page_id', '-'))}",
+        f"revision: {payload.get('revision', page.get('revision', '-'))}",
+        f"status:   {payload.get('source_status', page.get('source_status', '-'))}",
+        "",
+        "summary:",
+    ]
+    summary = str(page.get("summary") or "(no summary)")
+    body.extend(summary.splitlines() or [""])
+    body.extend(["", "claims:"])
+    claims = page.get("claims")
+    if isinstance(claims, list) and claims:
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            body.append(
+                f"[{claim.get('status', 'unverified')}] {claim.get('text', '')}"
+            )
+            citations = claim.get("citations")
+            if isinstance(citations, list):
+                for citation in citations:
+                    if isinstance(citation, dict):
+                        body.append(
+                            f"  citation: {citation.get('source_id', '-')} "
+                            f"{citation.get('location', '')}"
+                        )
+    else:
+        body.append("(no claims)")
+    if state.wiki_error:
+        body.extend(["", _style(f"ERROR: {state.wiki_error}", color, Ansi.RED)])
+    if state.mcp_status or state.mcp_error:
+        body.append(_mcp_status_line(state, color))
+    wrapped_body: list[str] = []
+    for line in body:
+        if not line:
+            wrapped_body.append("")
+        else:
+            wrapped_body.extend(
+                textwrap.wrap(
+                    line,
+                    width=max(1, width),
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+            )
+    visible_count = max(3, height - 10)
+    state.wiki_page_scroll_offset = _clamp_content_scroll_offset(
+        state.wiki_page_scroll_offset, visible_count, len(wrapped_body)
+    )
+    visible = wrapped_body[
+        state.wiki_page_scroll_offset : state.wiki_page_scroll_offset + visible_count
+    ]
+    return "\n".join(
+        [_trim(line, width) for line in visible]
+        + ["", "↑/↓ scroll  PgUp/PgDn  Esc back"]
+    )
+
+
 def render_state_entry_view(
     url: str,
     color: bool,
@@ -1581,8 +1839,7 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
     totals = {
         "requests": 0,
         "packs": 0,
-        "lookup_hits": 0,
-        "lookup_misses": 0,
+        "cache_hit_ratio": 0.0,
         "active_references": 0,
         "total_references": 0,
         "pack_elapsed_ms": 0.0,
@@ -1597,8 +1854,8 @@ def _aggregate_totals(rows: list[ProjectSnapshot]) -> dict[str, Any]:
         totals["packs"] += _int_at(
             metrics, ("requests", "by_operation", "context_pack", "count")
         )
-        totals["lookup_hits"] += _int_at(metrics, ("cache", "lookup", "hits"))
-        totals["lookup_misses"] += _int_at(metrics, ("cache", "lookup", "misses"))
+        _, _, cache_ratio = _combined_cache_stats(metrics)
+        totals["cache_hit_ratio"] = max(totals["cache_hit_ratio"], cache_ratio)
         totals["active_references"] += _int_at(metrics, ("references", "active_count"))
         totals["total_references"] += _int_at(metrics, ("references", "total_count"))
         totals["pack_elapsed_ms"] += _context_pack_count(
@@ -1622,8 +1879,7 @@ def _summary_table(
     ok_rows: list[ProjectSnapshot],
     color: bool,
 ) -> list[str]:
-    lookup_total = int(totals["lookup_hits"]) + int(totals["lookup_misses"])
-    lookup_ratio = int(totals["lookup_hits"]) / lookup_total if lookup_total else 0.0
+    cache_ratio = float(totals["cache_hit_ratio"])
     packs = int(totals["packs"])
     average_pack_ms = float(totals["pack_elapsed_ms"]) / packs if packs else 0.0
     source_tokens = int(totals["source_tokens_est"])
@@ -1635,8 +1891,8 @@ def _summary_table(
         ("context_pack", fmt_int(totals["packs"])),
         ("avg pack ms", fmt_ms(average_pack_ms)),
         (
-            "lookup cache",
-            f"{_bar(lookup_ratio, 18, color)} {lookup_ratio * 100:5.1f}%",
+            "max cache hit",
+            f"{_bar(cache_ratio, 18, color)} {cache_ratio * 100:5.1f}%",
         ),
         (
             "compression",
@@ -1674,7 +1930,7 @@ def _project_table(
             "req",
             "pack",
             "avg ms",
-            "lookup cache",
+            "max cache hit",
             "checks",
         ),
         rows,
@@ -1685,7 +1941,7 @@ def _project_table(
             widths["req"],
             widths["pack"],
             widths["avg_ms"],
-            widths["lookup"],
+            widths["combined_cache"],
             widths["checks"],
         ),
         aligns=(
@@ -1717,7 +1973,7 @@ def _project_column_widths(width: int) -> dict[str, int]:
         "req": 4,
         "pack": 4,
         "avg_ms": 6,
-        "lookup": 16,
+        "combined_cache": 16,
         "checks": 9,
     }
     target_width = min(DEFAULT_TERMINAL_COLUMNS, max(100, width))
@@ -1763,10 +2019,8 @@ def _project_cells(
         metrics, ("requests", "by_operation", "context_pack", "avg_elapsed_ms")
     )
     checks = _matrix_status(snapshot.matrix or {}, color)
-    lookup = _mapping_at(metrics, ("cache", "lookup"))
-    lookup_total = _int_at(lookup, ("hits",)) + _int_at(lookup, ("misses",))
-    lookup_ratio = _int_at(lookup, ("hits",)) / lookup_total if lookup_total else 0.0
-    lookup_bar_width = max(6, widths["lookup"] - 9)
+    _, _, cache_ratio = _combined_cache_stats(metrics)
+    cache_bar_width = max(6, widths["combined_cache"] - 9)
     return (
         selector,
         project,
@@ -1774,7 +2028,7 @@ def _project_cells(
         fmt_int(requests),
         fmt_int(packs),
         fmt_ms(avg_ms),
-        f"{_bar(lookup_ratio, lookup_bar_width, color)} {lookup_ratio * 100:5.1f}%",
+        f"{_bar(cache_ratio, cache_bar_width, color)} {cache_ratio * 100:5.1f}%",
         checks,
     )
 
@@ -1797,7 +2051,7 @@ def _controls(
     status_line: str = "",
 ) -> str:
     keys = (
-        "keys: Up/Down select  Enter open  p performance  l detailed usage  i inspect  b state  Esc table  "
+        "keys: Up/Down select  Enter open  p performance  l detailed usage  i inspect  b state  v wiki  Esc table  "
         "PgUp/PgDn navigate  +/- refresh  r reload  w warmup  P prune  q quit"
     )
     controls = (
@@ -1955,7 +2209,6 @@ def _performance_index_rows(
     references = _mapping_at(metrics, ("references",))
     pack_tokens = _mapping_at(metrics, ("tokens", "context_pack"))
     continuation = _mapping_at(metrics, ("continuation",))
-    lookup = _mapping_at(metrics, ("cache", "lookup"))
     file_cache = _mapping_at(metrics, ("cache", "file"))
     diff_cache = _mapping_at(metrics, ("cache", "git_diff"))
     symbol_cache = _mapping_at(metrics, ("cache", "symbols"))
@@ -1967,7 +2220,11 @@ def _performance_index_rows(
             "direct retrieval",
             f"{fmt_int(retrieval.get('candidate_count', 0))} candidates, {fmt_ms(_int_at(retrieval, ('retrieval_micros',)) / count / 1000)} average",
         ),
-        ("lookup cache", _lookup_cache_summary(lookup)),
+        ("max cache hit", _combined_cache_summary(metrics)),
+        (
+            "lookup cache entries",
+            f"{fmt_int(_int_at(_mapping_at(metrics, ('cache', 'lookup')), ('entries',)))} entries",
+        ),
         ("file cache", _index_file_cache_summary(file_cache)),
         ("Git diff cache", _git_diff_cache_summary(diff_cache)),
         ("symbol postings", _symbol_cache_summary(symbol_cache)),
@@ -2293,7 +2550,8 @@ def _legend(color: bool) -> str:
     return (
         f"{_style('checks', color, Ansi.BOLD)} come from "
         "context_admin(mode='measurement_report'); pending means the project "
-        "has not been opened for a quality run. Lookup-cache bars report indexed lookup reuse."
+        "has not been opened for a quality run. Max-cache bars report the "
+        "highest hit rate among file, Git diff, and lookup caches."
     )
 
 
@@ -2331,12 +2589,26 @@ def _mapping_at(payload: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any
     return value if isinstance(value, dict) else {}
 
 
-def _lookup_cache_summary(cache: dict[str, Any]) -> str:
-    hits = _int_at(cache, ("hits",))
-    misses = _int_at(cache, ("misses",))
-    total = hits + misses
-    ratio = hits / total if total else 0.0
-    return f"{fmt_int(hits)}/{fmt_int(misses)} h/m  {ratio * 100:5.1f}%; {fmt_int(cache.get('entries', 0))} entries"
+def _combined_cache_stats(metrics: dict[str, Any]) -> tuple[int, int, float]:
+    """Return counters and hit rate for the cache layer with the highest rate."""
+    best_stats = (0, 0, 0.0)
+    found_cache = False
+    for cache_name in ("file", "git_diff", "lookup"):
+        cache = _mapping_at(metrics, ("cache", cache_name))
+        hits = _int_at(cache, ("hits",))
+        misses = _int_at(cache, ("misses",))
+        total = hits + misses
+        if total:
+            ratio = hits / total
+            if not found_cache or ratio > best_stats[2]:
+                best_stats = (hits, misses, ratio)
+                found_cache = True
+    return best_stats
+
+
+def _combined_cache_summary(metrics: dict[str, Any]) -> str:
+    hits, misses, ratio = _combined_cache_stats(metrics)
+    return f"{fmt_int(hits)} hits / {fmt_int(misses)} misses " f"({ratio * 100:.1f}%)"
 
 
 def _index_file_cache_summary(cache: dict[str, Any]) -> str:
@@ -2515,6 +2787,8 @@ def decode_key(sequence: str) -> str | None:
         return "refresh"
     if sequence in {"b", "B"}:
         return "browser"
+    if sequence in {"v", "V"}:
+        return "wiki"
     if sequence in {"i", "I"}:
         return "inspection"
     if sequence == "p":
@@ -2572,6 +2846,7 @@ def _search_text_for_key(key: str) -> str:
         "minus": "-",
         "refresh": "r",
         "browser": "b",
+        "wiki": "v",
         "inspection": "i",
         "performance": "p",
         "monitor_usage": "l",
@@ -2588,6 +2863,101 @@ def handle_key(
     row_count: int,
     state_row_count: int = 0,
 ) -> str:
+    if state.view == "wiki" and state.wiki_page:
+        if key in {"quit", "interrupt"}:
+            return "quit"
+        if key == "escape":
+            state.wiki_page = None
+            state.wiki_error = ""
+            state.wiki_page_scroll_offset = 0
+            return "redraw"
+        if key == "up":
+            state.wiki_page_scroll_offset = max(0, state.wiki_page_scroll_offset - 1)
+            return "redraw"
+        if key == "down":
+            state.wiki_page_scroll_offset += 1
+            return "redraw"
+        if key == "page_up":
+            state.wiki_page_scroll_offset = max(0, state.wiki_page_scroll_offset - 10)
+            return "redraw"
+        if key == "page_down":
+            state.wiki_page_scroll_offset += 10
+            return "redraw"
+        if key == "home":
+            state.wiki_page_scroll_offset = 0
+            return "redraw"
+        if key == "end":
+            state.wiki_page_scroll_offset = 1_000_000
+            return "redraw"
+        return "ignore"
+
+    if state.view == "wiki" and state.wiki_query_active:
+        if key == "interrupt":
+            return "quit"
+        if key == "escape":
+            state.wiki_query_active = False
+            return "redraw"
+        if key == "enter":
+            state.wiki_query_active = False
+            state.wiki_selected_index = 0
+            state.wiki_scroll_offset = 0
+            return "wiki_search"
+        if key == "backspace":
+            state.wiki_query = state.wiki_query[:-1]
+            return "redraw"
+        text = _search_text_for_key(key)
+        if text:
+            state.wiki_query += text
+            return "redraw"
+        return "ignore"
+
+    if state.view == "wiki":
+        result_count = len(state.wiki_results)
+        if key in {"quit", "interrupt"}:
+            return "quit"
+        if key == "escape":
+            state.view = "table"
+            state.wiki_error = ""
+            return "redraw"
+        if key in {"refresh"}:
+            return "wiki_refresh"
+        if key == "search":
+            state.wiki_query = ""
+            state.wiki_query_active = True
+            state.wiki_selected_index = 0
+            state.wiki_scroll_offset = 0
+            return "redraw"
+        if key == "up":
+            state.wiki_selected_index = _clamped_index(
+                state.wiki_selected_index - 1, result_count
+            )
+            return "redraw"
+        if key == "down":
+            state.wiki_selected_index = _clamped_index(
+                state.wiki_selected_index + 1, result_count
+            )
+            return "redraw"
+        if key == "page_up":
+            state.wiki_selected_index = _clamped_index(
+                state.wiki_selected_index - 10, result_count
+            )
+            return "redraw"
+        if key == "page_down":
+            state.wiki_selected_index = _clamped_index(
+                state.wiki_selected_index + 10, result_count
+            )
+            return "redraw"
+        if key == "home":
+            state.wiki_selected_index = 0
+            state.wiki_scroll_offset = 0
+            return "redraw"
+        if key == "end":
+            state.wiki_selected_index = _clamped_index(result_count - 1, result_count)
+            return "redraw"
+        if key == "enter" and result_count:
+            return "wiki_page"
+        return "ignore"
+
     if state.view == "state" and state.state_entry:
         if key in {"quit", "interrupt"}:
             return "quit"
@@ -2734,6 +3104,18 @@ def handle_key(
     if key == "inspection":
         state.view = "inspection"
         return "inspection"
+    if key == "wiki" and row_count:
+        state.view = "wiki"
+        state.wiki_target = None
+        state.wiki_status = None
+        state.wiki_results = []
+        state.wiki_query = ""
+        state.wiki_query_active = False
+        state.wiki_selected_index = 0
+        state.wiki_scroll_offset = 0
+        state.wiki_page = None
+        state.wiki_error = ""
+        return "wiki"
     if key == "browser" and row_count:
         state.view = "state"
         state.state_entry = None
@@ -2900,6 +3282,54 @@ def _fetch_state_browser_result(
         return StateBrowserResult(target=target, error=friendly_mcp_error(exc))
 
 
+def _fetch_wiki_browser_result(
+    client: Any,
+    snapshots: list[ProjectSnapshot],
+    selected_index: int,
+    query: str = "",
+    include_status: bool = True,
+) -> WikiBrowserResult:
+    if not snapshots:
+        return WikiBrowserResult(target=None, error="no project selected")
+    selected = _clamped_index(selected_index, len(snapshots))
+    target = snapshots[selected].target
+    try:
+        status = fetch_wiki_status(client, target) if include_status else None
+        response = search_wiki(client, target, query)
+        results = response.get("results")
+        return WikiBrowserResult(
+            target=target,
+            status=status,
+            results=(
+                [row for row in results if isinstance(row, dict)]
+                if isinstance(results, list)
+                else []
+            ),
+        )
+    except Exception as exc:
+        return WikiBrowserResult(target=target, error=friendly_mcp_error(exc))
+
+
+def _fetch_wiki_page_result(
+    client: Any,
+    target: ProjectTarget | None,
+    page_id: str,
+) -> WikiPageResult:
+    if target is None:
+        return WikiPageResult(target=None, page_id=page_id, error="no project selected")
+    try:
+        payload = fetch_wiki_page(client, target, page_id)
+        if payload.get("status") == "missing":
+            return WikiPageResult(
+                target=target, page_id=page_id, error="wiki page revision is missing"
+            )
+        return WikiPageResult(target=target, page_id=page_id, payload=payload)
+    except Exception as exc:
+        return WikiPageResult(
+            target=target, page_id=page_id, error=friendly_mcp_error(exc)
+        )
+
+
 def _apply_state_browser_result(
     state: MonitorState,
     result: StateBrowserResult,
@@ -2926,6 +3356,91 @@ def _apply_state_browser_result(
             False,
         ),
         _state_row_count(state),
+    )
+
+
+def _apply_wiki_browser_result(state: MonitorState, result: WikiBrowserResult) -> None:
+    state.wiki_target = result.target
+    state.wiki_page = None
+    state.wiki_error = result.error
+    if result.status is not None:
+        state.wiki_status = result.status
+    if not result.error:
+        state.wiki_results = result.results
+    state.wiki_selected_index = _clamped_index(
+        state.wiki_selected_index, len(state.wiki_results)
+    )
+    state.wiki_scroll_offset = _adjust_scroll_offset(
+        state.wiki_scroll_offset,
+        state.wiki_selected_index,
+        max(
+            3,
+            shutil.get_terminal_size(
+                (DEFAULT_TERMINAL_COLUMNS, DEFAULT_TERMINAL_LINES)
+            ).lines
+            - 13,
+        ),
+        len(state.wiki_results),
+    )
+
+
+def _apply_wiki_page_result(state: MonitorState, result: WikiPageResult) -> None:
+    state.wiki_target = result.target
+    state.wiki_error = result.error
+    state.wiki_page = result.payload if not result.error else None
+    state.wiki_page_scroll_offset = 0
+
+
+def _submit_wiki_operation(
+    executor: ThreadPoolExecutor,
+    client: Any,
+    state: MonitorState,
+    snapshots: list[ProjectSnapshot],
+    action: str,
+) -> PendingMcpOperation:
+    if action in {"wiki", "wiki_refresh", "wiki_search"}:
+        include_status = action in {"wiki", "wiki_refresh"}
+        message = (
+            "loading wiki status and pages..."
+            if include_status
+            else "searching wiki..."
+        )
+        _set_mcp_loading(state, message)
+        return _submit_mcp_operation(
+            executor,
+            "wiki_browser",
+            lambda: _fetch_wiki_browser_result(
+                client,
+                snapshots,
+                state.selected_index,
+                state.wiki_query.strip(),
+                include_status=include_status,
+            ),
+        )
+
+    rows = state.wiki_results
+    if not rows:
+        state.wiki_error = "no wiki page selected"
+        return _submit_mcp_operation(
+            executor,
+            "wiki_page",
+            lambda: WikiPageResult(None, "", error=state.wiki_error),
+        )
+    row = rows[_clamped_index(state.wiki_selected_index, len(rows))]
+    page_id = str(row.get("page_id") or "")
+    target = state.wiki_target
+    if not page_id:
+        state.wiki_error = "selected wiki result has no page id"
+        return _submit_mcp_operation(
+            executor,
+            "wiki_page",
+            lambda: WikiPageResult(target, page_id, error=state.wiki_error),
+        )
+    _set_mcp_loading(state, "loading wiki page...")
+    return _submit_mcp_operation(
+        executor,
+        "wiki_page",
+        lambda: _fetch_wiki_page_result(client, target, page_id),
     )
 
 
@@ -3149,6 +3664,14 @@ def _apply_mcp_operation_result(
         if isinstance(result, StateEntryResult):
             _apply_state_entry_result(state, result)
         return snapshots
+    if pending.kind == "wiki_browser":
+        if isinstance(result, WikiBrowserResult):
+            _apply_wiki_browser_result(state, result)
+        return snapshots
+    if pending.kind == "wiki_page":
+        if isinstance(result, WikiPageResult):
+            _apply_wiki_page_result(state, result)
+        return snapshots
     if pending.kind == "warmup":
         if isinstance(result, WarmupResult):
             _apply_warmup_result(state, result)
@@ -3208,6 +3731,7 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
     queued_refresh = False
     queued_warmup = False
     queued_prune = False
+    queued_wiki_action = ""
     fd = sys.stdin.fileno()
 
     with (
@@ -3226,7 +3750,13 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                 pending = None
                 if completed_kind != "monitor_usage":
                     next_refresh = time.monotonic() + state.refresh_interval
-                if queued_browser_load and state.view == "state":
+                if queued_wiki_action and state.view == "wiki":
+                    action_to_run = queued_wiki_action
+                    queued_wiki_action = ""
+                    pending = _submit_wiki_operation(
+                        executor, client, state, snapshots, action_to_run
+                    )
+                elif queued_browser_load and state.view == "state":
                     queued_browser_load = False
                     state.state_payload = None
                     state.state_entry = None
@@ -3269,7 +3799,7 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
                     force_refresh = False
                 dirty = True
 
-            browser_open = state.view in {"state", "inspection"}
+            browser_open = state.view in {"state", "inspection", "wiki"}
             if _needs_initial_usage_status(state, snapshots, pending):
                 state.usage_status_requested = True
                 _set_mcp_loading(state, "loading detailed usage status...")
@@ -3318,7 +3848,7 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
 
             if pending:
                 timeout = 0.1
-            elif state.view == "state":
+            elif state.view in {"state", "wiki"}:
                 timeout = 0.5
             else:
                 timeout = min(0.5, max(0.0, next_refresh - time.monotonic()))
@@ -3333,6 +3863,15 @@ def run_interactive_monitor(client: Any, args: argparse.Namespace, color: bool) 
             )
             if action == "quit":
                 return 0
+            if action in {"wiki", "wiki_refresh", "wiki_search", "wiki_page"}:
+                if pending is None:
+                    pending = _submit_wiki_operation(
+                        executor, client, state, snapshots, action
+                    )
+                else:
+                    queued_wiki_action = action
+                    _set_mcp_loading(state, "waiting for current MCP request...")
+                dirty = True
             if action == "browser" and pending is None:
                 state.state_payload = None
                 state.state_entry = None

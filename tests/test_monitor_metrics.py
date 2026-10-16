@@ -514,6 +514,235 @@ class MonitorStateEntryViewTests(unittest.TestCase):
         self.assertIs(state.state_entry_preview_lines, cached_lines)
 
 
+class MonitorWikiBrowserTests(unittest.TestCase):
+    def test_wiki_status_and_browse_requests_are_selected_project_scoped(self) -> None:
+        class WikiClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            def call_tool(
+                self, name: str, arguments: dict[str, object]
+            ) -> dict[str, object]:
+                self.calls.append((name, arguments))
+                if arguments["mode"] == "wiki":
+                    return {
+                        "schema": "agent_wiki.status.v1",
+                        "generation": 4,
+                        "chunk_count": 12,
+                        "project_count": 2,
+                    }
+                if arguments["mode"] == "wiki_search":
+                    return {
+                        "schema": "agent_wiki.search.v1",
+                        "results": [
+                            {
+                                "page_id": "transport",
+                                "revision": "abc123",
+                                "title": "Transport behavior",
+                                "summary": "Retries are bounded.",
+                                "source_status": "current",
+                            }
+                        ],
+                    }
+                return {
+                    "schema": "agent_wiki.get.v1",
+                    "status": "resolved",
+                    "page_id": "transport",
+                    "revision": "abc123",
+                    "project_id": "one",
+                    "source_status": "current",
+                    "reference": {"kind": "wiki"},
+                    "page": {
+                        "title": "Transport behavior",
+                        "summary": "Retries are bounded.",
+                        "claims": [
+                            {
+                                "text": "Retries stop after three attempts.",
+                                "status": "verified",
+                                "citations": [{"source_id": "source-a"}],
+                            }
+                        ],
+                    },
+                }
+
+        client = WikiClient()
+        target = monitor_metrics.ProjectTarget(project_id="one", name="one")
+        result = monitor_metrics._fetch_wiki_browser_result(
+            client,
+            [monitor_metrics.ProjectSnapshot(target=target)],
+            0,
+            "",
+        )
+
+        self.assertEqual(result.status["generation"], 4)
+        self.assertEqual(result.results[0]["page_id"], "transport")
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "context_admin",
+                    {"mode": "wiki", "action": "status", "project_id": "one"},
+                ),
+                (
+                    "context_lookup",
+                    {
+                        "mode": "wiki_search",
+                        "query": "",
+                        "wiki_scope": "selected_project",
+                        "max_results": 40,
+                        "project_id": "one",
+                    },
+                ),
+            ],
+        )
+
+        page_result = monitor_metrics._fetch_wiki_page_result(
+            client, target, "transport"
+        )
+        self.assertEqual(page_result.payload["reference"]["kind"], "wiki")
+        self.assertEqual(
+            client.calls[-1],
+            (
+                "context_lookup",
+                {
+                    "mode": "wiki_get",
+                    "path": "transport",
+                    "wiki_scope": "selected_project",
+                    "project_id": "one",
+                },
+            ),
+        )
+
+    def test_wiki_view_renders_status_pages_and_page_citations(self) -> None:
+        state = monitor_metrics.MonitorState(
+            view="wiki",
+            mcp_status="loading wiki status and pages...",
+            wiki_target=monitor_metrics.ProjectTarget(project_id="one", name="demo"),
+            wiki_status={
+                "generation": 4,
+                "chunk_count": 12,
+                "project_count": 2,
+                "history": {"status": "idle"},
+                "source_refresh": {"status": "current"},
+            },
+            wiki_results=[
+                {
+                    "page_id": "transport",
+                    "title": "Transport behavior",
+                    "source_status": "current",
+                }
+            ],
+        )
+        listing = monitor_metrics.render_wiki_browser(
+            "http://localhost:8000/mcp", False, 120, state, height=30
+        )
+
+        self.assertIn("generation 4 / 12 chunks", listing)
+        self.assertIn("Transport behavior", listing)
+        self.assertIn("current", listing)
+        self.assertIn("loading wiki status and pages", listing)
+
+        state.wiki_page = {
+            "schema": "agent_wiki.get.v1",
+            "status": "resolved",
+            "page_id": "transport",
+            "revision": "abc123",
+            "project_id": "one",
+            "source_status": "current",
+            "reference": {"kind": "wiki", "page_id": "transport"},
+            "page": {
+                "title": "Transport behavior",
+                "summary": "Retries are bounded.",
+                "claims": [
+                    {
+                        "text": "Retries stop after three attempts.",
+                        "status": "verified",
+                        "citations": [{"source_id": "source-a"}],
+                    }
+                ],
+            },
+        }
+        detail = monitor_metrics.render_wiki_browser(
+            "http://localhost:8000/mcp", False, 120, state, height=30
+        )
+        self.assertIn("Retries stop after three attempts.", detail)
+        self.assertIn("citation: source-a", detail)
+
+    def test_wiki_page_wraps_long_text_for_vertical_browsing(self) -> None:
+        state = monitor_metrics.MonitorState(
+            view="wiki",
+            wiki_target=monitor_metrics.ProjectTarget(project_id="one", name="demo"),
+            wiki_page={
+                "schema": "agent_wiki.get.v1",
+                "status": "resolved",
+                "page_id": "long-page",
+                "revision": "abc123",
+                "project_id": "one",
+                "source_status": "current",
+                "reference": {"kind": "wiki", "page_id": "long-page"},
+                "page": {
+                    "title": "Long page",
+                    "summary": "A detailed summary with enough words to wrap across several terminal lines.",
+                    "claims": [
+                        {
+                            "text": "A claim with enough words to wrap and remain readable in a narrow terminal window.",
+                            "status": "verified",
+                            "citations": [{"source_id": "source-a"}],
+                        }
+                    ],
+                },
+            },
+        )
+
+        rendered = monitor_metrics.render_wiki_browser(
+            "http://localhost:8000/mcp", False, 36, state, height=30
+        )
+
+        self.assertIn("A detailed summary", rendered)
+        self.assertIn("terminal", rendered)
+        self.assertIn("lines.", rendered)
+        self.assertIn("remain readable", rendered)
+        self.assertTrue(all(len(line) <= 36 for line in rendered.splitlines()))
+
+    def test_wiki_navigation_and_empty_or_error_results_are_safe(self) -> None:
+        state = monitor_metrics.MonitorState()
+        self.assertEqual(monitor_metrics.decode_key("v"), "wiki")
+        self.assertEqual(monitor_metrics.handle_key("wiki", state, row_count=1), "wiki")
+        self.assertEqual(state.view, "wiki")
+        self.assertEqual(monitor_metrics.handle_key("search", state, 1), "redraw")
+        self.assertTrue(state.wiki_query_active)
+        self.assertEqual(monitor_metrics.handle_key("text:chip", state, 1), "redraw")
+        self.assertEqual(state.wiki_query, "chip")
+        self.assertEqual(monitor_metrics.handle_key("enter", state, 1), "wiki_search")
+
+        state.wiki_results = [{"page_id": "transport"}]
+        self.assertEqual(monitor_metrics.handle_key("enter", state, 1), "wiki_page")
+        state.wiki_page = {"page_id": "transport", "page": {}}
+        self.assertEqual(monitor_metrics.handle_key("escape", state, 1), "redraw")
+        self.assertIsNone(state.wiki_page)
+        self.assertEqual(state.view, "wiki")
+
+        state.wiki_error = "wiki service unavailable"
+        rendered = monitor_metrics.render_wiki_browser(
+            "http://localhost:8000/mcp", False, 100, state, height=24
+        )
+        self.assertIn("ERROR: wiki service unavailable", rendered)
+        state.wiki_error = ""
+        state.wiki_query = ""
+        state.wiki_results = []
+        rendered = monitor_metrics.render_wiki_browser(
+            "http://localhost:8000/mcp", False, 100, state, height=24
+        )
+        self.assertIn("No wiki pages stored for this project.", rendered)
+        state.wiki_query = "missing"
+        rendered = monitor_metrics.render_wiki_browser(
+            "http://localhost:8000/mcp", False, 100, state, height=24
+        )
+        self.assertIn("No matching wiki pages.", rendered)
+        self.assertEqual(monitor_metrics.handle_key("escape", state, 1), "redraw")
+        self.assertEqual(state.view, "table")
+
+
 def native_metrics(*, status: str = "idle") -> dict[str, object]:
     return {
         "schema": "context_metrics.v2",
@@ -618,13 +847,13 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
             matrix=quality_matrix(),
         )
 
-    def test_dashboard_uses_native_lookup_and_index_counters(self) -> None:
+    def test_dashboard_uses_combined_cache_and_index_counters(self) -> None:
         rendered = monitor_metrics.render_dashboard(
             [self.snapshot], "http://localhost:8000/mcp", color=False, width=160
         )
 
-        self.assertIn("lookup cache", rendered)
-        self.assertIn("75.0%", rendered)
+        self.assertIn("max cache hit", rendered)
+        self.assertIn("80.0%", rendered)
         self.assertNotIn("L0", rendered)
         self.assertNotIn("L1", rendered)
         self.assertIn("2 pass", rendered)
@@ -704,7 +933,8 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("context_pack", performance)
         self.assertIn("21.5", performance)
         self.assertIn("direct retrieval", performance)
-        self.assertIn("lookup cache", performance)
+        self.assertIn("max cache hit", performance)
+        self.assertIn("8 hits / 2 misses (80.0%)", performance)
         self.assertNotIn("L0", performance)
         self.assertNotIn("L1", performance)
         self.assertIn("context_lookup.search", performance)
@@ -730,9 +960,77 @@ class MonitorNativeMetricsRenderingTests(unittest.TestCase):
         self.assertIn("1 / 50.0%", performance)
         self.assertNotIn("search_fragment_ms", performance)
         self.assertIn("7 entries", detail)
+        self.assertIn("max cache hit", detail)
+        self.assertIn("8 hits / 2 misses (80.0%)", detail)
         self.assertIn("4 active / 6 total", detail)
         self.assertIn("900 source / 240 cards / 120 returned / 180 wire (720B)", detail)
         self.assertIn("quality.required_anchor_recall", detail)
+
+    def test_max_cache_hit_selects_highest_layer_rate(self) -> None:
+        cases = (
+            ("file", (8, 2, 0.8)),
+            ("git_diff", (9, 1, 0.9)),
+            ("lookup", (99, 1, 0.99)),
+        )
+
+        for winner, expected in cases:
+            with self.subTest(winner=winner):
+                metrics = native_metrics()
+                metrics["cache"] = {
+                    name: {"hits": 1, "misses": 1}
+                    for name in ("file", "git_diff", "lookup")
+                }
+                metrics["cache"][winner] = {
+                    "hits": expected[0],
+                    "misses": expected[1],
+                }
+
+                self.assertEqual(
+                    monitor_metrics._combined_cache_stats(metrics), expected
+                )
+
+    def test_dashboard_uses_max_cache_hit_across_projects(self) -> None:
+        other_metrics = native_metrics()
+        other_metrics["cache"] = {
+            "file": {"hits": 0, "misses": 100},
+            "git_diff": {"hits": 3, "misses": 2},
+            "lookup": {"hits": 12, "misses": 4},
+        }
+        other_snapshot = monitor_metrics.ProjectSnapshot(
+            target=monitor_metrics.ProjectTarget(project_id="other", name="other"),
+            metrics=other_metrics,
+        )
+        totals = monitor_metrics._aggregate_totals([self.snapshot, other_snapshot])
+
+        summary = "\n".join(
+            monitor_metrics._summary_table(
+                totals, [self.snapshot, other_snapshot], [self.snapshot], color=False
+            )
+        )
+
+        self.assertEqual(totals["cache_hit_ratio"], 0.8)
+        self.assertIn("80.0%", summary)
+
+        higher_metrics = native_metrics()
+        higher_metrics["cache"]["git_diff"] = {"hits": 9, "misses": 1}
+        higher_snapshot = monitor_metrics.ProjectSnapshot(
+            target=monitor_metrics.ProjectTarget(project_id="higher", name="higher"),
+            metrics=higher_metrics,
+        )
+        higher_totals = monitor_metrics._aggregate_totals(
+            [self.snapshot, other_snapshot, higher_snapshot]
+        )
+        self.assertEqual(higher_totals["cache_hit_ratio"], 0.9)
+
+    def test_combined_cache_handles_missing_and_zero_counters(self) -> None:
+        self.assertEqual(
+            monitor_metrics._combined_cache_stats({"cache": {"lookup": None}}),
+            (0, 0, 0.0),
+        )
+        self.assertEqual(
+            monitor_metrics._combined_cache_summary({"cache": {}}),
+            "0 hits / 0 misses (0.0%)",
+        )
 
     def test_detail_check_descriptions_are_concise(self) -> None:
         matrix = {

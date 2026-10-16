@@ -369,24 +369,23 @@ impl WikiSearchIndex {
         limit: usize,
     ) -> Result<Vec<WikiSearchHit>> {
         let terms = normalize_terms(query, 12);
-        if terms.is_empty() || limit == 0 {
+        if limit == 0 {
             return Ok(Vec::new());
         }
         let searcher = self.reader.searcher();
-        let mut parser =
-            QueryParser::for_index(&self.index, vec![self.title, self.body, self.tags]);
-        parser.set_field_boost(self.title, 2.5);
-        let text_query = parser.parse_query(&terms.join(" OR "))?;
-        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![
-            (Occur::Must, text_query),
-            (
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.current, "true"),
-                    tantivy::schema::IndexRecordOption::Basic,
-                )),
-            ),
-        ];
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(self.current, "true"),
+                tantivy::schema::IndexRecordOption::Basic,
+            )),
+        )];
+        if !terms.is_empty() {
+            let mut parser =
+                QueryParser::for_index(&self.index, vec![self.title, self.body, self.tags]);
+            parser.set_field_boost(self.title, 2.5);
+            clauses.push((Occur::Must, parser.parse_query(&terms.join(" OR "))?));
+        }
         if let Some(project_id) = project_filter {
             clauses.push((
                 Occur::Must,
@@ -2583,5 +2582,33 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(first_hits[0].score > first_hits[2].score);
+    }
+
+    #[test]
+    fn empty_wiki_search_lists_bounded_current_pages_in_stable_project_scope() {
+        let pages = vec![
+            serde_json::json!({"page_id":"z-page", "revision":format!("{:064x}", 1), "project_id":"target", "title":"Zulu", "summary":"last", "current":true}),
+            serde_json::json!({"page_id":"stale", "revision":format!("{:064x}", 2), "project_id":"target", "title":"Stale", "summary":"old", "current":false}),
+            serde_json::json!({"page_id":"a-page", "revision":format!("{:064x}", 3), "project_id":"target", "title":"Alpha", "summary":"first", "current":true}),
+            serde_json::json!({"page_id":"other-page", "revision":format!("{:064x}", 4), "project_id":"other", "title":"Other", "summary":"elsewhere", "current":true}),
+        ];
+        let index = WikiSearchIndex::build(&pages).expect("wiki index");
+
+        let first = index
+            .search("", Some("target"), 1)
+            .expect("bounded wiki browse");
+        let all = index
+            .search("", Some("target"), 10)
+            .expect("scoped wiki browse");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].page_id, "a-page");
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.iter()
+                .map(|hit| hit.page_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a-page", "z-page"]
+        );
     }
 }
