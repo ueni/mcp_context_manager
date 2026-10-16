@@ -1008,6 +1008,22 @@ fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
     difference == 0
 }
 
+#[cfg(unix)]
+async fn shutdown_signal(cancellation: CancellationToken) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    } else {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    cancellation.cancel();
+}
+
+#[cfg(not(unix))]
 async fn shutdown_signal(cancellation: CancellationToken) {
     let _ = tokio::signal::ctrl_c().await;
     cancellation.cancel();

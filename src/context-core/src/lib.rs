@@ -469,7 +469,7 @@ const CONTINUATION_TTL_SECONDS: i64 = 24 * 60 * 60;
 const CONTINUATION_MAX_ENTRIES: usize = 256;
 const CONTINUATION_MAX_SESSION_BYTES: usize = 128;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 struct LookupCacheKey(String);
 
 struct LookupCacheEntry {
@@ -477,6 +477,10 @@ struct LookupCacheEntry {
     generation: u64,
     refresh_signature: String,
     expires_at: Instant,
+    expires_at_unix_ms: u64,
+    response_has_query: bool,
+    response_has_terms: bool,
+    persistable: bool,
 }
 
 #[derive(Default)]
@@ -491,8 +495,8 @@ const LOOKUP_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
 
 fn lookup_cache_key(
     request: &ContextLookupRequest,
-    generation: u64,
-    refresh_signature: &str,
+    _generation: u64,
+    _refresh_signature: &str,
 ) -> Result<LookupCacheKey> {
     let mut include_globs = request.include_globs.clone();
     include_globs.sort();
@@ -508,8 +512,6 @@ fn lookup_cache_key(
             "max_entries": request.max_entries,
             "max_depth": request.max_depth,
             "include_globs": include_globs,
-            "generation": generation,
-            "refresh_signature": refresh_signature,
         }))?,
     )))
 }
@@ -865,6 +867,7 @@ struct RefreshShared {
     metrics: Arc<EngineMetrics>,
     index_snapshot_path: std::path::PathBuf,
     git_diff_cache: Arc<Mutex<GitDiffCache>>,
+    cache_checkpoint_dirty: Arc<AtomicBool>,
     #[cfg(test)]
     refresh_hook: Arc<Mutex<Option<RefreshHook>>>,
 }
@@ -873,7 +876,7 @@ const GIT_DIFF_CACHE_MAX_ENTRIES: usize = 256;
 const GIT_DIFF_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const GIT_DIFF_PATCH_MAX_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct GitDiffCacheKey {
     index_generation: u64,
     head: String,
@@ -888,6 +891,50 @@ struct GitDiffCacheKey {
 struct GitDiffCache {
     entries: BTreeMap<GitDiffCacheKey, Vec<u8>>,
     bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedLookupCacheEntry {
+    key: String,
+    payload: Value,
+    expires_at_unix_ms: u64,
+    response_has_query: bool,
+    response_has_terms: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedGitDiffEntry {
+    key: GitDiffCacheKey,
+    diff: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CacheCheckpoint {
+    schema: String,
+    project_id: String,
+    refresh_signature: String,
+    lookup: Vec<PersistedLookupCacheEntry>,
+    git_diff: Vec<PersistedGitDiffEntry>,
+}
+
+const CACHE_CHECKPOINT_SCHEMA: &str = "context_cache.checkpoint.v1";
+const CACHE_CHECKPOINT_MAX_BYTES: usize = LOOKUP_CACHE_MAX_BYTES + GIT_DIFF_CACHE_MAX_BYTES;
+const CACHE_CHECKPOINT_METADATA_RESERVE_BYTES: usize = 4096;
+
+struct CacheCheckpointGuard {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+    last_error: Arc<Mutex<Option<String>>>,
+}
+
+impl Drop for CacheCheckpointGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.thread.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2115,7 +2162,7 @@ pub struct ProjectEngine {
     store: Arc<StateStore>,
     wiki_index: RwLock<Arc<WikiSearchIndex>>,
     project_id: String,
-    lookup_cache: Mutex<LookupCacheState>,
+    lookup_cache: Arc<Mutex<LookupCacheState>>,
     pack_snapshots: Mutex<HashMap<String, Arc<PackSnapshot>>>,
     continuation_lock: Mutex<()>,
     deferred_references: Mutex<HashMap<String, ReferenceValidation>>,
@@ -2127,6 +2174,7 @@ pub struct ProjectEngine {
     #[cfg(test)]
     refresh_hook: Arc<Mutex<Option<RefreshHook>>>,
     refresh_coordinator: Arc<RefreshCoordinator>,
+    _cache_checkpoint: CacheCheckpointGuard,
     _watcher: Arc<WatchGuard>,
 }
 
@@ -2217,6 +2265,8 @@ impl ProjectEngine {
         #[cfg(test)]
         let refresh_hook = Arc::new(Mutex::new(None));
         let wiki_hub = Arc::new(RwLock::new(None));
+        let git_diff_cache = Arc::new(Mutex::new(GitDiffCache::default()));
+        let cache_checkpoint_dirty = Arc::new(AtomicBool::new(true));
         let refresh_shared = Arc::new(RefreshShared {
             wiki_hub: Arc::new(RwLock::new(None)),
             index: Arc::clone(&index),
@@ -2224,7 +2274,8 @@ impl ProjectEngine {
             project_id: project_id.clone(),
             metrics: Arc::clone(&metrics),
             index_snapshot_path: index_snapshot_path.clone(),
-            git_diff_cache: Arc::new(Mutex::new(GitDiffCache::default())),
+            git_diff_cache: Arc::clone(&git_diff_cache),
+            cache_checkpoint_dirty: Arc::clone(&cache_checkpoint_dirty),
             #[cfg(test)]
             refresh_hook: Arc::clone(&refresh_hook),
         });
@@ -2233,13 +2284,37 @@ impl ProjectEngine {
             wake: Condvar::new(),
             shared: refresh_shared,
         });
+        let (lookup_state, restored_git_diff_cache) = load_cache_checkpoint(
+            &store.paths().index.join("context-cache.checkpoint.v1.json"),
+            &project_id,
+            &index
+                .read()
+                .map_err(|_| anyhow!("index lock poisoned"))?
+                .stats()
+                .refresh_signature,
+            freshness.generation.load(Ordering::Acquire),
+            &root,
+        )?;
+        *git_diff_cache
+            .lock()
+            .map_err(|_| anyhow!("Git diff cache lock poisoned"))? = restored_git_diff_cache;
+        let lookup_cache = Arc::new(Mutex::new(lookup_state));
+        let cache_checkpoint = CacheCheckpointGuard::start(
+            store.paths().index.join("context-cache.checkpoint.v1.json"),
+            project_id.clone(),
+            Arc::clone(&index),
+            Arc::clone(&lookup_cache),
+            Arc::clone(&git_diff_cache),
+            Arc::clone(&cache_checkpoint_dirty),
+            Arc::clone(&freshness),
+        )?;
         Ok(Self {
             wiki_hub,
             index,
             store,
             wiki_index: RwLock::new(wiki_index),
             project_id,
-            lookup_cache: Mutex::new(LookupCacheState::default()),
+            lookup_cache,
             pack_snapshots: Mutex::new(pack_snapshots),
             continuation_lock: Mutex::new(()),
             deferred_references: Mutex::new(deferred_references),
@@ -2251,6 +2326,7 @@ impl ProjectEngine {
             #[cfg(test)]
             refresh_hook,
             refresh_coordinator,
+            _cache_checkpoint: cache_checkpoint,
             _watcher: Arc::new(watcher),
         })
     }
@@ -3568,6 +3644,7 @@ impl ProjectEngine {
                     }
                     cache.bytes = cache.bytes.saturating_add(diff.len());
                     cache.entries.insert(key, diff.clone());
+                    shared.cache_checkpoint_dirty.store(true, Ordering::Release);
                     while cache.entries.len() > GIT_DIFF_CACHE_MAX_ENTRIES
                         || cache.bytes > GIT_DIFF_CACHE_MAX_BYTES
                     {
@@ -3636,7 +3713,7 @@ impl ProjectEngine {
             };
             if let Some(cache_key) = cache_key.as_ref()
                 && let Some(bytes) =
-                    self.lookup_cache_get(cache_key, generation, &refresh_signature)?
+                    self.lookup_cache_get(cache_key, generation, &refresh_signature, request)?
             {
                 self.metrics
                     .lookup_cache_hits
@@ -3695,6 +3772,7 @@ impl ProjectEngine {
         key: &LookupCacheKey,
         generation: u64,
         refresh_signature: &str,
+        request: &ContextLookupRequest,
     ) -> Result<Option<Vec<u8>>> {
         let now = Instant::now();
         let mut state = self
@@ -3705,6 +3783,7 @@ impl ProjectEngine {
             return Ok(None);
         };
         let valid = entry.expires_at > now
+            && entry.expires_at_unix_ms > now_millis()
             && entry.generation == generation
             && entry.refresh_signature == refresh_signature;
         if !valid {
@@ -3715,7 +3794,28 @@ impl ProjectEngine {
             state.bytes = state.bytes.saturating_sub(removed.bytes.len());
             return Ok(None);
         }
-        Ok(Some(entry.bytes.as_ref().clone()))
+        let mut bytes = entry.bytes.as_ref().clone();
+        if entry.response_has_query || entry.response_has_terms {
+            let mut value: Value = serde_json::from_slice(&bytes)?;
+            if let Some(object) = value.as_object_mut() {
+                if entry.response_has_query {
+                    object.insert("query".to_owned(), json!(request.query));
+                }
+                if entry.response_has_terms {
+                    let terms = normalize_terms(&request.query, 8);
+                    object.insert("terms".to_owned(), json!(terms));
+                    if let Some(results) = object.get_mut("results").and_then(Value::as_array_mut) {
+                        for result in results {
+                            if let Some(result) = result.as_object_mut() {
+                                result.insert("terms".to_owned(), json!(terms));
+                            }
+                        }
+                    }
+                }
+            }
+            bytes = serde_json::to_vec(&value)?;
+        }
+        Ok(Some(bytes))
     }
 
     fn lookup_cache_insert(
@@ -3735,6 +3835,29 @@ impl ProjectEngine {
         if let Some(previous) = state.entries.remove(&key) {
             state.bytes = state.bytes.saturating_sub(previous.bytes.len());
         }
+        let response_has_query = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .is_some_and(|value| value.get("query").is_some());
+        let response_has_terms = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .is_some_and(|value| value.get("terms").is_some());
+        let persistable = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .is_some_and(|mut value| {
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("query");
+                    object.remove("terms");
+                    if let Some(results) = object.get_mut("results").and_then(Value::as_array_mut) {
+                        for result in results {
+                            if let Some(result) = result.as_object_mut() {
+                                result.remove("terms");
+                            }
+                        }
+                    }
+                }
+                let (safe, sensitivity) = sanitize_json_value(value.clone());
+                sensitivity["redacted"] != true && safe == value
+            });
         state.entries.insert(
             key,
             LookupCacheEntry {
@@ -3742,9 +3865,19 @@ impl ProjectEngine {
                 generation,
                 refresh_signature,
                 expires_at: Instant::now() + LOOKUP_CACHE_TTL,
+                expires_at_unix_ms: now_millis().saturating_add(
+                    u64::try_from(LOOKUP_CACHE_TTL.as_millis()).unwrap_or(u64::MAX),
+                ),
+                response_has_query,
+                response_has_terms,
+                persistable,
             },
         );
         state.bytes = state.bytes.saturating_add(bytes.len());
+        self.refresh_coordinator
+            .shared
+            .cache_checkpoint_dirty
+            .store(true, Ordering::Release);
         while state.entries.len() > LOOKUP_CACHE_MAX_ENTRIES || state.bytes > LOOKUP_CACHE_MAX_BYTES
         {
             let Some(oldest) = state
@@ -3850,6 +3983,10 @@ impl ProjectEngine {
                     .map_err(|_| anyhow!("lookup cache lock poisoned"))?;
                 lookup_cache.entries.clear();
                 lookup_cache.bytes = 0;
+                self.refresh_coordinator
+                    .shared
+                    .cache_checkpoint_dirty
+                    .store(true, Ordering::Release);
                 if matches!(request.mode.as_str(), "wiki_upsert" | "wiki_consolidate") {
                     *self
                         .wiki_index
@@ -4964,6 +5101,351 @@ fn persist_index_snapshot_bytes(
     Ok(())
 }
 
+impl CacheCheckpointGuard {
+    fn start(
+        path: std::path::PathBuf,
+        project_id: String,
+        index: Arc<RwLock<Arc<ProjectIndex>>>,
+        lookup_cache: Arc<Mutex<LookupCacheState>>,
+        git_diff_cache: Arc<Mutex<GitDiffCache>>,
+        dirty: Arc<AtomicBool>,
+        freshness: Arc<FreshnessState>,
+    ) -> Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let last_error = Arc::new(Mutex::new(None));
+        let worker_error = Arc::clone(&last_error);
+        let thread = thread::Builder::new()
+            .name("context-cache-checkpoint".into())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    thread::park_timeout(StdDuration::from_secs(1));
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if !dirty.swap(false, Ordering::AcqRel) {
+                        continue;
+                    }
+                    let signature = index
+                        .read()
+                        .ok()
+                        .map(|index| index.stats().refresh_signature.clone());
+                    let Some(signature) = signature else {
+                        dirty.store(true, Ordering::Release);
+                        continue;
+                    };
+                    let generation = freshness.generation.load(Ordering::Acquire);
+                    let result = make_cache_checkpoint(
+                        &project_id,
+                        &signature,
+                        generation,
+                        &lookup_cache,
+                        &git_diff_cache,
+                    )
+                    .ok_or_else(|| anyhow!("cache checkpoint snapshot unavailable"))
+                    .and_then(|snapshot| persist_cache_checkpoint(&path, &snapshot));
+                    if let Err(error) = result {
+                        if let Ok(mut last_error) = worker_error.lock() {
+                            *last_error = Some(error.to_string());
+                        }
+                        dirty.store(true, Ordering::Release);
+                    } else if let Ok(mut last_error) = worker_error.lock() {
+                        *last_error = None;
+                    }
+                }
+                let signature = index
+                    .read()
+                    .ok()
+                    .map(|index| index.stats().refresh_signature.clone());
+                if let Some(signature) = signature {
+                    let result = make_cache_checkpoint(
+                        &project_id,
+                        &signature,
+                        freshness.generation.load(Ordering::Acquire),
+                        &lookup_cache,
+                        &git_diff_cache,
+                    )
+                    .ok_or_else(|| anyhow!("cache checkpoint snapshot unavailable"))
+                    .and_then(|snapshot| persist_cache_checkpoint(&path, &snapshot));
+                    if let Err(error) = result
+                        && let Ok(mut last_error) = worker_error.lock()
+                    {
+                        *last_error = Some(error.to_string());
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+            last_error,
+        })
+    }
+}
+
+fn load_cache_checkpoint(
+    path: &std::path::Path,
+    project_id: &str,
+    refresh_signature: &str,
+    generation: u64,
+    root: &std::path::Path,
+) -> Result<(LookupCacheState, GitDiffCache)> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((LookupCacheState::default(), GitDiffCache::default()));
+        }
+        Err(_) => return Ok((LookupCacheState::default(), GitDiffCache::default())),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > CACHE_CHECKPOINT_MAX_BYTES as u64
+    {
+        return Ok((LookupCacheState::default(), GitDiffCache::default()));
+    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok((LookupCacheState::default(), GitDiffCache::default())),
+    };
+    let checkpoint: CacheCheckpoint = match serde_json::from_slice(&bytes) {
+        Ok(checkpoint) => checkpoint,
+        Err(_) => return Ok((LookupCacheState::default(), GitDiffCache::default())),
+    };
+    if checkpoint.schema != CACHE_CHECKPOINT_SCHEMA
+        || checkpoint.project_id != project_id
+        || checkpoint.refresh_signature != refresh_signature
+    {
+        return Ok((LookupCacheState::default(), GitDiffCache::default()));
+    }
+    let now = now_millis();
+    let mut state = LookupCacheState::default();
+    for entry in checkpoint.lookup {
+        if entry.expires_at_unix_ms <= now
+            || entry.expires_at_unix_ms
+                > now
+                    .saturating_add(u64::try_from(LOOKUP_CACHE_TTL.as_millis()).unwrap_or(u64::MAX))
+            || state.entries.len() >= LOOKUP_CACHE_MAX_ENTRIES
+        {
+            continue;
+        }
+        let mut payload = entry.payload;
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("query");
+            object.remove("terms");
+            if let Some(results) = object.get_mut("results").and_then(Value::as_array_mut) {
+                for result in results {
+                    if let Some(result) = result.as_object_mut() {
+                        result.remove("terms");
+                    }
+                }
+            }
+        }
+        let (safe_payload, sensitivity) = sanitize_json_value(payload.clone());
+        if sensitivity["redacted"] == true || safe_payload != payload {
+            continue;
+        }
+        let bytes = serde_json::to_vec(&payload)?;
+        if state.bytes.saturating_add(bytes.len()) > LOOKUP_CACHE_MAX_BYTES {
+            continue;
+        }
+        let remaining = entry.expires_at_unix_ms.saturating_sub(now);
+        state.bytes = state.bytes.saturating_add(bytes.len());
+        state.entries.insert(
+            LookupCacheKey(entry.key),
+            LookupCacheEntry {
+                bytes: Arc::new(bytes),
+                generation,
+                refresh_signature: refresh_signature.to_owned(),
+                expires_at: Instant::now() + StdDuration::from_millis(remaining),
+                expires_at_unix_ms: entry.expires_at_unix_ms,
+                response_has_query: entry.response_has_query,
+                response_has_terms: entry.response_has_terms,
+                persistable: true,
+            },
+        );
+    }
+    let mut git_cache = GitDiffCache::default();
+    let head = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let index_path = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--git-path", "index"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let path = std::path::PathBuf::from(path);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        });
+    let index_metadata = index_path.and_then(|path| fs::metadata(path).ok());
+    let index_len = index_metadata.as_ref().map_or(0, fs::Metadata::len);
+    let index_modified = index_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    for mut entry in checkpoint.git_diff {
+        if git_cache.entries.len() >= GIT_DIFF_CACHE_MAX_ENTRIES
+            || entry.diff.len() > GIT_DIFF_CACHE_MAX_BYTES
+            || head.as_deref() != Some(entry.key.head.as_str())
+            || entry.key.git_index_len != index_len
+            || entry.key.git_index_modified_nanos != index_modified
+            || sanitize_text(&entry.diff).0 != entry.diff
+        {
+            continue;
+        }
+        let Ok(relative) = validate_relative_path(&entry.key.path) else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(root.join(relative)) else {
+            continue;
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        if metadata.len() != entry.key.file_len || modified != entry.key.modified_nanos {
+            continue;
+        }
+        entry.key.index_generation = generation;
+        let bytes = entry.diff.into_bytes();
+        if git_cache.bytes.saturating_add(bytes.len()) > GIT_DIFF_CACHE_MAX_BYTES {
+            continue;
+        }
+        git_cache.bytes = git_cache.bytes.saturating_add(bytes.len());
+        git_cache.entries.insert(entry.key, bytes);
+    }
+    Ok((state, git_cache))
+}
+
+fn make_cache_checkpoint(
+    project_id: &str,
+    refresh_signature: &str,
+    generation: u64,
+    lookup_cache: &Mutex<LookupCacheState>,
+    git_diff_cache: &Mutex<GitDiffCache>,
+) -> Option<CacheCheckpoint> {
+    let mut lookup = Vec::new();
+    let mut encoded_entry_bytes = 0usize;
+    if let Ok(state) = lookup_cache.lock() {
+        let mut entries: Vec<_> = state.entries.iter().collect();
+        entries.sort_by(|(left, _), (right, _)| left.0.cmp(&right.0));
+        for (key, entry) in entries {
+            if entry.expires_at <= Instant::now()
+                || entry.expires_at_unix_ms <= now_millis()
+                || entry.generation != generation
+                || entry.refresh_signature != refresh_signature
+                || !entry.persistable
+            {
+                continue;
+            }
+            let Ok(mut payload) = serde_json::from_slice::<Value>(&entry.bytes) else {
+                continue;
+            };
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("query");
+                object.remove("terms");
+                if let Some(results) = object.get_mut("results").and_then(Value::as_array_mut) {
+                    for result in results {
+                        if let Some(result) = result.as_object_mut() {
+                            result.remove("terms");
+                        }
+                    }
+                }
+            }
+            let (safe_payload, sensitivity) = sanitize_json_value(payload.clone());
+            if sensitivity["redacted"] == true || safe_payload != payload {
+                continue;
+            }
+            let candidate = PersistedLookupCacheEntry {
+                key: key.0.clone(),
+                payload,
+                expires_at_unix_ms: entry.expires_at_unix_ms,
+                response_has_query: entry.response_has_query,
+                response_has_terms: entry.response_has_terms,
+            };
+            let candidate_size = serde_json::to_vec(&candidate).ok()?.len();
+            if encoded_entry_bytes
+                .saturating_add(candidate_size)
+                .saturating_add(CACHE_CHECKPOINT_METADATA_RESERVE_BYTES)
+                > CACHE_CHECKPOINT_MAX_BYTES
+            {
+                continue;
+            }
+            encoded_entry_bytes = encoded_entry_bytes.saturating_add(candidate_size);
+            lookup.push(candidate);
+        }
+    }
+    let mut git_diff = Vec::new();
+    if let Ok(cache) = git_diff_cache.lock() {
+        let mut entries: Vec<_> = cache.entries.iter().collect();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, bytes) in entries {
+            if key.index_generation != generation {
+                continue;
+            }
+            let Ok(diff) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            if sanitize_text(diff).0 != diff {
+                continue;
+            }
+            let candidate = PersistedGitDiffEntry {
+                key: key.clone(),
+                diff: diff.to_owned(),
+            };
+            let candidate_size = serde_json::to_vec(&candidate).ok()?.len();
+            if encoded_entry_bytes
+                .saturating_add(candidate_size)
+                .saturating_add(CACHE_CHECKPOINT_METADATA_RESERVE_BYTES)
+                > CACHE_CHECKPOINT_MAX_BYTES
+            {
+                continue;
+            }
+            encoded_entry_bytes = encoded_entry_bytes.saturating_add(candidate_size);
+            git_diff.push(candidate);
+        }
+    }
+    let mut checkpoint = CacheCheckpoint {
+        schema: CACHE_CHECKPOINT_SCHEMA.to_owned(),
+        project_id: project_id.to_owned(),
+        refresh_signature: refresh_signature.to_owned(),
+        lookup,
+        git_diff,
+    };
+    while serde_json::to_vec(&checkpoint).ok()?.len() > CACHE_CHECKPOINT_MAX_BYTES {
+        if checkpoint.git_diff.pop().is_none() && checkpoint.lookup.pop().is_none() {
+            return None;
+        }
+    }
+    Some(checkpoint)
+}
+
+fn persist_cache_checkpoint(path: &std::path::Path, checkpoint: &CacheCheckpoint) -> Result<()> {
+    let bytes = serde_json::to_vec(checkpoint)?;
+    if bytes.len() > CACHE_CHECKPOINT_MAX_BYTES {
+        bail!("cache checkpoint exceeds configured bound");
+    }
+    let temporary = path.with_extension("json.pending");
+    let mut file = fs::File::create(&temporary)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn remove_oversized_snapshot(path: &std::path::Path) -> Result<()> {
     if let Ok(metadata) = std::fs::symlink_metadata(path)
         && metadata.is_file()
@@ -5056,6 +5538,14 @@ async fn admin_dispatch(
             ) = engine.index().cache_diagnostics();
             Ok(json!({
                 "schema": "context_cache.stats.v2",
+                "persistence": {
+                    "schema": CACHE_CHECKPOINT_SCHEMA,
+                    "status": "background_checkpoint",
+                    "last_error": engine._cache_checkpoint.last_error
+                        .lock()
+                        .ok()
+                        .and_then(|error| error.clone()),
+                },
                 "namespaces": {
                     "lookup": {
                         "entries": lookup.entries.len(),
@@ -7861,6 +8351,22 @@ mod tests {
             serde_json::from_slice(&engine.context_lookup(&old_page).expect("old page"))
                 .expect("old page response");
         assert_eq!(old_page["page"]["superseded_by"], "transport-retries-v2");
+        drop(engine);
+        let reopened = ProjectEngine::build_with_state(root.path(), state.path(), "wiki-test")
+            .expect("reopened wiki state");
+        let current_page: ContextLookupRequest = serde_json::from_value(json!({
+            "mode": "wiki_get",
+            "path": "transport-retries-v2"
+        }))
+        .expect("reopened wiki request");
+        let current_page: Value = serde_json::from_slice(
+            &reopened
+                .context_lookup(&current_page)
+                .expect("read durable wiki page"),
+        )
+        .expect("reopened wiki JSON");
+        assert_eq!(current_page["status"], "resolved");
+        assert_eq!(current_page["page"]["title"], "Transport retry behavior");
     }
 
     #[test]
@@ -8361,6 +8867,11 @@ mod tests {
             )
             .expect("admin JSON");
             assert_eq!(response["schema"], schema, "mode={mode}");
+            if mode == "cache_stats" {
+                assert_eq!(response["persistence"]["schema"], CACHE_CHECKPOINT_SCHEMA);
+                assert_eq!(response["persistence"]["status"], "background_checkpoint");
+                assert!(response["persistence"]["last_error"].is_null());
+            }
             assert!(
                 !response
                     .to_string()
@@ -8618,6 +9129,215 @@ mod tests {
         assert_eq!(first["cache"]["hit"], false);
         assert_eq!(second["cache"]["hit"], true);
         assert_eq!(engine.metrics.lookup_cache_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn lookup_cache_checkpoint_survives_engine_restart_without_query_text() {
+        let root = tempdir().expect("temporary repository");
+        let state = tempdir().expect("persistent project state");
+        fs::write(root.path().join("notes.txt"), "restartmarker evidence\n").expect("fixture file");
+        let request: ContextLookupRequest = serde_json::from_value(json!({
+            "mode": "search",
+            "query": "restartmarker"
+        }))
+        .expect("lookup request");
+
+        let first = ProjectEngine::build_with_state(root.path(), state.path(), "restart-test")
+            .expect("first engine");
+        let first_response: Value =
+            serde_json::from_slice(&first.context_lookup(&request).expect("first lookup"))
+                .expect("first response");
+        assert_eq!(first_response["cache"]["hit"], false);
+        drop(first);
+
+        let checkpoint = state
+            .path()
+            .join("rust-v2/index/context-cache.checkpoint.v1.json");
+        let checkpoint_value: Value =
+            serde_json::from_slice(&fs::read(&checkpoint).expect("checkpoint saved"))
+                .expect("checkpoint JSON");
+        assert!(
+            checkpoint_value["lookup"][0]["payload"]
+                .get("query")
+                .is_none()
+        );
+        assert!(
+            checkpoint_value["lookup"][0]["payload"]
+                .get("terms")
+                .is_none()
+        );
+
+        let restarted = ProjectEngine::build_with_state(root.path(), state.path(), "restart-test")
+            .expect("restarted engine");
+        let restored: Value = serde_json::from_slice(
+            &restarted
+                .context_lookup(&request)
+                .expect("lookup after restart"),
+        )
+        .expect("restored response");
+        assert_eq!(restored["cache"]["hit"], true);
+        assert_eq!(restored["query"], "restartmarker");
+        assert!(!restored["results"].as_array().unwrap().is_empty());
+        assert_eq!(restored["terms"], first_response["terms"]);
+        assert_eq!(
+            restored["results"][0]["terms"],
+            first_response["results"][0]["terms"]
+        );
+        let mut expected = first_response;
+        expected["cache"] = Value::Null;
+        let mut actual = restored.clone();
+        actual["cache"] = Value::Null;
+        assert_eq!(actual, expected);
+
+        let checkpoint_value: Value =
+            serde_json::from_slice(&fs::read(&checkpoint).expect("checkpoint bytes"))
+                .expect("checkpoint JSON");
+        let signature = restarted.index().stats().refresh_signature.clone();
+        let (stale_lookup, stale_git) = load_cache_checkpoint(
+            &checkpoint,
+            "restart-test",
+            "different-repository-signature",
+            0,
+            root.path(),
+        )
+        .expect("stale checkpoint is discarded safely");
+        assert!(stale_lookup.entries.is_empty());
+        assert!(stale_git.entries.is_empty());
+
+        let mut expired = checkpoint_value;
+        expired["refresh_signature"] = json!(signature);
+        expired["lookup"][0]["expires_at_unix_ms"] = json!(now_millis().saturating_sub(1));
+        fs::write(
+            &checkpoint,
+            serde_json::to_vec(&expired).expect("expired JSON"),
+        )
+        .expect("write expired checkpoint");
+        let (expired_lookup, _) =
+            load_cache_checkpoint(&checkpoint, "restart-test", &signature, 0, root.path())
+                .expect("expired checkpoint is discarded safely");
+        assert!(expired_lookup.entries.is_empty());
+
+        let mut future = serde_json::from_slice::<Value>(
+            &fs::read(&checkpoint).expect("expired checkpoint bytes"),
+        )
+        .expect("expired checkpoint JSON");
+        future["lookup"][0]["expires_at_unix_ms"] = json!(
+            now_millis()
+                .saturating_add(u64::try_from(LOOKUP_CACHE_TTL.as_millis()).unwrap_or(u64::MAX))
+                .saturating_add(1)
+        );
+        fs::write(
+            &checkpoint,
+            serde_json::to_vec(&future).expect("future JSON"),
+        )
+        .expect("write future checkpoint");
+        let (future_lookup, _) =
+            load_cache_checkpoint(&checkpoint, "restart-test", &signature, 0, root.path())
+                .expect("future expiry is discarded safely");
+        assert!(future_lookup.entries.is_empty());
+
+        fs::write(&checkpoint, b"invalid checkpoint").expect("write corrupt checkpoint");
+        let (corrupt_lookup, _) =
+            load_cache_checkpoint(&checkpoint, "restart-test", &signature, 0, root.path())
+                .expect("corrupt checkpoint is discarded safely");
+        assert!(corrupt_lookup.entries.is_empty());
+
+        let mut stale_lookup = LookupCacheState::default();
+        stale_lookup.entries.insert(
+            LookupCacheKey("stable-key".to_owned()),
+            LookupCacheEntry {
+                bytes: Arc::new(b"{\"schema\":\"test\"}".to_vec()),
+                generation: 4,
+                refresh_signature: "old-signature".to_owned(),
+                expires_at: Instant::now() + LOOKUP_CACHE_TTL,
+                expires_at_unix_ms: now_millis()
+                    .saturating_add(u64::try_from(LOOKUP_CACHE_TTL.as_millis()).unwrap_or(0)),
+                response_has_query: false,
+                response_has_terms: false,
+                persistable: true,
+            },
+        );
+        let stale_key = GitDiffCacheKey {
+            index_generation: 4,
+            head: "head".to_owned(),
+            git_index_len: 0,
+            git_index_modified_nanos: 0,
+            path: "tracked.txt".to_owned(),
+            file_len: 1,
+            modified_nanos: 0,
+        };
+        let mut stale_git = GitDiffCache::default();
+        stale_git
+            .entries
+            .insert(stale_key, b"diff --git a/a b/a\n".to_vec());
+        let unpromoted = make_cache_checkpoint(
+            "restart-test",
+            "new-signature",
+            5,
+            &Mutex::new(stale_lookup),
+            &Mutex::new(stale_git),
+        )
+        .expect("checkpoint snapshot");
+        assert!(unpromoted.lookup.is_empty());
+        assert!(unpromoted.git_diff.is_empty());
+    }
+
+    #[test]
+    fn git_diff_cache_checkpoint_restores_only_for_matching_repository_state() {
+        let root = tempdir().expect("temporary repository");
+        let state = tempdir().expect("persistent project state");
+        fs::write(root.path().join("tracked.txt"), "base content\n").expect("fixture file");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(root.path())
+                .args(args)
+                .output()
+                .expect("Git command");
+            assert!(output.status.success(), "Git command failed: {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        git(&["config", "user.name", "Cache Test"]);
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "initial"]);
+        fs::write(
+            root.path().join("tracked.txt"),
+            "base content with a small edit\n",
+        )
+        .expect("modified tracked file");
+
+        let engine = ProjectEngine::build_with_state(root.path(), state.path(), "git-cache-test")
+            .expect("first engine");
+        let paths = BTreeSet::from(["tracked.txt".to_owned()]);
+        let index = engine.index();
+        ProjectEngine::cache_git_diffs(&engine.refresh_coordinator.shared, &index, &paths);
+        assert_eq!(
+            engine
+                .refresh_coordinator
+                .shared
+                .git_diff_cache
+                .lock()
+                .expect("cache lock")
+                .entries
+                .len(),
+            1
+        );
+        drop(engine);
+
+        let restarted =
+            ProjectEngine::build_with_state(root.path(), state.path(), "git-cache-test")
+                .expect("restarted engine");
+        ProjectEngine::cache_git_diffs(&restarted.refresh_coordinator.shared, &index, &paths);
+        assert_eq!(restarted.metrics.git_diff_hits.load(Ordering::Relaxed), 1);
+
+        fs::write(root.path().join("tracked.txt"), "changed again\n")
+            .expect("change repository state");
+        ProjectEngine::cache_git_diffs(&restarted.refresh_coordinator.shared, &index, &paths);
+        assert_eq!(
+            restarted.metrics.git_diff_hits.load(Ordering::Relaxed),
+            1,
+            "modified source must invalidate the restored diff",
+        );
     }
 
     #[test]
@@ -9769,9 +10489,14 @@ mod tests {
         fs::remove_file(&source).expect("source deletion");
         fs::write(&added, "fn added() {}\n").expect("source addition");
         let lifecycle_deadline = Instant::now() + StdDuration::from_secs(1);
-        while freshness.event_epoch.load(Ordering::Acquire) <= modified_epoch
-            && Instant::now() < lifecycle_deadline
-        {
+        while Instant::now() < lifecycle_deadline {
+            let has_both_lifecycle_paths = {
+                let journal = freshness.changed_paths.lock().expect("change journal");
+                journal.contains("lib.rs") && journal.contains("added.rs")
+            };
+            if has_both_lifecycle_paths {
+                break;
+            }
             thread::sleep(StdDuration::from_millis(10));
         }
         let journal = freshness.changed_paths.lock().expect("change journal");

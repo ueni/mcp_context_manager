@@ -367,6 +367,17 @@ Keep the named state volume when upgrading so native project state persists:
     server.lock
 ```
 
+The state volume also keeps authored wiki revisions and source records in LMDB.
+Lookup and Git-diff caches are checkpointed in the background to the project's
+`rust-v2/index/context-cache.checkpoint.v1.json`; cache snapshots are bounded,
+atomic, and restored only for the same project and repository generation. The
+`cache_stats.persistence` fields are diagnostic status, not a persistence API.
+lookup cache keeps its original 30-second expiry across restarts. Raw lookup
+queries are omitted, and cache responses that need redaction are not checkpointed.
+Git diffs are checkpointed only when UTF-8 and unchanged by secret sanitization;
+restore also checks the Git head, index, and source-file metadata. Keep the named
+volume to retain this state across container upgrades and restarts.
+
 ## Run a standalone executable
 
 Dynamic glibc:
@@ -528,8 +539,9 @@ The request path uses:
 
 Lookup cache diagnostics are exposed in the per-result `cache` object and in
 metrics; they are diagnostic fields rather than retrieved project evidence.
-Lookup caching is bounded to 256 entries or 16 MiB with a 30-second TTL,
-and keys include the normalized request plus published generation/signature.
+Lookup caching is bounded to 256 entries or 16 MiB with a 30-second TTL;
+stable request hashes identify entries while the stored generation and source
+signature determine whether an entry can be used.
 Pack snapshots retain the evidence identities needed for explicit deltas and
 continuation memory. They do not serve cached pack responses or retrieval results.
 
