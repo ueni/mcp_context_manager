@@ -613,6 +613,109 @@ class MonitorWikiBrowserTests(unittest.TestCase):
             ),
         )
 
+    def test_wiki_source_hit_resolves_immutable_reference(self) -> None:
+        class SourceClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            def call_tool(
+                self, name: str, arguments: dict[str, object]
+            ) -> dict[str, object]:
+                self.calls.append((name, arguments))
+                return {
+                    "schema": "agent_wiki.source.v1",
+                    "status": "resolved",
+                    "source": {
+                        "source_id": "git-deadbeef",
+                        "kind": "git",
+                        "commit": "deadbeef",
+                        "sha256": "a" * 64,
+                    },
+                    "excerpt": "diff --git a/display.c b/display.c",
+                    "reference": arguments["reference"],
+                }
+
+        client = SourceClient()
+        target = monitor_metrics.ProjectTarget(project_id="cop-flip")
+        reference = {
+            "kind": "wiki_source",
+            "project_id": "cop-flip",
+            "source_id": "git-deadbeef",
+            "sha256": "a" * 64,
+            "start_line": 12,
+            "end_line": 17,
+            "start_byte": 100,
+            "end_byte": 140,
+        }
+        row = {
+            "page_id": "source-git-deadbeef-12-100",
+            "title": "Display test pattern",
+            "source_kind": "git",
+            "reference": reference,
+        }
+
+        result = monitor_metrics._fetch_wiki_row_result(client, target, row)
+
+        self.assertEqual(
+            result.payload["excerpt"], "diff --git a/display.c b/display.c"
+        )
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    "result_reference_resolve",
+                    {"reference": reference, "project_id": "cop-flip"},
+                )
+            ],
+        )
+        rendered = monitor_metrics.render_wiki_browser(
+            "http://localhost:8000/mcp",
+            False,
+            120,
+            monitor_metrics.MonitorState(
+                view="wiki",
+                wiki_target=target,
+                wiki_page=result.payload,
+            ),
+            height=30,
+        )
+        self.assertIn("deadbeef", rendered)
+        self.assertIn("100–140", rendered)
+        self.assertIn("diff --git a/display.c", rendered)
+        self.assertTrue(
+            monitor_metrics._wiki_row_title(
+                {
+                    "page_id": "source-git-deadbeef-12-100",
+                    "title": "Document display screen test pattern object",
+                    "source_kind": "git",
+                    "reference": reference,
+                }
+            ).startswith("[git 12-17]")
+        )
+
+    def test_wiki_history_progress_is_derived_from_counters(self) -> None:
+        state = monitor_metrics.MonitorState(
+            wiki_status={
+                "generation": 184,
+                "chunk_count": 7_500,
+                "project_count": 2,
+                "history": {
+                    "imported_this_batch": 0,
+                    "reachable_batch": 1_000,
+                    "remaining_in_batch": 0,
+                    "resumable": True,
+                },
+                "source_refresh": {"status": "ready"},
+            }
+        )
+        rendered = monitor_metrics.render_wiki_browser(
+            "http://localhost:8000/mcp", False, 120, state, height=30
+        )
+
+        self.assertIn("history:  0 new, 1000 processed", rendered)
+        self.assertNotIn("(resumable)", rendered)
+        self.assertIn("sources: ready", rendered)
+
     def test_wiki_view_renders_status_pages_and_page_citations(self) -> None:
         state = monitor_metrics.MonitorState(
             view="wiki",

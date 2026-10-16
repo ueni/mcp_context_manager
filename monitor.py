@@ -589,6 +589,16 @@ def fetch_wiki_page(
     )
 
 
+def resolve_wiki_source(
+    client: Any, target: ProjectTarget, reference: dict[str, Any]
+) -> dict[str, Any]:
+    root_uri = target.name if target.source == "root_uri" else ""
+    return client.call_tool(
+        "result_reference_resolve",
+        {"reference": reference, **_selector_args(target, root_uri)},
+    )
+
+
 def warmup_project(client: Any, target: ProjectTarget) -> dict[str, Any]:
     root_uri = target.name if target.source == "root_uri" else ""
     return client.call_tool(
@@ -1561,8 +1571,9 @@ def render_wiki_browser(
             f"{fmt_int(status.get('chunk_count', 0))} chunks / "
             f"{fmt_int(status.get('project_count', 0))} wiki projects"
         )
+        history_summary = _wiki_history_summary(history)
         lines.append(
-            f"history:  {history.get('status', 'unknown')}   "
+            f"history:  {history_summary}   "
             f"sources: {source_refresh.get('status', 'unknown')}"
         )
     lines.append(
@@ -1594,7 +1605,7 @@ def render_wiki_browser(
                 if state.wiki_scroll_offset + index == state.wiki_selected_index
                 else " "
             ),
-            _trim(str(row.get("title") or row.get("page_id") or "-"), 42),
+            _trim(_wiki_row_title(row), 42),
             _trim(str(row.get("page_id") or "-"), 28),
             _trim(str(row.get("source_status") or "-"), 20),
         )
@@ -1630,17 +1641,48 @@ def render_wiki_page(
 ) -> str:
     payload = state.wiki_page or {}
     page = payload.get("page") if isinstance(payload.get("page"), dict) else payload
-    title = str(page.get("title") or payload.get("page_id") or "wiki page")
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    is_source = payload.get("schema") == "agent_wiki.source.v1"
+    title = str(
+        source.get("title")
+        if is_source
+        else page.get("title") or payload.get("page_id") or "wiki page"
+    )
     body = [
         _style(title, color, Ansi.BOLD + Ansi.CYAN),
         f"endpoint: {url}",
         f"project:  {target_name}",
-        f"page:     {payload.get('page_id', page.get('page_id', '-'))}",
-        f"revision: {payload.get('revision', page.get('revision', '-'))}",
-        f"status:   {payload.get('source_status', page.get('source_status', '-'))}",
-        "",
-        "summary:",
+        f"page:     {payload.get('page_id', page.get('page_id', source.get('source_id', '-')))}",
+        f"revision: {payload.get('revision', source.get('sha256', page.get('revision', '-')))}",
+        f"status:   {payload.get('source_status', payload.get('status', page.get('source_status', '-')))}",
     ]
+    if is_source:
+        reference = payload.get("reference")
+        reference = reference if isinstance(reference, dict) else {}
+        body.extend(
+            [
+                f"source:   {source.get('kind', '-')} {source.get('source_id', '-')}",
+                f"commit:   {source.get('commit', '-')}",
+                f"hash:     {source.get('sha256', '-')}",
+                f"lines:    {reference.get('start_line', '-')}–{reference.get('end_line', '-')}",
+                f"bytes:    {reference.get('start_byte', '-')}–{reference.get('end_byte', '-')}",
+                "",
+                "excerpt:",
+            ]
+        )
+        body.extend(str(payload.get("excerpt") or "(no excerpt)").splitlines())
+        body.extend(
+            ["", f"prompt injection: {payload.get('prompt_injection_signals', {})}"]
+        )
+        if state.mcp_status or state.mcp_error:
+            body.append(_mcp_status_line(state, color))
+        return _render_scrollable_lines(body, color, width, height, state)
+    body.extend(
+        [
+            "",
+            "summary:",
+        ]
+    )
     summary = str(page.get("summary") or "(no summary)")
     body.extend(summary.splitlines() or [""])
     body.extend(["", "claims:"])
@@ -1666,6 +1708,12 @@ def render_wiki_page(
         body.extend(["", _style(f"ERROR: {state.wiki_error}", color, Ansi.RED)])
     if state.mcp_status or state.mcp_error:
         body.append(_mcp_status_line(state, color))
+    return _render_scrollable_lines(body, color, width, height, state)
+
+
+def _render_scrollable_lines(
+    body: list[str], color: bool, width: int, height: int, state: MonitorState
+) -> str:
     wrapped_body: list[str] = []
     for line in body:
         if not line:
@@ -1690,6 +1738,42 @@ def render_wiki_page(
         [_trim(line, width) for line in visible]
         + ["", "↑/↓ scroll  PgUp/PgDn  Esc back"]
     )
+
+
+def _wiki_row_reference(row: dict[str, Any]) -> dict[str, Any] | None:
+    reference = row.get("reference")
+    if not isinstance(reference, dict):
+        reference = row.get("source_reference")
+    return reference if isinstance(reference, dict) else None
+
+
+def _wiki_row_title(row: dict[str, Any]) -> str:
+    title = str(row.get("title") or row.get("page_id") or "-")
+    reference = _wiki_row_reference(row)
+    if reference and reference.get("kind") == "wiki_source":
+        kind = str(row.get("source_kind") or "source")
+        start, end = reference.get("start_line"), reference.get("end_line")
+        title = f"[{kind} {start}-{end}] {title}"
+    return title
+
+
+def _wiki_history_summary(history: dict[str, Any]) -> str:
+    imported = history.get("imported_this_batch")
+    remaining = history.get("remaining_in_batch")
+    reachable = history.get("reachable_batch")
+    if isinstance(imported, int) and isinstance(remaining, int):
+        processed = (
+            reachable - remaining
+            if isinstance(reachable, int)
+            else imported + remaining
+        )
+        state = f"{imported} new, {processed} processed"
+        if remaining:
+            state += f", {remaining} remaining"
+        if remaining > 0 and history.get("resumable"):
+            state += " (resumable)"
+        return state
+    return str(history.get("status") or "unknown")
 
 
 def render_state_entry_view(
@@ -3440,8 +3524,30 @@ def _submit_wiki_operation(
     return _submit_mcp_operation(
         executor,
         "wiki_page",
-        lambda: _fetch_wiki_page_result(client, target, page_id),
+        lambda: _fetch_wiki_row_result(client, target, row),
     )
+
+
+def _fetch_wiki_row_result(
+    client: Any, target: ProjectTarget | None, row: dict[str, Any]
+) -> WikiPageResult:
+    page_id = str(row.get("page_id") or "")
+    if target is None:
+        return WikiPageResult(None, page_id, error="no project selected")
+    reference = _wiki_row_reference(row)
+    if reference and reference.get("kind") == "wiki_source":
+        try:
+            payload = resolve_wiki_source(client, target, reference)
+            if payload.get("status") != "resolved":
+                return WikiPageResult(
+                    target,
+                    page_id,
+                    error=f"wiki source resolution returned {payload.get('status', 'no status')}",
+                )
+            return WikiPageResult(target, page_id, payload=payload)
+        except Exception as exc:
+            return WikiPageResult(target, page_id, error=friendly_mcp_error(exc))
+    return _fetch_wiki_page_result(client, target, page_id)
 
 
 def _selected_state_key(state: MonitorState) -> str:
