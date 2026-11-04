@@ -141,8 +141,47 @@ and does not change pack behavior.
 
 `ProjectRegistry` canonicalizes the configured default repository and all
 explicit roots. Project ids combine a slug with the SHA-256 of the canonical
-host-side file URI. Host-to-container mappings are applied only after the host
-path passes its allowed-root check.
+host-side file URI. Host-to-container mappings are applied after the host path
+passes its allowed-root check, with registered-worktree membership as the
+explicit out-of-root admission path.
+
+For Git projects the registry also records an opaque `repository_id` derived
+from the mapping-normalized common Git directory. This preserves path-derived
+checkout ids while distinguishing separate clones. A shared Git helper resolves
+the checkout root, private administrative directory, common directory, branch,
+and HEAD through Git itself, including linked-worktree `.git` pointers, packed
+refs, and detached HEAD. Its porcelain parser accepts Git's quoted paths so
+the supported Git 2.34 command need not provide NUL-delimited output.
+
+An out-of-root request is considered only when its exact canonical checkout
+appears in the registered worktree list of an admitted repository and resolves
+to the same common directory. Mappings are applied to registration paths and
+embedded administrative pointers before membership checks. Discovery enumerates
+registrations without constructing indexes; index and runtime state remain
+checkout-local. Cached engines revalidate checkout existence and registered
+membership before reuse.
+
+Git wiki data is stored by repository id. On activation, checkout-local legacy
+wiki records are imported in stable project-id order. Page revisions are copied
+transactionally with deterministic conflict aliases; a per-page marker makes
+interrupted imports restartable and prevents a retry from replacing a shared
+edit. Immutable page bodies remain content-equivalent under their revision
+hashes. Existing shared content wins on repeat imports. Markdown and governed
+corpus source ids include the checkout id; every shared page is evaluated
+against the requesting checkout's branch, declared applicability, index, and
+source fingerprints. Non-Git projects receive a stable local wiki owner and
+keep their single-project behavior through the durable migration path.
+
+Reconciliation runs at startup, on explicit project discovery, and every sixty
+seconds. A confirmed `NotFound` with its containing boundary still accessible
+hides a checkout immediately. Permission errors and absent parent boundaries
+clear the pending timer instead of counting as deletion. Five uninterrupted
+minutes of absence retires the registry entry and, after in-flight engine and
+construction references drain, removes only the server-owned project state
+directory. Repository wiki records and citation revisions remain in the repository state
+directory and can be resolved in archive mode after the final checkout
+disappears; this grants no source-tree access. Discovery and retirement never
+alter source trees or Git registrations.
 
 Every public path is validated as repository-relative. Absolute paths, parent
 traversal, symlink project roots, roots outside the configured boundary, and

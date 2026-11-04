@@ -1,6 +1,7 @@
 //! Native repository scanning, deterministic chunking, and Tantivy retrieval.
 
 mod corpus;
+pub mod git;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},

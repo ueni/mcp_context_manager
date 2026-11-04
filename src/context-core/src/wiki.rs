@@ -1,10 +1,17 @@
 //! Generated, revision-addressed knowledge and the shared agent search snapshot.
 use super::*;
-use std::{io::Read, path::Path};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone)]
 struct Project {
     owner: String,
+    repository_id: String,
+    branch: Option<String>,
+    head: Option<String>,
+    git_mappings: Vec<(PathBuf, PathBuf)>,
     store: Arc<StateStore>,
     index: Arc<RwLock<Arc<ProjectIndex>>>,
     freshness: Arc<FreshnessState>,
@@ -63,11 +70,20 @@ impl WikiHub {
                 Arc::clone(&previous.refreshing)
             })
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let git_identity =
+            context_index::git::checkout_with_mappings(engine.index().root(), &engine.git_mappings)
+                .ok();
         projects.insert(
             engine.project_id.clone(),
             Project {
                 owner: engine.project_id.clone(),
-                store: Arc::clone(&engine.store),
+                repository_id: engine.repository_id.clone(),
+                branch: git_identity
+                    .as_ref()
+                    .and_then(|identity| identity.branch.clone()),
+                head: git_identity.map(|identity| identity.head),
+                git_mappings: engine.git_mappings.clone(),
+                store: Arc::clone(&engine.wiki_store),
                 index: Arc::clone(&engine.index),
                 freshness: Arc::clone(&engine.freshness),
                 refreshing,
@@ -102,7 +118,7 @@ impl WikiHub {
                                 .read()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .clone();
-                            let git = git_head_stamp(repository.root());
+                            let git = git_head_stamp(repository.root(), &project.git_mappings);
                             let stamp = (project.freshness.generation.load(Ordering::Acquire), git);
                             if observed.get(&id) != Some(&stamp)
                                 && !project.refreshing.load(Ordering::Acquire)
@@ -118,6 +134,36 @@ impl WikiHub {
         }
         self.publish(&engine.project_id)?;
         self.schedule_refresh(&engine.project_id);
+        Ok(())
+    }
+
+    pub fn unregister(&self, owner: &str) -> Result<()> {
+        let _publication = self
+            .publication
+            .lock()
+            .map_err(|_| anyhow!("wiki publication lock poisoned"))?;
+        self.projects
+            .write()
+            .map_err(|_| anyhow!("wiki projects lock poisoned"))?
+            .remove(owner);
+        let old = self
+            .snapshot
+            .read()
+            .map_err(|_| anyhow!("wiki snapshot lock poisoned"))?
+            .clone();
+        let documents = old
+            .documents
+            .iter()
+            .filter(|((project_id, _), _)| project_id != owner)
+            .map(|(key, page)| (key.clone(), page.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let index = WikiSearchIndex::build(&documents.values().cloned().collect::<Vec<_>>())?;
+        *self
+            .snapshot
+            .write()
+            .map_err(|_| anyhow!("wiki snapshot lock poisoned"))? =
+            Arc::new(Snapshot { index, documents });
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -159,15 +205,29 @@ impl WikiHub {
             page["page_id"] = json!(id);
             page["revision"] = json!(revision);
             page["project_id"] = json!(owner);
+            page["repository_id"] = json!(project.repository_id);
             page["current"] = json!(page.get("superseded_by").is_none());
             page["prompt_injection_signals"] = sanitize_text(&serde_json::to_string(&page)?).2;
-            documents.insert((owner.to_owned(), id.to_owned()), page);
+            documents.insert((owner.to_owned(), id.to_owned()), page.clone());
+            let peer_projects = self
+                .projects
+                .read()
+                .map_err(|_| anyhow!("wiki projects lock poisoned"))?
+                .values()
+                .filter(|peer| peer.owner != owner && peer.repository_id == project.repository_id)
+                .map(|peer| peer.owner.clone())
+                .collect::<Vec<_>>();
+            for peer_owner in peer_projects {
+                let mut projected_page = page.clone();
+                projected_page["project_id"] = json!(peer_owner);
+                documents.insert((peer_owner, id.to_owned()), projected_page);
+            }
         }
         for (_, pointer) in project.store.iter_json("wiki:source_current:")? {
             let Some(source) = project.store.get_json(&source_revision_key(&pointer))? else {
                 continue;
             };
-            for doc in source_documents(owner, &source) {
+            for doc in source_documents(owner, &project.repository_id, &source) {
                 let id = doc["page_id"]
                     .as_str()
                     .expect("generated source page id")
@@ -195,6 +255,17 @@ impl WikiHub {
         limit: usize,
         for_pack: bool,
     ) -> Result<Vec<Value>> {
+        self.search_for_checkout(query, owner, None, limit, for_pack)
+    }
+
+    pub fn search_for_checkout(
+        &self,
+        query: &str,
+        owner: Option<&str>,
+        requesting_project: Option<&str>,
+        limit: usize,
+        for_pack: bool,
+    ) -> Result<Vec<Value>> {
         if limit == 0 || limit > 100 {
             bail!("wiki search limit must be in 1..=100");
         }
@@ -213,6 +284,13 @@ impl WikiHub {
         if owner.is_some_and(|id| !projects.contains_key(id)) {
             bail!("wiki project is not authorized");
         }
+        let requesting = requesting_project
+            .map(|id| {
+                projects
+                    .get(id)
+                    .ok_or_else(|| anyhow!("requesting wiki project is not authorized"))
+            })
+            .transpose()?;
         let mut result = Vec::new();
         let mut wire_bytes = 0usize;
         for hit in snapshot.index.search(query, owner, (limit * 8).min(256))? {
@@ -229,14 +307,36 @@ impl WikiHub {
                 .index
                 .read()
                 .map_err(|_| anyhow!("wiki repository lock poisoned"))?;
-            let status = source_status(page, &project.store, &index, &project.freshness);
+            let status = if let Some(requesting) = requesting {
+                let requesting_index = requesting
+                    .index
+                    .read()
+                    .map_err(|_| anyhow!("wiki repository lock poisoned"))?;
+                if applicable_to(
+                    page,
+                    &requesting.owner,
+                    requesting.branch.as_deref(),
+                    requesting.head.as_deref(),
+                ) {
+                    source_status(
+                        page,
+                        &project.store,
+                        &requesting_index,
+                        &requesting.freshness,
+                    )
+                } else {
+                    "inapplicable"
+                }
+            } else {
+                source_status(page, &project.store, &index, &project.freshness)
+            };
             if for_pack && !matches!(status, "current" | "historical") {
                 continue;
             }
             let mut summary = page["summary"].as_str().unwrap_or_default().to_owned();
             truncate_string(&mut summary, 600);
             let reference = page.get("source_reference").cloned().unwrap_or_else(|| json!({
-                "kind":"wiki", "project_id":hit.project_id, "page_id":hit.page_id, "revision":hit.revision,
+                "kind":"wiki", "project_id":hit.project_id, "repository_id":project.repository_id, "page_id":hit.page_id, "revision":hit.revision,
             }));
             result.push(json!({"project_id":hit.project_id, "page_id":hit.page_id,
                 "revision":hit.revision, "title":hit.title, "summary":summary,
@@ -330,6 +430,23 @@ impl WikiHub {
     }
 }
 
+fn applicable_to(page: &Value, owner: &str, branch: Option<&str>, head: Option<&str>) -> bool {
+    let projects = page["applicability"]["projects"].as_array();
+    let project_matches = projects.is_none_or(|values| {
+        values.is_empty() || values.iter().any(|value| value.as_str() == Some(owner))
+    });
+    let branches = page["applicability"]["branches"].as_array();
+    let branch_matches = branches.is_none_or(|values| {
+        values.is_empty()
+            || branch
+                .is_some_and(|branch| values.iter().any(|value| value.as_str() == Some(branch)))
+    });
+    let commit_matches = page["applicability"]["commit"]
+        .as_str()
+        .is_none_or(|commit| head == Some(commit));
+    project_matches && branch_matches && commit_matches
+}
+
 fn source_revision_key(pointer: &Value) -> String {
     format!(
         "wiki:source_revision:{}:{}",
@@ -406,21 +523,27 @@ fn refresh_project_sources(project: &Project, history_limit: usize) -> Result<()
     if corpus_digest != index.reference_signature() {
         bail!("reference source generation changed; retry background refresh");
     }
+    let mut seen = HashSet::new();
     for mut source in corpus_sources {
         let text = sanitize_text(source["text"].as_str().unwrap_or_default()).0;
         source["text"] = json!(text);
         source["sha256"] = json!(sha256_text(&text));
         source["source_id"] = json!(format!(
-            "corpus-{}",
+            "corpus-{}-{}",
+            &sha256_text(&project.owner)[..12],
             &sha256_text(source["source_id"].as_str().unwrap_or_default())[..24]
         ));
+        seen.insert(source["source_id"].as_str().unwrap_or_default().to_owned());
         source["corpus_digest"] = json!(corpus_digest);
         let (source, _) = sanitize_json_value(source);
         put_source(&project.store, &source)?;
     }
-    let mut seen = HashSet::new();
     for (path, text) in index.markdown_documents() {
-        let id = format!("md-{}", &sha256_text(path)[..24]);
+        let id = format!(
+            "md-{}-{}",
+            &sha256_text(&project.owner)[..12],
+            &sha256_text(&format!("{}:{path}", project.owner))[..24]
+        );
         seen.insert(id.clone());
         let (text, _, _) = sanitize_text(text);
         let source = json!({"source_id":id,"kind":"markdown","title":path,"text":text,
@@ -428,18 +551,26 @@ fn refresh_project_sources(project: &Project, history_limit: usize) -> Result<()
         put_source(&project.store, &source)?;
     }
     // Deleted Markdown remains available by revision, but its current pointer is stale.
-    for (key, mut pointer) in project.store.iter_json("wiki:source_current:md-")? {
-        if !seen.contains(pointer["source_id"].as_str().unwrap_or_default()) {
+    let owner_hash = &sha256_text(&project.owner)[..12];
+    let markdown_prefix = format!("md-{owner_hash}-");
+    let corpus_prefix = format!("corpus-{owner_hash}-");
+    for (key, mut pointer) in project.store.iter_json("wiki:source_current:")? {
+        let source_id = pointer["source_id"].as_str().unwrap_or_default();
+        if (source_id.starts_with(&markdown_prefix) || source_id.starts_with(&corpus_prefix))
+            && !seen.contains(source_id)
+        {
             pointer["freshness"] = json!("stale");
             project.store.put_json(&key, &pointer)?;
         }
     }
     if index.root().join(".git").exists() {
+        let git = context_index::git::checkout_with_mappings(index.root(), &project.git_mappings)?;
         let limit = history_limit.to_string();
         let commits = run_git(
             index.root(),
             &["log", "--format=%H", "-n", &limit, "HEAD"],
             800_000,
+            Some(&git.git_dir),
         )?;
         let started = Instant::now();
         let mut imported = 0usize;
@@ -473,6 +604,7 @@ fn refresh_project_sources(project: &Project, history_limit: usize) -> Result<()
                     ".",
                 ],
                 32_768,
+                Some(&git.git_dir),
             )?;
             let (text, _, _) = sanitize_text(&body);
             let title = text.lines().nth(1).unwrap_or("Historical change");
@@ -491,8 +623,14 @@ fn refresh_project_sources(project: &Project, history_limit: usize) -> Result<()
     Ok(())
 }
 
-fn run_git(root: &Path, arguments: &[&str], bound: usize) -> Result<String> {
-    let mut child = Command::new("git")
+fn run_git(
+    root: &Path,
+    arguments: &[&str],
+    bound: usize,
+    git_dir: Option<&Path>,
+) -> Result<String> {
+    let mut command = Command::new("git");
+    command
         .current_dir(root)
         .args(["--no-pager", "-c", "core.quotePath=true"])
         .args(arguments)
@@ -503,8 +641,11 @@ fn run_git(root: &Path, arguments: &[&str], bound: usize) -> Result<String> {
         })
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    if let Some(git_dir) = git_dir {
+        command.env("GIT_DIR", git_dir).env("GIT_WORK_TREE", root);
+    }
+    let mut child = command.spawn()?;
     let output = child
         .stdout
         .take()
@@ -560,7 +701,7 @@ fn put_source(store: &StateStore, source: &Value) -> Result<()> {
     ])
 }
 
-fn source_documents(owner: &str, source: &Value) -> Vec<Value> {
+fn source_documents(owner: &str, repository_id: &str, source: &Value) -> Vec<Value> {
     let text = source["text"].as_str().unwrap_or_default();
     let mut result = Vec::new();
     let mut offset = 0usize;
@@ -584,6 +725,7 @@ fn source_documents(owner: &str, source: &Value) -> Vec<Value> {
         let last_line = line + newlines - usize::from(fragment.ends_with('\n'));
         result.push(source_document(
             owner,
+            repository_id,
             source,
             line,
             last_line,
@@ -598,6 +740,7 @@ fn source_documents(owner: &str, source: &Value) -> Vec<Value> {
 
 fn source_document(
     owner: &str,
+    repository_id: &str,
     source: &Value,
     start: usize,
     end: usize,
@@ -621,11 +764,11 @@ fn source_document(
         }
     }
     let injection = sanitize_text(&format!("{}\n{text}\n{citation}", source["title"])).2;
-    json!({"page_id":format!("source-{id}-{start}-{}",bytes.0),"project_id":owner,"revision":source["sha256"],"prompt_injection_signals":injection,
+    json!({"page_id":format!("source-{id}-{start}-{}",bytes.0),"project_id":owner,"repository_id":repository_id,"revision":source["sha256"],"prompt_injection_signals":injection,
         "title":source["title"],"summary":text,"current":true,"source_kind":kind,
         "sources":[citation],"claims":[{"text":text,"status":if kind=="git" {"historical"} else {"verified"},"citations":[{"source_id":id}]}],
         "applicability":{"projects":[owner],"commit":source.get("commit"),"version":source.get("version")},
-        "source_reference":{"kind":"wiki_source","project_id":owner,"source_id":id,"sha256":source["sha256"],"start_line":start,"end_line":end,"start_byte":bytes.0,"end_byte":bytes.1,"pdf_page":source["page_starts"].as_array().map(|starts|starts.iter().filter(|line|line.as_u64().unwrap_or(u64::MAX)<=start as u64).count()),"pdf_page_end":source["page_starts"].as_array().map(|starts|starts.iter().filter(|line|line.as_u64().unwrap_or(u64::MAX)<=end as u64).count())}})
+        "source_reference":{"kind":"wiki_source","project_id":owner,"repository_id":repository_id,"source_id":id,"sha256":source["sha256"],"start_line":start,"end_line":end,"start_byte":bytes.0,"end_byte":bytes.1,"pdf_page":source["page_starts"].as_array().map(|starts|starts.iter().filter(|line|line.as_u64().unwrap_or(u64::MAX)<=start as u64).count()),"pdf_page_end":source["page_starts"].as_array().map(|starts|starts.iter().filter(|line|line.as_u64().unwrap_or(u64::MAX)<=end as u64).count())}})
 }
 
 pub(crate) fn resolve_source(store: &StateStore, reference: &Value) -> Result<Value> {
@@ -760,7 +903,7 @@ pub(crate) fn admin(engine: &ProjectEngine, request: &ContextAdminRequest) -> Re
             if sensitivity["redacted"] == true {
                 bail!("ingestion metadata contains sensitive values");
             }
-            engine.store.put_json(
+            engine.wiki_store.put_json(
                 &format!(
                     "wiki:job:{}",
                     job["job_id"].as_str().expect("generated job id")
@@ -770,7 +913,7 @@ pub(crate) fn admin(engine: &ProjectEngine, request: &ContextAdminRequest) -> Re
             Ok(job)
         }
         "ingest_claim" => {
-            for (key, job) in engine.store.iter_json("wiki:job:")? {
+            for (key, job) in engine.wiki_store.iter_json("wiki:job:")? {
                 if job["status"] != "queued" {
                     continue;
                 }
@@ -893,8 +1036,8 @@ pub(crate) fn admin(engine: &ProjectEngine, request: &ContextAdminRequest) -> Re
             next["source_id"] = json!(source_id);
             next["sha256"] = json!(hash);
             let revision_key = source_revision_key(&pointer);
-            let immutable = engine.store.get_json(&revision_key)?.unwrap_or(source);
-            engine.store.compare_and_swap_json_batch(
+            let immutable = engine.wiki_store.get_json(&revision_key)?.unwrap_or(source);
+            engine.wiki_store.compare_and_swap_json_batch(
                 &key,
                 &job,
                 &next,
@@ -943,31 +1086,10 @@ fn compact_sources(page: &Value) -> Value {
     )
 }
 
-fn git_head_stamp(root: &Path) -> String {
-    let dot = root.join(".git");
-    let directory = if dot.is_file() {
-        let contents = fs::read_to_string(&dot).unwrap_or_default();
-        let Some(path) = contents.trim().strip_prefix("gitdir:") else {
-            return String::new();
-        };
-        root.join(path.trim())
-    } else {
-        dot
-    };
-    let head = fs::read_to_string(directory.join("HEAD")).unwrap_or_default();
-    let reference = head
-        .trim()
-        .strip_prefix("ref: ")
-        .and_then(|reference| validate_relative_path(reference).ok());
-    let value = reference
-        .and_then(|reference| fs::read_to_string(directory.join(reference)).ok())
-        .unwrap_or_default();
-    let packed = fs::metadata(directory.join("packed-refs"))
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .map(|time| format!("{time:?}"))
-        .unwrap_or_default();
-    sha256_text(&format!("{head}:{value}:{packed}"))
+fn git_head_stamp(root: &Path, mappings: &[(PathBuf, PathBuf)]) -> String {
+    context_index::git::checkout_with_mappings(root, mappings)
+        .map(|identity| identity.head)
+        .unwrap_or_default()
 }
 
 fn compact_applicability(page: &Value) -> Value {
@@ -1045,7 +1167,7 @@ mod tests {
         );
         let reference = hit["reference"].clone();
         assert!(
-            resolve_source(&engine.store, &reference).unwrap()["excerpt"]
+            resolve_source(&engine.wiki_store, &reference).unwrap()["excerpt"]
                 .as_str()
                 .unwrap()
                 .contains("400ms")
@@ -1066,7 +1188,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            resolve_source(&engine.store, &reference).unwrap()["status"],
+            resolve_source(&engine.wiki_store, &reference).unwrap()["status"],
             "resolved"
         );
     }
@@ -1094,15 +1216,13 @@ mod tests {
         let fixture = tempdir().unwrap();
         let hub = Arc::new(WikiHub::new().unwrap());
         let aroot = fixture.path().join("a");
+        let broot = fixture.path().join("b");
         fs::create_dir_all(&aroot).unwrap();
+        fs::create_dir_all(&broot).unwrap();
         fs::write(aroot.join("policy.md"), "Timeout policy is 400ms.\n").unwrap();
+        fs::write(broot.join("policy.md"), "Timeout policy is 400ms.\n").unwrap();
         let a = engine(&aroot, &fixture.path().join("as"), "alpha", &hub);
-        let b = engine(
-            &fixture.path().join("b"),
-            &fixture.path().join("bs"),
-            "beta",
-            &hub,
-        );
+        let b = engine(&broot, &fixture.path().join("bs"), "beta", &hub);
         hub.refresh("alpha", 1).unwrap();
         thread::sleep(StdDuration::from_millis(80));
         let first = publish(&a, None, "quasarwiki timeout is 400ms");
@@ -1156,6 +1276,138 @@ mod tests {
     }
 
     #[test]
+    fn linked_checkout_sources_stay_isolated_and_shared_page_edits_refresh_projections() {
+        fn git(root: &Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let fixture = tempdir().unwrap();
+        let main_root = fixture.path().join("main");
+        let feature_root = fixture.path().join("feature");
+        fs::create_dir_all(&main_root).unwrap();
+        git(&main_root, &["init", "-b", "main"]);
+        git(
+            &main_root,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(&main_root, &["config", "user.name", "Test"]);
+        fs::write(
+            main_root.join("policy.md"),
+            "Quasar policy applies on main.\n",
+        )
+        .unwrap();
+        git(&main_root, &["add", "policy.md"]);
+        git(&main_root, &["commit", "-m", "main policy"]);
+        git(
+            &main_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature_root.to_str().unwrap(),
+                "main",
+            ],
+        );
+        fs::write(
+            feature_root.join("policy.md"),
+            "Quasar policy applies on feature.\n",
+        )
+        .unwrap();
+        git(&feature_root, &["add", "policy.md"]);
+        git(&feature_root, &["commit", "-m", "feature policy"]);
+
+        let hub = Arc::new(WikiHub::new().unwrap());
+        let shared = Arc::new(StateStore::open(fixture.path().join("shared-wiki")).unwrap());
+        let mut main = ProjectEngine::build_with_state(
+            &main_root,
+            fixture.path().join("main-state"),
+            "main-checkout",
+        )
+        .unwrap();
+        let mut feature = ProjectEngine::build_with_state(
+            &feature_root,
+            fixture.path().join("feature-state"),
+            "feature-checkout",
+        )
+        .unwrap();
+        for engine in [&mut main, &mut feature] {
+            engine.repository_id = "repo-test".to_owned();
+            engine.wiki_store = Arc::clone(&shared);
+        }
+        main.attach_wiki_hub(Arc::clone(&hub)).unwrap();
+        feature.attach_wiki_hub(Arc::clone(&hub)).unwrap();
+        hub.refresh("main-checkout", 10).unwrap();
+        hub.refresh("feature-checkout", 10).unwrap();
+
+        let main_sources = shared
+            .iter_json("wiki:source_current:md-")
+            .unwrap()
+            .into_iter()
+            .filter(|(_, pointer)| pointer["source_id"].as_str().unwrap().starts_with("md-"))
+            .map(|(_, pointer)| pointer)
+            .collect::<Vec<_>>();
+        assert!(main_sources.len() >= 2);
+        let main_policy = main_sources
+            .iter()
+            .find(|pointer| {
+                pointer["source_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("md-{}-", &sha256_text("main-checkout")[..12]))
+            })
+            .unwrap();
+        assert_eq!(main_policy["freshness"], "current");
+
+        let first = publish(&main, None, "quasarwiki main-only timeout is 400ms");
+        let first_revision = first["revision"].as_str().unwrap().to_owned();
+        let on_feature = hub
+            .search_for_checkout("quasarwiki", None, Some("feature-checkout"), 10, false)
+            .unwrap();
+        assert!(on_feature.iter().any(|hit| {
+            hit["page_id"] == "quasarwiki" && hit["project_id"] == "feature-checkout"
+        }));
+        let on_feature = hub
+            .search_for_checkout("quasarwiki", None, Some("feature-checkout"), 10, true)
+            .unwrap();
+        assert!(on_feature.is_empty());
+
+        let index = feature.index();
+        let (text, _) = index.file_content("policy.md", 4096).unwrap();
+        let update = serde_json::from_value(json!({"mode":"wiki_upsert","wiki":{
+            "page_id":"quasarwiki","expected_revision":first_revision,"title":"quasarwiki policy",
+            "summary":"quasarwiki feature-only timeout is 250ms",
+            "claims":[{"text":"quasarwiki feature-only timeout is 250ms","status":"verified","citations":[{"source_id":"policy"}]}],
+            "sources":[{"id":"policy","kind":"markdown","path":"policy.md","sha256":sha256_text(&text),"fingerprint":index.snapshot_fingerprint("policy.md")}],
+            "applicability":{"branches":["feature"]}
+        }})).unwrap();
+        let updated: Value =
+            serde_json::from_slice(&feature.context_memory(&update).unwrap()).unwrap();
+        let new_revision = updated["revision"].as_str().unwrap();
+
+        let main_projection = hub
+            .search_for_checkout("quasarwiki", None, Some("main-checkout"), 10, false)
+            .unwrap();
+        assert_eq!(main_projection[0]["revision"], new_revision);
+        assert_eq!(main_projection[0]["source_status"], "inapplicable");
+        let feature_projection = hub
+            .search_for_checkout("quasarwiki", None, Some("feature-checkout"), 10, true)
+            .unwrap();
+        assert_eq!(feature_projection[0]["revision"], new_revision);
+        assert_eq!(feature_projection[0]["source_status"], "current");
+    }
+
+    #[test]
     fn ingestion_requires_claim_hash_and_page_map_and_commits_atomically() {
         let fixture = tempdir().unwrap();
         let hub = Arc::new(WikiHub::new().unwrap());
@@ -1199,7 +1451,7 @@ mod tests {
             .iter()
             .find(|hit| hit["source_kind"] == "datasheet")
             .unwrap()["reference"];
-        let resolved = resolve_source(&engine.store, reference).unwrap();
+        let resolved = resolve_source(&engine.wiki_store, reference).unwrap();
         assert!(
             resolved["excerpt"]
                 .as_str()

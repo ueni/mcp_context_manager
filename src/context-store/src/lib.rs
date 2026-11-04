@@ -146,6 +146,19 @@ impl StateStore {
         Ok(())
     }
 
+    /// Inserts a generated record only when no writer has committed that key.
+    pub fn put_json_if_absent(&self, key: &str, value: &serde_json::Value) -> Result<bool> {
+        validate_state_key(key)?;
+        let encoded = encode_json_record(value)?;
+        let mut txn = self.shared.environment.write_txn()?;
+        if self.shared.records.get(&txn, key)?.is_some() {
+            return Ok(false);
+        }
+        self.shared.records.put(&mut txn, key, &encoded)?;
+        txn.commit()?;
+        Ok(true)
+    }
+
     /// A generated-job transition and its imported records commit together.
     pub fn compare_and_swap_json_batch(
         &self,
@@ -282,6 +295,20 @@ impl StateStore {
         Ok(pages)
     }
 
+    pub fn list_all_wiki_pages(&self) -> Result<Vec<serde_json::Value>> {
+        let mut pages = self
+            .iter_json("wiki:page:")?
+            .into_iter()
+            .map(|(_, page)| page)
+            .collect::<Vec<_>>();
+        pages.sort_by(|left, right| {
+            left.get("page_id")
+                .and_then(serde_json::Value::as_str)
+                .cmp(&right.get("page_id").and_then(serde_json::Value::as_str))
+        });
+        Ok(pages)
+    }
+
     /// Atomically stores a new immutable revision and moves the current pointer.
     /// The expected hash makes concurrent updates fail without losing either edit.
     pub fn put_wiki_revision(
@@ -381,6 +408,213 @@ impl StateStore {
             bail!("wiki revision integrity check failed");
         }
         Ok(page)
+    }
+
+    /// Restartably imports the wiki namespace from an older checkout store.
+    /// Each row is committed independently; the completion marker is written
+    /// last, so interruption safely resumes without replacing shared edits.
+    pub fn migrate_wiki_from(
+        &self,
+        source: &StateStore,
+        source_project_id: &str,
+        repository_id: &str,
+    ) -> Result<()> {
+        if source_project_id.is_empty()
+            || !source_project_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("invalid legacy wiki owner");
+        }
+        let marker = format!("wiki:migration:v1:{source_project_id}");
+        if self.get_json(&marker)?.is_some() {
+            return Ok(());
+        }
+        self.put_json_if_absent(
+            &format!("wiki:owner:{source_project_id}"),
+            &serde_json::json!({"repository_id":repository_id}),
+        )?;
+        let mut page_aliases = HashMap::new();
+        for source_pointer in source.list_all_wiki_pages()? {
+            let Some(page_id) = source_pointer
+                .get("page_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(revision) = source_pointer
+                .get("revision")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(_) = source.get_wiki_revision(page_id, revision)? else {
+                continue;
+            };
+            let revisions = source.iter_json(&format!("wiki:revision:{page_id}:"))?;
+            let destination_id = self.import_legacy_wiki_page(
+                source_project_id,
+                page_id,
+                &source_pointer,
+                &revisions,
+            )?;
+            page_aliases.insert(page_id.to_owned(), destination_id);
+        }
+        let source_rows = source.iter_json("wiki:")?;
+        for (key, value) in source_rows {
+            if key.starts_with("wiki:page:")
+                || key.starts_with("wiki:revision:")
+                || key.starts_with("wiki:alias:")
+                || key.starts_with("wiki:migration:")
+            {
+                continue;
+            }
+            if let Some(old_source_id) = key
+                .strip_prefix("wiki:source_current:")
+                .filter(|id| id.starts_with("md-"))
+            {
+                let Some(old_hash) = value
+                    .get("sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let source_key = format!("wiki:source_revision:{old_source_id}:{old_hash}");
+                let Some(source_revision) = source.get_json(&source_key)? else {
+                    continue;
+                };
+                let Some(path) = source_revision
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let new_source_id = format!(
+                    "md-{}-{}",
+                    &sha256_bytes(source_project_id.as_bytes())[..12],
+                    &sha256_bytes(format!("{source_project_id}:{path}").as_bytes())[..24]
+                );
+                let mut pointer = value;
+                pointer["source_id"] = serde_json::json!(new_source_id);
+                self.put_json_if_absent(
+                    &format!("wiki:source_revision:{new_source_id}:{old_hash}"),
+                    &source_revision,
+                )?;
+                self.put_json_if_absent(&format!("wiki:source_current:{new_source_id}"), &pointer)?;
+                self.put_json_if_absent(
+                    &format!("wiki:source_alias:{source_project_id}:{old_source_id}"),
+                    &serde_json::json!({"source_id":new_source_id}),
+                )?;
+                continue;
+            }
+            self.put_json_if_absent(&key, &value)?;
+        }
+        for (key, value) in source.iter_json("wiki:revision:")? {
+            let remainder = key
+                .strip_prefix("wiki:revision:")
+                .ok_or_else(|| anyhow!("invalid legacy wiki revision key"))?;
+            let Some((page_id, revision)) = remainder.rsplit_once(':') else {
+                continue;
+            };
+            let destination_id = page_aliases
+                .get(page_id)
+                .map(String::as_str)
+                .unwrap_or(page_id);
+            self.put_json_if_absent(
+                &format!("wiki:revision:{destination_id}:{revision}"),
+                &value,
+            )?;
+        }
+        self.put_json_if_absent(&marker, &serde_json::json!({"status":"complete"}))?;
+        Ok(())
+    }
+
+    fn import_legacy_wiki_page(
+        &self,
+        owner: &str,
+        page_id: &str,
+        source_pointer: &serde_json::Value,
+        revisions: &[(String, serde_json::Value)],
+    ) -> Result<String> {
+        validate_wiki_page_id(page_id)?;
+        let current_revision = source_pointer["revision"]
+            .as_str()
+            .ok_or_else(|| anyhow!("legacy wiki pointer is invalid"))?;
+        let mut txn = self.shared.environment.write_txn()?;
+        let migration_page_key =
+            format!("wiki:migration_page:{owner}:{page_id}:{current_revision}");
+        if let Some(record) = self.shared.records.get(&txn, &migration_page_key)? {
+            let record = decode_json_record(record)?;
+            return record["page_id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("legacy wiki migration marker is invalid"));
+        }
+        let original_key = format!("wiki:page:{page_id}");
+        let current = self
+            .shared
+            .records
+            .get(&txn, &original_key)?
+            .map(decode_json_record)
+            .transpose()?;
+        let destination_id = if current
+            .as_ref()
+            .is_none_or(|pointer| pointer["revision"] == current_revision)
+        {
+            page_id.to_owned()
+        } else {
+            let digest = sha256_bytes(&serde_json::to_vec(&serde_json::json!({
+                "page_id": page_id,
+                "revision": current_revision,
+            }))?);
+            format!("legacy-{}", &digest[..24])
+        };
+        let page_key = format!("wiki:page:{destination_id}");
+        let target_current = self
+            .shared
+            .records
+            .get(&txn, &page_key)?
+            .map(decode_json_record)
+            .transpose()?;
+        for (key, value) in revisions {
+            let suffix = key
+                .strip_prefix(&format!("wiki:revision:{page_id}:"))
+                .ok_or_else(|| anyhow!("invalid legacy wiki revision key"))?;
+            let hash = suffix;
+            if sha256_bytes(&serde_json::to_vec(value)?) != hash {
+                bail!("legacy wiki revision failed its content hash");
+            }
+            let target_key = format!("wiki:revision:{destination_id}:{suffix}");
+            if self.shared.records.get(&txn, &target_key)?.is_none() {
+                self.shared
+                    .records
+                    .put(&mut txn, &target_key, &encode_json_record(value)?)?;
+            }
+        }
+        if target_current.is_none() {
+            let mut pointer = source_pointer.clone();
+            pointer["page_id"] = serde_json::json!(destination_id);
+            self.shared
+                .records
+                .put(&mut txn, &page_key, &encode_json_record(&pointer)?)?;
+        }
+        if destination_id != page_id {
+            let alias_key = format!("wiki:alias:{owner}:{page_id}");
+            let alias = serde_json::json!({"page_id":destination_id});
+            if self.shared.records.get(&txn, &alias_key)?.is_none() {
+                self.shared
+                    .records
+                    .put(&mut txn, &alias_key, &encode_json_record(&alias)?)?;
+            }
+        }
+        self.shared.records.put(
+            &mut txn,
+            &migration_page_key,
+            &encode_json_record(&serde_json::json!({"page_id":destination_id}))?,
+        )?;
+        txn.commit()?;
+        Ok(destination_id)
     }
 
     pub fn create_reference(
@@ -793,6 +1027,148 @@ fn digest_hex(digest: Sha256) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::StateStore;
+
+    #[test]
+    fn wiki_migration_preserves_shared_precedence_and_renames_collisions() {
+        let fixture = tempfile::tempdir().unwrap();
+        let shared = StateStore::open(fixture.path().join("shared")).unwrap();
+        let legacy_a = StateStore::open(fixture.path().join("a")).unwrap();
+        let legacy_b = StateStore::open(fixture.path().join("b")).unwrap();
+        let first = legacy_a
+            .put_wiki_revision("topic", None, &serde_json::json!({"body":"first"}))
+            .unwrap();
+        let conflict = legacy_b
+            .put_wiki_revision("topic", None, &serde_json::json!({"body":"second"}))
+            .unwrap();
+        shared
+            .migrate_wiki_from(&legacy_a, "project-a", "repo-a")
+            .unwrap();
+        shared
+            .migrate_wiki_from(&legacy_b, "project-b", "repo-a")
+            .unwrap();
+        assert_eq!(
+            shared.get_wiki_revision("topic", &first).unwrap().unwrap()["body"],
+            "first"
+        );
+        let alias = shared
+            .get_json("wiki:alias:project-b:topic")
+            .unwrap()
+            .unwrap();
+        let renamed = alias["page_id"].as_str().unwrap();
+        assert!(renamed.starts_with("legacy-"));
+        assert_eq!(
+            shared
+                .get_wiki_revision(renamed, &conflict)
+                .unwrap()
+                .unwrap()["body"],
+            "second"
+        );
+        shared
+            .migrate_wiki_from(&legacy_b, "project-b", "repo-a")
+            .unwrap();
+        assert_eq!(
+            shared
+                .get_json("wiki:alias:project-b:topic")
+                .unwrap()
+                .unwrap()["page_id"],
+            renamed
+        );
+    }
+
+    #[test]
+    fn wiki_migration_restart_keeps_an_edit_committed_after_partial_import() {
+        let fixture = tempfile::tempdir().unwrap();
+        let shared = StateStore::open(fixture.path().join("shared")).unwrap();
+        let legacy = StateStore::open(fixture.path().join("legacy")).unwrap();
+        let original = legacy
+            .put_wiki_revision("topic", None, &serde_json::json!({"body":"legacy"}))
+            .unwrap();
+        let pointer = legacy.get_wiki_page("topic").unwrap().unwrap();
+        let revisions = legacy.iter_json("wiki:revision:topic:").unwrap();
+        shared
+            .import_legacy_wiki_page("project-a", "topic", &pointer, &revisions)
+            .unwrap();
+        let edited = shared
+            .put_wiki_revision(
+                "topic",
+                Some(&original),
+                &serde_json::json!({"body":"shared edit"}),
+            )
+            .unwrap();
+
+        shared
+            .migrate_wiki_from(&legacy, "project-a", "repo-a")
+            .unwrap();
+        assert_eq!(
+            shared.get_wiki_page("topic").unwrap().unwrap()["revision"],
+            edited
+        );
+        assert!(
+            shared
+                .get_json("wiki:alias:project-a:topic")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn wiki_migration_uses_the_current_markdown_source_id() {
+        let fixture = tempfile::tempdir().unwrap();
+        let shared = StateStore::open(fixture.path().join("shared")).unwrap();
+        let legacy = StateStore::open(fixture.path().join("legacy")).unwrap();
+        let owner = "project-a";
+        let path = "README.md";
+        let old_id = "md-legacy";
+        let text = "Shared wiki source text.";
+        let hash = sha256_bytes(text.as_bytes());
+        let source = serde_json::json!({
+            "source_id": old_id,
+            "kind": "markdown",
+            "path": path,
+            "text": text,
+            "sha256": hash,
+            "freshness": "current"
+        });
+        legacy
+            .put_json_batch(&[
+                (format!("wiki:source_revision:{old_id}:{hash}"), source),
+                (
+                    format!("wiki:source_current:{old_id}"),
+                    serde_json::json!({"source_id":old_id,"sha256":hash,"freshness":"current"}),
+                ),
+            ])
+            .unwrap();
+
+        shared.migrate_wiki_from(&legacy, owner, "repo-a").unwrap();
+
+        let expected_id = format!(
+            "md-{}-{}",
+            &sha256_bytes(owner.as_bytes())[..12],
+            &sha256_bytes(format!("{owner}:{path}").as_bytes())[..24]
+        );
+        let pointer = shared
+            .get_json(&format!("wiki:source_current:{expected_id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pointer["source_id"], expected_id);
+        assert_eq!(pointer["sha256"], hash);
+        assert_eq!(
+            shared
+                .get_json(&format!("wiki:source_revision:{expected_id}:{hash}"))
+                .unwrap()
+                .unwrap()["path"],
+            path
+        );
+        assert_eq!(
+            shared
+                .get_json(&format!("wiki:source_alias:{owner}:{old_id}"))
+                .unwrap()
+                .unwrap()["source_id"],
+            expected_id
+        );
+    }
+
     #[test]
     fn simultaneous_wiki_writers_have_exactly_one_winner() {
         let root = tempfile::tempdir().unwrap();

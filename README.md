@@ -119,6 +119,32 @@ There is no human UI or model service. Agents add structured claims and
 consolidate revisioned pages; the native server stores and searches generated
 state while repository sources remain read-only.
 
+Git worktrees keep their path-derived `project_id`, source index, cache,
+continuations, and watcher state separate. `repository_id` is an opaque digest
+of Git's common-directory identity, so linked worktrees share one authored wiki
+and separate clones do not. Discovery reads Git's registered worktree list
+without building indexes. A checkout outside configured allowed roots is
+admitted only when an admitted repository registers that exact path and both
+checkouts resolve to the same common Git directory. Container path mappings
+apply to checkout roots, Git administrative pointers, and registered paths.
+
+On first activation, legacy wiki pages, immutable revisions, imported sources,
+ingestion jobs, and Git history are copied into repository-owned state in
+project-id order. The import records progress per page, preserves old revision
+bodies, keeps an existing shared page, and assigns conflicting legacy content a
+stable `legacy-<hash>` page id with an alias for old references. Current
+Markdown source pointers include the checkout identity, while each request
+checks source fingerprints against its selected checkout.
+
+The server reconciles discovery at startup, when projects are explicitly
+listed, and once a minute in the background. A confirmed missing checkout is
+hidden immediately. After five uninterrupted minutes its checkout registry,
+index, caches, and local generated state are removed after active requests
+drain. A returning root cancels cleanup. Permission failures and unavailable
+parent mount boundaries are treated as unavailable. Repository wiki state and
+archived citations remain under repository-owned state after its last checkout
+is removed; Git registrations and repository files are never modified.
+
 | Operation | Interface |
 | --- | --- |
 | Retrieve relevant knowledge | `context_pack` returns bounded `wiki` entries and durable references. |

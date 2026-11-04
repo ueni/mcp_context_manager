@@ -3,6 +3,58 @@
 mod wiki;
 pub use wiki::WikiHub;
 
+pub fn resolve_archived_wiki_reference(
+    store: &StateStore,
+    reference: &Value,
+    expected_hash: &str,
+) -> Result<Vec<u8>> {
+    match reference.get("kind").and_then(Value::as_str) {
+        Some("wiki_source") => {
+            if !expected_hash.is_empty() && reference["sha256"] != expected_hash {
+                bail!("wiki source expected hash mismatch");
+            }
+            serde_json::to_vec(&wiki::resolve_source(store, reference)?).map_err(Into::into)
+        }
+        Some("wiki") => {
+            let owner = reference["project_id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("wiki reference requires project_id"))?;
+            let referenced_page = reference["page_id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("wiki reference requires page_id"))?;
+            let page_id = store
+                .get_json(&format!("wiki:alias:{owner}:{referenced_page}"))?
+                .and_then(|alias| alias["page_id"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| referenced_page.to_owned());
+            let revision = reference["revision"]
+                .as_str()
+                .ok_or_else(|| anyhow!("wiki reference requires revision"))?;
+            if !expected_hash.is_empty() && expected_hash != revision {
+                bail!("wiki expected revision mismatch");
+            }
+            let page = store.get_wiki_revision(&page_id, revision)?;
+            let result = match page {
+                Some(page) => json!({
+                    "schema":"agent_wiki.resolve.v1",
+                    "status":"resolved",
+                    "project_id":owner,
+                    "repository_id":reference["repository_id"],
+                    "page_id":page_id,
+                    "revision":revision,
+                    "revision_status":if store.get_wiki_page(&page_id)?.is_some_and(|pointer|pointer["revision"]==revision) {"current"} else {"historical"},
+                    "source_status":"archived",
+                    "content":page
+                }),
+                None => {
+                    json!({"schema":"agent_wiki.resolve.v1","status":"missing","project_id":owner,"page_id":page_id,"revision":revision})
+                }
+            };
+            serde_json::to_vec(&result).map_err(Into::into)
+        }
+        _ => bail!("reference is not an archived wiki reference"),
+    }
+}
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
@@ -278,6 +330,8 @@ pub struct WikiApplicability {
     pub projects: Vec<String>,
     #[serde(default)]
     pub branches: Vec<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -2164,8 +2218,11 @@ pub struct ProjectEngine {
     wiki_hub: Arc<RwLock<Option<Arc<WikiHub>>>>,
     index: Arc<RwLock<Arc<ProjectIndex>>>,
     store: Arc<StateStore>,
+    wiki_store: Arc<StateStore>,
     wiki_index: RwLock<Arc<WikiSearchIndex>>,
     project_id: String,
+    repository_id: String,
+    git_mappings: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     lookup_cache: Arc<Mutex<LookupCacheState>>,
     pack_snapshots: Mutex<HashMap<String, Arc<PackSnapshot>>>,
     continuation_lock: Mutex<()>,
@@ -2222,17 +2279,54 @@ impl ProjectEngine {
         usage_monitor: Arc<UsageMonitor>,
         control: Option<&WorkControl>,
     ) -> Result<Self> {
-        Self::build_inner(root, project_state, project_id, usage_monitor, control)
+        Self::build_inner(
+            root,
+            project_state,
+            None,
+            project_id,
+            None,
+            Vec::new(),
+            usage_monitor,
+            control,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_repository_wiki(
+        root: impl AsRef<std::path::Path>,
+        project_state: impl AsRef<std::path::Path>,
+        wiki_state: impl AsRef<std::path::Path>,
+        project_id: impl Into<String>,
+        repository_id: impl Into<String>,
+        git_mappings: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        usage_monitor: Arc<UsageMonitor>,
+        control: Option<&WorkControl>,
+    ) -> Result<Self> {
+        Self::build_inner(
+            root,
+            project_state,
+            Some(wiki_state.as_ref()),
+            project_id,
+            Some(repository_id.into()),
+            git_mappings,
+            usage_monitor,
+            control,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn build_inner(
         root: impl AsRef<std::path::Path>,
         project_state: impl AsRef<std::path::Path>,
+        wiki_state: Option<&std::path::Path>,
         project_id: impl Into<String>,
+        repository_id: Option<String>,
+        git_mappings: Vec<(std::path::PathBuf, std::path::PathBuf)>,
         usage_monitor: Arc<UsageMonitor>,
         control: Option<&WorkControl>,
     ) -> Result<Self> {
         let project_id = project_id.into();
+        let repository_id = repository_id.unwrap_or_else(|| project_id.clone());
         let root = root.as_ref().canonicalize()?;
         let freshness = Arc::new(FreshnessState {
             last_poll_ms: AtomicU64::new(now_millis()),
@@ -2244,6 +2338,13 @@ impl ProjectEngine {
         // missed permanently by ordinary watcher-driven freshness.
         let watcher = WatchGuard::start(root.clone(), Arc::clone(&freshness));
         let store = Arc::new(StateStore::open(project_state)?);
+        let wiki_store = Arc::new(StateStore::open(wiki_state.unwrap_or_else(|| {
+            store
+                .paths()
+                .overlay
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+        }))?);
         let index_snapshot_path = store.paths().index.join("context-index.snapshot.v2.json");
         let index = load_index_snapshot(&root, &project_id, &index_snapshot_path, control)
             .or_else(|_| {
@@ -2251,7 +2352,7 @@ impl ProjectEngine {
             })?;
         persist_index_snapshot(&index_snapshot_path, &index, control)?;
         let index = Arc::new(index);
-        let wiki_index = Arc::new(load_wiki_index(&store, &project_id)?);
+        let wiki_index = Arc::new(load_wiki_index(&wiki_store, &project_id)?);
         if let Some(control) = control {
             control.check()?;
         }
@@ -2316,8 +2417,11 @@ impl ProjectEngine {
             wiki_hub,
             index,
             store,
+            wiki_store,
             wiki_index: RwLock::new(wiki_index),
             project_id,
+            repository_id,
+            git_mappings,
             lookup_cache,
             pack_snapshots: Mutex::new(pack_snapshots),
             continuation_lock: Mutex::new(()),
@@ -2369,6 +2473,23 @@ impl ProjectEngine {
         &self.project_id
     }
 
+    pub fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub fn wiki_owner_matches(&self, legacy_owner: &str) -> Result<bool> {
+        Ok(self
+            .wiki_store
+            .get_json(&format!("wiki:owner:{legacy_owner}"))?
+            .and_then(|record| {
+                record
+                    .get("repository_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|repository_id| repository_id == self.repository_id))
+    }
+
     pub fn attach_wiki_hub(&self, hub: Arc<WikiHub>) -> Result<()> {
         *self
             .refresh_coordinator
@@ -2402,17 +2523,17 @@ impl ProjectEngine {
     pub fn wiki_index_documents(&self) -> Result<Vec<Value>> {
         let repository = self.index();
         let mut pages = Vec::new();
-        for pointer in self.store.list_wiki_pages(100_000)? {
+        for pointer in self.wiki_store.list_wiki_pages(100_000)? {
             let Some(page_id) = pointer.get("page_id").and_then(Value::as_str) else {
                 continue;
             };
             let Some(revision) = pointer.get("revision").and_then(Value::as_str) else {
                 continue;
             };
-            let Some(mut page) = self.store.get_wiki_revision(page_id, revision)? else {
+            let Some(mut page) = self.wiki_store.get_wiki_revision(page_id, revision)? else {
                 continue;
             };
-            let source_status = if wiki_sources_current(&page, &self.store, &repository) {
+            let source_status = if wiki_sources_current(&page, &self.wiki_store, &repository) {
                 "current"
             } else {
                 "stale_or_unverified"
@@ -2421,6 +2542,7 @@ impl ProjectEngine {
                 object.insert("page_id".to_owned(), json!(page_id));
                 object.insert("revision".to_owned(), json!(revision));
                 object.insert("project_id".to_owned(), json!(self.project_id));
+                object.insert("repository_id".to_owned(), json!(self.repository_id));
                 object.insert("current".to_owned(), json!(true));
                 object.insert("source_status".to_owned(), json!(source_status));
                 pages.push(page);
@@ -3919,7 +4041,13 @@ impl ProjectEngine {
                 self.refresh_index_with_paths(true, &[], None)?;
             }
             let mut value = if matches!(request.mode.as_str(), "wiki_upsert" | "wiki_consolidate") {
-                wiki_dispatch(&self.store, request, &self.project_id, &self.index())?
+                wiki_dispatch(
+                    &self.wiki_store,
+                    request,
+                    &self.project_id,
+                    &self.repository_id,
+                    &self.index(),
+                )?
             } else {
                 memory_dispatch(&self.store, request, &self.index())?
             };
@@ -3996,7 +4124,7 @@ impl ProjectEngine {
                         .wiki_index
                         .write()
                         .map_err(|_| anyhow!("wiki index lock poisoned"))? =
-                        Arc::new(load_wiki_index(&self.store, &self.project_id)?);
+                        Arc::new(load_wiki_index(&self.wiki_store, &self.project_id)?);
                     if let Some(hub) = self
                         .wiki_hub
                         .read()
@@ -4037,14 +4165,22 @@ impl ProjectEngine {
                 .as_ref()
                 .filter(|reference| reference["kind"] == "wiki_source")
             {
-                if reference["project_id"] != self.project_id {
+                let repository_matches = reference
+                    .get("repository_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|repository_id| repository_id == self.repository_id);
+                if !repository_matches
+                    && reference["project_id"] != self.project_id
+                    && !self
+                        .wiki_owner_matches(reference["project_id"].as_str().unwrap_or_default())?
+                {
                     bail!("wiki source owner differs from selected project");
                 }
                 if !request.expected_hash.is_empty() && reference["sha256"] != request.expected_hash
                 {
                     bail!("wiki source expected hash mismatch");
                 }
-                return serde_json::to_vec(&wiki::resolve_source(&self.store, reference)?)
+                return serde_json::to_vec(&wiki::resolve_source(&self.wiki_store, reference)?)
                     .map_err(Into::into);
             }
             if request
@@ -4059,13 +4195,30 @@ impl ProjectEngine {
                     .get("project_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("wiki reference requires project_id"))?;
-                if project_id != self.project_id {
+                let repository_matches = reference
+                    .get("repository_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|repository_id| repository_id == self.repository_id);
+                if !repository_matches
+                    && project_id != self.project_id
+                    && !self.wiki_owner_matches(project_id)?
+                {
                     bail!("wiki reference is outside the selected project boundary");
                 }
-                let page_id = reference
+                let referenced_page_id = reference
                     .get("page_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("wiki reference requires page_id"))?;
+                let page_id = self
+                    .wiki_store
+                    .get_json(&format!("wiki:alias:{project_id}:{referenced_page_id}"))?
+                    .and_then(|alias| {
+                        alias
+                            .get("page_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| referenced_page_id.to_owned());
                 let revision = reference
                     .get("revision")
                     .and_then(Value::as_str)
@@ -4073,11 +4226,11 @@ impl ProjectEngine {
                 if !request.expected_hash.is_empty() && request.expected_hash != revision {
                     bail!("wiki expected revision mismatch");
                 }
-                let value = match self.store.get_wiki_revision(page_id, revision)? {
+                let value = match self.wiki_store.get_wiki_revision(&page_id, revision)? {
                     Some(page) => {
                         json!({"schema":"agent_wiki.resolve.v1", "status":"resolved", "project_id":project_id, "page_id":page_id, "revision":revision,
-                            "revision_status":if self.store.get_wiki_page(page_id)?.is_some_and(|pointer|pointer["revision"]==revision){"current"}else{"historical"},
-                            "source_status":if wiki_sources_current(&page,&self.store,&self.index()){"current"}else{"stale_or_unverified"},"content":page})
+                            "revision_status":if self.wiki_store.get_wiki_page(&page_id)?.is_some_and(|pointer|pointer["revision"]==revision){"current"}else{"historical"},
+                            "source_status":if wiki_sources_current(&page,&self.wiki_store,&self.index()){"current"}else{"stale_or_unverified"},"content":page})
                     }
                     None => {
                         json!({"schema":"agent_wiki.resolve.v1", "status":"missing", "project_id":project_id, "page_id":page_id, "revision":revision})
@@ -4298,7 +4451,7 @@ impl ProjectEngine {
             .map_err(|_| anyhow!("wiki hub lock poisoned"))?
             .clone()
         {
-            return hub.search(prompt, None, limit, true);
+            return hub.search_for_checkout(prompt, None, Some(&self.project_id), limit, true);
         }
         let wiki_index = self
             .wiki_index
@@ -4307,10 +4460,22 @@ impl ProjectEngine {
         let hits = wiki_index.search(prompt, Some(&self.project_id), limit)?;
         let mut pages = Vec::new();
         for hit in hits {
-            let Some(page) = self.store.get_wiki_revision(&hit.page_id, &hit.revision)? else {
+            let Some(page) = self
+                .wiki_store
+                .get_wiki_revision(&hit.page_id, &hit.revision)?
+            else {
                 continue;
             };
-            if !wiki_sources_current(&page, &self.store, repository) {
+            let git =
+                context_index::git::checkout_with_mappings(repository.root(), &self.git_mappings)
+                    .ok();
+            if !wiki_applicable_to(
+                &page,
+                &self.project_id,
+                git.as_ref().and_then(|identity| identity.branch.as_deref()),
+                git.as_ref().map(|identity| identity.head.as_str()),
+            ) || !wiki_sources_current(&page, &self.wiki_store, repository)
+            {
                 continue;
             }
             pages.push(json!({
@@ -4325,6 +4490,7 @@ impl ProjectEngine {
                 "reference": {
                     "kind": "wiki",
                     "project_id": hit.project_id,
+                    "repository_id": self.repository_id,
                     "page_id": hit.page_id,
                     "revision": hit.revision,
                 },
@@ -4423,10 +4589,13 @@ impl ProjectEngine {
         let repository = self.index();
         let mut results = Vec::new();
         for hit in hits {
-            let Some(page) = self.store.get_wiki_revision(&hit.page_id, &hit.revision)? else {
+            let Some(page) = self
+                .wiki_store
+                .get_wiki_revision(&hit.page_id, &hit.revision)?
+            else {
                 continue;
             };
-            let status = if wiki_sources_current(&page, &self.store, &repository) {
+            let status = if wiki_sources_current(&page, &self.wiki_store, &repository) {
                 "current"
             } else {
                 "stale_or_unverified"
@@ -4439,7 +4608,7 @@ impl ProjectEngine {
                 "summary": hit.summary,
                 "tags": page.get("tags").cloned().unwrap_or_default(),
                 "source_status": status,
-                "reference": {"kind":"wiki", "project_id":hit.project_id, "page_id":hit.page_id, "revision":hit.revision},
+                "reference": {"kind":"wiki", "project_id":hit.project_id, "repository_id":self.repository_id, "page_id":hit.page_id, "revision":hit.revision},
             }));
         }
         Ok(json!({"schema":"agent_wiki.search.v1", "query":request.query, "results":results}))
@@ -4447,7 +4616,7 @@ impl ProjectEngine {
 
     fn lookup_wiki_get(&self, request: &ContextLookupRequest) -> Result<Value> {
         let page_id = validate_wiki_page_id(&request.path)?;
-        let Some(pointer) = self.store.get_wiki_page(page_id)? else {
+        let Some(pointer) = self.wiki_store.get_wiki_page(page_id)? else {
             return Ok(
                 json!({"schema":"agent_wiki.get.v1", "status":"missing", "page_id":page_id}),
             );
@@ -4456,10 +4625,10 @@ impl ProjectEngine {
             .get("revision")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("wiki page pointer is invalid"))?;
-        let Some(page) = self.store.get_wiki_revision(page_id, revision)? else {
+        let Some(page) = self.wiki_store.get_wiki_revision(page_id, revision)? else {
             bail!("wiki current revision is missing");
         };
-        let status = if wiki_sources_current(&page, &self.store, &self.index()) {
+        let status = if wiki_sources_current(&page, &self.wiki_store, &self.index()) {
             "current"
         } else {
             "stale_or_unverified"
@@ -4470,9 +4639,10 @@ impl ProjectEngine {
             "page_id":page_id,
             "revision":revision,
             "project_id":self.project_id,
+            "repository_id":self.repository_id,
             "page":page,
             "source_status":status,
-            "reference":{"kind":"wiki", "project_id":self.project_id, "page_id":page_id, "revision":revision},
+            "reference":{"kind":"wiki", "project_id":self.project_id, "repository_id":self.repository_id, "page_id":page_id, "revision":revision},
         }))
     }
 
@@ -5046,6 +5216,31 @@ fn wiki_sources_current(page: &Value, store: &StateStore, index: &ProjectIndex) 
                             })
                     })
         })
+}
+
+fn wiki_applicable_to(
+    page: &Value,
+    project_id: &str,
+    branch: Option<&str>,
+    head: Option<&str>,
+) -> bool {
+    let projects = page["applicability"]["projects"].as_array();
+    let project_matches = projects.is_none_or(|values| {
+        values.is_empty()
+            || values
+                .iter()
+                .any(|value| value.as_str() == Some(project_id))
+    });
+    let branches = page["applicability"]["branches"].as_array();
+    let branch_matches = branches.is_none_or(|values| {
+        values.is_empty()
+            || branch
+                .is_some_and(|branch| values.iter().any(|value| value.as_str() == Some(branch)))
+    });
+    let commit_matches = page["applicability"]["commit"]
+        .as_str()
+        .is_none_or(|commit| head == Some(commit));
+    project_matches && branch_matches && commit_matches
 }
 
 fn load_index_snapshot(
@@ -6390,6 +6585,7 @@ fn wiki_dispatch(
     store: &StateStore,
     request: &ContextMemoryRequest,
     project_id: &str,
+    repository_id: &str,
     index: &ProjectIndex,
 ) -> Result<Value> {
     if request.max_entries == 0 || request.max_entries > 1000 {
@@ -6562,9 +6758,10 @@ fn wiki_dispatch(
         "schema":"agent_wiki.upsert.v1",
         "status":"published",
         "project_id":project_id,
+        "repository_id":repository_id,
         "page_id":page_id,
         "revision":revision,
-        "reference":{"kind":"wiki", "project_id":project_id, "page_id":page_id, "revision":revision},
+        "reference":{"kind":"wiki", "project_id":project_id, "repository_id":repository_id, "page_id":page_id, "revision":revision},
     }))
 }
 
@@ -8277,6 +8474,21 @@ mod tests {
         let markdown =
             "# Agent wiki fixture\nThe quasar transport retries after a bounded timeout.\n";
         fs::write(root.path().join("README.md"), markdown).expect("markdown source");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "README.md"],
+            vec!["commit", "-m", "wiki fixture"],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .args(args)
+                .output()
+                .expect("git command");
+            assert!(output.status.success());
+        }
         let engine = ProjectEngine::build_with_state(root.path(), state.path(), "wiki-test")
             .expect("engine");
         let index = engine.index();
@@ -9262,7 +9474,7 @@ mod tests {
         future["lookup"][0]["expires_at_unix_ms"] = json!(
             now_millis()
                 .saturating_add(u64::try_from(LOOKUP_CACHE_TTL.as_millis()).unwrap_or(u64::MAX))
-                .saturating_add(1)
+                .saturating_add(1_000)
         );
         fs::write(
             &checkpoint,

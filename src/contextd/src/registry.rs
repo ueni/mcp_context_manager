@@ -15,6 +15,7 @@ use context_core::{
     ResultReferenceRequest, UsageMonitor, WikiHub,
 };
 use context_index::{WorkControl, is_ignored_repository_path};
+use context_store::StateStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -23,10 +24,14 @@ use walkdir::{DirEntry, WalkDir};
 
 const ENGINE_CAPACITY: usize = 8;
 const DISCOVERY_MAX_PROJECTS: usize = 100;
+const DISCOVERY_MAX_ENTRIES: usize = 10_000;
 const DEFAULT_DISCOVERY_MAX_DEPTH: usize = 4;
 const PROJECT_CATALOG_FILE: &str = "project-catalog.v1.json";
+const WIKI_OWNER_CATALOG_FILE: &str = "wiki-owners.v1.json";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 48;
 const DEFAULT_CANCELLATION_GRACE_SECS: u64 = 2;
+const MISSING_PROJECT_GRACE: Duration = Duration::from_secs(5 * 60);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_PROJECT_MARKERS: &[&str] = &[
     ".git",
     "pyproject.toml",
@@ -116,6 +121,7 @@ struct RegistryState {
     specs: HashMap<String, ProjectSpec>,
     engines: HashMap<String, CachedEngine>,
     construction_gates: HashMap<String, Arc<Mutex<()>>>,
+    missing_since: HashMap<String, Instant>,
 }
 
 struct CachedEngine {
@@ -133,6 +139,10 @@ struct ProjectSpec {
     source: String,
     mapped: bool,
     legacy: bool,
+    repository_id: Option<String>,
+    registered_worktree: bool,
+    git_head: Option<String>,
+    git_branch: Option<String>,
 }
 
 impl ProjectRegistry {
@@ -174,6 +184,17 @@ impl ProjectRegistry {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| format!("legacy-{}", &root_hash[..12]));
+        let default_git =
+            context_index::git::checkout_with_mappings(&base_root, &root_mappings).ok();
+        let default_repository_id = default_git.as_ref().map_or_else(
+            || local_repository_id(&root_hash),
+            |identity| {
+                repository_id(&normalize_common_dir_for_mappings(
+                    &identity.common_dir,
+                    &root_mappings,
+                ))
+            },
+        );
         let default_spec = ProjectSpec {
             project_id: project_id.clone(),
             name: base_root
@@ -187,6 +208,12 @@ impl ProjectRegistry {
             source: "repo_path".to_owned(),
             mapped: false,
             legacy: true,
+            repository_id: Some(default_repository_id),
+            registered_worktree: false,
+            git_head: default_git.as_ref().map(|identity| identity.head.clone()),
+            git_branch: default_git
+                .as_ref()
+                .and_then(|identity| identity.branch.clone()),
         };
         let mut specs = HashMap::new();
         specs.insert(project_id.clone(), default_spec);
@@ -245,6 +272,7 @@ impl ProjectRegistry {
                 specs,
                 engines: HashMap::new(),
                 construction_gates: HashMap::new(),
+                missing_since: HashMap::new(),
             })),
         })
     }
@@ -255,12 +283,16 @@ impl ProjectRegistry {
         root_uri: Option<&str>,
     ) -> Result<Arc<ProjectEngine>> {
         let usage_monitor = Arc::clone(&self.usage_monitor);
+        let registry = self.clone();
         self.engine_for_with_builder(project_id, root_uri, move |spec| {
-            ProjectEngine::build_with_state_and_monitor(
-                &spec.local_root,
-                &spec.state_root,
-                &spec.project_id,
+            ensure_checkout_state_marker(spec)?;
+            let wiki_state = registry.migrate_repository_wiki(spec)?;
+            build_project_engine(
+                spec,
+                wiki_state.as_deref(),
+                registry.git_mappings(),
                 usage_monitor,
+                None,
             )
         })
     }
@@ -280,12 +312,15 @@ impl ProjectRegistry {
             .fetch_max(singleflight_waiter, Ordering::Relaxed);
         let _singleflight_waiter = CountGuard(&blocking.singleflight_waiters);
         let build_metrics = Arc::clone(&blocking);
+        let registry = self.clone();
         self.engine_for_with_builder(project_id, root_uri, move |spec| {
             control.check()?;
-            let engine = ProjectEngine::build_with_state_and_monitor_controlled(
-                &spec.local_root,
-                &spec.state_root,
-                &spec.project_id,
+            ensure_checkout_state_marker(spec)?;
+            let wiki_state = registry.migrate_repository_wiki(spec)?;
+            let engine = build_project_engine(
+                spec,
+                wiki_state.as_deref(),
+                registry.git_mappings(),
                 usage_monitor,
                 Some(&control),
             )?;
@@ -607,6 +642,15 @@ impl ProjectRegistry {
                     Ok(Vec::new())
                 })
                 .await;
+            loop {
+                tokio::time::sleep(RECONCILE_INTERVAL).await;
+                let registry = Arc::clone(&registry);
+                let _ = tokio::task::spawn_blocking(move || {
+                    registry.discover_projects()?;
+                    registry.reconcile_missing_at(Instant::now())
+                })
+                .await;
+            }
         });
     }
 
@@ -715,22 +759,85 @@ impl ProjectRegistry {
                 .and_then(|reference| reference.get("project_id"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("wiki reference requires owner project_id"))?;
-            if request
-                .project_id
-                .as_deref()
-                .is_some_and(|selected| selected != owner)
+            let repository_id = request
+                .reference
+                .as_ref()
+                .and_then(|reference| reference.get("repository_id"))
+                .and_then(Value::as_str);
+            if repository_id.is_none()
+                && self.project_for_legacy_wiki_owner(owner)?.is_none()
+                && let Some(archived_repository) = self.repository_for_legacy_wiki_owner(owner)?
             {
+                return self.resolve_archived_wiki_reference(request, &archived_repository);
+            }
+            let engine = if let Some(root) = request.root_uri.as_deref() {
+                self.engine_for(None, Some(root))?
+            } else if let Some(project_id) = request.project_id.as_deref() {
+                match self.engine_for(Some(project_id), None) {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        if let Some(repository_id) = repository_id {
+                            match self.project_for_repository(repository_id) {
+                                Ok(selected) => self.engine_for(Some(&selected), None)?,
+                                Err(_) => {
+                                    return self
+                                        .resolve_archived_wiki_reference(request, repository_id);
+                                }
+                            }
+                        } else {
+                            let engine = self.default_engine()?;
+                            if owner != engine.project_id()
+                                && !self.default_project_id_aliases().contains(owner)
+                                && !engine.wiki_owner_matches(owner)?
+                            {
+                                return Err(anyhow!(
+                                    "wiki reference owner does not select an admitted project"
+                                ));
+                            }
+                            engine
+                        }
+                    }
+                }
+            } else if let Some(repository_id) = repository_id {
+                let project_id = match self.project_for_repository(repository_id) {
+                    Ok(project_id) => project_id,
+                    Err(_) => return self.resolve_archived_wiki_reference(request, repository_id),
+                };
+                self.engine_for(Some(&project_id), None)?
+            } else {
+                let selected = self.project_for_legacy_wiki_owner(owner)?;
+                match selected
+                    .map(|project_id| self.engine_for(Some(&project_id), None))
+                    .unwrap_or_else(|| self.engine_for(Some(owner), None))
+                {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        if let Some(repository_id) = self.repository_for_legacy_wiki_owner(owner)? {
+                            return self.resolve_archived_wiki_reference(request, &repository_id);
+                        }
+                        let engine = self.default_engine()?;
+                        if owner != engine.project_id()
+                            && !self.default_project_id_aliases().contains(owner)
+                            && !engine.wiki_owner_matches(owner)?
+                        {
+                            return Err(anyhow!(
+                                "wiki reference owner does not select an admitted project"
+                            ));
+                        }
+                        engine
+                    }
+                }
+            };
+            if let Some(repository_id) = repository_id {
+                if engine.repository_id() != repository_id {
+                    bail!("wiki reference belongs to another repository");
+                }
+            } else if engine.project_id() != owner && !engine.wiki_owner_matches(owner)? {
                 bail!("wiki reference owner does not match the selected project");
             }
-            if let Some(root) = request.root_uri.as_deref()
-                && self.select_project(None, Some(root))? != owner
-            {
-                bail!("wiki reference owner does not match selected root");
-            }
             let mut scoped = request.clone();
-            scoped.project_id = Some(owner.to_owned());
+            scoped.project_id = Some(engine.project_id().to_owned());
             scoped.root_uri = None;
-            let engine = self.engine_for(Some(owner), None)?;
             return engine.result_reference_resolve(&scoped);
         }
         let engine = self.engine_for(request.project_id.as_deref(), request.root_uri.as_deref())?;
@@ -744,6 +851,169 @@ impl ProjectRegistry {
             return Ok(encoded);
         }
         engine.result_reference_resolve(&scoped)
+    }
+
+    fn resolve_archived_wiki_reference(
+        &self,
+        request: &ResultReferenceRequest,
+        repository_id: &str,
+    ) -> Result<Vec<u8>> {
+        if repository_id.is_empty()
+            || !repository_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("invalid archived repository id");
+        }
+        let repository_root = self.state_root.join("repositories").join(repository_id);
+        let wiki_root = repository_root.join("wiki");
+        let server_root = self.state_root.canonicalize()?;
+        let mut current = self.state_root.join("repositories");
+        for component in [repository_id, "wiki"] {
+            current.push(component);
+            let metadata = std::fs::symlink_metadata(&current)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("archived wiki state is not server-owned");
+            }
+        }
+        let canonical_wiki = wiki_root.canonicalize()?;
+        if !canonical_wiki.starts_with(server_root.join("repositories")) {
+            bail!("archived wiki state escaped the server state root");
+        }
+        let store = StateStore::open(&wiki_root)?;
+        let reference = request
+            .reference
+            .as_ref()
+            .ok_or_else(|| anyhow!("archived wiki resolution requires a reference"))?;
+        context_core::resolve_archived_wiki_reference(&store, reference, &request.expected_hash)
+    }
+
+    fn project_for_repository(&self, repository_id: &str) -> Result<String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("project registry lock poisoned"))?;
+        state
+            .specs
+            .values()
+            .filter(|spec| spec.repository_id.as_deref() == Some(repository_id))
+            .map(|spec| spec.project_id.clone())
+            .min()
+            .ok_or_else(|| anyhow!("repository_id is not an admitted project"))
+    }
+
+    fn project_for_legacy_wiki_owner(&self, owner: &str) -> Result<Option<String>> {
+        let candidates = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("project registry lock poisoned"))?;
+            state
+                .specs
+                .values()
+                .filter_map(|spec| {
+                    spec.repository_id
+                        .as_ref()
+                        .map(|repo| (repo.clone(), spec.project_id.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (repository_id, project_id) in candidates {
+            let wiki_state = self
+                .state_root
+                .join("repositories")
+                .join(&repository_id)
+                .join("wiki");
+            let Ok(store) = StateStore::open(wiki_state) else {
+                continue;
+            };
+            let owner_record = store.get_json(&format!("wiki:owner:{owner}"))?;
+            if owner_record
+                .as_ref()
+                .and_then(|record| record["repository_id"].as_str())
+                == Some(repository_id.as_str())
+            {
+                return Ok(Some(project_id));
+            }
+        }
+        Ok(None)
+    }
+
+    fn migrate_repository_wiki(&self, spec: &ProjectSpec) -> Result<Option<PathBuf>> {
+        let Some(repository_id) = spec.repository_id.as_deref() else {
+            return Ok(None);
+        };
+        let wiki_state = self
+            .state_root
+            .join("repositories")
+            .join(repository_id)
+            .join("wiki");
+        let shared = StateStore::open(&wiki_state)?;
+        let mut sources = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("project registry lock poisoned"))?
+            .specs
+            .values()
+            .filter(|candidate| candidate.repository_id.as_deref() == Some(repository_id))
+            .map(|candidate| (candidate.project_id.clone(), candidate.state_root.clone()))
+            .collect::<Vec<_>>();
+        if !sources
+            .iter()
+            .any(|(project_id, _)| project_id == &spec.project_id)
+        {
+            sources.push((spec.project_id.clone(), spec.state_root.clone()));
+        }
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
+        for (project_id, project_state) in sources {
+            if project_state == wiki_state {
+                continue;
+            }
+            let legacy = StateStore::open(project_state)?;
+            shared.migrate_wiki_from(&legacy, &project_id, repository_id)?;
+            self.record_wiki_owner(repository_id, &project_id)?;
+        }
+        Ok(Some(wiki_state))
+    }
+
+    fn record_wiki_owner(&self, repository_id: &str, owner: &str) -> Result<()> {
+        let _guard = self
+            .wiki_catalog_lock
+            .lock()
+            .map_err(|_| anyhow!("wiki owner catalogue lock poisoned"))?;
+        let path = self.state_root.join(WIKI_OWNER_CATALOG_FILE);
+        let mut entries = std::fs::read(&path)
+            .ok()
+            .filter(|bytes| bytes.len() <= 256 * 1024)
+            .and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
+            .unwrap_or_default();
+        let row = json!({"owner":owner,"repository_id":repository_id});
+        entries.retain(|entry| entry["owner"] != owner);
+        entries.push(row);
+        entries.sort_by(|left, right| left["owner"].as_str().cmp(&right["owner"].as_str()));
+        if entries.len() > 1000 {
+            entries.truncate(1000);
+        }
+        let temporary = self
+            .state_root
+            .join(format!(".{WIKI_OWNER_CATALOG_FILE}.tmp"));
+        std::fs::write(&temporary, serde_json::to_vec(&entries)?)?;
+        std::fs::rename(temporary, path)?;
+        Ok(())
+    }
+
+    fn repository_for_legacy_wiki_owner(&self, owner: &str) -> Result<Option<String>> {
+        let path = self.state_root.join(WIKI_OWNER_CATALOG_FILE);
+        let entries = std::fs::read(&path)
+            .ok()
+            .filter(|bytes| bytes.len() <= 256 * 1024)
+            .and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok())
+            .unwrap_or_default();
+        Ok(entries.into_iter().find_map(|entry| {
+            (entry["owner"].as_str() == Some(owner))
+                .then(|| entry["repository_id"].as_str().map(str::to_owned))
+                .flatten()
+        }))
     }
 
     fn persist_wiki_registration(&self, spec: &ProjectSpec) -> Result<()> {
@@ -838,7 +1108,7 @@ impl ProjectRegistry {
         };
         Ok(
             json!({"schema":"agent_wiki.search.v1", "generation":self.shared_wiki.generation(),
-            "results":self.shared_wiki.search(&request.query,selected.as_deref(),usize::from(request.max_results),false)?}),
+            "results":self.shared_wiki.search_for_checkout(&request.query,selected.as_deref(),Some(active.project_id()),usize::from(request.max_results),false)?}),
         )
     }
 
@@ -973,6 +1243,7 @@ impl ProjectRegistry {
 
     pub fn projects_payload(&self, max_entries: u16) -> Result<Value> {
         self.discover_projects()?;
+        self.reconcile_missing_at(Instant::now())?;
         let payload = self.project_payload(false)?;
         self.persist_project_catalog(&payload);
         Self::bounded_project_catalog(payload, max_entries)
@@ -1023,6 +1294,7 @@ impl ProjectRegistry {
         let mut projects = state
             .specs
             .values()
+            .filter(|spec| !self.confirmed_missing_root(spec))
             // Python keeps this engine-only fallback out of the discovered
             // project list.  Otherwise a workspace parent appears alongside
             // the real projects found below it.
@@ -1074,6 +1346,25 @@ impl ProjectRegistry {
     }
 
     fn cached_engine(&self, project_id: &str) -> Result<Option<Arc<ProjectEngine>>> {
+        let spec = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("project registry lock poisoned"))?
+            .specs
+            .get(project_id)
+            .cloned();
+        if let Some(spec) = spec {
+            let root = spec
+                .local_root
+                .canonicalize()
+                .context("project root is unavailable")?;
+            if root != spec.local_root {
+                bail!("project root identity changed");
+            }
+            if spec.registered_worktree && !self.is_registered_worktree(&root)? {
+                bail!("Git worktree registration changed");
+            }
+        }
         let mut state = self
             .state
             .lock()
@@ -1131,8 +1422,21 @@ impl ProjectRegistry {
         let host_root = uri
             .to_file_path()
             .map_err(|_| anyhow!("root_uri is not a valid local file URI"))?;
-        self.ensure_allowed(&host_root)?;
         let (mapped_root, mapped) = self.map_host_path(&host_root);
+        let outside_allowed_roots = !self.is_allowed_root(&host_root);
+        let registered_worktree = if outside_allowed_roots {
+            mapped_root
+                .canonicalize()
+                .ok()
+                .is_some_and(|root| self.is_registered_worktree(&root).unwrap_or(false))
+        } else {
+            false
+        };
+        if outside_allowed_roots && !registered_worktree {
+            bail!(
+                "MCP root is outside MCP_CONTEXT_ALLOWED_ROOTS and is not a registered Git worktree"
+            );
+        }
         if mapped_root.symlink_metadata()?.file_type().is_symlink() {
             bail!("project root must not be a symlink");
         }
@@ -1142,6 +1446,8 @@ impl ProjectRegistry {
         if !local_root.is_dir() {
             bail!("project root must be a directory");
         }
+        let registered_worktree =
+            registered_worktree || self.is_registered_worktree(&local_root)?;
         let local_boundaries = if self.allowed_roots.is_empty() {
             vec![self.base_root.clone()]
         } else {
@@ -1153,9 +1459,10 @@ impl ProjectRegistry {
                 })
                 .collect::<Vec<_>>()
         };
-        if !local_boundaries
-            .iter()
-            .any(|allowed| local_root == *allowed || local_root.starts_with(allowed))
+        if !registered_worktree
+            && !local_boundaries
+                .iter()
+                .any(|allowed| local_root == *allowed || local_root.starts_with(allowed))
         {
             bail!("mapped project root escapes its configured local boundary");
         }
@@ -1180,6 +1487,12 @@ impl ProjectRegistry {
             .and_then(|name| name.to_str())
             .unwrap_or("project")
             .to_owned();
+        let mappings = self.git_mappings();
+        let git = context_index::git::checkout_with_mappings(&local_root, &mappings).ok();
+        let repository_id = Some(git.as_ref().map_or_else(
+            || local_repository_id(&root_hash),
+            |identity| repository_id(&self.normalize_common_dir(&identity.common_dir)),
+        ));
         Ok(ProjectSpec {
             state_root: self.state_root.join("projects").join(&project_id),
             project_id,
@@ -1189,6 +1502,10 @@ impl ProjectRegistry {
             source: source.to_owned(),
             mapped,
             legacy: false,
+            repository_id,
+            registered_worktree,
+            git_head: git.as_ref().map(|identity| identity.head.clone()),
+            git_branch: git.and_then(|identity| identity.branch),
         })
     }
 
@@ -1216,22 +1533,66 @@ impl ProjectRegistry {
         aliases
     }
 
-    fn ensure_allowed(&self, host_root: &Path) -> Result<()> {
-        if self.allowed_roots.is_empty() {
-            if host_root == self.base_root {
-                return Ok(());
+    fn is_allowed_root(&self, host_root: &Path) -> bool {
+        host_root == self.base_root
+            || self
+                .allowed_roots
+                .iter()
+                .any(|allowed| host_root == allowed || host_root.starts_with(allowed))
+    }
+
+    fn normalize_common_dir(&self, common_dir: &Path) -> PathBuf {
+        normalize_common_dir_for_mappings(common_dir, &self.root_mappings)
+    }
+
+    fn is_registered_worktree(&self, root: &Path) -> Result<bool> {
+        let mappings = self.git_mappings();
+        let Ok(identity) = context_index::git::checkout_with_mappings(root, &mappings) else {
+            return Ok(false);
+        };
+        let mut checked_common_dirs = HashSet::new();
+        for repository in self.admitted_git_roots() {
+            let Ok(repository_identity) =
+                context_index::git::checkout_with_mappings(&repository, &mappings)
+            else {
+                continue;
+            };
+            if repository_identity.common_dir != identity.common_dir {
+                continue;
             }
-            bail!("MCP_CONTEXT_ALLOWED_ROOTS is required for roots outside REPO_PATH");
+            if !checked_common_dirs.insert(repository_identity.common_dir.clone()) {
+                continue;
+            }
+            if context_index::git::registered_worktrees_with_mappings(&repository, &mappings)
+                .is_ok_and(|roots| roots.iter().any(|registered| registered == root))
+            {
+                return Ok(true);
+            }
         }
-        if self
-            .allowed_roots
-            .iter()
-            .any(|allowed| host_root == allowed || host_root.starts_with(allowed))
-        {
-            Ok(())
-        } else {
-            bail!("MCP root is outside MCP_CONTEXT_ALLOWED_ROOTS")
-        }
+        Ok(false)
+    }
+
+    fn admitted_git_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .specs
+                    .values()
+                    .map(|spec| spec.local_root.clone())
+                    .collect()
+            })
+            .unwrap_or_else(|_| vec![self.base_root.clone()]);
+        roots.push(self.base_root.clone());
+        roots.sort();
+        roots.dedup();
+        roots.truncate(DISCOVERY_MAX_PROJECTS);
+        roots
+    }
+
+    fn git_mappings(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.root_mappings.clone()
     }
 
     fn map_host_path(&self, host_root: &Path) -> (PathBuf, bool) {
@@ -1266,7 +1627,12 @@ impl ProjectRegistry {
                 .max_depth(self.discovery_max_depth)
                 .sort_by_file_name()
                 .into_iter();
+            let mut inspected = 0usize;
             while let Some(entry) = entries.next() {
+                inspected += 1;
+                if inspected > DISCOVERY_MAX_ENTRIES {
+                    break;
+                }
                 let Ok(entry) = entry else {
                     continue;
                 };
@@ -1295,7 +1661,32 @@ impl ProjectRegistry {
                     continue;
                 };
                 if let Ok(spec) = self.project_from_uri(&uri, source) {
+                    let repository_root = spec.local_root.clone();
                     discovered.push(spec);
+                    if let Ok(worktrees) = context_index::git::registered_worktrees_with_mappings(
+                        &repository_root,
+                        &self.git_mappings(),
+                    ) {
+                        for worktree in worktrees.into_iter().take(DISCOVERY_MAX_PROJECTS) {
+                            if worktree == repository_root || !worktree.is_dir() {
+                                continue;
+                            }
+                            let Some(host_path) = self.host_path_for_local(&worktree) else {
+                                continue;
+                            };
+                            let Ok(worktree_uri) = canonical_file_uri(&host_path) else {
+                                continue;
+                            };
+                            if let Ok(worktree_spec) =
+                                self.project_from_uri(&worktree_uri, "discovered_worktree")
+                            {
+                                discovered.push(worktree_spec);
+                            }
+                            if discovered.len() >= DISCOVERY_MAX_PROJECTS {
+                                break;
+                            }
+                        }
+                    }
                     if discovered.len() == DISCOVERY_MAX_PROJECTS {
                         break;
                     }
@@ -1313,13 +1704,202 @@ impl ProjectRegistry {
         // explicit root selections and the legacy fallback, but replace prior
         // discovery rows so renamed/removed projects and old false positives
         // do not remain visible forever.
-        state
-            .specs
-            .retain(|_, spec| spec.legacy || !spec.source.starts_with("discovered"));
         for spec in discovered {
             state.specs.entry(spec.project_id.clone()).or_insert(spec);
         }
+        drop(state);
+        self.reconcile_missing_at(Instant::now())?;
         Ok(())
+    }
+
+    fn reconcile_missing_at(&self, now: Instant) -> Result<()> {
+        let mut expired = Vec::new();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("project registry lock poisoned"))?;
+            let ids = state.specs.keys().cloned().collect::<Vec<_>>();
+            for id in ids {
+                let Some(spec) = state.specs.get(&id).cloned() else {
+                    continue;
+                };
+                match std::fs::symlink_metadata(&spec.local_root) {
+                    Ok(_) => {
+                        state.missing_since.remove(&id);
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && self.confirmed_missing_root(&spec) =>
+                    {
+                        let since = *state.missing_since.entry(id.clone()).or_insert(now);
+                        if now.saturating_duration_since(since) >= MISSING_PROJECT_GRACE
+                            && state
+                                .engines
+                                .get(&id)
+                                .is_none_or(|entry| Arc::strong_count(&entry.engine) == 1)
+                            && state.construction_gates.get(&id).is_none_or(|gate| {
+                                Arc::strong_count(gate) == 1 && gate.try_lock().is_ok()
+                            })
+                        {
+                            expired.push((id, spec));
+                        }
+                    }
+                    Err(_) => {
+                        state.missing_since.remove(&id);
+                    }
+                }
+            }
+        }
+        for (id, spec) in expired {
+            if spec.repository_id.is_some() {
+                self.migrate_repository_wiki(&spec)?;
+            }
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("project registry lock poisoned"))?;
+            let still_registered = state
+                .specs
+                .get(&id)
+                .is_some_and(|current| current.local_root == spec.local_root);
+            let still_absent = self.confirmed_missing_root(&spec);
+            let grace_elapsed = state.missing_since.get(&id).is_some_and(|since| {
+                now.saturating_duration_since(*since) >= MISSING_PROJECT_GRACE
+            });
+            let engine_idle = state
+                .engines
+                .get(&id)
+                .is_none_or(|entry| Arc::strong_count(&entry.engine) == 1);
+            let gate = state.construction_gates.get(&id).cloned();
+            let gate_guard = gate.as_ref().map(|gate| {
+                (Arc::strong_count(gate) == 2)
+                    .then(|| gate.try_lock().ok())
+                    .flatten()
+            });
+            let gate_idle = gate.is_none() || gate_guard.as_ref().is_some_and(Option::is_some);
+            if !still_registered || !still_absent || !grace_elapsed || !engine_idle || !gate_idle {
+                if !still_absent {
+                    state.missing_since.remove(&id);
+                }
+                continue;
+            }
+            self.shared_wiki.unregister(&id)?;
+            self.remove_checkout_state(&spec)?;
+            state.specs.remove(&id);
+            state.engines.remove(&id);
+            state.construction_gates.remove(&id);
+            state.missing_since.remove(&id);
+            drop(gate_guard);
+            drop(state);
+        }
+        self.persist_project_catalog(&self.project_payload(false)?);
+        Ok(())
+    }
+
+    fn confirmed_missing_root(&self, spec: &ProjectSpec) -> bool {
+        if !confirmed_missing_root(spec) {
+            return false;
+        }
+        let mapped_boundaries = self
+            .allowed_roots
+            .iter()
+            .map(|root| self.map_host_path(root).0)
+            .filter_map(|root| root.canonicalize().ok())
+            .collect::<Vec<_>>();
+        if mapped_boundaries.iter().any(|boundary| {
+            (spec.local_root == *boundary || spec.local_root.starts_with(boundary))
+                && boundary.is_dir()
+        }) {
+            return true;
+        }
+        if self.base_root == spec.local_root || spec.local_root.starts_with(&self.base_root) {
+            return self.base_root.is_dir();
+        }
+        if spec.registered_worktree {
+            return spec.local_root.parent().is_some_and(Path::is_dir);
+        }
+        false
+    }
+
+    fn remove_checkout_state(&self, spec: &ProjectSpec) -> Result<()> {
+        let project_id = &spec.project_id;
+        if project_id.is_empty()
+            || !project_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("refusing to remove state for an invalid project id");
+        }
+        if spec.legacy {
+            if spec.state_root != self.state_root {
+                bail!("refusing to remove state outside the configured legacy state root");
+            }
+            let generated = spec.state_root.join("rust-v2");
+            if let Ok(metadata) = std::fs::symlink_metadata(&generated) {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!("refusing to remove unsafe legacy checkout state");
+                }
+                if generated.canonicalize()? != generated {
+                    bail!("refusing to remove legacy checkout state through a changed path");
+                }
+                std::fs::remove_dir_all(generated)?;
+            }
+            return Ok(());
+        }
+        if spec.state_root != self.state_root.join("projects").join(project_id) {
+            bail!("refusing to remove state outside a registered checkout directory");
+        }
+        let root = spec.state_root.clone();
+        let parent = self.state_root.join("projects").canonicalize();
+        let Ok(parent) = parent else {
+            return Ok(());
+        };
+        let expected = parent.join(project_id);
+        if root != expected
+            || std::fs::symlink_metadata(&root)
+                .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+        {
+            bail!("refusing to remove state outside the project state directory");
+        }
+        if let Ok(metadata) = std::fs::symlink_metadata(&root) {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("refusing to remove an unverified checkout state path");
+            }
+            let canonical = root.canonicalize()?;
+            if canonical != root {
+                bail!("refusing to remove checkout state through a changed path");
+            }
+            let marker = root.join("project-owner.v1.json");
+            let marker_metadata = std::fs::symlink_metadata(&marker)?;
+            if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+                bail!("refusing to remove checkout state without an ownership marker");
+            }
+            let owner: Value = serde_json::from_slice(&std::fs::read(&marker)?)?;
+            if owner["project_id"] != *project_id
+                || owner["root_hash"] != spec.root_hash
+                || owner["schema"] != "context_project_state.owner.v1"
+                || owner["repository_id"] != spec.repository_id.clone().unwrap_or_default()
+            {
+                bail!("checkout state ownership marker does not match the project registry");
+            }
+            std::fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    fn host_path_for_local(&self, local_path: &Path) -> Option<PathBuf> {
+        self.root_mappings
+            .iter()
+            .filter_map(|(host, local)| {
+                local_path
+                    .strip_prefix(local)
+                    .ok()
+                    .map(|relative| (host, relative, local.as_os_str().len()))
+            })
+            .max_by_key(|(_, _, local_len)| *local_len)
+            .map(|(host, relative, _)| host.join(relative))
+            .or_else(|| Some(local_path.to_owned()))
     }
 
     #[cfg(test)]
@@ -1398,6 +1978,7 @@ impl ProjectSpec {
             "project_id": self.project_id,
             "name": self.name,
             "source": self.source,
+            "repository_id": self.repository_id,
             "root": {"uri_hash": self.root_hash, "scheme": "file", "mapped": self.mapped},
             "state": {
                 "state_key": if self.legacy {"rust-v2".to_owned()} else {format!("projects/{}", self.project_id)},
@@ -1407,9 +1988,122 @@ impl ProjectSpec {
                 "memory_exists": self.state_root.join("rust-v2/state.lmdb/data.mdb").exists(),
                 "repo_boundary_enforced": true,
             },
-            "git": {"is_repo": self.local_root.join(".git").exists(), "available": false, "head": "", "branch": "", "status_hash": "", "changes_hash": "", "dirty": false},
+            "git": {
+                "is_repo": self.git_head.is_some(),
+                "available": self.git_head.is_some(),
+                "head": self.git_head,
+                "branch": self.git_branch,
+                "common_dir_hash": self.repository_id,
+                "status_hash": "",
+                "changes_hash": "",
+                "dirty": false,
+            },
         })
     }
+}
+
+fn normalize_common_dir_for_mappings(
+    common_dir: &Path,
+    mappings: &[(PathBuf, PathBuf)],
+) -> PathBuf {
+    mappings
+        .iter()
+        .filter_map(|(host, local)| {
+            common_dir
+                .strip_prefix(local)
+                .ok()
+                .map(|relative| (host, relative, local.as_os_str().len()))
+        })
+        .max_by_key(|(_, _, local_len)| *local_len)
+        .map(|(host, relative, _)| host.join(relative))
+        .unwrap_or_else(|| common_dir.to_owned())
+}
+
+fn repository_id(common_dir: &Path) -> String {
+    format!(
+        "repo-{}",
+        &sha256_hex(common_dir.to_string_lossy().as_bytes())[..24]
+    )
+}
+
+fn local_repository_id(root_hash: &str) -> String {
+    format!("local-{}", &sha256_hex(root_hash.as_bytes())[..24])
+}
+
+fn confirmed_missing_root(spec: &ProjectSpec) -> bool {
+    matches!(
+        std::fs::symlink_metadata(&spec.local_root),
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+    ) && spec.local_root.parent().is_some_and(Path::is_dir)
+}
+
+fn build_project_engine(
+    spec: &ProjectSpec,
+    wiki_state: Option<&Path>,
+    git_mappings: Vec<(PathBuf, PathBuf)>,
+    usage_monitor: Arc<UsageMonitor>,
+    control: Option<&WorkControl>,
+) -> Result<ProjectEngine> {
+    if let (Some(repository_id), Some(wiki_state)) = (&spec.repository_id, wiki_state) {
+        ProjectEngine::build_with_repository_wiki(
+            &spec.local_root,
+            &spec.state_root,
+            wiki_state,
+            &spec.project_id,
+            repository_id,
+            git_mappings,
+            usage_monitor,
+            control,
+        )
+    } else {
+        match control {
+            Some(control) => ProjectEngine::build_with_state_and_monitor_controlled(
+                &spec.local_root,
+                &spec.state_root,
+                &spec.project_id,
+                usage_monitor,
+                Some(control),
+            ),
+            None => ProjectEngine::build_with_state_and_monitor(
+                &spec.local_root,
+                &spec.state_root,
+                &spec.project_id,
+                usage_monitor,
+            ),
+        }
+    }
+}
+
+fn ensure_checkout_state_marker(spec: &ProjectSpec) -> Result<()> {
+    if spec.legacy {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&spec.state_root)?;
+    let marker = spec.state_root.join("project-owner.v1.json");
+    let expected = json!({
+        "schema":"context_project_state.owner.v1",
+        "project_id":&spec.project_id,
+        "root_hash":&spec.root_hash,
+        "repository_id":spec.repository_id.clone().unwrap_or_default(),
+    });
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("project state ownership marker is unsafe");
+            }
+            let current: Value = serde_json::from_slice(&std::fs::read(marker)?)?;
+            if current != expected {
+                bail!("project state directory belongs to a different checkout");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let temporary = spec.state_root.join(".project-owner.v1.tmp");
+            std::fs::write(&temporary, serde_json::to_vec(&expected)?)?;
+            std::fs::rename(temporary, marker)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 fn prune_idle_engines(state: &mut RegistryState, default_project_id: &str) {
@@ -1561,6 +2255,160 @@ fn project_markers_from_env() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn external_checkout_requires_git_registration_and_cached_roots_are_rechecked() {
+        use std::process::Command;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().join("base");
+        let linked = fixture.path().join("outside linked");
+        let forged = fixture.path().join("forged");
+        std::fs::create_dir_all(&base).unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&base)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ])
+            .current_dir(&base)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ])
+            .current_dir(&base)
+            .status()
+            .unwrap();
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::write(
+            forged.join(".git"),
+            format!("gitdir: {}\n", base.join(".git").display()),
+        )
+        .unwrap();
+
+        let registry =
+            super::ProjectRegistry::new(base.clone(), fixture.path().join("state"), vec![], vec![])
+                .unwrap();
+        let linked_engine = registry
+            .engine_for(None, Some(linked.to_str().unwrap()))
+            .unwrap();
+        assert!(
+            registry
+                .engine_for(None, Some(forged.to_str().unwrap()))
+                .is_err()
+        );
+
+        let project_id = linked_engine.project_id().to_owned();
+        drop(linked_engine);
+        Command::new("git")
+            .args(["worktree", "remove", "--force", linked.to_str().unwrap()])
+            .current_dir(&base)
+            .status()
+            .unwrap();
+        assert!(registry.engine_for(Some(&project_id), None).is_err());
+    }
+
+    #[test]
+    fn missing_project_cleanup_observes_grace_and_cancels_on_restore() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let base = workspace.join("base");
+        let child = workspace.join("child");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        let registry = super::ProjectRegistry::new(
+            base,
+            fixture.path().join("state"),
+            vec![workspace],
+            vec![],
+        )
+        .unwrap();
+        let spec = registry
+            .project_from_uri(&super::canonical_file_uri(&child).unwrap(), "root_uri")
+            .unwrap();
+        let id = spec.project_id.clone();
+        let index = spec.state_root.join("rust-v2/index");
+        super::ensure_checkout_state_marker(&spec).unwrap();
+        std::fs::create_dir_all(&index).unwrap();
+        registry
+            .state
+            .lock()
+            .unwrap()
+            .specs
+            .insert(id.clone(), spec);
+        let now = Instant::now();
+        std::fs::remove_dir_all(&child).unwrap();
+
+        registry.reconcile_missing_at(now).unwrap();
+        assert!(registry.state.lock().unwrap().specs.contains_key(&id));
+        std::fs::create_dir(&child).unwrap();
+        registry
+            .reconcile_missing_at(now + Duration::from_secs(6 * 60))
+            .unwrap();
+        assert!(registry.state.lock().unwrap().specs.contains_key(&id));
+        assert!(index.is_dir());
+
+        std::fs::remove_dir_all(&child).unwrap();
+        let removed_at = now + Duration::from_secs(7 * 60);
+        registry.reconcile_missing_at(removed_at).unwrap();
+        registry
+            .reconcile_missing_at(removed_at + Duration::from_secs(5 * 60))
+            .unwrap();
+        assert!(!registry.state.lock().unwrap().specs.contains_key(&id));
+        assert!(!index.exists());
+    }
+
+    #[test]
+    fn archived_wiki_references_resolve_after_last_project_is_removed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let base = workspace.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        let state_root = fixture.path().join("state");
+        let registry =
+            super::ProjectRegistry::new(base, state_root.clone(), vec![workspace], vec![]).unwrap();
+        let repository_id = "repo-archive";
+        let wiki_state = state_root
+            .join("repositories")
+            .join(repository_id)
+            .join("wiki");
+        let store = StateStore::open(&wiki_state).unwrap();
+        let body =
+            json!({"title":"Archived","summary":"citation survives","claims":[],"sources":[]});
+        let revision = store
+            .put_wiki_revision("archived-page", None, &body)
+            .unwrap();
+        let request: ResultReferenceRequest = serde_json::from_value(json!({
+            "reference":{"kind":"wiki","project_id":"deleted-checkout","repository_id":repository_id,
+                "page_id":"archived-page","revision":revision}
+        }))
+        .unwrap();
+
+        let resolved: Value =
+            serde_json::from_slice(&registry.result_reference_resolve(&request).unwrap()).unwrap();
+        assert_eq!(resolved["status"], "resolved");
+        assert_eq!(resolved["source_status"], "archived");
+        assert_eq!(resolved["content"]["summary"], "citation survives");
+    }
+
     #[test]
     fn shared_wiki_rechecks_project_boundaries_and_restores_registered_projects() {
         let fixture = tempfile::tempdir().unwrap();
@@ -1607,7 +2455,9 @@ mod tests {
         let reference =
             serde_json::from_value(serde_json::json!({"reference":published["reference"]}))
                 .unwrap();
-        assert!(registry.result_reference_resolve(&reference).is_ok());
+        registry
+            .result_reference_resolve(&reference)
+            .unwrap_or_else(|error| panic!("resolve failed: {error:#}"));
         let mismatch = serde_json::from_value(
             serde_json::json!({"reference":published["reference"],"root_uri":b}),
         )
