@@ -26,17 +26,19 @@ set(MCP_IMAGE_ARCHIVE
 function(mcp_collect_rust_sources out_var)
     file(GLOB_RECURSE _sources CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/*.rs"
-        "${CMAKE_SOURCE_DIR}/src/*/*.rs"
-        "${CMAKE_SOURCE_DIR}/src/*/*/*.rs"
         "${CMAKE_SOURCE_DIR}/xtask/*.rs"
-        "${CMAKE_SOURCE_DIR}/xtask/*/*.rs"
-        "${CMAKE_SOURCE_DIR}/Cargo.toml"
+    )
+    file(GLOB _manifests CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/*/Cargo.toml"
-        "${CMAKE_SOURCE_DIR}/xtask/Cargo.toml"
+    )
+    list(APPEND _sources
+        "${CMAKE_SOURCE_DIR}/Cargo.toml"
         "${CMAKE_SOURCE_DIR}/Cargo.lock"
         "${CMAKE_SOURCE_DIR}/rust-toolchain.toml"
+        "${CMAKE_SOURCE_DIR}/xtask/Cargo.toml"
+        ${_manifests}
     )
-    set(${out_var} ${_sources} PARENT_SCOPE)
+    set(${out_var} "${_sources}" PARENT_SCOPE)
 endfunction()
 
 function(mcp_add_standalone_binary runtime image output_name)
