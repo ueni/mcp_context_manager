@@ -1472,7 +1472,7 @@ impl UsageMonitor {
         let mut value = self
             .store
             .get_json(&key)?
-            .filter(|bucket| is_current_usage_bucket(bucket))
+            .filter(is_current_usage_bucket)
             .unwrap_or_else(|| {
                 json!({
                     "schema": USAGE_BUCKET_SCHEMA, "day": day, "project_id": project_id,
@@ -5394,7 +5394,7 @@ fn make_cache_checkpoint(
     let mut git_diff = Vec::new();
     if let Ok(cache) = git_diff_cache.lock() {
         let mut entries: Vec<_> = cache.entries.iter().collect();
-        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        entries.sort_by_key(|(left, _)| *left);
         for (key, bytes) in entries {
             if key.index_generation != generation {
                 continue;
