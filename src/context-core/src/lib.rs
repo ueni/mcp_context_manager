@@ -1024,7 +1024,6 @@ impl RefreshCoordinator {
             .map_err(|_| anyhow!("refresh coordinator lock poisoned"))?;
         state.next_job = state.next_job.saturating_add(1);
         state.pending_job = state.next_job;
-        state.pending_force = false;
         state.pending_paths.extend(explicit_paths.iter().cloned());
         if state.pending_paths.len() > CHANGE_JOURNAL_MAX_PATHS {
             state.pending_paths.clear();
@@ -1134,9 +1133,7 @@ impl RefreshCoordinator {
                 while state.pending_job <= state.completed_job {
                     let current_epoch = self.shared.freshness.event_epoch.load(Ordering::Acquire);
                     if current_epoch > state.completed_epoch {
-                        state.next_job = state.next_job.saturating_add(1);
-                        state.pending_job = state.next_job;
-                        state.pending_force = true;
+                        queue_event_retry(&mut state);
                         break;
                     }
                     let (next, _) = self
@@ -1183,12 +1180,19 @@ impl RefreshCoordinator {
             state.completed_epoch = self.shared.freshness.event_epoch.load(Ordering::Acquire);
             state.last_error = result.as_ref().err().map(ToString::to_string);
             if self.shared.freshness.event_epoch.load(Ordering::Acquire) > starting_epoch {
-                state.next_job = state.next_job.saturating_add(1);
-                state.pending_job = state.next_job;
-                state.pending_force = true;
+                queue_event_retry(&mut state);
             }
             self.wake.notify_all();
         }
+    }
+}
+
+fn queue_event_retry(state: &mut RefreshCoordinatorState) {
+    // Event-driven refreshes must pass through the normal debounce path; only
+    // explicit requests should force a full rebuild.
+    if state.pending_job <= state.completed_job {
+        state.next_job = state.next_job.saturating_add(1);
+        state.pending_job = state.next_job;
     }
 }
 
@@ -8095,6 +8099,40 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn event_retry_queues_coalesced_work_without_forcing_refresh() {
+        let mut state = RefreshCoordinatorState {
+            completed_job: 4,
+            next_job: 4,
+            pending_job: 4,
+            ..RefreshCoordinatorState::default()
+        };
+
+        queue_event_retry(&mut state);
+
+        assert_eq!(state.pending_job, 5);
+        assert_eq!(state.next_job, 5);
+        assert!(!state.pending_force);
+        assert!(state.pending_job > state.completed_job);
+    }
+
+    #[test]
+    fn event_retry_preserves_an_already_queued_forced_refresh() {
+        let mut state = RefreshCoordinatorState {
+            completed_job: 4,
+            next_job: 5,
+            pending_job: 5,
+            pending_force: true,
+            ..RefreshCoordinatorState::default()
+        };
+
+        queue_event_retry(&mut state);
+
+        assert_eq!(state.pending_job, 5);
+        assert_eq!(state.next_job, 5);
+        assert!(state.pending_force);
+    }
 
     #[test]
     fn request_defaults_are_the_v2_contract_defaults() {
