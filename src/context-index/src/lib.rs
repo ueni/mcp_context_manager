@@ -2212,7 +2212,8 @@ mod tests {
         );
         let diagnostics = index.cache_diagnostics();
         assert_eq!(diagnostics.3, 1);
-        assert_eq!(diagnostics.4, 2);
+        assert_eq!(diagnostics.4, 1);
+        assert_eq!(diagnostics.5, 2);
     }
 
     #[test]
