@@ -598,7 +598,10 @@ Administrative metrics expose the bounded watcher diagnostic under
 `index_freshness.watcher`: `backend` is `native`, `metadata_snapshot`, or
 `failed`; `status` is `starting`, `healthy`, or `failed`; and `failure` uses a
 small category such as `setup_create`, `setup_register`, `runtime`, or
-`disconnect`. Error text and repository paths are never included.
+`disconnect`. `last_error` is a bounded diagnostic such as `io_errno_28`,
+`permission_denied_errno_13`, `path_not_found`, or `generic`; it is retained
+after polling fallback succeeds.
+Raw error text and repository paths are never included.
 
 Incremental refresh replaces only changed paths' Tantivy documents and pins
 old readers until publication. Metadata copying and full signature scans still

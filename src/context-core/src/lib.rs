@@ -76,7 +76,8 @@ use context_index::{
 };
 use context_store::{ReferenceValidation, StateStore};
 use notify::{
-    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    Config as NotifyConfig, ErrorKind as NotifyErrorKind, Event, EventKind, RecommendedWatcher,
+    RecursiveMode, Watcher,
 };
 use regex::Regex;
 use schemars::JsonSchema;
@@ -893,6 +894,7 @@ struct FreshnessState {
     watcher_status: AtomicU8,
     watcher_backend: AtomicU8,
     watcher_failure: AtomicU8,
+    watcher_error_detail: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
@@ -4915,14 +4917,19 @@ fn try_recommended_watcher(
         move |event| {
             let _ = callback_sender.send(event);
         },
-        NotifyConfig::default(),
+        NotifyConfig::default().with_follow_symlinks(false),
     );
-    let Ok(mut watcher) = recommended else {
-        record_watcher_failure(freshness, WATCHER_FAILURE_SETUP_CREATE);
-        return false;
+    let mut watcher = match recommended {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            record_watcher_failure(freshness, WATCHER_FAILURE_SETUP_CREATE);
+            record_watcher_error_detail(freshness, &error);
+            return false;
+        }
     };
-    if watcher.watch(root, RecursiveMode::Recursive).is_err() {
+    if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
         record_watcher_failure(freshness, WATCHER_FAILURE_SETUP_REGISTER);
+        record_watcher_error_detail(freshness, &error);
         return false;
     }
     freshness
@@ -5949,6 +5956,34 @@ fn watcher_failure_name(value: u8) -> &'static str {
     }
 }
 
+fn watcher_error_detail(error: &notify::Error) -> String {
+    match &error.kind {
+        NotifyErrorKind::Io(error) => {
+            let category = match error.kind() {
+                std::io::ErrorKind::PermissionDenied => "permission_denied",
+                std::io::ErrorKind::NotFound => "not_found",
+                _ => "io",
+            };
+            match error.raw_os_error() {
+                Some(code) => format!("{category}_errno_{code}"),
+                None => category.to_owned(),
+            }
+        }
+        NotifyErrorKind::PathNotFound => "path_not_found".to_owned(),
+        NotifyErrorKind::WatchNotFound => "watch_not_found".to_owned(),
+        NotifyErrorKind::Generic(_) => "generic".to_owned(),
+        NotifyErrorKind::InvalidConfig(_) => "invalid_config".to_owned(),
+        NotifyErrorKind::MaxFilesWatch => "max_files_watch".to_owned(),
+    }
+}
+
+fn record_watcher_error_detail(freshness: &FreshnessState, error: &notify::Error) {
+    *freshness
+        .watcher_error_detail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(watcher_error_detail(error));
+}
+
 fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
     let now = now_iso()?;
     let operations = engine.metrics.operation_snapshots();
@@ -6107,6 +6142,12 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
                 "failure": watcher_failure_name(
                     engine.freshness.watcher_failure.load(Ordering::Relaxed),
                 ),
+                "last_error": engine
+                    .freshness
+                    .watcher_error_detail
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
                 "poll_interval_ms": watch_poll_interval().as_millis(),
             },
             "coalesce_ms": WATCH_COALESCE_MS,
@@ -10758,6 +10799,70 @@ mod tests {
         assert!(watcher.join().expect("watcher thread"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_watcher_ignores_symlink_targets_and_tracks_local_changes() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempdir().expect("repository root");
+        let external = tempdir().expect("external directory");
+        let source = fixture.path().join("lib.rs");
+        let external_source = external.path().join("external.rs");
+        fs::write(&source, "fn before() {}\n").expect("local source");
+        fs::write(&external_source, "fn external_before() {}\n").expect("external source");
+        symlink(external.path(), fixture.path().join("external-link")).expect("external symlink");
+
+        let freshness = Arc::new(FreshnessState::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_freshness = Arc::clone(&freshness);
+        let thread_stop = Arc::clone(&stop);
+        let root = fixture.path().to_path_buf();
+        let watcher =
+            thread::spawn(move || try_recommended_watcher(&root, &thread_freshness, &thread_stop));
+
+        let startup_deadline = Instant::now() + StdDuration::from_secs(1);
+        while freshness.watcher_status.load(Ordering::Acquire) != WATCHER_HEALTHY
+            && Instant::now() < startup_deadline
+        {
+            thread::sleep(StdDuration::from_millis(1));
+        }
+        assert_eq!(
+            watcher_backend_name(freshness.watcher_backend.load(Ordering::Acquire)),
+            "native"
+        );
+        assert_eq!(
+            freshness.watcher_status.load(Ordering::Acquire),
+            WATCHER_HEALTHY
+        );
+
+        fs::write(&source, "fn after() {}\n").expect("local source modification");
+        let local_deadline = Instant::now() + StdDuration::from_secs(1);
+        while !freshness
+            .changed_paths
+            .lock()
+            .expect("change journal")
+            .contains("lib.rs")
+            && Instant::now() < local_deadline
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(
+            freshness
+                .changed_paths
+                .lock()
+                .expect("change journal")
+                .contains("lib.rs")
+        );
+
+        let local_epoch = freshness.event_epoch.load(Ordering::Acquire);
+        fs::write(&external_source, "fn external_after() {}\n").expect("external modification");
+        thread::sleep(StdDuration::from_millis(100));
+        assert_eq!(freshness.event_epoch.load(Ordering::Acquire), local_epoch);
+
+        stop.store(true, Ordering::Release);
+        assert!(watcher.join().expect("native watcher"));
+    }
+
     #[test]
     fn watcher_registration_precedes_the_baseline_scan() {
         let root = tempdir().expect("repository root");
@@ -11012,6 +11117,18 @@ mod tests {
         );
         assert!(backend_freshness.dirty.load(Ordering::Acquire));
         assert!(backend_freshness.journal_overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn watcher_error_diagnostic_is_bounded_and_redacts_error_text() {
+        let error = notify::Error::generic("/private/repository/path: denied");
+        assert_eq!(watcher_error_detail(&error), "generic");
+
+        let error = notify::Error::from(std::io::Error::from_raw_os_error(28));
+        assert_eq!(watcher_error_detail(&error), "io_errno_28");
+
+        let error = notify::Error::from(std::io::Error::from_raw_os_error(13));
+        assert_eq!(watcher_error_detail(&error), "permission_denied_errno_13");
     }
 
     #[test]
