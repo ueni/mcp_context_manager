@@ -594,6 +594,16 @@ and `unverified` means the watcher cannot certify completeness. Watcher failure
 requires authoritative verification before pack generation. These
 states do not promise a filesystem transaction across concurrent editor writes.
 
+Projects are active for 60 seconds after foreground repository work, idle until
+10 minutes, then dormant. Metadata polling uses the configured base interval
+(2 seconds by default) while active, backs off to at most 5 minutes while idle,
+and suspends scans while dormant. Poll backoff never extends the base freshness
+age: a foreground request verifies an overdue snapshot before it can report
+`current`. Metrics and status reads do not wake projects. Dormant shared-wiki
+sources remain `unverified` until their owner is checked. Native watching
+registers each indexable directory without recursively entering ignored or
+symlinked trees.
+
 Administrative metrics expose the bounded watcher diagnostic under
 `index_freshness.watcher`: `backend` is `native`, `metadata_snapshot`, or
 `failed`; `status` is `starting`, `healthy`, or `failed`; and `failure` uses a
@@ -601,7 +611,10 @@ small category such as `setup_create`, `setup_register`, `runtime`, or
 `disconnect`. `last_error` is a bounded diagnostic such as `io_errno_28`,
 `permission_denied_errno_13`, `path_not_found`, or `generic`; it is retained
 after polling fallback succeeds.
-Raw error text and repository paths are never included.
+`index_freshness` also reports `activity_state`, `foreground_idle_ms`, metadata
+scan count/duration, wiki publication attempted/skipped/completed counts, and
+the last bounded incremental fallback category. These fields are diagnostic;
+raw error text and repository paths are never included.
 
 Incremental refresh replaces only changed paths' Tantivy documents and pins
 old readers until publication. Metadata copying and full signature scans still

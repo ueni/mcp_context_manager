@@ -5,6 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const WIKI_MONITOR_INTERVAL: StdDuration =
+    StdDuration::from_millis(if cfg!(test) { 100 } else { 2_000 });
+
 #[derive(Clone)]
 struct Project {
     owner: String,
@@ -16,13 +19,15 @@ struct Project {
     index: Arc<RwLock<Arc<ProjectIndex>>>,
     freshness: Arc<FreshnessState>,
     refreshing: Arc<AtomicBool>,
+    refresh_pending: Arc<AtomicBool>,
     _watcher: Arc<WatchGuard>,
     _refresh: Arc<RefreshCoordinator>,
 }
 
 struct Snapshot {
-    index: WikiSearchIndex,
+    index: Arc<WikiSearchIndex>,
     documents: BTreeMap<(String, String), Value>,
+    projections: BTreeMap<(String, String), String>,
 }
 
 /// One generated search projection, shared only by projects admitted by the registry.
@@ -40,8 +45,9 @@ impl WikiHub {
             epoch: Arc::new(AtomicU64::new(0)),
             projects: RwLock::new(BTreeMap::new()),
             snapshot: RwLock::new(Arc::new(Snapshot {
-                index: WikiSearchIndex::build(&[])?,
+                index: Arc::new(WikiSearchIndex::build(&[])?),
                 documents: BTreeMap::new(),
+                projections: BTreeMap::new(),
             })),
             publication: Mutex::new(()),
             monitoring: AtomicBool::new(false),
@@ -70,6 +76,10 @@ impl WikiHub {
                 Arc::clone(&previous.refreshing)
             })
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let refresh_pending = projects
+            .get(engine.project_id())
+            .map(|previous| Arc::clone(&previous.refresh_pending))
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let git_identity =
             context_index::git::checkout_with_mappings(engine.index().root(), &engine.git_mappings)
                 .ok();
@@ -87,6 +97,7 @@ impl WikiHub {
                 index: Arc::clone(&engine.index),
                 freshness: Arc::clone(&engine.freshness),
                 refreshing,
+                refresh_pending,
                 _watcher: Arc::clone(&engine._watcher),
                 _refresh: Arc::clone(&engine.refresh_coordinator),
             },
@@ -113,6 +124,9 @@ impl WikiHub {
                             .map(|projects| projects.clone())
                             .unwrap_or_default();
                         for (id, project) in projects {
+                            if project.freshness.activity_state() == "dormant" {
+                                continue;
+                            }
                             let repository = project
                                 .index
                                 .read()
@@ -120,7 +134,8 @@ impl WikiHub {
                                 .clone();
                             let git = git_head_stamp(repository.root(), &project.git_mappings);
                             let stamp = (project.freshness.generation.load(Ordering::Acquire), git);
-                            if observed.get(&id) != Some(&stamp)
+                            let deferred_work = project.refresh_pending.load(Ordering::Acquire);
+                            if (observed.get(&id) != Some(&stamp) || deferred_work)
                                 && !project.refreshing.load(Ordering::Acquire)
                             {
                                 observed.insert(id.clone(), stamp);
@@ -128,7 +143,7 @@ impl WikiHub {
                             }
                         }
                         drop(hub);
-                        thread::sleep(StdDuration::from_secs(2));
+                        thread::sleep(WIKI_MONITOR_INTERVAL);
                     }
                 })?;
         }
@@ -142,7 +157,8 @@ impl WikiHub {
             .publication
             .lock()
             .map_err(|_| anyhow!("wiki publication lock poisoned"))?;
-        self.projects
+        let removed_project = self
+            .projects
             .write()
             .map_err(|_| anyhow!("wiki projects lock poisoned"))?
             .remove(owner);
@@ -151,25 +167,104 @@ impl WikiHub {
             .read()
             .map_err(|_| anyhow!("wiki snapshot lock poisoned"))?
             .clone();
-        let documents = old
+        let mut documents = old
             .documents
             .iter()
-            .filter(|((project_id, _), _)| project_id != owner)
+            .filter(|(key, _)| {
+                key.0 != owner
+                    && old
+                        .projections
+                        .get(*key)
+                        .is_none_or(|source| source != owner)
+            })
             .map(|(key, page)| (key.clone(), page.clone()))
             .collect::<BTreeMap<_, _>>();
-        let index = WikiSearchIndex::build(&documents.values().cloned().collect::<Vec<_>>())?;
+        if documents == old.documents {
+            return Ok(());
+        }
+        let projections = old
+            .projections
+            .iter()
+            .filter(|(key, source)| {
+                key.0 != owner && source.as_str() != owner && documents.contains_key(*key)
+            })
+            .map(|(key, source)| (key.clone(), source.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut projections = projections;
+        if let Some(removed_project) = removed_project {
+            let removed_keys = old
+                .projections
+                .iter()
+                .filter(|(_, source)| source.as_str() == owner)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            let projects = self
+                .projects
+                .read()
+                .map_err(|_| anyhow!("wiki projects lock poisoned"))?
+                .clone();
+            for (target_owner, page_id) in removed_keys {
+                if documents.contains_key(&(target_owner.clone(), page_id.clone())) {
+                    continue;
+                }
+                let Some(target) = projects.get(&target_owner) else {
+                    continue;
+                };
+                if target.repository_id != removed_project.repository_id {
+                    continue;
+                }
+                let mut fallback = None;
+                for (candidate_owner, candidate) in &projects {
+                    if candidate_owner == &target_owner
+                        || candidate.repository_id != target.repository_id
+                    {
+                        continue;
+                    }
+                    if let Some(page) = native_page_for(candidate, candidate_owner, &page_id)? {
+                        fallback = Some((candidate_owner.clone(), page));
+                        break;
+                    }
+                }
+                if let Some((source_owner, page)) = fallback {
+                    let key = (target_owner.clone(), page_id);
+                    let mut page = page;
+                    page["project_id"] = json!(target_owner);
+                    documents.insert(key.clone(), page);
+                    projections.insert(key, source_owner);
+                }
+            }
+        }
+        if documents == old.documents {
+            if projections != old.projections {
+                *self
+                    .snapshot
+                    .write()
+                    .map_err(|_| anyhow!("wiki snapshot lock poisoned"))? = Arc::new(Snapshot {
+                    index: Arc::clone(&old.index),
+                    documents,
+                    projections,
+                });
+            }
+            return Ok(());
+        }
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let index = Arc::new(WikiSearchIndex::build(
+            &documents.values().cloned().collect::<Vec<_>>(),
+        )?);
         *self
             .snapshot
             .write()
-            .map_err(|_| anyhow!("wiki snapshot lock poisoned"))? =
-            Arc::new(Snapshot { index, documents });
+            .map_err(|_| anyhow!("wiki snapshot lock poisoned"))? = Arc::new(Snapshot {
+            index,
+            documents,
+            projections,
+        });
         self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
     /// Rebuild on the write/background path; query readers retain the old immutable snapshot.
     pub fn publish(&self, owner: &str) -> Result<()> {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
         let _publication = self
             .publication
             .lock()
@@ -181,13 +276,33 @@ impl WikiHub {
             .get(owner)
             .cloned()
             .ok_or_else(|| anyhow!("wiki project is not authorized"))?;
+        project
+            .freshness
+            .wiki_publication_attempted
+            .fetch_add(1, Ordering::Relaxed);
         let old = self
             .snapshot
             .read()
             .map_err(|_| anyhow!("wiki snapshot lock poisoned"))?
             .clone();
         let mut documents = old.documents.clone();
-        documents.retain(|(project_id, _), _| project_id != owner);
+        documents.retain(|key, _| {
+            key.0 != owner
+                || old
+                    .projections
+                    .get(key)
+                    .is_some_and(|source_owner| source_owner != owner)
+        });
+        let mut projections = old.projections.clone();
+        let previous_projections = projections
+            .iter()
+            .filter(|(_, source)| source.as_str() == owner)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in previous_projections {
+            projections.remove(&key);
+            documents.remove(&key);
+        }
         for pointer in project.store.list_wiki_pages(100_001)? {
             let id = pointer["page_id"]
                 .as_str()
@@ -208,19 +323,38 @@ impl WikiHub {
             page["repository_id"] = json!(project.repository_id);
             page["current"] = json!(page.get("superseded_by").is_none());
             page["prompt_injection_signals"] = sanitize_text(&serde_json::to_string(&page)?).2;
-            documents.insert((owner.to_owned(), id.to_owned()), page.clone());
+            let owner_key = (owner.to_owned(), id.to_owned());
+            projections.remove(&owner_key);
+            documents.insert(owner_key, page.clone());
             let peer_projects = self
                 .projects
                 .read()
                 .map_err(|_| anyhow!("wiki projects lock poisoned"))?
                 .values()
                 .filter(|peer| peer.owner != owner && peer.repository_id == project.repository_id)
-                .map(|peer| peer.owner.clone())
+                .map(|peer| {
+                    (
+                        peer.owner.clone(),
+                        same_store_location(&peer.store, &project.store),
+                    )
+                })
                 .collect::<Vec<_>>();
-            for peer_owner in peer_projects {
+            for (peer_owner, shared_store) in peer_projects {
+                let key = (peer_owner.clone(), id.to_owned());
+                if old.documents.contains_key(&key)
+                    && !old.projections.contains_key(&key)
+                    && !shared_store
+                {
+                    continue;
+                }
                 let mut projected_page = page.clone();
                 projected_page["project_id"] = json!(peer_owner);
-                documents.insert((peer_owner, id.to_owned()), projected_page);
+                documents.insert(key.clone(), projected_page);
+                if shared_store {
+                    projections.remove(&key);
+                } else {
+                    projections.insert(key, owner.to_owned());
+                }
             }
         }
         for (_, pointer) in project.store.iter_json("wiki:source_current:")? {
@@ -232,19 +366,51 @@ impl WikiHub {
                     .as_str()
                     .expect("generated source page id")
                     .to_owned();
-                documents.insert((owner.to_owned(), id), doc);
+                let key = (owner.to_owned(), id);
+                documents.insert(key.clone(), doc);
+                projections.remove(&key);
             }
         }
         if documents.len() > 1_000_000 {
             bail!("shared wiki exceeds one million indexed chunks");
         }
-        let index = WikiSearchIndex::build(&documents.values().cloned().collect::<Vec<_>>())?;
+        if documents == old.documents {
+            project
+                .freshness
+                .wiki_publication_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            if projections != old.projections {
+                *self
+                    .snapshot
+                    .write()
+                    .map_err(|_| anyhow!("wiki snapshot lock poisoned"))? = Arc::new(Snapshot {
+                    index: Arc::clone(&old.index),
+                    documents,
+                    projections,
+                });
+            }
+            return Ok(());
+        }
+        // Invalidate readers before building so a cached pack cannot race with
+        // an in-progress publication. The second increment marks the committed
+        // snapshot boundary for readers that waited on the old generation.
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let index = Arc::new(WikiSearchIndex::build(
+            &documents.values().cloned().collect::<Vec<_>>(),
+        )?);
         *self
             .snapshot
             .write()
-            .map_err(|_| anyhow!("wiki snapshot lock poisoned"))? =
-            Arc::new(Snapshot { index, documents });
+            .map_err(|_| anyhow!("wiki snapshot lock poisoned"))? = Arc::new(Snapshot {
+            index,
+            documents,
+            projections,
+        });
         self.epoch.fetch_add(1, Ordering::AcqRel);
+        project
+            .freshness
+            .wiki_publication_completed
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -303,7 +469,12 @@ impl WikiHub {
             else {
                 continue;
             };
-            let index = project
+            let source_project = snapshot
+                .projections
+                .get(&(hit.project_id.clone(), hit.page_id.clone()))
+                .and_then(|owner| projects.get(owner))
+                .unwrap_or(project);
+            let index = source_project
                 .index
                 .read()
                 .map_err(|_| anyhow!("wiki repository lock poisoned"))?;
@@ -320,15 +491,22 @@ impl WikiHub {
                 ) {
                     source_status(
                         page,
-                        &project.store,
+                        &source_project.store,
                         &requesting_index,
                         &requesting.freshness,
+                        &source_project.freshness,
                     )
                 } else {
                     "inapplicable"
                 }
             } else {
-                source_status(page, &project.store, &index, &project.freshness)
+                source_status(
+                    page,
+                    &source_project.store,
+                    &index,
+                    &source_project.freshness,
+                    &source_project.freshness,
+                )
             };
             if for_pack && !matches!(status, "current" | "historical") {
                 continue;
@@ -378,33 +556,62 @@ impl WikiHub {
         let Some(project) = project else {
             return;
         };
+        project.refresh_pending.store(true, Ordering::Release);
         if project.refreshing.swap(true, Ordering::AcqRel) {
             return;
         }
         let hub = Arc::clone(self);
         let owner = owner.to_owned();
         let flag = Arc::clone(&project.refreshing);
+        let worker_flag = Arc::clone(&flag);
+        let pending_flag = Arc::clone(&project.refresh_pending);
         if thread::Builder::new()
             .name("wiki-ingest".into())
             .spawn(move || {
-                let refreshed = refresh_project_sources(&project, 1_000);
-                let result = refreshed.and(hub.publish(&owner));
-                if result.is_err() {
-                    let _ = project.store.put_json(
-                        "wiki:ingest_status",
-                        &json!({"status":"failed", "reason":"source_refresh_failed"}),
-                    );
-                }
-                project.refreshing.store(false, Ordering::Release);
-                let pending = project
-                    .store
-                    .get_json("wiki:history_status")
-                    .ok()
-                    .flatten()
-                    .and_then(|status| status["remaining_in_batch"].as_u64())
-                    .unwrap_or(0);
-                if result.is_ok() && pending > 0 {
-                    hub.schedule_refresh(&owner);
+                let mut error_retry_remaining = 1;
+                loop {
+                    pending_flag.store(false, Ordering::Release);
+                    let result =
+                        refresh_project_sources(&project, 1_000).and_then(|()| hub.publish(&owner));
+                    if result.is_err() {
+                        let _ = project.store.put_json(
+                            "wiki:ingest_status",
+                            &json!({"status":"failed", "reason":"source_refresh_failed"}),
+                        );
+                        if error_retry_remaining > 0
+                            && project.freshness.activity_state() != "dormant"
+                            && pending_flag.swap(false, Ordering::AcqRel)
+                        {
+                            error_retry_remaining -= 1;
+                            continue;
+                        }
+                        worker_flag.store(false, Ordering::Release);
+                        return;
+                    }
+                    if project.freshness.activity_state() == "dormant" {
+                        pending_flag.store(true, Ordering::Release);
+                        worker_flag.store(false, Ordering::Release);
+                        return;
+                    }
+                    let pending_history = project
+                        .store
+                        .get_json("wiki:history_status")
+                        .ok()
+                        .flatten()
+                        .and_then(|status| status["remaining_in_batch"].as_u64())
+                        .unwrap_or(0)
+                        > 0;
+                    if pending_flag.swap(false, Ordering::AcqRel) || pending_history {
+                        continue;
+                    }
+                    worker_flag.store(false, Ordering::Release);
+                    if !pending_flag.swap(false, Ordering::AcqRel)
+                        || worker_flag
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        return;
+                    }
                 }
             })
             .is_err()
@@ -447,6 +654,42 @@ fn applicable_to(page: &Value, owner: &str, branch: Option<&str>, head: Option<&
     project_matches && branch_matches && commit_matches
 }
 
+fn native_page_for(project: &Project, owner: &str, page_id: &str) -> Result<Option<Value>> {
+    let pointer = project
+        .store
+        .list_wiki_pages(100_001)?
+        .into_iter()
+        .find(|pointer| pointer["page_id"].as_str() == Some(page_id));
+    let Some(pointer) = pointer else {
+        return Ok(None);
+    };
+    let revision = pointer["revision"]
+        .as_str()
+        .ok_or_else(|| anyhow!("invalid wiki pointer"))?;
+    let mut page = project
+        .store
+        .get_wiki_revision(page_id, revision)?
+        .ok_or_else(|| anyhow!("missing wiki revision"))?;
+    if !page.is_object() {
+        bail!("wiki revision is not a structured page");
+    }
+    page["page_id"] = json!(page_id);
+    page["revision"] = json!(revision);
+    page["project_id"] = json!(owner);
+    page["repository_id"] = json!(project.repository_id);
+    page["current"] = json!(page.get("superseded_by").is_none());
+    page["prompt_injection_signals"] = json!(sanitize_text(&serde_json::to_string(&page)?).2);
+    Ok(Some(page))
+}
+
+fn same_store_location(left: &StateStore, right: &StateStore) -> bool {
+    let left = std::fs::canonicalize(&left.paths().overlay)
+        .unwrap_or_else(|_| left.paths().overlay.clone());
+    let right = std::fs::canonicalize(&right.paths().overlay)
+        .unwrap_or_else(|_| right.paths().overlay.clone());
+    left == right
+}
+
 fn source_revision_key(pointer: &Value) -> String {
     format!(
         "wiki:source_revision:{}:{}",
@@ -460,6 +703,7 @@ fn source_status(
     store: &StateStore,
     index: &ProjectIndex,
     freshness: &FreshnessState,
+    owner_freshness: &FreshnessState,
 ) -> &'static str {
     if page.get("superseded_by").is_some() {
         return "superseded";
@@ -485,7 +729,12 @@ fn source_status(
                     .as_str()
                     .is_some_and(|id| id.starts_with("corpus-"))
         })
-    }) && (freshness.dirty.load(Ordering::Acquire) || freshness.watcher_requires_verification())
+    }) && (freshness.dirty.load(Ordering::Acquire)
+        || freshness.watcher_requires_verification()
+        || freshness.activity_state() == "dormant"
+        || owner_freshness.dirty.load(Ordering::Acquire)
+        || owner_freshness.watcher_requires_verification()
+        || owner_freshness.activity_state() == "dormant")
     {
         return "unverified";
     }
@@ -685,20 +934,18 @@ fn put_source(store: &StateStore, source: &Value) -> Result<()> {
     if let Some(digest) = source.get("corpus_digest") {
         pointer["corpus_digest"] = digest.clone();
     }
+    let current_key = format!(
+        "wiki:source_current:{}",
+        source["source_id"].as_str().unwrap_or_default()
+    );
+    if store.get_json(&current_key)?.as_ref() == Some(&pointer) {
+        return Ok(());
+    }
     let revision_key = source_revision_key(&pointer);
     let immutable = store
         .get_json(&revision_key)?
         .unwrap_or_else(|| source.clone());
-    store.put_json_batch(&[
-        (revision_key, immutable),
-        (
-            format!(
-                "wiki:source_current:{}",
-                source["source_id"].as_str().unwrap_or_default()
-            ),
-            pointer,
-        ),
-    ])
+    store.put_json_batch(&[(revision_key, immutable), (current_key, pointer)])
 }
 
 fn source_documents(owner: &str, repository_id: &str, source: &Value) -> Vec<Value> {
@@ -1201,14 +1448,217 @@ mod tests {
     }
 
     fn publish(engine: &ProjectEngine, expected: Option<&str>, summary: &str) -> Value {
+        publish_page(engine, "quasarwiki", expected, summary)
+    }
+
+    fn publish_page(
+        engine: &ProjectEngine,
+        page_id: &str,
+        expected: Option<&str>,
+        summary: &str,
+    ) -> Value {
         let index = engine.index();
         let (text, _) = index.file_content("policy.md", 4096).unwrap();
-        let request=serde_json::from_value(json!({"mode":"wiki_upsert","wiki":{
-            "page_id":"quasarwiki","expected_revision":expected,"title":"quasarwiki policy","summary":summary,
+        let request = serde_json::from_value(json!({"mode":"wiki_upsert","wiki":{
+            "page_id":page_id,"expected_revision":expected,"title":format!("{page_id} policy"),"summary":summary,
             "claims":[{"text":summary,"status":"verified","citations":[{"source_id":"policy"}]}],
             "sources":[{"id":"policy","kind":"markdown","path":"policy.md","sha256":sha256_text(&text),"fingerprint":index.snapshot_fingerprint("policy.md")}]
         }})).unwrap();
         serde_json::from_slice(&engine.context_memory(&request).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn wiki_noop_publication_and_peer_projection_ownership_are_stable() {
+        let fixture = tempdir().unwrap();
+        let hub = Arc::new(WikiHub::new().unwrap());
+        fs::create_dir_all(fixture.path().join("source")).unwrap();
+        fs::create_dir_all(fixture.path().join("peer")).unwrap();
+        fs::create_dir_all(fixture.path().join("alternate")).unwrap();
+        fs::write(fixture.path().join("source/policy.md"), "source policy\n").unwrap();
+        fs::write(fixture.path().join("peer/policy.md"), "peer policy\n").unwrap();
+        fs::write(
+            fixture.path().join("alternate/policy.md"),
+            "alternate policy\n",
+        )
+        .unwrap();
+        let mut source = ProjectEngine::build_with_state(
+            fixture.path().join("source"),
+            fixture.path().join("source-state"),
+            "source",
+        )
+        .unwrap();
+        let mut peer = ProjectEngine::build_with_state(
+            fixture.path().join("peer"),
+            fixture.path().join("peer-state"),
+            "peer",
+        )
+        .unwrap();
+        let mut alternate = ProjectEngine::build_with_state(
+            fixture.path().join("alternate"),
+            fixture.path().join("alternate-state"),
+            "alternate",
+        )
+        .unwrap();
+        source.repository_id = "same-repository".to_owned();
+        peer.repository_id = "same-repository".to_owned();
+        alternate.repository_id = "same-repository".to_owned();
+        source.attach_wiki_hub(Arc::clone(&hub)).unwrap();
+        peer.attach_wiki_hub(Arc::clone(&hub)).unwrap();
+        alternate.attach_wiki_hub(Arc::clone(&hub)).unwrap();
+        hub.refresh("source", 10).unwrap();
+        hub.refresh("peer", 10).unwrap();
+        hub.refresh("alternate", 10).unwrap();
+
+        let first = publish(&source, None, "source projection is 400ms");
+        let peer_hit = hub
+            .search_for_checkout("quasarwiki", None, Some("peer"), 10, false)
+            .unwrap();
+        assert!(peer_hit.iter().any(|hit| hit["project_id"] == "peer"));
+        source
+            .freshness
+            .set_activity_age_for_test(PROJECT_DORMANT_MS);
+        let dormant_hit = hub
+            .search_for_checkout("quasarwiki", None, Some("peer"), 10, false)
+            .unwrap();
+        assert!(
+            dormant_hit
+                .iter()
+                .any(|hit| { hit["project_id"] == "peer" && hit["source_status"] == "unverified" }),
+            "{dormant_hit:?}"
+        );
+        source.freshness.note_foreground();
+
+        hub.publish("source").unwrap();
+        let snapshot = hub
+            .snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let generation = hub.generation();
+        hub.publish("source").unwrap();
+        let unchanged = hub
+            .snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(hub.generation(), generation);
+        assert!(Arc::ptr_eq(&snapshot.index, &unchanged.index));
+
+        publish(&alternate, None, "alternate projection is 500ms");
+        hub.unregister("alternate").unwrap();
+        let peer_hit = hub
+            .search_for_checkout("quasarwiki", None, Some("peer"), 10, false)
+            .unwrap();
+        assert!(
+            peer_hit
+                .iter()
+                .any(|hit| { hit["summary"] == "source projection is 400ms" })
+        );
+        hub.unregister("source").unwrap();
+        let peer_hit = hub
+            .search_for_checkout("quasarwiki", None, Some("peer"), 10, false)
+            .unwrap();
+        assert!(!peer_hit.iter().any(|hit| hit["project_id"] == "peer"));
+        source.attach_wiki_hub(Arc::clone(&hub)).unwrap();
+        hub.publish("source").unwrap();
+
+        publish_page(&peer, "peer-only", None, "peer unrelated policy");
+        hub.publish("peer").unwrap();
+        let peer_hit = hub
+            .search_for_checkout("quasarwiki", None, Some("peer"), 10, false)
+            .unwrap();
+        assert!(
+            peer_hit
+                .iter()
+                .any(|hit| { hit["summary"] == "source projection is 400ms" })
+        );
+
+        let peer_native = publish(&peer, None, "peer native policy is 250ms");
+        publish(
+            &source,
+            first["revision"].as_str(),
+            "source updated projection is 300ms",
+        );
+        hub.publish("source").unwrap();
+        let peer_hit = hub
+            .search_for_checkout("quasarwiki", None, Some("peer"), 10, false)
+            .unwrap();
+        assert!(peer_hit.iter().any(|hit| {
+            hit["project_id"] == "peer" && hit["summary"] == "peer native policy is 250ms"
+        }));
+
+        hub.unregister("source").unwrap();
+        let peer_hit = hub
+            .search_for_checkout("quasarwiki", None, Some("peer"), 10, false)
+            .unwrap();
+        assert!(peer_hit.iter().any(|hit| {
+            hit["project_id"] == "peer" && hit["summary"] == "peer native policy is 250ms"
+        }));
+        assert_ne!(peer_native["revision"], Value::Null);
+    }
+
+    #[test]
+    fn deferred_wiki_refresh_resumes_after_foreground_wake() {
+        let fixture = tempdir().unwrap();
+        let hub = Arc::new(WikiHub::new().unwrap());
+        let engine = engine(
+            &fixture.path().join("deferred"),
+            &fixture.path().join("deferred-state"),
+            "deferred-owner",
+            &hub,
+        );
+        let project = hub
+            .projects
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("deferred-owner")
+            .unwrap()
+            .clone();
+        let startup_deadline = Instant::now() + StdDuration::from_secs(2);
+        while project.refreshing.load(Ordering::Acquire) && Instant::now() < startup_deadline {
+            thread::sleep(StdDuration::from_millis(5));
+        }
+        thread::sleep(WIKI_MONITOR_INTERVAL.saturating_mul(2));
+
+        project
+            .freshness
+            .set_activity_age_for_test(PROJECT_DORMANT_MS);
+        project.refresh_pending.store(true, Ordering::Release);
+        project.refreshing.store(true, Ordering::Release);
+        let attempts_before = project
+            .freshness
+            .wiki_publication_attempted
+            .load(Ordering::Acquire);
+        thread::sleep(WIKI_MONITOR_INTERVAL.saturating_mul(2));
+        assert_eq!(
+            project
+                .freshness
+                .wiki_publication_attempted
+                .load(Ordering::Acquire),
+            attempts_before
+        );
+
+        project.refreshing.store(false, Ordering::Release);
+        project.freshness.note_foreground();
+        let wake_deadline = Instant::now() + StdDuration::from_secs(2);
+        while project
+            .freshness
+            .wiki_publication_attempted
+            .load(Ordering::Acquire)
+            == attempts_before
+            && Instant::now() < wake_deadline
+        {
+            thread::sleep(StdDuration::from_millis(5));
+        }
+        assert!(
+            project
+                .freshness
+                .wiki_publication_attempted
+                .load(Ordering::Acquire)
+                > attempts_before
+        );
+        assert!(Instant::now() < wake_deadline);
+        drop(engine);
     }
 
     #[tokio::test]
@@ -1328,7 +1778,8 @@ mod tests {
         git(&feature_root, &["commit", "-m", "feature policy"]);
 
         let hub = Arc::new(WikiHub::new().unwrap());
-        let shared = Arc::new(StateStore::open(fixture.path().join("shared-wiki")).unwrap());
+        let shared_wiki_path = fixture.path().join("shared-wiki");
+        let shared = Arc::new(StateStore::open(&shared_wiki_path).unwrap());
         let mut main = ProjectEngine::build_with_state(
             &main_root,
             fixture.path().join("main-state"),
@@ -1343,7 +1794,7 @@ mod tests {
         .unwrap();
         for engine in [&mut main, &mut feature] {
             engine.repository_id = "repo-test".to_owned();
-            engine.wiki_store = Arc::clone(&shared);
+            engine.wiki_store = Arc::new(StateStore::open(&shared_wiki_path).unwrap());
         }
         main.attach_wiki_hub(Arc::clone(&hub)).unwrap();
         feature.attach_wiki_hub(Arc::clone(&hub)).unwrap();
@@ -1394,6 +1845,18 @@ mod tests {
         let updated: Value =
             serde_json::from_slice(&feature.context_memory(&update).unwrap()).unwrap();
         let new_revision = updated["revision"].as_str().unwrap();
+        hub.publish("feature-checkout").unwrap();
+        let published = hub
+            .snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            published.documents[&("main-checkout".to_owned(), "quasarwiki".to_owned())]["revision"],
+            new_revision,
+            "projections={:?}",
+            published.projections
+        );
 
         let main_projection = hub
             .search_for_checkout("quasarwiki", None, Some("main-checkout"), 10, false)

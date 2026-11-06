@@ -392,12 +392,21 @@ postings, Git-diff snapshots, and the shared wiki search index remain in use.
 ## Freshness
 
 A `notify` watcher coalesces events for 50 ms and owns ordinary dirty-state
-transitions. There is no fixed two-second request-path content hash. When the
-native watcher is unavailable, a metadata-snapshot fallback traverses only
-non-ignored regular files, does not follow symlinks, and compares bounded file
-metadata fingerprints at a two-second interval by default. The interval can be
-set with `MCP_CONTEXT_WATCH_POLL_INTERVAL_SECS` (1–300 seconds). Watcher
-errors conservatively dirty the project. Explicit `changed_files` queues
+transitions. Native registration watches the root and each non-ignored directory
+without following symlinks; newly created or renamed directory trees are
+registered before their event can be consumed, and topology changes request a
+full verification. When native registration is unavailable, metadata fallback
+compares fingerprints for non-ignored regular files. Its interval defaults to
+two seconds while active, backs off up to five minutes while idle, and suspends
+scans while dormant. Projects are active for 60 seconds after foreground
+repository work, idle until 10 minutes, and dormant thereafter. The base
+interval remains configurable with `MCP_CONTEXT_WATCH_POLL_INTERVAL_SECS`
+(1–300 seconds); idle backoff does not extend the base freshness age used by
+foreground requests. Metrics and status reads do not wake projects. Foreground
+work wakes a dormant project and authoritatively verifies an overdue snapshot
+before it can report `current`. Dormant cross-project wiki hits are
+`unverified` until checked.
+Watcher errors conservatively dirty the project. Explicit `changed_files` queues
 verification. Pack requests wait for known pending changes or watcher-failure
 verification before retrieval, using their cancellation control while waiting.
 Watcher events schedule background refreshes, and a completed refresh atomically
@@ -419,7 +428,10 @@ and event-channel disconnection mark the project for background full
 verification. A later successful metadata snapshot may recover the fallback
 backend, while the dirty/overflow journal remains fail-closed until that full
 verification completes. Administrative metrics expose only bounded backend and
-failure categories, without raw errors or paths. Available-snapshot lookup
+failure categories, metadata scan count/duration, project activity state, and a
+bounded last incremental-fallback category plus wiki publication
+attempted/skipped/completed counts, without raw errors or paths.
+Available-snapshot lookup
 responses report `unverified` while verification is pending. A failed strict
 pack verification returns the retryable
 `context_pack freshness unavailable` error.
@@ -533,7 +545,11 @@ claims carry an attempt number and a ten-minute lease. Unknown rights metadata,
 hash mismatch, malformed page locations, and sensitive text prevent import.
 
 A registry-authorized `WikiHub` publishes one deterministic Tantivy snapshot,
-with keyed document metadata and per-project source views. Query work consists
+with keyed document metadata and per-project source views. A candidate projection
+is compared with the immutable current document map before building Tantivy; an
+unchanged candidate leaves both the index and shared freshness generation alone.
+Concurrent source changes coalesce into a pending refresh pass that reads the
+latest project index. Query work consists
 of lexical retrieval, bounded point lookups, and indexed fingerprint checks;
 it performs no repository scan, Git command, network access, or model call.
 Publication is serialized and occurs on write/background paths. The projection

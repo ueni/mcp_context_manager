@@ -77,7 +77,7 @@ use context_index::{
 use context_store::{ReferenceValidation, StateStore};
 use notify::{
     Config as NotifyConfig, ErrorKind as NotifyErrorKind, Event, EventKind, RecommendedWatcher,
-    RecursiveMode, Watcher,
+    RecursiveMode, Watcher, event::ModifyKind,
 };
 use regex::Regex;
 use schemars::JsonSchema;
@@ -887,6 +887,19 @@ struct FreshnessState {
     dirty: AtomicBool,
     last_event_ms: AtomicU64,
     last_poll_ms: AtomicU64,
+    last_metadata_scan_ms: AtomicU64,
+    last_foreground_ms: AtomicU64,
+    #[cfg(test)]
+    activity_age_override_ms: AtomicU64,
+    metadata_scan_count: AtomicU64,
+    metadata_scan_micros: AtomicU64,
+    wiki_publication_attempted: AtomicU64,
+    wiki_publication_skipped: AtomicU64,
+    wiki_publication_completed: AtomicU64,
+    incremental_fallback_reason: Mutex<Option<&'static str>>,
+    activity_generation: AtomicU64,
+    activity_lock: Mutex<()>,
+    activity_wake: Condvar,
     generation: AtomicU64,
     event_epoch: AtomicU64,
     changed_paths: Mutex<BTreeSet<String>>,
@@ -1268,15 +1281,126 @@ const WATCHER_FAILURE_DISCONNECT: u8 = 6;
 const WATCHER_FAILURE_STARTUP_TIMEOUT: u8 = 7;
 const WATCHER_STARTUP_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const WATCHER_POLL_INTERVAL_SECS: u64 = 2;
+const PROJECT_ACTIVE_MS: u64 = 60_000;
+const PROJECT_DORMANT_MS: u64 = 600_000;
+const PROJECT_MAX_IDLE_POLL_SECS: u64 = 300;
 const REFRESH_STABILITY_ATTEMPTS: usize = 3;
 
 impl FreshnessState {
+    #[cfg(test)]
+    fn note_foreground(&self) {
+        let _guard = self
+            .activity_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.note_foreground_locked();
+    }
+
+    fn note_foreground_locked(&self) {
+        self.last_foreground_ms
+            .store(monotonic_millis(), Ordering::Release);
+        #[cfg(test)]
+        self.activity_age_override_ms.store(0, Ordering::Release);
+        self.activity_generation.fetch_add(1, Ordering::AcqRel);
+        self.activity_wake.notify_all();
+    }
+
+    fn activity_age_ms(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let override_ms = self.activity_age_override_ms.load(Ordering::Acquire);
+            if override_ms > 0 {
+                return override_ms;
+            }
+        }
+        monotonic_millis().saturating_sub(self.last_foreground_ms.load(Ordering::Acquire))
+    }
+
+    #[cfg(test)]
+    fn set_activity_age_for_test(&self, age_ms: u64) {
+        self.activity_age_override_ms
+            .store(age_ms, Ordering::Release);
+    }
+
+    fn activity_state(&self) -> &'static str {
+        Self::activity_state_for_age(self.activity_age_ms())
+    }
+
+    fn activity_state_for_age(age: u64) -> &'static str {
+        match age {
+            age if age < PROJECT_ACTIVE_MS => "active",
+            age if age < PROJECT_DORMANT_MS => "idle",
+            _ => "dormant",
+        }
+    }
+
+    fn metadata_poll_interval(&self, base: StdDuration) -> Option<StdDuration> {
+        Self::metadata_poll_interval_for_age(base, self.activity_age_ms())
+    }
+
+    fn metadata_poll_interval_for_age(base: StdDuration, idle_ms: u64) -> Option<StdDuration> {
+        if idle_ms >= PROJECT_DORMANT_MS {
+            return None;
+        }
+        if idle_ms < PROJECT_ACTIVE_MS {
+            return Some(base);
+        }
+        let idle_minutes = (idle_ms - PROJECT_ACTIVE_MS) / PROJECT_ACTIVE_MS;
+        let multiplier = 1u64
+            .checked_shl(idle_minutes.min(8) as u32)
+            .unwrap_or(u64::MAX);
+        Some(
+            base.saturating_mul(multiplier as u32)
+                .min(StdDuration::from_secs(PROJECT_MAX_IDLE_POLL_SECS)),
+        )
+    }
+
+    fn wait_for_activity_or_timeout(
+        &self,
+        stop: &AtomicBool,
+        observed_generation: u64,
+        timeout: Option<StdDuration>,
+    ) -> bool {
+        let Ok(guard) = self.activity_lock.lock() else {
+            return true;
+        };
+        let notified = match timeout {
+            Some(timeout) => self
+                .activity_wake
+                .wait_timeout_while(guard, timeout, |_| {
+                    !stop.load(Ordering::Acquire)
+                        && self.activity_generation.load(Ordering::Acquire) == observed_generation
+                })
+                .map(|(guard, _)| guard)
+                .ok(),
+            None => self
+                .activity_wake
+                .wait_while(guard, |_| {
+                    !stop.load(Ordering::Acquire)
+                        && self.activity_generation.load(Ordering::Acquire) == observed_generation
+                })
+                .ok(),
+        };
+        drop(notified);
+        stop.load(Ordering::Acquire)
+            || self.activity_generation.load(Ordering::Acquire) != observed_generation
+    }
+
     fn watcher_requires_verification(&self) -> bool {
         self.watcher_status.load(Ordering::Acquire) != WATCHER_HEALTHY
     }
 
     fn watcher_failed(&self) -> bool {
         self.watcher_status.load(Ordering::Acquire) == WATCHER_FAILED
+    }
+
+    fn foreground_verification_due(&self) -> bool {
+        if self.activity_state() == "dormant" {
+            return true;
+        }
+        self.watcher_backend.load(Ordering::Acquire) == WATCHER_BACKEND_METADATA
+            && monotonic_millis().saturating_sub(self.last_metadata_scan_ms.load(Ordering::Acquire))
+                >= watch_poll_interval().as_millis() as u64
     }
 }
 
@@ -1370,11 +1494,12 @@ fn record_watcher_event(
         epoch.fetch_add(1, Ordering::AcqRel);
     }
     drop(journal);
-    if let Some(refresh) = freshness
-        .wiki_refresh
-        .lock()
-        .ok()
-        .and_then(|refresh| refresh.as_ref().and_then(std::sync::Weak::upgrade))
+    if freshness.activity_state() != "dormant"
+        && let Some(refresh) = freshness
+            .wiki_refresh
+            .lock()
+            .ok()
+            .and_then(|refresh| refresh.as_ref().and_then(std::sync::Weak::upgrade))
     {
         let _ = refresh.request_background(&[]);
     }
@@ -1382,6 +1507,7 @@ fn record_watcher_event(
 
 struct WatchGuard {
     stop: Arc<AtomicBool>,
+    wake: Arc<FreshnessState>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -2197,11 +2323,16 @@ impl WatchGuard {
         match handle {
             Ok(handle) => Self {
                 stop,
+                wake: freshness,
                 thread: Some(handle),
             },
             Err(_) => {
                 mark_watcher_failed_with_reason(&freshness, WATCHER_FAILURE_THREAD);
-                Self { stop, thread: None }
+                Self {
+                    stop,
+                    wake: freshness,
+                    thread: None,
+                }
             }
         }
     }
@@ -2209,7 +2340,15 @@ impl WatchGuard {
 
 impl Drop for WatchGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        {
+            let _guard = self
+                .wake
+                .activity_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.stop.store(true, Ordering::Release);
+            self.wake.activity_wake.notify_all();
+        }
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -3291,6 +3430,7 @@ impl ProjectEngine {
         request: &ContextPackRequest,
         control: Option<&WorkControl>,
     ) -> Result<(bool, bool)> {
+        self.verify_foreground_freshness(control)?;
         self.ensure_fresh_controlled(request, control)?;
         if self.freshness.watcher_requires_verification() {
             return self.refresh_index_with_paths(true, &[], control);
@@ -3302,6 +3442,26 @@ impl ProjectEngine {
             return self.refresh_index_with_paths(true, &[], control);
         }
         Ok((false, false))
+    }
+
+    fn verify_foreground_freshness(&self, control: Option<&WorkControl>) -> Result<()> {
+        let verification_due = {
+            let _activity = self
+                .freshness
+                .activity_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = self.freshness.foreground_verification_due();
+            if due {
+                record_watcher_event(&self.freshness, std::iter::empty(), false);
+            }
+            self.freshness.note_foreground_locked();
+            due
+        };
+        if verification_due {
+            self.refresh_index_with_paths(true, &[], control)?;
+        }
+        Ok(())
     }
 
     fn ensure_fresh_controlled(
@@ -3472,13 +3632,13 @@ impl ProjectEngine {
             }
 
             let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
-            let (replacement, incremental, fallback) =
+            let (replacement, incremental, fallback, fallback_reason) =
                 if !require_full_rebuild && !overflow && !changed_paths.is_empty() {
                     match current.refresh_paths_controlled(&changed_paths, control) {
                         Ok(incremental) if incremental.stats().refresh_signature == signature => {
-                            (incremental, true, false)
+                            (incremental, true, false, None)
                         }
-                        _ => (
+                        Ok(_) => (
                             ProjectIndex::build_for_project_controlled(
                                 current.root(),
                                 Some(&shared.project_id),
@@ -3486,6 +3646,17 @@ impl ProjectEngine {
                             )?,
                             false,
                             true,
+                            Some("incremental_signature_mismatch"),
+                        ),
+                        Err(_) => (
+                            ProjectIndex::build_for_project_controlled(
+                                current.root(),
+                                Some(&shared.project_id),
+                                control,
+                            )?,
+                            false,
+                            true,
+                            Some("incremental_rejected"),
                         ),
                     }
                 } else {
@@ -3497,6 +3668,13 @@ impl ProjectEngine {
                         )?,
                         false,
                         overflow || require_full_rebuild,
+                        if overflow {
+                            Some("journal_overflow")
+                        } else if require_full_rebuild {
+                            Some("unstable_events")
+                        } else {
+                            Some("missing_change_paths")
+                        },
                     )
                 };
             #[cfg(test)]
@@ -3571,6 +3749,9 @@ impl ProjectEngine {
                     .fetch_add(1, Ordering::Relaxed);
             }
             if fallback {
+                if let Ok(mut reason) = shared.freshness.incremental_fallback_reason.lock() {
+                    *reason = fallback_reason;
+                }
                 shared
                     .metrics
                     .incremental_fallbacks
@@ -3831,6 +4012,8 @@ impl ProjectEngine {
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
+            let control = CURRENT_WORK_CONTROL.with(|slot| slot.borrow().clone());
+            self.verify_foreground_freshness(control.as_ref())?;
             self.refresh_index(false)?;
             let (index, generation) = self.index_generation();
             let refresh_signature = index.stats().refresh_signature.clone();
@@ -4267,6 +4450,11 @@ impl ProjectEngine {
                 request.project_id.as_deref(),
                 request.root_uri.as_deref(),
             )?;
+            if request.mode == "wiki"
+                && matches!(request.action.as_str(), "refresh" | "history_deepen")
+            {
+                self.verify_foreground_freshness(control)?;
+            }
             let value = if request.mode == "wiki" {
                 wiki::admin(self, request)?
             } else {
@@ -4298,6 +4486,8 @@ impl ProjectEngine {
         if let Some(text) = static_resource_text(&uri)? {
             return Ok(text);
         }
+        let control = CURRENT_WORK_CONTROL.with(|slot| slot.borrow().clone());
+        self.verify_foreground_freshness(control.as_ref())?;
         let index = self.index();
         let value = match uri.as_str() {
             "repo://summary" => serde_json::to_string(&self.repo_summary()?)?,
@@ -4927,9 +5117,17 @@ fn try_recommended_watcher(
             return false;
         }
     };
-    if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
+    if let Err(error) = watcher.watch(root, RecursiveMode::NonRecursive) {
         record_watcher_failure(freshness, WATCHER_FAILURE_SETUP_REGISTER);
         record_watcher_error_detail(freshness, &error);
+        return false;
+    }
+    let mut watched_directories = BTreeSet::from([root.to_path_buf()]);
+    if let Err(_error) =
+        register_indexable_directories(&mut watcher, root, root, &mut watched_directories)
+    {
+        record_watcher_failure(freshness, WATCHER_FAILURE_SETUP_REGISTER);
+        record_watcher_registration_error(freshness, &_error);
         return false;
     }
     freshness
@@ -4937,8 +5135,100 @@ fn try_recommended_watcher(
         .store(WATCHER_BACKEND_NATIVE, Ordering::Release);
     mark_watcher_healthy(freshness);
     drop(sender);
-    watcher_loop(&receiver, root, freshness, stop);
-    true
+    watcher_loop(
+        &receiver,
+        &mut watcher,
+        &mut watched_directories,
+        root,
+        freshness,
+        stop,
+    )
+}
+
+fn register_indexable_directories(
+    watcher: &mut RecommendedWatcher,
+    repository_root: &std::path::Path,
+    subtree: &std::path::Path,
+    watched: &mut BTreeSet<std::path::PathBuf>,
+) -> Result<()> {
+    visit_indexable_directories(repository_root, subtree, |directory| {
+        if watched.insert(directory.to_path_buf())
+            && let Err(error) = watcher.watch(directory, RecursiveMode::NonRecursive)
+        {
+            watched.remove(directory);
+            return Err(error.into());
+        }
+        Ok(())
+    })
+}
+
+fn visit_indexable_directories(
+    repository_root: &std::path::Path,
+    subtree: &std::path::Path,
+    mut register: impl FnMut(&std::path::Path) -> Result<()>,
+) -> Result<()> {
+    let mut pending = vec![subtree.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(relative) = directory.strip_prefix(repository_root) else {
+            continue;
+        };
+        if !relative.as_os_str().is_empty() && is_ignored_repository_path(relative) {
+            continue;
+        }
+        let _metadata = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        register(&directory)?;
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let child = entry.path();
+            let Ok(child_relative) = child.strip_prefix(repository_root) else {
+                continue;
+            };
+            if is_ignored_repository_path(child_relative) {
+                continue;
+            }
+            match std::fs::symlink_metadata(&child) {
+                Ok(metadata) if metadata.file_type().is_dir() => pending.push(child),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn indexable_directories(
+    repository_root: &std::path::Path,
+    subtree: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>> {
+    let entries = WalkDir::new(subtree)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.path() == repository_root {
+                return true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(repository_root) else {
+                return false;
+            };
+            !is_ignored_repository_path(relative)
+                && (entry.depth() == 0 || !entry.file_type().is_symlink())
+        });
+    let mut directories = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        directories.push(entry.path().to_path_buf());
+    }
+    Ok(directories)
 }
 
 fn try_polling_watcher(
@@ -4955,19 +5245,50 @@ fn metadata_polling_watcher(
     stop: &Arc<AtomicBool>,
     interval: StdDuration,
 ) -> bool {
+    let mut observed_activity = freshness.activity_generation.load(Ordering::Acquire);
+    let initial_scan_started = Instant::now();
     let Ok(mut snapshot) = metadata_snapshot(root, stop) else {
         mark_watcher_failed_with_reason(freshness, WATCHER_FAILURE_STARTUP_SNAPSHOT);
         return false;
     };
+    freshness
+        .metadata_scan_count
+        .fetch_add(1, Ordering::Relaxed);
+    freshness.metadata_scan_micros.fetch_add(
+        u64::try_from(initial_scan_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    freshness
+        .last_poll_ms
+        .store(now_millis(), Ordering::Release);
     // A snapshot taken before the baseline index scan can race with a source
     // mutation.  Force one authoritative verification epoch before declaring
     // the fallback healthy so that the baseline cannot erase that race.
     record_watcher_event(freshness, std::iter::empty(), true);
+    freshness
+        .last_metadata_scan_ms
+        .store(monotonic_millis(), Ordering::Release);
     mark_watcher_backend(freshness, WATCHER_BACKEND_METADATA);
     while !stop.load(Ordering::Acquire) {
-        if wait_for_watcher_stop(stop, interval) {
+        let poll_interval = freshness.metadata_poll_interval(interval);
+        if freshness.wait_for_activity_or_timeout(stop, observed_activity, poll_interval) {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            observed_activity = freshness.activity_generation.load(Ordering::Acquire);
+            let last_foreground_ms = freshness.last_foreground_ms.load(Ordering::Acquire);
+            if monotonic_millis().saturating_sub(last_foreground_ms) < PROJECT_DORMANT_MS {
+                // A foreground request woke the scanner. Verify before its caller
+                // can treat the prior snapshot as current.
+            } else {
+                continue;
+            }
+        } else if poll_interval.is_none() {
+            continue;
+        } else if stop.load(Ordering::Acquire) {
             break;
         }
+        let scan_started = Instant::now();
         let next = match metadata_snapshot(root, stop) {
             Ok(next) => next,
             Err(_) => {
@@ -4978,11 +5299,24 @@ fn metadata_polling_watcher(
         if freshness.watcher_status.load(Ordering::Acquire) == WATCHER_FAILED {
             mark_watcher_backend(freshness, WATCHER_BACKEND_METADATA);
         }
+        freshness
+            .metadata_scan_count
+            .fetch_add(1, Ordering::Relaxed);
+        freshness.metadata_scan_micros.fetch_add(
+            u64::try_from(scan_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        freshness
+            .last_poll_ms
+            .store(now_millis(), Ordering::Release);
         if next != snapshot {
             let changed_paths = changed_snapshot_paths(&snapshot, &next);
             record_watcher_event(freshness, changed_paths, false);
             snapshot = next;
         }
+        freshness
+            .last_metadata_scan_ms
+            .store(monotonic_millis(), Ordering::Release);
     }
     true
 }
@@ -5016,18 +5350,6 @@ fn watch_poll_interval() -> StdDuration {
         .filter(|seconds| (1..=300).contains(seconds))
         .unwrap_or(WATCHER_POLL_INTERVAL_SECS);
     StdDuration::from_secs(seconds)
-}
-
-fn wait_for_watcher_stop(stop: &AtomicBool, duration: StdDuration) -> bool {
-    let deadline = Instant::now() + duration;
-    while !stop.load(Ordering::Acquire) {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        thread::sleep(remaining.min(StdDuration::from_millis(100)));
-    }
-    true
 }
 
 fn metadata_snapshot(
@@ -5093,16 +5415,24 @@ fn metadata_snapshot(
 
 fn watcher_loop(
     receiver: &std::sync::mpsc::Receiver<notify::Result<Event>>,
+    watcher: &mut RecommendedWatcher,
+    watched_directories: &mut BTreeSet<std::path::PathBuf>,
     root: &std::path::Path,
     freshness: &FreshnessState,
     stop: &AtomicBool,
-) {
+) -> bool {
     while !stop.load(Ordering::Acquire) {
         match receiver.recv_timeout(StdDuration::from_millis(100)) {
             Ok(Ok(event)) if matches!(event.kind, EventKind::Access(_)) => {}
+            Ok(Ok(event)) if event.need_rescan() => {
+                record_watcher_event(freshness, std::iter::empty(), true);
+            }
             Ok(Ok(event)) if event.paths.iter().any(|path| source_event_path(root, path)) => {
                 let mut changed_paths = Vec::new();
                 let mut overflow = event.need_rescan();
+                let folder_created = matches!(event.kind, EventKind::Create(_));
+                let folder_removed = matches!(event.kind, EventKind::Remove(_));
+                let renamed = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)));
                 for path in &event.paths {
                     let Ok(relative) = path.strip_prefix(root) else {
                         overflow = true;
@@ -5110,6 +5440,33 @@ fn watcher_loop(
                     };
                     if !is_ignored_repository_path(relative) {
                         changed_paths.push(relative.to_string_lossy().replace('\\', "/"));
+                        let is_directory = std::fs::symlink_metadata(path)
+                            .is_ok_and(|metadata| metadata.file_type().is_dir());
+                        let watched_subtree = watched_directories
+                            .iter()
+                            .any(|directory| directory.starts_with(path));
+                        let directory_removed = (folder_removed || renamed) && watched_subtree;
+                        let directory_added =
+                            (folder_created || folder_removed || renamed) && is_directory;
+                        let topology_changed = directory_removed
+                            || directory_added
+                            || (folder_removed && watched_subtree);
+                        if directory_removed {
+                            unwatch_directory_subtree(watcher, path, watched_directories);
+                        }
+                        if directory_added
+                            && let Err(_error) = register_indexable_directories(
+                                watcher,
+                                root,
+                                path,
+                                watched_directories,
+                            )
+                        {
+                            record_watcher_failure(freshness, WATCHER_FAILURE_RUNTIME);
+                            record_watcher_registration_error(freshness, &_error);
+                            return false;
+                        }
+                        overflow |= topology_changed;
                     }
                 }
                 record_watcher_event(freshness, changed_paths, overflow);
@@ -5125,6 +5482,23 @@ fn watcher_loop(
                 break;
             }
         }
+    }
+    true
+}
+
+fn unwatch_directory_subtree(
+    watcher: &mut RecommendedWatcher,
+    removed_root: &std::path::Path,
+    watched: &mut BTreeSet<std::path::PathBuf>,
+) {
+    let removed = watched
+        .iter()
+        .filter(|directory| directory.starts_with(removed_root))
+        .cloned()
+        .collect::<Vec<_>>();
+    for directory in removed {
+        let _ = watcher.unwatch(&directory);
+        watched.remove(&directory);
     }
 }
 
@@ -5958,17 +6332,7 @@ fn watcher_failure_name(value: u8) -> &'static str {
 
 fn watcher_error_detail(error: &notify::Error) -> String {
     match &error.kind {
-        NotifyErrorKind::Io(error) => {
-            let category = match error.kind() {
-                std::io::ErrorKind::PermissionDenied => "permission_denied",
-                std::io::ErrorKind::NotFound => "not_found",
-                _ => "io",
-            };
-            match error.raw_os_error() {
-                Some(code) => format!("{category}_errno_{code}"),
-                None => category.to_owned(),
-            }
-        }
+        NotifyErrorKind::Io(error) => watcher_io_error_detail(error),
         NotifyErrorKind::PathNotFound => "path_not_found".to_owned(),
         NotifyErrorKind::WatchNotFound => "watch_not_found".to_owned(),
         NotifyErrorKind::Generic(_) => "generic".to_owned(),
@@ -5977,11 +6341,39 @@ fn watcher_error_detail(error: &notify::Error) -> String {
     }
 }
 
+fn watcher_io_error_detail(error: &std::io::Error) -> String {
+    let category = match error.kind() {
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::NotFound => "not_found",
+        _ => "io",
+    };
+    match error.raw_os_error() {
+        Some(code) => format!("{category}_errno_{code}"),
+        None => category.to_owned(),
+    }
+}
+
 fn record_watcher_error_detail(freshness: &FreshnessState, error: &notify::Error) {
     *freshness
         .watcher_error_detail
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(watcher_error_detail(error));
+}
+
+fn record_watcher_registration_error(freshness: &FreshnessState, error: &anyhow::Error) {
+    let detail = error
+        .downcast_ref::<notify::Error>()
+        .map(watcher_error_detail)
+        .or_else(|| {
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(watcher_io_error_detail)
+        })
+        .unwrap_or_else(|| "directory_registration_failed".to_owned());
+    *freshness
+        .watcher_error_detail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail);
 }
 
 fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
@@ -6133,6 +6525,19 @@ fn metrics_snapshot(engine: &ProjectEngine) -> Result<Value> {
         "index_freshness": {
             "generation": engine.freshness.generation.load(Ordering::Relaxed),
             "dirty": engine.freshness.dirty.load(Ordering::Relaxed),
+            "activity_state": engine.freshness.activity_state(),
+            "foreground_idle_ms": engine.freshness.activity_age_ms(),
+            "metadata_scans": engine.freshness.metadata_scan_count.load(Ordering::Relaxed),
+            "metadata_scan_micros": engine.freshness.metadata_scan_micros.load(Ordering::Relaxed),
+            "wiki_publication_attempted": engine.freshness.wiki_publication_attempted.load(Ordering::Relaxed),
+            "wiki_publication_skipped": engine.freshness.wiki_publication_skipped.load(Ordering::Relaxed),
+            "wiki_publication_completed": engine.freshness.wiki_publication_completed.load(Ordering::Relaxed),
+            "incremental_fallback_reason": engine
+                .freshness
+                .incremental_fallback_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or("none"),
             "poll_interval_ms": FAST_POLL_INTERVAL_MS,
             "watcher": {
                 "backend": watcher_backend_name(
@@ -7592,6 +7997,17 @@ fn now_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn monotonic_millis() -> u64 {
+    static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(
+        PROCESS_START
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn expiry_iso(ttl_days: Option<i64>) -> Result<Option<String>> {
@@ -10802,6 +11218,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn native_watcher_ignores_symlink_targets_and_tracks_local_changes() {
+        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::fs::symlink;
 
         let fixture = tempdir().expect("repository root");
@@ -10811,6 +11228,12 @@ mod tests {
         fs::write(&source, "fn before() {}\n").expect("local source");
         fs::write(&external_source, "fn external_before() {}\n").expect("external source");
         symlink(external.path(), fixture.path().join("external-link")).expect("external symlink");
+        let ignored_unreadable = fixture.path().join(".downloads/private");
+        fs::create_dir_all(&ignored_unreadable).expect("ignored unreadable directory");
+        fs::write(ignored_unreadable.join("hidden.rs"), "fn ignored() {}\n")
+            .expect("ignored source");
+        fs::set_permissions(&ignored_unreadable, fs::Permissions::from_mode(0o000))
+            .expect("make ignored directory unreadable");
 
         let freshness = Arc::new(FreshnessState::default());
         let stop = Arc::new(AtomicBool::new(false));
@@ -10834,6 +11257,12 @@ mod tests {
             freshness.watcher_status.load(Ordering::Acquire),
             WATCHER_HEALTHY
         );
+        assert!(
+            indexable_directories(fixture.path(), fixture.path())
+                .expect("eligible directory set")
+                .iter()
+                .all(|path| !path.to_string_lossy().contains(".downloads"))
+        );
 
         fs::write(&source, "fn after() {}\n").expect("local source modification");
         let local_deadline = Instant::now() + StdDuration::from_secs(1);
@@ -10854,13 +11283,448 @@ mod tests {
                 .contains("lib.rs")
         );
 
-        let local_epoch = freshness.event_epoch.load(Ordering::Acquire);
+        freshness
+            .changed_paths
+            .lock()
+            .expect("clear local journal")
+            .clear();
+        thread::sleep(StdDuration::from_millis(100));
+        freshness
+            .changed_paths
+            .lock()
+            .expect("clear settled local journal")
+            .clear();
         fs::write(&external_source, "fn external_after() {}\n").expect("external modification");
         thread::sleep(StdDuration::from_millis(100));
-        assert_eq!(freshness.event_epoch.load(Ordering::Acquire), local_epoch);
+        assert!(
+            !freshness
+                .changed_paths
+                .lock()
+                .expect("external event journal")
+                .iter()
+                .any(|path| path.contains("external"))
+        );
+
+        let atomic_temp = fixture.path().join("lib.rs.tmp");
+        let atomic_saved = fixture.path().join("atomic.rs");
+        let before_atomic_rename = freshness.event_epoch.load(Ordering::Acquire);
+        freshness.journal_overflow.store(false, Ordering::Release);
+        freshness
+            .changed_paths
+            .lock()
+            .expect("clear atomic rename journal")
+            .clear();
+        fs::write(&atomic_temp, "fn atomic_save() {}\n").expect("temporary editor file");
+        fs::rename(&atomic_temp, &atomic_saved).expect("atomic editor rename");
+        let atomic_deadline = Instant::now() + StdDuration::from_secs(1);
+        while freshness.event_epoch.load(Ordering::Acquire) == before_atomic_rename
+            && Instant::now() < atomic_deadline
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(freshness.event_epoch.load(Ordering::Acquire) > before_atomic_rename);
+        assert!(!freshness.journal_overflow.load(Ordering::Acquire));
+
+        let deep_file = fixture.path().join("added/deep/source.rs");
+        let before_create = freshness.event_epoch.load(Ordering::Acquire);
+        fs::create_dir_all(deep_file.parent().expect("deep source parent"))
+            .expect("new directory tree");
+        let created_deadline = Instant::now() + StdDuration::from_secs(1);
+        while Instant::now() < created_deadline
+            && !freshness
+                .changed_paths
+                .lock()
+                .expect("created directory journal")
+                .iter()
+                .any(|path| path == "added" || path == "added/deep")
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(freshness.event_epoch.load(Ordering::Acquire) > before_create);
+        assert!(
+            freshness
+                .changed_paths
+                .lock()
+                .expect("created directory journal")
+                .iter()
+                .any(|path| path == "added" || path == "added/deep")
+        );
+
+        let before_nested_edit = freshness.event_epoch.load(Ordering::Acquire);
+        freshness
+            .changed_paths
+            .lock()
+            .expect("clear nested creation journal")
+            .clear();
+        fs::write(&deep_file, "fn deep_before() {}\n").expect("new nested source");
+        fs::write(&deep_file, "fn deep_after_registration() {}\n").expect("nested edit");
+        let nested_deadline = Instant::now() + StdDuration::from_secs(1);
+        while Instant::now() < nested_deadline
+            && (freshness.event_epoch.load(Ordering::Acquire) <= before_nested_edit
+                || !freshness
+                    .changed_paths
+                    .lock()
+                    .expect("nested journal")
+                    .contains("added/deep/source.rs"))
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(
+            freshness
+                .changed_paths
+                .lock()
+                .expect("nested journal")
+                .contains("added/deep/source.rs")
+        );
+
+        let renamed_root = fixture.path().join("renamed");
+        let before_rename = freshness.event_epoch.load(Ordering::Acquire);
+        fs::rename(fixture.path().join("added"), &renamed_root).expect("rename watched tree");
+        let rename_deadline = Instant::now() + StdDuration::from_secs(1);
+        while Instant::now() < rename_deadline
+            && !freshness
+                .changed_paths
+                .lock()
+                .expect("rename journal")
+                .contains("renamed")
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(freshness.event_epoch.load(Ordering::Acquire) > before_rename);
+        assert!(
+            freshness
+                .changed_paths
+                .lock()
+                .expect("rename journal")
+                .contains("renamed")
+        );
+        let before_renamed_edit = freshness.event_epoch.load(Ordering::Acquire);
+        freshness
+            .changed_paths
+            .lock()
+            .expect("clear rename journal")
+            .clear();
+        let renamed_file = renamed_root.join("deep/source.rs");
+        fs::write(&renamed_file, "fn renamed_tree_edit() {}\n").expect("renamed tree edit");
+        let renamed_deadline = Instant::now() + StdDuration::from_secs(1);
+        while Instant::now() < renamed_deadline
+            && (freshness.event_epoch.load(Ordering::Acquire) <= before_renamed_edit
+                || !freshness
+                    .changed_paths
+                    .lock()
+                    .expect("renamed journal")
+                    .contains("renamed/deep/source.rs"))
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(
+            freshness
+                .changed_paths
+                .lock()
+                .expect("renamed journal")
+                .contains("renamed/deep/source.rs")
+        );
+
+        freshness
+            .changed_paths
+            .lock()
+            .expect("clear pre-removal journal")
+            .clear();
+        let removed_deadline = Instant::now() + StdDuration::from_secs(1);
+        fs::remove_dir_all(&renamed_root).expect("remove watched tree");
+        while Instant::now() < removed_deadline
+            && !freshness
+                .changed_paths
+                .lock()
+                .expect("removed directory journal")
+                .iter()
+                .any(|path| path == "renamed" || path == "renamed/deep")
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        let recreated_epoch = freshness.event_epoch.load(Ordering::Acquire);
+        freshness
+            .changed_paths
+            .lock()
+            .expect("clear removed directory journal")
+            .clear();
+        fs::create_dir_all(renamed_root.join("deep")).expect("recreate same directory path");
+        let recreated_deadline = Instant::now() + StdDuration::from_secs(1);
+        while Instant::now() < recreated_deadline
+            && !freshness
+                .changed_paths
+                .lock()
+                .expect("recreated directory journal")
+                .iter()
+                .any(|path| path == "renamed" || path == "renamed/deep")
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(freshness.event_epoch.load(Ordering::Acquire) > recreated_epoch);
+        assert!(
+            freshness
+                .changed_paths
+                .lock()
+                .expect("recreated directory journal")
+                .iter()
+                .any(|path| path == "renamed" || path == "renamed/deep")
+        );
+        let before_recreated_edit = freshness.event_epoch.load(Ordering::Acquire);
+        freshness
+            .changed_paths
+            .lock()
+            .expect("clear recreated journal")
+            .clear();
+        fs::write(&renamed_file, "fn recreated_tree_edit() {}\n").expect("recreated tree edit");
+        let recreated_edit_deadline = Instant::now() + StdDuration::from_secs(1);
+        while Instant::now() < recreated_edit_deadline
+            && (freshness.event_epoch.load(Ordering::Acquire) == before_recreated_edit
+                || !freshness
+                    .changed_paths
+                    .lock()
+                    .expect("recreated journal")
+                    .contains("renamed/deep/source.rs"))
+        {
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(
+            freshness
+                .changed_paths
+                .lock()
+                .expect("recreated journal")
+                .contains("renamed/deep/source.rs")
+        );
 
         stop.store(true, Ordering::Release);
         assert!(watcher.join().expect("native watcher"));
+        fs::set_permissions(&ignored_unreadable, fs::Permissions::from_mode(0o755))
+            .expect("restore ignored directory permissions");
+    }
+
+    #[test]
+    fn directory_registration_installs_parent_before_enumerating_children() {
+        let root = tempdir().expect("repository root");
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+        let late = nested.join("created-during-registration");
+        let mut visited = Vec::new();
+        visit_indexable_directories(root.path(), root.path(), |directory| {
+            visited.push(directory.to_path_buf());
+            if directory == nested {
+                fs::create_dir(&late).expect("create child after parent registration");
+            }
+            Ok(())
+        })
+        .expect("directory traversal");
+        assert!(visited.contains(&nested));
+        assert!(visited.contains(&late));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_registration_fails_closed_on_unreadable_nonignored_subtree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("repository root");
+        let unreadable = root.path().join("private");
+        fs::create_dir(&unreadable).expect("private directory");
+        fs::write(unreadable.join("source.rs"), "fn private() {}\n").expect("private source");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("make directory unreadable");
+
+        let result = visit_indexable_directories(root.path(), root.path(), |_| Ok(()));
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755))
+            .expect("restore directory permissions");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_watcher_reconciles_any_kind_directory_events() {
+        let root = tempdir().expect("repository root");
+        let added = root.path().join("added");
+        fs::create_dir(&added).expect("new directory");
+        let mut watcher =
+            RecommendedWatcher::new(|_: notify::Result<Event>| {}, NotifyConfig::default())
+                .expect("native watcher");
+        watcher
+            .watch(root.path(), RecursiveMode::NonRecursive)
+            .expect("root watch");
+        let mut watched = BTreeSet::from([root.path().to_path_buf()]);
+        let freshness = FreshnessState::default();
+        let stop = AtomicBool::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(Event::new(EventKind::Create(
+                notify::event::CreateKind::Any,
+            ))
+            .add_path(added.clone())))
+            .expect("directory event");
+        drop(sender);
+        watcher_loop(
+            &receiver,
+            &mut watcher,
+            &mut watched,
+            root.path(),
+            &freshness,
+            &stop,
+        );
+        assert!(watched.contains(&added));
+        assert!(freshness.journal_overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn metadata_fallback_activity_backoff_has_bounded_idle_and_dormant_states() {
+        let base = StdDuration::from_secs(2);
+        assert_eq!(FreshnessState::activity_state_for_age(0), "active");
+        assert_eq!(
+            FreshnessState::metadata_poll_interval_for_age(base, PROJECT_ACTIVE_MS - 1),
+            Some(base)
+        );
+        assert_eq!(
+            FreshnessState::activity_state_for_age(PROJECT_ACTIVE_MS),
+            "idle"
+        );
+        assert_eq!(
+            FreshnessState::metadata_poll_interval_for_age(base, PROJECT_ACTIVE_MS),
+            Some(base)
+        );
+        assert_eq!(
+            FreshnessState::metadata_poll_interval_for_age(base, 9 * PROJECT_ACTIVE_MS),
+            Some(StdDuration::from_secs(PROJECT_MAX_IDLE_POLL_SECS))
+        );
+        assert_eq!(
+            FreshnessState::activity_state_for_age(PROJECT_DORMANT_MS),
+            "dormant"
+        );
+        assert_eq!(
+            FreshnessState::metadata_poll_interval_for_age(base, PROJECT_DORMANT_MS),
+            None
+        );
+    }
+
+    #[test]
+    fn foreground_request_verifies_dormant_metadata_snapshot_before_returning() {
+        let root = tempdir().expect("repository root");
+        let state = tempdir().expect("state root");
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn before_wake() {}\n").expect("initial source");
+        let engine = ProjectEngine::build_with_state(root.path(), state.path(), "wake-test")
+            .expect("project engine");
+        engine._watcher.stop.store(true, Ordering::Release);
+        {
+            let _activity = engine
+                .freshness
+                .activity_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            engine.freshness.activity_wake.notify_all();
+        }
+        while engine
+            ._watcher
+            .thread
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            thread::yield_now();
+        }
+        fs::write(&source, "fn after_wake() {}\n").expect("change while dormant");
+        engine
+            .freshness
+            .set_activity_age_for_test(PROJECT_DORMANT_MS);
+        engine
+            .freshness
+            .last_metadata_scan_ms
+            .store(0, Ordering::Release);
+        engine
+            .freshness
+            .watcher_backend
+            .store(WATCHER_BACKEND_METADATA, Ordering::Release);
+        assert_eq!(engine.freshness.activity_state(), "dormant");
+        let generation_before = engine.freshness.generation.load(Ordering::Acquire);
+
+        engine
+            .verify_foreground_freshness(None)
+            .expect("foreground wake verification");
+
+        let (indexed, _) = engine.index().file_content("lib.rs", 1024).unwrap();
+        assert!(
+            indexed.contains("after_wake"),
+            "indexed={indexed:?}, disk={:?}, generation_before={generation_before}, generation_after={}, dirty={}",
+            fs::read_to_string(&source).unwrap(),
+            engine.freshness.generation.load(Ordering::Acquire),
+            engine.freshness.dirty.load(Ordering::Acquire),
+        );
+        assert_eq!(engine.freshness.activity_state(), "active");
+        assert!(!engine.freshness.dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dormant_native_wake_keeps_a_known_change_incremental() {
+        let root = tempdir().expect("repository root");
+        let state = tempdir().expect("state root");
+        let source = root.path().join("lib.rs");
+        fs::write(&source, "fn before_wake() {}\n").expect("initial source");
+        let engine = ProjectEngine::build_with_state(root.path(), state.path(), "native-wake-test")
+            .expect("project engine");
+        engine._watcher.stop.store(true, Ordering::Release);
+        {
+            let _activity = engine
+                .freshness
+                .activity_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            engine.freshness.activity_wake.notify_all();
+        }
+        while engine
+            ._watcher
+            .thread
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            thread::yield_now();
+        }
+        fs::write(&source, "fn after_wake() {}\n").expect("change while dormant");
+        engine
+            .freshness
+            .set_activity_age_for_test(PROJECT_DORMANT_MS);
+        record_watcher_event(&engine.freshness, ["lib.rs".to_owned()], false);
+        assert!(!engine.freshness.journal_overflow.load(Ordering::Acquire));
+
+        engine
+            .verify_foreground_freshness(None)
+            .expect("foreground wake verification");
+
+        let (indexed, _) = engine.index().file_content("lib.rs", 1024).unwrap();
+        assert!(indexed.contains("after_wake"));
+        assert!(engine.metrics.incremental_refreshes.load(Ordering::Acquire) > 0);
+        assert!(!engine.freshness.journal_overflow.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn watcher_guard_stops_a_dormant_condvar_waiter() {
+        let root = tempdir().expect("repository root");
+        let freshness = Arc::new(FreshnessState::default());
+        freshness.set_activity_age_for_test(PROJECT_DORMANT_MS);
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let runner_started = Arc::clone(&started);
+        let runner = WatchGuard::start_with_runner(
+            root.path().to_path_buf(),
+            Arc::clone(&freshness),
+            move |_, freshness, stop| {
+                mark_watcher_healthy(&freshness);
+                runner_started.wait();
+                freshness.wait_for_activity_or_timeout(
+                    &stop,
+                    freshness.activity_generation.load(Ordering::Acquire),
+                    None,
+                );
+            },
+        );
+        started.wait();
+        let stop_started = Instant::now();
+        drop(runner);
+        assert!(stop_started.elapsed() < StdDuration::from_secs(1));
     }
 
     #[test]
@@ -11211,7 +12075,18 @@ mod tests {
             }
             controller_stop.store(true, Ordering::Release);
         });
-        watcher_loop(&receiver, root.path(), &runtime_freshness, &runtime_stop);
+        let mut runtime_watcher =
+            RecommendedWatcher::new(|_: notify::Result<Event>| {}, NotifyConfig::default())
+                .expect("runtime watcher");
+        let mut runtime_directories = BTreeSet::new();
+        watcher_loop(
+            &receiver,
+            &mut runtime_watcher,
+            &mut runtime_directories,
+            root.path(),
+            &runtime_freshness,
+            &runtime_stop,
+        );
         controller.join().expect("runtime error controller");
         assert!(runtime_freshness.dirty.load(Ordering::Acquire));
         assert!(runtime_freshness.journal_overflow.load(Ordering::Acquire));
@@ -11227,8 +12102,14 @@ mod tests {
         let disconnected_stop = AtomicBool::new(false);
         let (sender, receiver) = std::sync::mpsc::channel();
         drop(sender);
+        let mut disconnected_watcher =
+            RecommendedWatcher::new(|_: notify::Result<Event>| {}, NotifyConfig::default())
+                .expect("disconnected watcher");
+        let mut disconnected_directories = BTreeSet::new();
         watcher_loop(
             &receiver,
+            &mut disconnected_watcher,
+            &mut disconnected_directories,
             root.path(),
             &disconnected_freshness,
             &disconnected_stop,
